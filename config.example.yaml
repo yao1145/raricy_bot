@@ -1,0 +1,49 @@
+# Raricy 站内聊天机器人配置示例。
+# 复制为 config.yaml 后按需修改；也可以用 BOT_CONFIG_PATH 指定其他路径。
+#
+# 密钥不写在本文件里，一律通过环境变量提供：
+#   RARICY_USERNAME   站点登录用户名
+#   RARICY_PASSWORD   站点登录密码
+#   LLM_API_KEY       模型服务的 API Key
+# 缺失或为空时程序会直接以配置错误退出。
+
+site:
+  base_url: "https://example.com"
+  request_timeout_seconds: 20
+
+model:
+  base_url: "https://provider.example/v1"
+  model: "configured-model-name"
+  temperature: 0.4
+  timeout_seconds: 45
+  max_output_tokens: 600
+
+behavior:
+  context_turns: 10
+  context_input_tokens: 8000
+  max_input_chars: 8000
+  max_output_chars: 4000
+  concurrency: 3
+  queue_size: 50
+  minute_attempt_limit: 25
+  daily_normal_limit: 750
+  daily_absolute_limit: 790
+  notice_cooldown_seconds: 300
+  reconnect_base_seconds: 3.0
+  reconnect_max_seconds: 60.0
+  ready_probe_seconds: 300.0
+  rate_limit_wait_seconds: 60.0
+
+ops:
+  host: "0.0.0.0"
+  port: 8080
+
+storage:
+  db_path: "./data/bot.db"
+
+logging:
+  level: "INFO"
+
+system_prompt: |
+  你是站内通用聊天机器人。明确自己的机器人身份，
+  跟随用户语言，保持简洁友好，不代表站方作正式承诺。
