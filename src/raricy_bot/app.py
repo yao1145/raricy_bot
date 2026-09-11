@@ -120,6 +120,10 @@ class BotApp:
         if self._started:
             return
         await self._store.open()
+        # 崩溃恢复第一步（§16）：此刻本进程尚未认领任何事件，所以任何非终态行
+        # 必定属于已经死掉的旧进程。标成 recover 之后，它们才能被重新认领。
+        # **必须早于 sse.run()**，否则会把本进程刚入队的在途工作误标成孤儿。
+        await self._store.mark_orphans_recoverable()
         await self._client.start()
         try:
             user = await self._client.login()
@@ -151,8 +155,14 @@ class BotApp:
             base_delay=self._config.behavior.reconnect_base_seconds,
             max_delay=self._config.behavior.reconnect_max_seconds,
         )
-        # D-16：崩溃恢复的关键一步。构造之后、run() 之前，用存储层水位播种
-        # Last-Event-ID；否则重启会从「此刻」重新订阅，崩溃瞬间在处理的消息永久丢失。
+        # D-16 崩溃恢复第二步：构造之后、run() 之前，用存储层水位播种 Last-Event-ID。
+        # 否则重启会从「此刻」重新订阅，崩溃瞬间在处理的消息永久丢失。
+        #
+        # 两步缺一不可：上面 mark_orphans_recoverable() 把旧进程遗留的行标成 recover，
+        # 这里的水位因为该行非终态而停在它**之前**，于是服务端会把它补发回来，
+        # 路由器再在第 6 步用 reclaim_orphan() 认领它。只做这一步（只有水位播种）
+        # 是不够的：补发回来的消息会被当成 duplicate 丢掉，消息永远不处理、
+        # 水位永远卡住 —— 这正是外部审查发现的问题。
         self._sse.set_last_event_id(await self._store.watermark())
 
         await self._workers.start()
@@ -289,6 +299,17 @@ class BotApp:
                 # D-4：不可用期间不发消息。这里刻意不逐条记日志，
                 # 否则一条活跃私聊会把「期间不刷日志」变成每消息一行。
                 return
+            # 代次检查之一（§16）：请求入队后可能已被 /reset 作废。
+            # 这种请求连模型都不必调 —— 省下这次调用，也不会往新会话里写任何东西。
+            if self._ctx.generation(request.session_key) != request.generation:
+                log_event(
+                    _logger,
+                    logging.DEBUG,
+                    "app.stale_generation",
+                    channel_id=request.channel_id,
+                    kind="pre_model",
+                )
+                return
             # D-7：历史里只存干净正文；引用文本只拼在本轮（见 _apply_reply_prefix）。
             self._ctx.append_user(request.session_key, request.user_text)
             messages = self._ctx.build_messages(
@@ -310,6 +331,19 @@ class BotApp:
                     error=type(exc).__name__,
                 )
                 await self._notify_failure(request)
+                return
+
+            # 代次检查之二（§16）：模型调用可能持续几十秒，`/reset` 完全可能在它
+            # 返回之前发生。若已作废，就**不写历史、也不发这条过期回复** ——
+            # 否则它会污染刚清空的会话，并在下一轮被再次外送给模型。
+            if self._ctx.generation(request.session_key) != request.generation:
+                log_event(
+                    _logger,
+                    logging.INFO,
+                    "app.stale_generation",
+                    channel_id=request.channel_id,
+                    kind="post_model",
+                )
                 return
 
             self._ctx.append_assistant(request.session_key, text)

@@ -33,6 +33,25 @@ LOG_FIELDS: frozenset[str] = frozenset(
 # 日志行格式：单行输出，正文只保留稳定字段。
 LOG_FORMAT: str = "%(asctime)s %(levelname)s %(name)s %(message)s"
 
+# 必须压制的第三方 logger。
+# 把根 logger 设成 DEBUG 会连带打开它们的 DEBUG 输出，而 `openai._base_client`
+# 在 DEBUG 下会打印完整请求体，包含 system prompt 与用户正文：
+#
+#   openai._base_client DEBUG Request options: {... 'json_data': {'messages': [...]}}
+#
+# 这直接违反 §19.1「任何级别不得出现正文或模型请求体」。
+# 这里用**定级**而不是「发现敏感串就过滤」：SDK 的日志格式随版本变化，
+# 字符串过滤器很容易漏掉嵌套字段。降级后仍可诊断 —— 我们自己的
+# `model.retry` / 错误类别 / HTTP 状态等走 `raricy.*` 命名空间，不受影响。
+NOISY_THIRD_PARTY_LOGGERS: tuple[str, ...] = (
+    "openai",
+    "openai._base_client",
+    "httpx",
+    "httpcore",
+    "httpcore._trace",
+    "anyio",
+)
+
 # 进程级脱敏单例，`register_secret()` 与过滤器共用。
 _redactor = Redactor()
 
@@ -51,10 +70,19 @@ class RedactingFilter(logging.Filter):
 
 
 def setup_logging(level: str = "INFO") -> None:
-    """配置根 logger：单行格式输出到 stderr，并挂上脱敏过滤器。"""
+    """配置根 logger：单行格式输出到 stderr，并挂上脱敏过滤器。
+
+    同时把第三方库（模型 SDK、HTTP 栈）的级别压到 WARNING —— 否则根 logger 设成
+    DEBUG 时会连带打开它们的 DEBUG 输出，把模型请求体写进 stderr。
+    """
     global _handler
     root = logging.getLogger()
     root.setLevel(level.upper())
+
+    # 放在 if 之外：本函数可能被重复调用，每次都要确保压制生效。
+    for name in NOISY_THIRD_PARTY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
     if _handler is None:
         handler = logging.StreamHandler(sys.stderr)
         handler.setFormatter(logging.Formatter(LOG_FORMAT))

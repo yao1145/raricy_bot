@@ -42,6 +42,7 @@ _ACTIONABLE_REASONS: frozenset[str] = frozenset(
         "queued",
         "busy",
         "resync",
+        "recovered_sent",
         "help",
         "reset",
         "empty",
@@ -60,6 +61,7 @@ class Request:
     channel_id: str
     channel_kind: str  # "lobby" | "dm"
     session_key: str
+    generation: int  # 创建时的会话代次；worker 用它判断请求是否已被 /reset 作废
     message: ChatMessage
     user_text: str  # 已剔除 @机器人 的正文
     reply_context: str | None  # message.reply 非删除时的正文，否则 None
@@ -209,15 +211,35 @@ class MessageRouter:
 
         # 6. 主去重键拦截：只有通过前面过滤的候选消息才落库（D-15）。
         if not await self._store.record_event(event_id, message.id, channel_id):
-            return self._emit(
-                "ignored",
-                "duplicate",
-                channel_id=channel_id,
-                message_id=message.id,
-                reply_to=message.id,
-                channel_kind=channel_kind,
-                event_id=event_id,
-            )
+            # 该 message_id 已有记录。两种可能：
+            #   (a) 本进程已入队的重复投递 —— 应当忽略；
+            #   (b) **上一进程崩溃时遗留的未完成事件**（启动时被
+            #       mark_orphans_recoverable() 标成 recover）—— 必须重新认领。
+            # 没有 (b) 这条分支的话，崩溃后靠水位补发回来的消息会被当成 duplicate
+            # 丢掉：消息永远不处理、该行永远 pending、水位永远卡在它之前。
+            if not await self._store.reclaim_orphan(message.id):
+                return self._emit(
+                    "ignored",
+                    "duplicate",
+                    channel_id=channel_id,
+                    message_id=message.id,
+                    reply_to=message.id,
+                    channel_kind=channel_kind,
+                    event_id=event_id,
+                )
+            # 认领成功。但旧进程可能**其实已经回复过**、只是没来得及标记完成，
+            # 那就补一个完成标记即可，绝不能再回一遍。
+            if await self._store.find_sent_for_reply(channel_id, message.id) is not None:
+                await self._store.mark_handled(message.id, "done")
+                return self._emit(
+                    "ignored",
+                    "recovered_sent",
+                    channel_id=channel_id,
+                    message_id=message.id,
+                    reply_to=message.id,
+                    channel_kind=channel_kind,
+                    event_id=event_id,
+                )
 
         # 7. 引用上下文（已删除的引用视为无）。
         reply_context: str | None = None
@@ -309,6 +331,9 @@ class MessageRouter:
             channel_id=channel_id,
             channel_kind=channel_kind,
             session_key=session_key,
+            # 记下创建时的代次；worker 会在调模型前与模型返回后各比一次，
+            # 用来丢弃已被 /reset 作废的过期请求（§16）。
+            generation=self._ctx.generation(session_key),
             message=message,
             user_text=user_text,
             reply_context=reply_context,

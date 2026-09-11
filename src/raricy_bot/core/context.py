@@ -39,6 +39,8 @@ class ContextManager:
         self._max_turns = max_turns
         self._max_input_tokens = max_input_tokens
         self._sessions: dict[str, list[Turn]] = {}
+        # 会话代次：/reset 时递增。用途见 reset() 的注释。
+        self._generations: dict[str, int] = {}
 
     def append_user(self, session_key: str, content: str) -> None:
         """追加一条用户轮次；超出轮次上限时从最旧整对丢弃。"""
@@ -55,11 +57,24 @@ class ContextManager:
         )
 
     def reset(self, session_key: str) -> bool:
-        """清空指定会话的历史；该会话不存在时返回 False。"""
-        if session_key not in self._sessions:
-            return False
-        del self._sessions[session_key]
-        return True
+        """清空指定会话的历史并**递增其代次**；会话原本不存在时返回 False。
+
+        代次的用途是隔离 `/reset` 与**在途**模型请求的竞态：
+        一次模型调用可能持续几十秒，而 `/reset` 完全可能在它返回之前到达。
+        若不作废，旧请求返回后会往刚清空的会话里 `append_assistant()`，
+        把一条用户没见过的回复写进「新会话」，并在**下一轮**被再次外送给模型。
+
+        **即使会话原本不存在也要递增**：一个刚建立、还没写进历史的会话里
+        同样可能有请求正在跑，此时把代次留在 0 就作废不了它。
+        """
+        existed = session_key in self._sessions
+        self._sessions.pop(session_key, None)
+        self._generations[session_key] = self._generations.get(session_key, 0) + 1
+        return existed
+
+    def generation(self, session_key: str) -> int:
+        """返回当前代次；从未 reset 过的会话为 0。"""
+        return self._generations.get(session_key, 0)
 
     def build_messages(
         self, session_key: str, system_prompt: str

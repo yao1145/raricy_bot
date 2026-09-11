@@ -14,16 +14,24 @@ import asyncio
 import sqlite3
 import time
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import TypeVar
 
 _T = TypeVar("_T")
 
-# events.status 的取值：pending 表示已接收未处理；done/skipped 表示处理完毕。
+# events.status 的取值。
+#   pending —— 本进程已接收并入队，尚未处理完。
+#   recover —— **上一进程崩溃时遗留**的未完成行，启动时由 mark_orphans_recoverable()
+#              标记出来，允许被重新认领（见 INTERFACES.md §9 §12 §16）。
+#   done / skipped —— 终态。
 STATUS_PENDING: str = "pending"
+STATUS_RECOVER: str = "recover"
 STATUS_DONE: str = "done"
 STATUS_SKIPPED: str = "skipped"
 
-# 视为「已处理」的状态集合。
+# 视为「已处理」的状态集合；**其余状态一律是非终态**，会压住水位。
+# 判断非终态时请用 `status NOT IN HANDLED_STATUSES`，不要写成 `status = 'pending'`：
+# 那样会让 recover 行既不算 pending 又被水位忽略，等于把孤儿事件连同它的水位一起跳过。
 HANDLED_STATUSES: tuple[str, ...] = (STATUS_DONE, STATUS_SKIPPED)
 
 # 建表语句（字段类型自定，语义与 INTERFACES.md §9 一致）。
@@ -102,6 +110,12 @@ class Store:
 
     def _connect(self) -> sqlite3.Connection:
         """在工作线程里建连接、设 PRAGMA 并建表。"""
+        # 默认配置是 ./data/bot.db，而新检出的仓库里没有 data/ 目录；
+        # 不预先建目录的话 sqlite3.connect 会直接抛
+        # `OperationalError: unable to open database file`。
+        # 容器里 Dockerfile 已经建了 /app/data，所以这个问题只在本地直接运行时暴露。
+        if self._path != ":memory:":
+            Path(self._path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self._path, check_same_thread=False)
         # `:memory:` 不支持 WAL，此时 PRAGMA 返回 "memory"，不会报错。
         conn.execute("PRAGMA journal_mode=WAL")
@@ -200,9 +214,11 @@ class Store:
             # 一条带 event_id 的记录都没有（空表或全是 resync 行）。
             return 0
 
+        placeholders = ", ".join("?" for _ in HANDLED_STATUSES)
         pending = conn.execute(
-            "SELECT MIN(event_id) FROM events WHERE event_id IS NOT NULL AND status = ?",
-            (STATUS_PENDING,),
+            "SELECT MIN(event_id) FROM events WHERE event_id IS NOT NULL"
+            f" AND status NOT IN ({placeholders})",
+            HANDLED_STATUSES,
         ).fetchone()
         pending_min = pending[0] if pending is not None else None
 
@@ -214,15 +230,55 @@ class Store:
         return max(0, min(value, int(max_event_id)))
 
     async def pending_messages(self) -> list[tuple[int | None, int, str]]:
-        """按 message_id 升序返回未处理事件：(event_id, message_id, channel_id)。"""
+        """按 message_id 升序返回**所有未完成**事件：(event_id, message_id, channel_id)。
+
+        「未完成」= 状态不在 HANDLED_STATUSES 里，因此 pending 与 recover 都算。
+        """
 
         def operation(conn: sqlite3.Connection) -> list[tuple[int | None, int, str]]:
+            placeholders = ", ".join("?" for _ in HANDLED_STATUSES)
             rows = conn.execute(
                 "SELECT event_id, message_id, channel_id FROM events"
-                " WHERE status = ? ORDER BY message_id",
-                (STATUS_PENDING,),
+                f" WHERE status NOT IN ({placeholders}) ORDER BY message_id",
+                HANDLED_STATUSES,
             ).fetchall()
             return [(row[0], row[1], row[2]) for row in rows]
+
+        return await self._execute(operation)
+
+    async def mark_orphans_recoverable(self) -> int:
+        """崩溃恢复第一步：把所有 pending 行改标为 recover，返回改动行数。
+
+        由 `BotApp.start()` 在 `Store.open()` 之后、SSE 启动**之前**调用一次。
+        此刻本进程尚未认领任何事件，因此任何非终态行必定属于已经死掉的旧进程。
+        顺序不能反：在本进程入队之后再扫，会把我们自己的在途工作误标成孤儿。
+        """
+
+        def operation(conn: sqlite3.Connection) -> int:
+            cursor = conn.execute(
+                "UPDATE events SET status = ? WHERE status = ?",
+                (STATUS_RECOVER, STATUS_PENDING),
+            )
+            conn.commit()
+            return int(cursor.rowcount)
+
+        return await self._execute(operation)
+
+    async def reclaim_orphan(self, message_id: int) -> bool:
+        """原子地把一条 recover 行重新认领为 pending；True 表示本次认领成功。
+
+        单条 UPDATE + rowcount 判定，因此同一孤儿事件即使被 SSE 补发与 resync
+        并发投递，也只有一个调用方拿得到 True。
+        本进程已入队的 pending 行、以及 done/skipped 的终态行都不可认领。
+        """
+
+        def operation(conn: sqlite3.Connection) -> bool:
+            cursor = conn.execute(
+                "UPDATE events SET status = ? WHERE message_id = ? AND status = ?",
+                (STATUS_PENDING, message_id, STATUS_RECOVER),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
 
         return await self._execute(operation)
 
