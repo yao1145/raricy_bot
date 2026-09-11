@@ -1,0 +1,47 @@
+# 单副本部署（设计文档 §2.2：仅运行一个机器人实例）。
+# 密钥一律通过环境变量传入，本文件不得出现任何真实取值。
+# 使用前：
+#   export RARICY_USERNAME=...
+#   export RARICY_PASSWORD=...
+#   export LLM_API_KEY=...
+#   docker compose up -d
+services:
+  bot:
+    build: .
+    image: raricy-bot:latest
+    restart: unless-stopped
+    environment:
+      # 容器内固定读取只读挂载的配置。
+      BOT_CONFIG_PATH: /app/config.yaml
+      # 站点与模型凭据只从宿主环境透传，缺省为空由程序以配置错误退出。
+      RARICY_USERNAME: ${RARICY_USERNAME}
+      RARICY_PASSWORD: ${RARICY_PASSWORD}
+      LLM_API_KEY: ${LLM_API_KEY}
+    volumes:
+      # 配置只读挂载；其中 storage.db_path 用默认的 ./data/bot.db 即可。
+      - ./config.yaml:/app/config.yaml:ro
+      # 数据目录不变量：容器 WORKDIR 为 /app，配置默认 storage.db_path=./data/bot.db
+      # 解析为 /app/data/bot.db，所以卷必须挂在 /app/data，默认配置才能开箱持久化。
+      # 若改成别的路径（或改这里的挂载点），必须同步修改另一处。
+      - bot-data:/app/data
+    # 运维端口只对容器网络暴露，不发布到宿主（D-10）。
+    expose:
+      - "8080"
+    healthcheck:
+      # 用 /livez 而非 /readyz：站点临时故障不应触发容器重启风暴。
+      # 不变量：下面的 URL 硬编码 8080，与 Dockerfile 的 HEALTHCHECK 及默认
+      # ops.port=8080 一致；修改 ops.port 时必须同步改这两处健康检查。
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/livez', timeout=3).getcode() == 200 else 1)",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  bot-data:

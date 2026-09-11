@@ -1,0 +1,23 @@
+# 构建上下文排除项：减小镜像并防止把本地密钥、数据与测试带进去。
+.git
+.gitignore
+.github
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+tests
+docs
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+config.yaml
+.venv
+venv
+env
+*.egg-info
+dist
+build
+*.md

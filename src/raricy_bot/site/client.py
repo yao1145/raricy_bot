@@ -93,9 +93,8 @@ class SiteClient:
         self._transport = transport
         self._username = username
         self._password = password
-        # 凭据只供 login() 使用，绝不进日志/异常/__repr__；顺手登记进脱敏器，
-        # 这样即便服务端把用户名或密码回显在 message 里，出站前也会被替换掉。
-        self._redactor.add_secret(username)
+        # 只有密码算机密（INTERFACES §3）；用户名**不得**注册，否则日志与出站文本里
+        # 机器人自己的名字会被抹成 [redacted]。登记密码是为了让服务端回显时也不进异常文案。
         self._redactor.add_secret(password)
         self._client: httpx.AsyncClient | None = None
         self._user: Author | None = None

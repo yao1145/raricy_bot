@@ -85,7 +85,7 @@ class QuotaGuard:
 
     # --- 对外接口 -----------------------------------------------------------
 
-    async def reserve(self, channel_id: str, kind: str) -> QuotaResult:  # MUT-A
+    async def reserve(self, channel_id: str, kind: str) -> QuotaResult:
         """原子地判定并登记一笔预留；通过时调用方最终必须 note_sent() 或 release()。
 
         `kind` 是三值枚举，行为完全由它决定（见模块 docstring 与 D-1）：
@@ -149,7 +149,21 @@ class QuotaGuard:
         分钟额度（kind="notice" 时还会永久占掉该频道的通知名额）。
         """
         async with self._lock:
-            await self._store.record_send_attempt(channel_id, reply_to, kind)
+            try:
+                await self._store.record_send_attempt(channel_id, reply_to, kind)
+            except Exception as exc:  # 任何写库失败都必须走降级路径，不能外抛
+                # 尝试确实发生过，内存窗口照记；预留必须释放，避免泄漏。
+                self._recent.append(self._mono())
+                self._consume_pending(channel_id, kind)
+                log_event(
+                    logger,
+                    logging.ERROR,
+                    "quota.note_sent_failed",
+                    channel_id=channel_id,
+                    kind=kind,
+                    error=type(exc).__name__,
+                )
+                return
             self._recent.append(self._mono())
             self._consume_pending(channel_id, kind)
 
