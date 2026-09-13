@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from collections.abc import Iterable
@@ -23,6 +24,10 @@ from collections.abc import Iterable
 import httpx
 
 from . import texts
+from .comments.quota import CommentQuotaGuard
+from .comments.router import CommentRouter
+from .comments.sender import CommentSender
+from .comments.service import CommentService
 from .config import Config
 from .core.context import ContextManager, lobby_thread_session_key, speaker_wrapper
 from .core.router import MessageRouter, Request, RouteResult
@@ -64,21 +69,46 @@ class BotApp:
         self._store = Store(
             config.storage.db_path,
             wal_journal_limit_bytes=config.storage.wal_journal_limit_bytes,
+            conversation_retention_seconds=(
+                config.comments.conversation_retention_seconds
+            ),
+            dedupe_retention_seconds=config.comments.dedupe_retention_seconds,
         )
-        self._client = SiteClient(
-            config.site.base_url,
-            self._redactor,
-            timeout=config.site.request_timeout_seconds,
-            transport=transport,
-            username=config.secrets.username,
-            password=config.secrets.password,
-        )
+        client_kwargs: dict[str, object] = {
+            "timeout": config.site.request_timeout_seconds,
+            "transport": transport,
+            "username": config.secrets.username,
+            "password": config.secrets.password,
+            # 评论上限由 SiteClient 在流式响应/解析层执行；即使 comments
+            # disabled 也传默认值，保证启用时不会依赖隐含客户端常量。
+            "max_response_bytes": config.comments.max_response_bytes,
+            "max_tree_nodes": config.comments.max_tree_nodes,
+        }
+        # A/B 组或外部测试可能暂时注入旧版 SiteClient 替身。真实客户端和
+        # 支持 **kwargs 的替身接收上限；仅对明确没有该参数的窄替身过滤，避免
+        # 评论关闭时也破坏聊天启动。
+        try:
+            signature = inspect.signature(SiteClient)
+            parameters = signature.parameters
+            accepts_kwargs = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+            if not accepts_kwargs:
+                client_kwargs = {
+                    key: value for key, value in client_kwargs.items() if key in parameters
+                }
+        except (TypeError, ValueError):
+            pass
+        self._client = SiteClient(config.site.base_url, self._redactor, **client_kwargs)
         self._queue: asyncio.Queue[Request] = asyncio.Queue(
             maxsize=config.behavior.queue_size
         )
         self._ctx = ContextManager(
             config.behavior.context_turns, config.behavior.context_input_tokens
         )
+        # 聊天和评论共用同一模型门；评论 worker 仍保持自身 concurrency=1。
+        self._model_gate = asyncio.Semaphore(config.behavior.concurrency)
         self._quota = QuotaGuard(self._store, config.behavior)
         self._sender = MessageSender(
             client=self._client,
@@ -111,6 +141,17 @@ class BotApp:
         self._resync_task: asyncio.Task[None] | None = None
         self._probe_task: asyncio.Task[None] | None = None
         self._cleanup_task: asyncio.Task[None] | None = None
+        # 评论功能默认关闭；启用时由独立服务托管自己的队列与轮询任务。
+        self._comment_service: CommentService | None = None
+        self._comment_router: CommentRouter | None = None
+        self._comment_sender: CommentSender | None = None
+        self._comment_quota: CommentQuotaGuard | None = None
+        self._comment_ctx = ContextManager(
+            config.comments.context_turns, config.comments.context_input_tokens
+        )
+        self._comment_router_queue: asyncio.Queue = asyncio.Queue(
+            maxsize=max(1, config.comments.queue_size)
+        )
 
         self._started = False
         self._stopped = False
@@ -128,6 +169,11 @@ class BotApp:
         # 必定属于已经死掉的旧进程。标成 recover 之后，它们才能被重新认领。
         # **必须早于 sse.run()**，否则会把本进程刚入队的在途工作误标成孤儿。
         await self._store.mark_orphans_recoverable()
+        # 评论事件使用独立状态表；同样必须在评论服务创建任务前恢复旧进程遗留项。
+        if self._config.comments.enabled:
+            recover_comments = getattr(self._store, "recover_comment_events", None)
+            if recover_comments is not None:
+                await recover_comments()
         # 启动清理一次：过期链、旧事件、到期冷却都在这里收掉（D-23）。
         # 它失败不得阻止启动 —— 记录后继续，下一个周期还会再来。
         await self._prune_once()
@@ -184,6 +230,48 @@ class BotApp:
             await self._store.close()
             raise
 
+        # 评论与聊天共用 SiteClient、Store 和模型客户端，但评论服务拥有独立队列。
+        # 按阶段七生命周期，先让聊天 worker/ops 就位，再构造并启动评论后台任务。
+        if self._config.comments.enabled:
+            try:
+                self._comment_quota = CommentQuotaGuard(self._store, self._config.comments)
+                self._comment_sender = CommentSender(
+                    client=self._client,
+                    store=self._store,
+                    quota=self._comment_quota,
+                    redactor=self._redactor,
+                    cfg=self._config.comments,
+                    self_user_id=user.id,
+                )
+                self._comment_router = CommentRouter(
+                    self_user_id=user.id,
+                    bot_username=self._config.secrets.username,
+                    ctx=self._comment_ctx,
+                    store=self._store,
+                    queue=self._comment_router_queue,
+                    cfg=self._config.comments,
+                    now=time.time,
+                )
+                self._comment_service = CommentService(
+                    self._client,
+                    self._store,
+                    self._config.comments,
+                    bot_username=self._config.secrets.username,
+                    bot_user_id=user.id,
+                    router=self._comment_router,
+                    sender=self._comment_sender,
+                    model_client=self._model,
+                    model_gate=self._model_gate,
+                    quota=self._comment_quota,
+                    context_manager=self._comment_ctx,
+                    system_prompt=self._config.system_prompt,
+                )
+                await self._comment_service.start()
+            except BaseException:
+                # 评论初始化失败不能回滚聊天服务；live 会保持 false，日志只记稳定错误。
+                log_event(_logger, logging.ERROR, "app.comment_start_failed")
+                self._comment_service = None
+
         self._sse_task = asyncio.create_task(self._sse.run(), name="bot-sse")
         self._cleanup_task = asyncio.create_task(self._cleanup_loop(), name="bot-cleanup")
         self._started = True
@@ -231,7 +319,13 @@ class BotApp:
         sse_task = self._sse_task
         if sse_task is None or sse_task.done():
             return False
-        return self._workers.alive
+        if not self._workers.alive:
+            return False
+        if self._config.comments.enabled:
+            service = self._comment_service
+            if service is None or not service.alive:
+                return False
+        return True
 
     # --- SSE 事件分派 -------------------------------------------------------
 
@@ -393,7 +487,8 @@ class BotApp:
                 await self._notify_failure(request)
                 return
             try:
-                text = await model.complete(messages)
+                async with self._model_gate:
+                    text = await model.complete(messages)
             except Exception as exc:  # 模型最终失败（含重试后仍失败）
                 log_event(
                     _logger,
@@ -502,6 +597,22 @@ class BotApp:
 
         for root in result.expired_thread_roots:
             self._ctx.invalidate(lobby_thread_session_key(root))
+        # 评论会话同样只有内存历史；Store 清理返回已过期 conversation id 后
+        # 立即递增对应代次，作废仍在模型门/发送器中的旧请求，避免清理后幽灵
+        # assistant 轮次重新写回新链。兼容 A 组暂未扩展该字段的旧结果。
+        expired_comment_ids = getattr(result, "expired_comment_conversation_ids", ())
+        if expired_comment_ids:
+            if self._comment_service is not None:
+                self._comment_service.invalidate_conversations(expired_comment_ids)
+            else:
+                for conversation_id in expired_comment_ids:
+                    if isinstance(conversation_id, str) and conversation_id:
+                        key = (
+                            conversation_id
+                            if conversation_id.startswith("comment:")
+                            else f"comment:{conversation_id}"
+                        )
+                        self._comment_ctx.invalidate(key)
 
         deleted = (
             len(result.expired_thread_roots)
@@ -642,6 +753,10 @@ class BotApp:
 
     async def _shutdown(self) -> None:
         """按顺序停各组件；每一步都容忍组件尚未构造。"""
+        # 评论 poller 先停，禁止在聊天组件关闭期间再产生新的候选任务。
+        comment_service, self._comment_service = self._comment_service, None
+        if comment_service is not None:
+            await comment_service.stop()
         sse, self._sse = self._sse, None
         if sse is not None:
             await sse.stop()

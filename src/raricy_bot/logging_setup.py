@@ -29,6 +29,12 @@ LOG_FIELDS: frozenset[str] = frozenset(
         "delay",
         # 大区共享链与容量治理（D-20 / D-23）：只放 id 与字节数，绝不放用户名或正文。
         "thread_root_id",
+        # 评论对象公开 UUID 仅用于诊断；正文、用户名与 actor id 不在白名单内。
+        "comment_id",
+        "blog_id",
+        "notification_id",
+        "conversation_id",
+        "source",
         "size_bytes",
         "limit_bytes",
     }

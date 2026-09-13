@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import Any, Generic, Protocol, TypeVar
 
 import httpx
 import openai
@@ -22,10 +22,16 @@ from ..config import ModelConfig
 from ..logging_setup import get_logger, log_event
 from ..redact import Redactor
 
-if TYPE_CHECKING:
-    from .router import Request
-
 logger = get_logger("worker")
+
+
+class SessionRequest(Protocol):
+    """工作器要求请求对象提供的最小协议。"""
+
+    session_key: str
+
+
+RequestT = TypeVar("RequestT", bound=SessionRequest)
 
 # 可重试错误最多重试一次（总共两次调用），由本模块自己控制。
 _MAX_ATTEMPTS: int = 2
@@ -155,14 +161,14 @@ class OpenAIModelClient:
         return ModelError("network", True)
 
 
-class WorkerPool:
+class WorkerPool(Generic[RequestT]):
     """固定并发的工作器池；同一 `session_key` 的请求严格串行。"""
 
     def __init__(
         self,
         *,
-        queue: asyncio.Queue[Request],
-        handler: Callable[[Request], Awaitable[None]],
+        queue: asyncio.Queue[RequestT],
+        handler: Callable[[RequestT], Awaitable[None]],
         concurrency: int,
     ) -> None:
         self._queue = queue

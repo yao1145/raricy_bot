@@ -61,3 +61,28 @@ logging:
 system_prompt: |
   你是站内通用聊天机器人。明确自己的机器人身份，
   跟随用户语言，保持简洁友好，不代表站方作正式承诺。
+
+# 博客评论机器人默认关闭；启用前请确认机器人资料已披露第三方模型处理。
+comments:
+  enabled: false
+  recent_poll_seconds: 30
+  notification_poll_seconds: 15
+  notification_max_pages: 5
+  queue_size: 50
+  concurrency: 1
+  context_turns: 10
+  context_input_tokens: 8000
+  article_max_chars: 1000
+  max_output_chars: 1800
+  max_response_bytes: 8388608
+  max_tree_nodes: 10000
+  unmatched_attempt_limit: 5
+  minute_attempt_limit: 20
+  daily_reply_limit: 600
+  daily_absolute_limit: 630
+  article_cooldown_seconds: 5
+  conversation_retention_seconds: 2592000
+  dedupe_retention_seconds: 7776000
+  retry_base_seconds: 5
+  retry_max_seconds: 300
+  server_backoff_seconds: 3600

@@ -114,11 +114,15 @@ class ContextManager:
         至少保留最后一组；`pending_user` 永远保留（即使超限）。
         """
         system = system_prompt
+        system_tokens = estimate_tokens(system_prompt)
         if system_addendum:
             system = f"{system_prompt}\n\n{system_addendum}"
+            # 契约要求 system 与静态附加说明分别计入预算；若把它们先拼接再估算，
+            # 非 CJK 字符的 ceil 会少算一个分段的取整项。
+            system_tokens += estimate_tokens(system_addendum)
 
         history = list(self._sessions.get(session_key, []))
-        base_tokens = estimate_tokens(system)
+        base_tokens = system_tokens
         if pending_user is not None:
             base_tokens += estimate_tokens(pending_user)
         # len(history) > 2 保证「最后一组」一定留下：整对丢弃到只剩最旧一轮为止。

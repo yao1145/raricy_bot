@@ -24,6 +24,7 @@ _T = TypeVar("_T")
 
 # 运行期元数据里安全水位检查点的键名（INTERFACES §9.2）。
 _CHECKPOINT_KEY: str = "safe_event_watermark"
+DEFAULT_COMMENT_CONVERSATION_RETENTION_SECONDS: int = 30 * 86400
 
 
 def _read_checkpoint(conn: sqlite3.Connection) -> int:
@@ -62,7 +63,7 @@ def _read_watermark(conn: sqlite3.Connection) -> int:
 
 @dataclass(frozen=True)
 class CleanupResult:
-    """一次 `prune_runtime_state()` 的结果（INTERFACES §9.4）。"""
+    """一次清理结果；过期评论会话 ID 供内存上下文同步失效。"""
 
     expired_thread_roots: tuple[int, ...]
     deleted_events: int
@@ -73,6 +74,12 @@ class CleanupResult:
     safe_event_watermark: int
     db_logical_bytes: int
     db_physical_bytes: int
+    deleted_comment_send_attempts: int = 0
+    deleted_comment_conversations: int = 0
+    deleted_comment_events: int = 0
+    deleted_comment_sent_replies: int = 0
+    deleted_comment_notifications: int = 0
+    expired_comment_conversation_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -103,7 +110,14 @@ class CommentNotificationState:
     unmatched_attempts: int
 
 
-def _prune(conn: sqlite3.Connection, now: float, cfg: StorageConfig) -> CleanupResult:
+def _prune(
+    conn: sqlite3.Connection,
+    now: float,
+    cfg: StorageConfig,
+    *,
+    comment_conversation_retention_seconds: int = DEFAULT_COMMENT_CONVERSATION_RETENTION_SECONDS,
+    comment_dedupe_retention_seconds: int = 90 * 86400,
+) -> CleanupResult:
     """在一个事务里完成清理；调用方负责提交与回滚。
 
     三条不得违反的规则（D-23）：非终态事件永不按时间删除；
@@ -154,6 +168,62 @@ def _prune(conn: sqlite3.Connection, now: float, cfg: StorageConfig) -> CleanupR
         "DELETE FROM send_attempts WHERE attempted_at <= ?",
         (now - cfg.send_attempt_retention_seconds,),
     ).rowcount
+    deleted_comment_send_attempts = conn.execute(
+        "DELETE FROM comment_send_attempts WHERE attempted_at <= ?",
+        (now - cfg.send_attempt_retention_seconds,),
+    ).rowcount
+    # 评论正文不在库中；会话和去重元数据分别按评论配置清理。
+    # 非终态事件永不按时间删除。
+    comment_conversation_cutoff = now - comment_conversation_retention_seconds
+    # comment_events 的去重行通常保留 90 天，可能比会话映射多活 60 天。
+    # 终态事件不再需要会话归属，先断开可过期映射；非终态事件仍保留归属，
+    # 避免清理期间丢失恢复所需的活动会话。
+    conn.execute(
+        "UPDATE comment_events SET conversation_id=NULL "
+        "WHERE conversation_id IN ("
+        " SELECT conversation_id FROM comment_conversations WHERE updated_at <= ?"
+        ") AND (status='done' OR status='baseline_ignored' OR status LIKE 'skipped_%')",
+        (comment_conversation_cutoff,),
+    )
+    expired_comment_conversation_ids = tuple(
+        str(row[0])
+        for row in conn.execute(
+            "SELECT conversation_id FROM comment_conversations WHERE updated_at <= ? "
+            "AND NOT EXISTS ("
+            " SELECT 1 FROM comment_events "
+            " WHERE comment_events.conversation_id=comment_conversations.conversation_id"
+            ") ORDER BY conversation_id",
+            (comment_conversation_cutoff,),
+        ).fetchall()
+    )
+    deleted_comment_conversations = conn.execute(
+        "DELETE FROM comment_conversations WHERE updated_at <= ? "
+        "AND NOT EXISTS ("
+        " SELECT 1 FROM comment_events "
+        " WHERE comment_events.conversation_id=comment_conversations.conversation_id"
+        ")",
+        (comment_conversation_cutoff,),
+    ).rowcount
+    deleted_comment_events = conn.execute(
+        "DELETE FROM comment_events WHERE (status='done' OR status='baseline_ignored'"
+        " OR status LIKE 'skipped_%')"
+        " AND updated_at <= ? AND NOT EXISTS ("
+        " SELECT 1 FROM comment_notification_candidates AS nc "
+        " JOIN comment_notifications AS n "
+        " ON n.notification_id=nc.notification_id "
+        " WHERE nc.comment_id=comment_events.comment_id "
+        " AND n.status NOT IN ('done','unmatched','baseline_ignored')"
+        ")",
+        (now - comment_dedupe_retention_seconds,),
+    ).rowcount
+    deleted_comment_sent_replies = conn.execute(
+        "DELETE FROM comment_sent_replies WHERE sent_at <= ?",
+        (now - comment_dedupe_retention_seconds,),
+    ).rowcount
+    deleted_comment_notifications = conn.execute(
+        "DELETE FROM comment_notifications WHERE status IN ('done','unmatched','baseline_ignored') AND updated_at <= ?",
+        (now - comment_dedupe_retention_seconds,),
+    ).rowcount
 
     deleted_cooldowns = conn.execute(
         "DELETE FROM cooldowns WHERE until <= ?", (now,)
@@ -180,6 +250,12 @@ def _prune(conn: sqlite3.Connection, now: float, cfg: StorageConfig) -> CleanupR
         safe_event_watermark=checkpoint,
         db_logical_bytes=max(0, page_count - freelist) * page_size,
         db_physical_bytes=page_count * page_size,
+        deleted_comment_send_attempts=deleted_comment_send_attempts,
+        deleted_comment_conversations=deleted_comment_conversations,
+        deleted_comment_events=deleted_comment_events,
+        deleted_comment_sent_replies=deleted_comment_sent_replies,
+        deleted_comment_notifications=deleted_comment_notifications,
+        expired_comment_conversation_ids=expired_comment_conversation_ids,
     )
 
 # events.status 的取值。
@@ -196,6 +272,20 @@ STATUS_SKIPPED: str = "skipped"
 # 判断非终态时请用 `status NOT IN HANDLED_STATUSES`，不要写成 `status = 'pending'`：
 # 那样会让 recover 行既不算 pending 又被水位忽略，等于把孤儿事件连同它的水位一起跳过。
 HANDLED_STATUSES: tuple[str, ...] = (STATUS_DONE, STATUS_SKIPPED)
+
+
+def _merge_comment_sources(old: str, new: str) -> str:
+    """合并双来源诊断字段，顺序固定且幂等。"""
+    if old == "both" or new == "both":
+        return "both"
+    values = {item for item in (old + "," + new).split(",") if item in {"recent", "notification"}}
+    if values == {"recent", "notification"}:
+        return "both"
+    if "recent" in values:
+        return "recent"
+    if "notification" in values:
+        return "notification"
+    return old or new
 
 # 建表语句（字段类型自定，语义与 INTERFACES.md §9 一致）。
 # events 的主键是 message_id —— 去重键，event_id 可空，只供水位计算。
@@ -305,7 +395,9 @@ _SCHEMA: tuple[str, ...] = (
         observed_at REAL NOT NULL,
         updated_at REAL NOT NULL,
         attempts INTEGER NOT NULL DEFAULT 0,
-        next_attempt_at REAL
+        next_attempt_at REAL,
+        FOREIGN KEY(conversation_id)
+            REFERENCES comment_conversations(conversation_id)
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_comment_events_status_due ON comment_events(status, next_attempt_at)",
@@ -341,6 +433,14 @@ _SCHEMA: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS comment_notification_baseline_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        cutoff_timestamp REAL NOT NULL,
+        cutoff_notification_id TEXT NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS comment_notification_candidates (
         notification_id TEXT NOT NULL,
         comment_id TEXT NOT NULL,
@@ -365,9 +465,30 @@ _SCHEMA: tuple[str, ...] = (
 class Store:
     """SQLite 状态存储；全部方法 async，单连接 + 锁串行。"""
 
-    def __init__(self, path: str, *, wal_journal_limit_bytes: int = 16777216) -> None:
+    def __init__(
+        self,
+        path: str,
+        *,
+        wal_journal_limit_bytes: int = 16777216,
+        conversation_retention_seconds: int = DEFAULT_COMMENT_CONVERSATION_RETENTION_SECONDS,
+        dedupe_retention_seconds: int = 90 * 86400,
+    ) -> None:
+        if (
+            isinstance(conversation_retention_seconds, bool)
+            or not isinstance(conversation_retention_seconds, int)
+            or conversation_retention_seconds < 1
+        ):
+            raise ValueError("conversation_retention_seconds 必须是正整数")
+        if (
+            isinstance(dedupe_retention_seconds, bool)
+            or not isinstance(dedupe_retention_seconds, int)
+            or dedupe_retention_seconds < conversation_retention_seconds
+        ):
+            raise ValueError("dedupe_retention_seconds 必须是不小于会话保留期的正整数")
         self._path = path
         self._wal_journal_limit_bytes = wal_journal_limit_bytes
+        self._conversation_retention_seconds = conversation_retention_seconds
+        self._dedupe_retention_seconds = dedupe_retention_seconds
         # 构造时不建连接：open() 里才落盘/建表。
         self._conn: sqlite3.Connection | None = None
         self._lock = asyncio.Lock()
@@ -587,6 +708,874 @@ class Store:
 
         return await self._execute(operation)
 
+    # --- 博客评论发现与状态机 ----------------------------------------------
+
+    async def get_comment_discovery_state(self) -> CommentDiscoveryState:
+        """读取最近评论发现水位；尚未初始化时返回空基线。"""
+
+        def operation(conn: sqlite3.Connection) -> CommentDiscoveryState:
+            row = conn.execute(
+                "SELECT initialized, newest_created_at FROM comment_discovery_state WHERE singleton=1"
+            ).fetchone()
+            if row is None:
+                return CommentDiscoveryState(False, None, ())
+            boundary_rows = conn.execute(
+                "SELECT comment_id FROM comment_discovery_boundary WHERE created_at = ? ORDER BY comment_id",
+                (row[1],),
+            ).fetchall() if row[1] is not None else []
+            return CommentDiscoveryState(bool(row[0]), row[1], tuple(str(x[0]) for x in boundary_rows))
+
+        return await self._execute(operation)
+
+    async def comment_discovery_state(self) -> CommentDiscoveryState:
+        """`get_comment_discovery_state` 的简短别名。"""
+        return await self.get_comment_discovery_state()
+
+    async def comment_discovery_boundary(self) -> set[str]:
+        """返回当前水位时间的 UUID 边界集合。"""
+        state = await self.get_comment_discovery_state()
+        return set(state.boundary)
+
+    async def set_comment_discovery_state(
+        self,
+        *,
+        initialized: bool,
+        newest_created_at: float | None,
+        boundary: tuple[str, ...] | list[str] = (),
+        now: float | None = None,
+    ) -> None:
+        """原子更新发现水位和等时边界集合。"""
+        timestamp = time.time() if now is None else now
+
+        def operation(conn: sqlite3.Connection) -> None:
+            conn.execute("DELETE FROM comment_discovery_boundary")
+            if newest_created_at is not None:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO comment_discovery_boundary(comment_id, created_at) VALUES (?, ?)",
+                    [(str(item), newest_created_at) for item in boundary],
+                )
+            conn.execute(
+                "INSERT INTO comment_discovery_state(singleton, initialized, newest_created_at, updated_at) VALUES (1, ?, ?, ?)"
+                " ON CONFLICT(singleton) DO UPDATE SET initialized=excluded.initialized, newest_created_at=excluded.newest_created_at, updated_at=excluded.updated_at",
+                (1 if initialized else 0, newest_created_at, timestamp),
+            )
+            conn.commit()
+
+        await self._execute(operation)
+
+    async def initialize_comment_discovery(
+        self, newest_created_at: float | None, boundary: tuple[str, ...] | list[str], *, now: float | None = None
+    ) -> None:
+        """写入冷启动基线；调用方负责保证只执行一次业务初始化。"""
+        await self.set_comment_discovery_state(
+            initialized=True, newest_created_at=newest_created_at, boundary=boundary, now=now
+        )
+
+    async def update_comment_discovery(
+        self, newest_created_at: float | None, boundary: tuple[str, ...] | list[str], *, now: float | None = None
+    ) -> None:
+        """更新发现水位；水位只允许单调前进。"""
+        timestamp = time.time() if now is None else now
+
+        def operation(conn: sqlite3.Connection) -> None:
+            row = conn.execute(
+                "SELECT newest_created_at FROM comment_discovery_state WHERE singleton=1"
+            ).fetchone()
+            old = row[0] if row is not None else None
+            if old is not None and newest_created_at is not None and newest_created_at < old:
+                return
+            conn.execute("DELETE FROM comment_discovery_boundary")
+            if newest_created_at is not None:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO comment_discovery_boundary(comment_id, created_at) VALUES (?, ?)",
+                    [(str(item), newest_created_at) for item in boundary],
+                )
+            conn.execute(
+                "INSERT INTO comment_discovery_state(singleton, initialized, newest_created_at, updated_at) VALUES (1, 1, ?, ?)"
+                " ON CONFLICT(singleton) DO UPDATE SET initialized=1, newest_created_at=excluded.newest_created_at, updated_at=excluded.updated_at",
+                (newest_created_at, timestamp),
+            )
+            conn.commit()
+
+        await self._execute(operation)
+
+    async def claim_comment(
+        self,
+        *,
+        comment_id: str,
+        blog_id: str,
+        parent_id: str | None,
+        source: str,
+        requested_conversation_id: str | None,
+        force_new_conversation: bool,
+        observed_created_at: float | None,
+        now: float,
+        conversation_retention_seconds: int | None = None,
+    ) -> CommentClaim:
+        """在一个事务中完成评论 UUID 去重、会话归属和队列领取。"""
+
+        retention = (
+            self._conversation_retention_seconds
+            if conversation_retention_seconds is None
+            else conversation_retention_seconds
+        )
+        if isinstance(retention, bool) or not isinstance(retention, int) or retention < 1:
+            raise ValueError("conversation_retention_seconds 必须是正整数")
+
+        def operation(conn: sqlite3.Connection) -> CommentClaim:
+            existing = conn.execute(
+                "SELECT conversation_id, status, source FROM comment_events WHERE comment_id = ?",
+                (comment_id,),
+            ).fetchone()
+            if existing is not None:
+                old_source = str(existing[2])
+                merged = _merge_comment_sources(old_source, source)
+                conn.execute(
+                    "UPDATE comment_events SET source=?, updated_at=? WHERE comment_id=?",
+                    (merged, now, comment_id),
+                )
+                if str(existing[1]) == "recover":
+                    conn.execute(
+                        "UPDATE comment_events SET status='queued', next_attempt_at=NULL, updated_at=? WHERE comment_id=? AND status='recover'",
+                        (now, comment_id),
+                    )
+                    if existing[0] is not None:
+                        conn.execute(
+                            "UPDATE comment_conversations SET updated_at=? "
+                            "WHERE conversation_id=?",
+                            (now, existing[0]),
+                        )
+                    conn.commit()
+                    return CommentClaim(True, comment_id, existing[0], "queued")
+                conn.commit()
+                return CommentClaim(False, comment_id, existing[0], str(existing[1]))
+
+            conversation_id: str | None = None
+            if not force_new_conversation and parent_id is not None:
+                mapped = conn.execute(
+                    "SELECT m.conversation_id FROM comment_messages AS m "
+                    "JOIN comment_conversations AS c "
+                    "ON c.conversation_id=m.conversation_id "
+                    "WHERE m.comment_id=? AND m.role='bot' AND c.blog_id=? "
+                    "AND c.updated_at > ?",
+                    (parent_id, blog_id, now - retention),
+                ).fetchone()
+                if mapped is not None:
+                    conversation_id = str(mapped[0])
+            if conversation_id is None:
+                conversation_id = (
+                    comment_id if force_new_conversation else requested_conversation_id or comment_id
+                )
+            conn.execute(
+                "INSERT INTO comment_conversations(conversation_id, blog_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(conversation_id) DO UPDATE SET "
+                "updated_at=excluded.updated_at",
+                (conversation_id, blog_id, now, now),
+            )
+            conn.execute(
+                "INSERT INTO comment_events(comment_id, blog_id, parent_id, conversation_id, source, status, observed_created_at, observed_at, updated_at) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
+                (comment_id, blog_id, parent_id, conversation_id, source, observed_created_at, now, now),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO comment_messages(comment_id, conversation_id, role, parent_id, mapped_at) VALUES (?, ?, 'user', ?, ?)",
+                (comment_id, conversation_id, parent_id, now),
+            )
+            conn.commit()
+            return CommentClaim(True, comment_id, conversation_id, "queued")
+
+        return await self._execute(operation)
+
+    async def claim_comment_event(
+        self,
+        *,
+        comment_id: str,
+        blog_id: str,
+        parent_id: str | None,
+        source: str,
+        requested_conversation_id: str | None,
+        force_new_conversation: bool,
+        observed_created_at: float | None,
+        now: float,
+        conversation_retention_seconds: int | None = None,
+    ) -> CommentClaim:
+        """兼容名称别名。"""
+        return await self.claim_comment(
+            comment_id=comment_id,
+            blog_id=blog_id,
+            parent_id=parent_id,
+            source=source,
+            requested_conversation_id=requested_conversation_id,
+            force_new_conversation=force_new_conversation,
+            observed_created_at=observed_created_at,
+            now=now,
+            conversation_retention_seconds=conversation_retention_seconds,
+        )
+
+    async def comment_event_status(self, comment_id: str) -> str | None:
+        """读取评论事件状态。"""
+
+        def operation(conn: sqlite3.Connection) -> str | None:
+            row = conn.execute("SELECT status FROM comment_events WHERE comment_id=?", (comment_id,)).fetchone()
+            return str(row[0]) if row is not None else None
+
+        return await self._execute(operation)
+
+    async def get_comment_event(self, comment_id: str) -> dict[str, object] | None:
+        """读取评论事件的非敏感元数据。"""
+
+        def operation(conn: sqlite3.Connection) -> dict[str, object] | None:
+            row = conn.execute(
+                "SELECT comment_id, blog_id, parent_id, conversation_id, source, status, observed_created_at, observed_at, updated_at, attempts, next_attempt_at FROM comment_events WHERE comment_id=?",
+                (comment_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            names = (
+                "comment_id", "blog_id", "parent_id", "conversation_id", "source", "status",
+                "observed_created_at", "observed_at", "updated_at", "attempts", "next_attempt_at",
+            )
+            return dict(zip(names, row))
+
+        return await self._execute(operation)
+
+    async def set_comment_event_status(
+        self, comment_id: str, status: str, *, next_attempt_at: float | None = None, increment_attempt: bool = False, now: float | None = None
+    ) -> None:
+        """更新评论事件状态，不接触正文。"""
+        timestamp = time.time() if now is None else now
+
+        def operation(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE comment_events SET status=?, next_attempt_at=?, updated_at=?, attempts=attempts+? WHERE comment_id=?",
+                (status, next_attempt_at, timestamp, 1 if increment_attempt else 0, comment_id),
+            )
+            conn.commit()
+
+        await self._execute(operation)
+
+    async def mark_comment_handled(self, comment_id: str, status: str = "done", *, now: float | None = None) -> None:
+        """评论事件状态更新的语义别名。"""
+        await self.set_comment_event_status(comment_id, status, now=now)
+
+    async def recover_comment_events(self) -> int:
+        """把评论非终态任务统一转为 recover，供启动恢复使用。"""
+
+        def operation(conn: sqlite3.Connection) -> int:
+            cursor = conn.execute(
+                "UPDATE comment_events SET status='recover', updated_at=? WHERE status NOT IN ('done', 'baseline_ignored') AND status NOT LIKE 'skipped_%'",
+                (time.time(),),
+            )
+            conn.commit()
+            return int(cursor.rowcount)
+
+        return await self._execute(operation)
+
+    async def comment_events_due(self, *, now: float, limit: int = 50) -> list[tuple[str, str, str | None, str | None]]:
+        """返回到期可重新入队的评论摘要。"""
+
+        def operation(conn: sqlite3.Connection) -> list[tuple[str, str, str | None, str | None]]:
+            rows = conn.execute(
+                "SELECT comment_id, blog_id, parent_id, conversation_id FROM comment_events WHERE status IN ('waiting_queue','waiting_rate_limit','recover') AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY updated_at, comment_id LIMIT ?",
+                (now, limit),
+            ).fetchall()
+            return [(str(a), str(b), c, d) for a, b, c, d in rows]
+
+        return await self._execute(operation)
+
+    async def comment_conversation_for_message(
+        self,
+        comment_id: str,
+        *,
+        now: float | None = None,
+        retention_seconds: int | None = None,
+    ) -> str | None:
+        """查找活动评论消息归属；过期会话视为未命中。"""
+        reference = time.time() if now is None else now
+        retention = (
+            self._conversation_retention_seconds
+            if retention_seconds is None
+            else retention_seconds
+        )
+        if isinstance(retention, bool) or not isinstance(retention, int) or retention < 1:
+            raise ValueError("retention_seconds 必须是正整数")
+
+        def operation(conn: sqlite3.Connection) -> str | None:
+            row = conn.execute(
+                "SELECT m.conversation_id FROM comment_messages m JOIN comment_conversations c ON c.conversation_id=m.conversation_id WHERE m.comment_id=? AND c.updated_at > ?",
+                (comment_id, reference - retention),
+            ).fetchone()
+            return str(row[0]) if row is not None else None
+
+        return await self._execute(operation)
+
+    async def find_comment_parent(
+        self,
+        comment_id: str,
+        *,
+        blog_id: str | None = None,
+        now: float | None = None,
+        retention_seconds: int | None = None,
+    ) -> dict[str, str] | None:
+        """返回父机器人评论的会话映射，不返回正文。"""
+        reference = time.time() if now is None else now
+        retention = (
+            self._conversation_retention_seconds
+            if retention_seconds is None
+            else retention_seconds
+        )
+        if isinstance(retention, bool) or not isinstance(retention, int) or retention < 1:
+            raise ValueError("retention_seconds 必须是正整数")
+
+        def operation(conn: sqlite3.Connection) -> dict[str, str] | None:
+            sql = (
+                "SELECT m.conversation_id, c.blog_id FROM comment_messages m "
+                "JOIN comment_conversations c ON c.conversation_id=m.conversation_id "
+                "WHERE m.comment_id=? AND m.role='bot' AND c.updated_at > ?"
+            )
+            params: list[object] = [comment_id, reference - retention]
+            if blog_id is not None:
+                sql += " AND c.blog_id=?"
+                params.append(blog_id)
+            row = conn.execute(sql, params).fetchone()
+            return None if row is None else {"conversation_id": str(row[0]), "blog_id": str(row[1])}
+
+        return await self._execute(operation)
+
+    async def find_comment_conversation(
+        self,
+        comment_id: str,
+        *,
+        blog_id: str | None = None,
+        now: float | None = None,
+        retention_seconds: int | None = None,
+    ) -> dict[str, str] | None:
+        """父机器人评论映射别名。"""
+        return await self.find_comment_parent(
+            comment_id,
+            blog_id=blog_id,
+            now=now,
+            retention_seconds=retention_seconds,
+        )
+
+    async def find_comment_mapping(
+        self,
+        comment_id: str,
+        *,
+        blog_id: str | None = None,
+        now: float | None = None,
+        retention_seconds: int | None = None,
+    ) -> dict[str, str] | None:
+        """父机器人评论映射别名。"""
+        return await self.find_comment_parent(
+            comment_id,
+            blog_id=blog_id,
+            now=now,
+            retention_seconds=retention_seconds,
+        )
+
+    async def lookup_comment_message(
+        self,
+        comment_id: str,
+        *,
+        blog_id: str | None = None,
+        now: float | None = None,
+        retention_seconds: int | None = None,
+    ) -> dict[str, str] | None:
+        """父机器人评论映射别名。"""
+        return await self.find_comment_parent(
+            comment_id,
+            blog_id=blog_id,
+            now=now,
+            retention_seconds=retention_seconds,
+        )
+
+    async def get_comment_message(
+        self,
+        comment_id: str,
+        *,
+        blog_id: str | None = None,
+        now: float | None = None,
+        retention_seconds: int | None = None,
+    ) -> dict[str, str] | None:
+        """父机器人评论映射别名。"""
+        return await self.find_comment_parent(
+            comment_id,
+            blog_id=blog_id,
+            now=now,
+            retention_seconds=retention_seconds,
+        )
+
+    async def finalize_comment_send(
+        self,
+        trigger_comment_id: str,
+        bot_comment_id: str,
+        blog_id: str,
+        conversation_id: str,
+        *,
+        kind: str = "reply",
+        sent_at: float | None = None,
+        reservation_token: str | None = None,
+    ) -> None:
+        """在同一事务中幂等写入 sent 映射、发送尝试和事件终态。"""
+        del reservation_token
+        timestamp = time.time() if sent_at is None else sent_at
+
+        def operation(conn: sqlite3.Connection) -> None:
+            try:
+                write_finalize(conn)
+            except BaseException:
+                conn.rollback()
+                raise
+
+        def write_finalize(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "INSERT OR IGNORE INTO comment_conversations(conversation_id, blog_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                (conversation_id, blog_id, timestamp, timestamp),
+            )
+            existing = conn.execute(
+                "SELECT bot_comment_id, blog_id, conversation_id "
+                "FROM comment_sent_replies WHERE trigger_comment_id=?",
+                (trigger_comment_id,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    "INSERT OR IGNORE INTO comment_sent_replies "
+                    "(trigger_comment_id, bot_comment_id, blog_id, conversation_id, sent_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (trigger_comment_id, bot_comment_id, blog_id, conversation_id, timestamp),
+                )
+                existing = conn.execute(
+                    "SELECT bot_comment_id, blog_id, conversation_id "
+                    "FROM comment_sent_replies WHERE trigger_comment_id=?",
+                    (trigger_comment_id,),
+                ).fetchone()
+                if existing is None:
+                    raise sqlite3.IntegrityError("comment sent mapping conflict")
+            effective_bot_id = str(existing[0])
+            effective_blog_id = str(existing[1])
+            effective_conversation_id = str(existing[2])
+            conn.execute(
+                "INSERT OR IGNORE INTO comment_conversations "
+                "(conversation_id, blog_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                (effective_conversation_id, effective_blog_id, timestamp, timestamp),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO comment_messages(comment_id, conversation_id, role, parent_id, mapped_at) VALUES (?, ?, 'bot', ?, ?)",
+                (effective_bot_id, effective_conversation_id, trigger_comment_id, timestamp),
+            )
+            conn.execute(
+                "UPDATE comment_conversations SET updated_at=? WHERE conversation_id=?",
+                (timestamp, effective_conversation_id),
+            )
+            attempt = conn.execute(
+                "SELECT id FROM comment_send_attempts "
+                "WHERE trigger_comment_id=? AND kind=? ORDER BY id LIMIT 1",
+                (trigger_comment_id, kind),
+            ).fetchone()
+            if attempt is None:
+                conn.execute(
+                    "INSERT INTO comment_send_attempts "
+                    "(blog_id, trigger_comment_id, kind, attempted_at) VALUES (?, ?, ?, ?)",
+                    (effective_blog_id, trigger_comment_id, kind, timestamp),
+                )
+            conn.execute(
+                "UPDATE comment_events SET status='done', updated_at=? WHERE comment_id=?",
+                (timestamp, trigger_comment_id),
+            )
+            conn.commit()
+
+        await self._execute(operation)
+
+    async def record_comment_sent(
+        self,
+        trigger_comment_id: str,
+        bot_comment_id: str,
+        blog_id: str,
+        conversation_id: str,
+        now: float | None = None,
+        *,
+        kind: str | None = None,
+        sent_at: float | None = None,
+        reservation_token: str | None = None,
+    ) -> None:
+        """兼容旧名称；转发到评论发送成功的原子终结接口。"""
+        timestamp = sent_at if sent_at is not None else (time.time() if now is None else now)
+        await self.finalize_comment_send(
+            trigger_comment_id=trigger_comment_id,
+            bot_comment_id=bot_comment_id,
+            blog_id=blog_id,
+            conversation_id=conversation_id,
+            kind=kind or "reply",
+            sent_at=timestamp,
+            reservation_token=reservation_token,
+        )
+
+    async def find_comment_sent_for_trigger(self, trigger_comment_id: str) -> str | None:
+        """按触发评论查机器人回复。"""
+
+        def operation(conn: sqlite3.Connection) -> str | None:
+            row = conn.execute(
+                "SELECT bot_comment_id FROM comment_sent_replies WHERE trigger_comment_id=?",
+                (trigger_comment_id,),
+            ).fetchone()
+            return str(row[0]) if row is not None else None
+
+        return await self._execute(operation)
+
+    async def find_comment_sent_reply(self, trigger_comment_id: str) -> str | None:
+        """发送对账查询别名。"""
+        return await self.find_comment_sent_for_trigger(trigger_comment_id)
+
+    async def find_sent_comment_for_trigger(self, trigger_comment_id: str) -> str | None:
+        """发送对账查询别名。"""
+        return await self.find_comment_sent_for_trigger(trigger_comment_id)
+
+    async def find_comment_reply(self, trigger_comment_id: str) -> str | None:
+        """发送对账查询别名。"""
+        return await self.find_comment_sent_for_trigger(trigger_comment_id)
+
+    async def find_comment_conversation_for_bot_reply(self, bot_comment_id: str) -> tuple[str, str] | None:
+        """按机器人评论查会话与文章。"""
+
+        def operation(conn: sqlite3.Connection) -> tuple[str, str] | None:
+            row = conn.execute(
+                "SELECT conversation_id, blog_id FROM comment_sent_replies WHERE bot_comment_id=?",
+                (bot_comment_id,),
+            ).fetchone()
+            return (str(row[0]), str(row[1])) if row is not None else None
+
+        return await self._execute(operation)
+
+    async def comment_bot_replies(self, blog_id: str) -> list[tuple[str, str, float]]:
+        """返回文章内已知机器人评论的 id、会话和发送时刻。"""
+
+        def operation(conn: sqlite3.Connection) -> list[tuple[str, str, float]]:
+            rows = conn.execute(
+                "SELECT bot_comment_id, conversation_id, sent_at FROM comment_sent_replies WHERE blog_id=? ORDER BY sent_at, bot_comment_id",
+                (blog_id,),
+            ).fetchall()
+            return [(str(a), str(b), float(c)) for a, b, c in rows]
+
+        return await self._execute(operation)
+
+    async def known_bot_comment_ids(self, blog_id: str | None = None) -> set[str]:
+        """返回本地已确认的机器人评论 UUID，供发现器粗筛。"""
+
+        def operation(conn: sqlite3.Connection) -> set[str]:
+            if blog_id is None:
+                rows = conn.execute("SELECT bot_comment_id FROM comment_sent_replies").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT bot_comment_id FROM comment_sent_replies WHERE blog_id=?", (blog_id,)
+                ).fetchall()
+            return {str(row[0]) for row in rows}
+
+        return await self._execute(operation)
+
+    async def comment_bot_comment_ids(self, blog_id: str | None = None) -> set[str]:
+        """机器人评论 id 查询别名。"""
+        return await self.known_bot_comment_ids(blog_id)
+
+    async def get_bot_comment_ids(self, blog_id: str | None = None) -> set[str]:
+        """机器人评论 id 查询别名。"""
+        return await self.known_bot_comment_ids(blog_id)
+
+    async def comment_message_ids(self, conversation_id: str) -> list[str]:
+        """返回会话映射中的评论 id；不返回正文。"""
+
+        def operation(conn: sqlite3.Connection) -> list[str]:
+            rows = conn.execute(
+                "SELECT comment_id FROM comment_messages WHERE conversation_id=? ORDER BY mapped_at, comment_id",
+                (conversation_id,),
+            ).fetchall()
+            return [str(row[0]) for row in rows]
+
+        return await self._execute(operation)
+
+    # --- 评论通知 ----------------------------------------------------------
+
+    async def observe_comment_notification(
+        self,
+        notification_id: str,
+        blog_id: str,
+        actor_fingerprint: str | None,
+        *,
+        status: str = "observed",
+        now: float | None = None,
+    ) -> CommentNotificationState:
+        """登记通知；不保存通知正文或原始 actor id。"""
+        timestamp = time.time() if now is None else now
+
+        def operation(conn: sqlite3.Connection) -> CommentNotificationState:
+            conn.execute(
+                "INSERT INTO comment_notifications(notification_id, blog_id, actor_fingerprint, status, observed_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(notification_id) DO UPDATE SET blog_id=excluded.blog_id, actor_fingerprint=excluded.actor_fingerprint, updated_at=excluded.updated_at",
+                (notification_id, blog_id, actor_fingerprint, status, timestamp, timestamp),
+            )
+            row = conn.execute(
+                "SELECT status, unmatched_attempts FROM comment_notifications WHERE notification_id=?",
+                (notification_id,),
+            ).fetchone()
+            conn.commit()
+            return CommentNotificationState(notification_id, str(row[0]), int(row[1]))
+
+        return await self._execute(operation)
+
+    async def comment_notification_state(self, notification_id: str) -> CommentNotificationState | None:
+        """读取通知状态摘要。"""
+
+        def operation(conn: sqlite3.Connection) -> CommentNotificationState | None:
+            row = conn.execute("SELECT status, unmatched_attempts FROM comment_notifications WHERE notification_id=?", (notification_id,)).fetchone()
+            return None if row is None else CommentNotificationState(notification_id, str(row[0]), int(row[1]))
+
+        return await self._execute(operation)
+
+    async def add_comment_notification_candidate(self, notification_id: str, comment_id: str) -> None:
+        """关联通知与候选评论 UUID。"""
+
+        def operation(conn: sqlite3.Connection) -> None:
+            conn.execute("INSERT OR IGNORE INTO comment_notification_candidates(notification_id, comment_id) VALUES (?, ?)", (notification_id, comment_id))
+            conn.execute("UPDATE comment_notifications SET status='candidates_pending', updated_at=? WHERE notification_id=?", (time.time(), notification_id))
+            conn.commit()
+
+        await self._execute(operation)
+
+    async def comment_notification_candidates(self, notification_id: str) -> list[str]:
+        """返回通知关联的评论 UUID。"""
+
+        def operation(conn: sqlite3.Connection) -> list[str]:
+            rows = conn.execute("SELECT comment_id FROM comment_notification_candidates WHERE notification_id=? ORDER BY comment_id", (notification_id,)).fetchall()
+            return [str(row[0]) for row in rows]
+
+        return await self._execute(operation)
+
+    async def increment_comment_unmatched(self, notification_id: str, *, now: float | None = None) -> int:
+        """增加一次完整树匹配失败计数并返回新值。"""
+        timestamp = time.time() if now is None else now
+
+        def operation(conn: sqlite3.Connection) -> int:
+            conn.execute("UPDATE comment_notifications SET unmatched_attempts=unmatched_attempts+1, status='matching', updated_at=? WHERE notification_id=?", (timestamp, notification_id))
+            row = conn.execute("SELECT unmatched_attempts FROM comment_notifications WHERE notification_id=?", (notification_id,)).fetchone()
+            conn.commit()
+            return int(row[0]) if row is not None else 0
+
+        return await self._execute(operation)
+
+    async def set_comment_notification_status(self, notification_id: str, status: str, *, now: float | None = None) -> None:
+        """更新通知生命周期状态。"""
+        timestamp = time.time() if now is None else now
+
+        def operation(conn: sqlite3.Connection) -> None:
+            conn.execute("UPDATE comment_notifications SET status=?, updated_at=? WHERE notification_id=?", (status, timestamp, notification_id))
+            conn.commit()
+
+        await self._execute(operation)
+
+    async def record_comment_notification(
+        self, notification_id: str, blog_id: str, actor_fingerprint: str | None, *, now: float | None = None
+    ) -> CommentNotificationState:
+        """通知登记的语义别名。"""
+        return await self.observe_comment_notification(
+            notification_id, blog_id, actor_fingerprint, now=now
+        )
+
+    async def mark_comment_notification(self, notification_id: str, status: str, *, now: float | None = None) -> None:
+        """通知状态更新的语义别名。"""
+        await self.set_comment_notification_status(notification_id, status, now=now)
+
+    async def baseline_comment_notification(
+        self, notification_id: str, blog_id: str, actor_fingerprint: str | None, *, now: float | None = None
+    ) -> None:
+        """登记冷启动时已存在的通知，不创建评论任务。"""
+        await self.observe_comment_notification(notification_id, blog_id, actor_fingerprint, now=now)
+        await self.set_comment_notification_status(notification_id, "baseline_ignored", now=now)
+
+    async def comment_notification_baseline_done(self) -> bool:
+        """读取通知冷启动基线是否已经完成。"""
+
+        def operation(conn: sqlite3.Connection) -> bool:
+            row = conn.execute(
+                "SELECT int_value FROM runtime_meta WHERE key='comment_notification_baseline'"
+            ).fetchone()
+            return bool(row and row[0])
+
+        return await self._execute(operation)
+
+    async def is_comment_notification_baseline_initialized(self) -> bool:
+        """通知冷启动基线状态别名。"""
+        return await self.comment_notification_baseline_done()
+
+    async def set_comment_notification_baseline_done(self, *, now: float | None = None) -> None:
+        """原子记录通知冷启动完成标志。"""
+
+        def operation(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "INSERT INTO runtime_meta(key, int_value) VALUES ('comment_notification_baseline', 1) ON CONFLICT(key) DO UPDATE SET int_value=1"
+            )
+            conn.commit()
+
+        await self._execute(operation)
+
+    async def mark_comment_notification_baseline(self, *, now: float | None = None) -> None:
+        """通知冷启动标记别名。"""
+        await self.set_comment_notification_baseline_done(now=now)
+
+    async def comment_notification_baseline_cutoff(self) -> tuple[float, str] | None:
+        """读取通知冷启动快照边界；边界必须跨重启保留。"""
+
+        def operation(conn: sqlite3.Connection) -> tuple[float, str] | None:
+            row = conn.execute(
+                "SELECT cutoff_timestamp, cutoff_notification_id "
+                "FROM comment_notification_baseline_state WHERE singleton=1"
+            ).fetchone()
+            if row is None:
+                return None
+            return float(row[0]), str(row[1])
+
+        return await self._execute(operation)
+
+    async def get_comment_notification_baseline_cutoff(self) -> tuple[float, str] | None:
+        """通知冷启动快照边界查询别名。"""
+        return await self.comment_notification_baseline_cutoff()
+
+    async def set_comment_notification_baseline_cutoff(
+        self,
+        *,
+        timestamp: float,
+        notification_id: str,
+        cutoff: tuple[float, str] | None = None,
+        now: float | None = None,
+    ) -> None:
+        """原子保存通知冷启动快照边界。"""
+        del cutoff
+        updated_at = time.time() if now is None else now
+
+        def operation(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "INSERT INTO comment_notification_baseline_state "
+                "(singleton, cutoff_timestamp, cutoff_notification_id, updated_at) "
+                "VALUES (1, ?, ?, ?) "
+                "ON CONFLICT(singleton) DO UPDATE SET "
+                "cutoff_timestamp=excluded.cutoff_timestamp, "
+                "cutoff_notification_id=excluded.cutoff_notification_id, "
+                "updated_at=excluded.updated_at",
+                (float(timestamp), notification_id, updated_at),
+            )
+            conn.commit()
+
+        await self._execute(operation)
+
+    async def record_comment_notification_baseline_cutoff(
+        self,
+        *,
+        timestamp: float,
+        notification_id: str,
+        cutoff: tuple[float, str] | None = None,
+        now: float | None = None,
+    ) -> None:
+        """通知冷启动快照边界写入别名。"""
+        await self.set_comment_notification_baseline_cutoff(
+            timestamp=timestamp,
+            notification_id=notification_id,
+            cutoff=cutoff,
+            now=now,
+        )
+
+    async def comment_notification_candidates_terminal(self, notification_id: str) -> bool:
+        """只有通知关联的所有候选进入终态时才允许标已读。"""
+
+        def operation(conn: sqlite3.Connection) -> bool:
+            rows = conn.execute(
+                "SELECT e.status FROM comment_notification_candidates AS n "
+                "LEFT JOIN comment_events AS e ON e.comment_id=n.comment_id "
+                "WHERE n.notification_id=?",
+                (notification_id,),
+            ).fetchall()
+            if not rows:
+                return False
+            return all(
+                row[0] is not None
+                and (str(row[0]) == "done" or str(row[0]).startswith("skipped_"))
+                for row in rows
+            )
+
+        return await self._execute(operation)
+
+    async def notification_candidates_terminal(self, notification_id: str) -> bool:
+        """候选终态查询别名。"""
+        return await self.comment_notification_candidates_terminal(notification_id)
+
+    async def can_mark_comment_notification_read(self, notification_id: str) -> bool:
+        """候选终态查询别名。"""
+        return await self.comment_notification_candidates_terminal(notification_id)
+
+    # --- 评论发送尝试与配额 -----------------------------------------------
+
+    async def record_comment_send_attempt(self, blog_id: str, trigger_comment_id: str | None, kind: str, *, attempted_at: float | None = None) -> int:
+        """记录评论发送尝试；同一触发评论只转正一次。"""
+        timestamp = time.time() if attempted_at is None else attempted_at
+
+        def operation(conn: sqlite3.Connection) -> int:
+            # Store 的单连接锁使「查找并插入」保持原子；通知类发送没有触发评论，
+            # 因而每次都应计入总配额。
+            if trigger_comment_id is not None:
+                existing = conn.execute(
+                    "SELECT id FROM comment_send_attempts "
+                    "WHERE blog_id=? AND trigger_comment_id=? AND kind=? "
+                    "ORDER BY id LIMIT 1",
+                    (blog_id, trigger_comment_id, kind),
+                ).fetchone()
+                if existing is not None:
+                    return int(existing[0])
+            cursor = conn.execute("INSERT INTO comment_send_attempts(blog_id, trigger_comment_id, kind, attempted_at) VALUES (?, ?, ?, ?)", (blog_id, trigger_comment_id, kind, timestamp))
+            conn.commit()
+            return int(cursor.lastrowid)
+
+        return await self._execute(operation)
+
+    async def comment_send_attempt_exists(
+        self, blog_id: str, trigger_comment_id: str, kind: str
+    ) -> bool:
+        """查询触发评论是否已经转正；不返回正文或其他用户字段。"""
+
+        def operation(conn: sqlite3.Connection) -> bool:
+            row = conn.execute(
+                "SELECT 1 FROM comment_send_attempts "
+                "WHERE blog_id=? AND trigger_comment_id=? AND kind=? LIMIT 1",
+                (blog_id, trigger_comment_id, kind),
+            ).fetchone()
+            return row is not None
+
+        return await self._execute(operation)
+
+    async def count_comment_sends_since(self, since: float, *, kind: str | None = None, blog_id: str | None = None) -> int:
+        """统计评论发送尝试，可按 kind 和文章过滤。"""
+
+        def operation(conn: sqlite3.Connection) -> int:
+            sql = "SELECT COUNT(*) FROM comment_send_attempts WHERE attempted_at >= ?"
+            params: list[object] = [since]
+            if kind is not None:
+                sql += " AND kind=?"
+                params.append(kind)
+            if blog_id is not None:
+                sql += " AND blog_id=?"
+                params.append(blog_id)
+            row = conn.execute(sql, params).fetchone()
+            return int(row[0]) if row else 0
+
+        return await self._execute(operation)
+
+    async def latest_comment_send_at(self, blog_id: str, *, since: float | None = None) -> float | None:
+        """读取文章最近一次评论发送时间。"""
+
+        def operation(conn: sqlite3.Connection) -> float | None:
+            if since is None:
+                row = conn.execute("SELECT MAX(attempted_at) FROM comment_send_attempts WHERE blog_id=?", (blog_id,)).fetchone()
+            else:
+                row = conn.execute("SELECT MAX(attempted_at) FROM comment_send_attempts WHERE blog_id=? AND attempted_at >= ?", (blog_id, since)).fetchone()
+            return None if row is None or row[0] is None else float(row[0])
+
+        return await self._execute(operation)
+
     # --- 已发回复 -----------------------------------------------------------
 
     async def record_sent(
@@ -698,7 +1687,15 @@ class Store:
 
         def operation(conn: sqlite3.Connection) -> CleanupResult:
             try:
-                result = _prune(conn, now, cfg)
+                result = _prune(
+                    conn,
+                    now,
+                    cfg,
+                    comment_conversation_retention_seconds=(
+                        self._conversation_retention_seconds
+                    ),
+                    comment_dedupe_retention_seconds=self._dedupe_retention_seconds,
+                )
             except BaseException:
                 conn.rollback()
                 raise

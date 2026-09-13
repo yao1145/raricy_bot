@@ -10,7 +10,7 @@ import hashlib
 import os
 import urllib.parse
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import yaml
@@ -79,6 +79,34 @@ class OpsConfig:
 
 
 @dataclass(frozen=True)
+class CommentConfig:
+    """博客评论机器人配置；默认关闭以保持现有部署行为。"""
+
+    enabled: bool = False
+    recent_poll_seconds: int = 30
+    notification_poll_seconds: int = 15
+    notification_max_pages: int = 5
+    queue_size: int = 50
+    concurrency: int = 1
+    context_turns: int = 10
+    context_input_tokens: int = 8000
+    article_max_chars: int = 1000
+    max_output_chars: int = 1800
+    max_response_bytes: int = 8388608
+    max_tree_nodes: int = 10000
+    unmatched_attempt_limit: int = 5
+    minute_attempt_limit: int = 20
+    daily_reply_limit: int = 600
+    daily_absolute_limit: int = 630
+    article_cooldown_seconds: int = 5
+    conversation_retention_seconds: int = 2592000
+    dedupe_retention_seconds: int = 7776000
+    retry_base_seconds: int = 5
+    retry_max_seconds: int = 300
+    server_backoff_seconds: int = 3600
+
+
+@dataclass(frozen=True)
 class Secrets:
     """密钥集合；repr 必须脱敏。"""
 
@@ -119,6 +147,7 @@ class Config:
     system_prompt: str
     system_prompt_sha256: str
     secrets: Secrets
+    comments: CommentConfig = field(default_factory=CommentConfig)
 
     @property
     def db_path(self) -> str:
@@ -160,7 +189,7 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
     )
     behavior = _behavior(behavior_raw)
     storage = _storage(storage_raw)
-
+    comments = _comments(_section(raw, "comments"))
     ops = OpsConfig(
         host=_ops_host(ops_raw),
         port=_ops_port(ops_raw),
@@ -181,6 +210,7 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
             password=_secret(source, PASSWORD_ENV),
             llm_api_key=_secret(source, LLM_API_KEY_ENV),
         ),
+        comments=comments,
     )
 
 
@@ -374,6 +404,82 @@ def _storage(container: Mapping[str, Any]) -> StorageConfig:
         max_dm_channels=max_dm_channels,
         sqlite_soft_limit_bytes=sqlite_soft_limit_bytes,
         wal_journal_limit_bytes=wal_journal_limit_bytes,
+    )
+
+
+def _comments(container: Mapping[str, Any]) -> CommentConfig:
+    """构造评论配置并执行设计文档中的交叉校验。"""
+    enabled = container.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError("配置 comments.enabled 必须是布尔值")
+
+    def integer(key: str, default: int) -> int:
+        return _positive_int(container, key, "comments", default)
+
+    recent_poll_seconds = integer("recent_poll_seconds", 30)
+    notification_poll_seconds = integer("notification_poll_seconds", 15)
+    notification_max_pages = integer("notification_max_pages", 5)
+    queue_size = integer("queue_size", 50)
+    concurrency = integer("concurrency", 1)
+    context_turns = integer("context_turns", 10)
+    context_input_tokens = integer("context_input_tokens", 8000)
+    article_max_chars = integer("article_max_chars", 1000)
+    max_output_chars = integer("max_output_chars", 1800)
+    max_response_bytes = integer("max_response_bytes", 8 * 1024 * 1024)
+    max_tree_nodes = integer("max_tree_nodes", 10000)
+    unmatched_attempt_limit = integer("unmatched_attempt_limit", 5)
+    minute_attempt_limit = integer("minute_attempt_limit", 20)
+    daily_reply_limit = integer("daily_reply_limit", 600)
+    daily_absolute_limit = integer("daily_absolute_limit", 630)
+    article_cooldown_seconds = integer("article_cooldown_seconds", 5)
+    conversation_retention_seconds = integer("conversation_retention_seconds", 2592000)
+    dedupe_retention_seconds = integer("dedupe_retention_seconds", 7776000)
+    retry_base_seconds = integer("retry_base_seconds", 5)
+    retry_max_seconds = integer("retry_max_seconds", 300)
+    server_backoff_seconds = integer("server_backoff_seconds", 3600)
+
+    if concurrency != 1:
+        raise ConfigError("配置 comments.concurrency 首版必须为 1")
+    if not daily_reply_limit < daily_absolute_limit < 1200:
+        raise ConfigError(
+            "配置 comments.daily_reply_limit 必须小于 daily_absolute_limit 且小于 1200"
+        )
+    if max_output_chars > 1900:
+        raise ConfigError("配置 comments.max_output_chars 不能大于 1900")
+    if max_response_bytes > 8 * 1024 * 1024:
+        raise ConfigError("配置 comments.max_response_bytes 不能大于 8 MiB")
+    if max_tree_nodes > 10000:
+        raise ConfigError("配置 comments.max_tree_nodes 不能大于 10000")
+    if conversation_retention_seconds > dedupe_retention_seconds:
+        raise ConfigError(
+            "配置 comments.conversation_retention_seconds 不能大于 dedupe_retention_seconds"
+        )
+    if retry_base_seconds > retry_max_seconds:
+        raise ConfigError("配置 comments.retry_base_seconds 不能大于 retry_max_seconds")
+
+    return CommentConfig(
+        enabled=enabled,
+        recent_poll_seconds=recent_poll_seconds,
+        notification_poll_seconds=notification_poll_seconds,
+        notification_max_pages=notification_max_pages,
+        queue_size=queue_size,
+        concurrency=concurrency,
+        context_turns=context_turns,
+        context_input_tokens=context_input_tokens,
+        article_max_chars=article_max_chars,
+        max_output_chars=max_output_chars,
+        max_response_bytes=max_response_bytes,
+        max_tree_nodes=max_tree_nodes,
+        unmatched_attempt_limit=unmatched_attempt_limit,
+        minute_attempt_limit=minute_attempt_limit,
+        daily_reply_limit=daily_reply_limit,
+        daily_absolute_limit=daily_absolute_limit,
+        article_cooldown_seconds=article_cooldown_seconds,
+        conversation_retention_seconds=conversation_retention_seconds,
+        dedupe_retention_seconds=dedupe_retention_seconds,
+        retry_base_seconds=retry_base_seconds,
+        retry_max_seconds=retry_max_seconds,
+        server_backoff_seconds=server_backoff_seconds,
     )
 
 

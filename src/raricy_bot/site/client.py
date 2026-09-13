@@ -22,6 +22,16 @@ import httpx
 
 from ..logging_setup import get_logger, log_event, register_secret
 from ..redact import Redactor
+from .comment_models import (
+    BlogContext,
+    CommentNode,
+    CommentNotification,
+    CommentTreeTooLarge,
+    NotificationPage,
+    count_comment_nodes,
+    normalize_uuid,
+    strip_comment_content,
+)
 from .models import LOBBY, Author, ChatMessage, _parse_author
 
 # 会话 Cookie 名（chat-bot.md §3）。
@@ -37,6 +47,12 @@ _LOGIN_PATH: str = "/api/auth/login"
 _ME_PATH: str = "/api/auth/me"
 _STREAM_PATH: str = "/api/chat/stream"
 _CHANNELS_PREFIX: str = "/api/chat/channels"
+_COMMENTS_PREFIX: str = "/api/blogs"
+_SPIDER_COMMENTS_PATH: str = "/api/spider/comments"
+_SPIDER_BLOGS_PREFIX: str = "/api/spider/blogs"
+_NOTIFICATIONS_PATH: str = "/api/notifications"
+_MAX_COMMENT_RESPONSE_BYTES: int = 8 * 1024 * 1024
+_MAX_COMMENT_TREE_NODES: int = 10000
 
 
 def _messages_path(channel_id: str) -> str:
@@ -84,6 +100,8 @@ class SiteClient:
         transport: httpx.AsyncBaseTransport | None = None,
         username: str = "",
         password: str = "",
+        max_response_bytes: int = _MAX_COMMENT_RESPONSE_BYTES,
+        max_tree_nodes: int = _MAX_COMMENT_TREE_NODES,
     ) -> None:
         # username/password 是对 INTERFACES §7 构造签名的**追加**关键字参数：
         # 锁定签名里没有携带凭据的位置，而 login() 需要用它发登录请求。
@@ -93,6 +111,16 @@ class SiteClient:
         self._transport = transport
         self._username = username
         self._password = password
+        if isinstance(max_response_bytes, bool) or not isinstance(max_response_bytes, int):
+            raise ValueError("max_response_bytes 必须是整数")
+        if not 1 <= max_response_bytes <= _MAX_COMMENT_RESPONSE_BYTES:
+            raise ValueError("max_response_bytes 超出 8 MiB 硬上限")
+        if isinstance(max_tree_nodes, bool) or not isinstance(max_tree_nodes, int):
+            raise ValueError("max_tree_nodes 必须是整数")
+        if not 1 <= max_tree_nodes <= _MAX_COMMENT_TREE_NODES:
+            raise ValueError("max_tree_nodes 超出 10000 节点硬上限")
+        self._max_response_bytes = max_response_bytes
+        self._max_tree_nodes = max_tree_nodes
         # 只有密码算机密（INTERFACES §3）；用户名**不得**注册，否则日志与出站文本里
         # 机器人自己的名字会被抹成 [redacted]。登记密码是为了让服务端回显时也不进异常文案。
         self._redactor.add_secret(password)
@@ -215,6 +243,230 @@ class SiteClient:
     async def probe_chat(self) -> None:
         """读一条大区消息，用于探测 403 禁言/权限是否恢复；异常时抛 SiteError。"""
         await self._call("GET", _messages_path(LOBBY), params={"limit": 1})
+
+    # --- 博客评论接口 ------------------------------------------------------
+
+    async def fetch_recent_comments(self) -> list[CommentNode]:
+        """读取全站最近评论；该 spider 接口是裸数组且不带 Cookie。"""
+        payload = await self._request_public_json(_SPIDER_COMMENTS_PATH)
+        if not isinstance(payload, list):
+            raise self._error(200, "malformed comments response")
+        result: list[CommentNode] = []
+        for item in payload[:100]:
+            if not isinstance(item, Mapping):
+                continue
+            try:
+                node = CommentNode.from_dict(item, max_nodes=self._max_tree_nodes)
+                # recent spider 只用于发现和匹配；即便上游错误地返回正文，
+                # 也不能让它进入评论机器人后续流程。
+                result.append(strip_comment_content(node))
+            except CommentTreeTooLarge as exc:
+                raise self._error(200, "comment_tree_too_large") from exc
+            except ValueError:
+                continue
+        return result
+
+    async def fetch_blog_comments(self, blog_id: str) -> list[CommentNode]:
+        """读取整篇文章评论树并迭代解析为顶层节点列表。"""
+        normalized = normalize_uuid(blog_id)
+        if normalized is None:
+            raise ValueError("文章 id 不是 UUID")
+        response, payload = await self._request_comment_envelope(
+            "GET", f"{_COMMENTS_PREFIX}/{normalized}/comments", authenticated=False
+        )
+        if payload.get("code") != 200:
+            raise self._error_from_payload(response, payload)
+        raw = payload.get("comments")
+        if not isinstance(raw, list):
+            return []
+        result: list[CommentNode] = []
+        total_nodes = 0
+        for item in raw:
+            if not isinstance(item, Mapping):
+                continue
+            try:
+                remaining = self._max_tree_nodes - total_nodes
+                if remaining < 1:
+                    raise CommentTreeTooLarge("comment_tree_too_large")
+                # 把全树剩余额度传给每个根，避免先完整构造超限的后续子树，
+                # 再在聚合计数时才发现已经越过 10,000 节点。
+                node = CommentNode.from_dict(item, max_nodes=remaining)
+                total_nodes += count_comment_nodes((node,), remaining)
+                result.append(node)
+            except CommentTreeTooLarge as exc:
+                raise self._error(200, "comment_tree_too_large") from exc
+            except ValueError:
+                continue
+        return result
+
+    async def fetch_blog_context(self, blog_id: str) -> BlogContext:
+        """读取本轮文章资料；spider 博客接口是裸对象且不带 Cookie。"""
+        normalized = normalize_uuid(blog_id)
+        if normalized is None:
+            raise ValueError("文章 id 不是 UUID")
+        payload = await self._request_public_json(f"{_SPIDER_BLOGS_PREFIX}/{normalized}")
+        if not isinstance(payload, Mapping):
+            raise self._error(200, "malformed blog response")
+        meta = payload.get("meta")
+        title = meta.get("title") if isinstance(meta, Mapping) else ""
+        return BlogContext(
+            id=normalized,
+            title=title if isinstance(title, str) else "",
+            content=payload.get("content") if isinstance(payload.get("content"), str) else None,
+        )
+
+    async def fetch_notifications(
+        self, *, page: int, unread_only: bool = True
+    ) -> NotificationPage:
+        """读取登录用户的通知分页，并容错解析通知条目。"""
+        await self.ensure_session()
+        params = {"page": page, "unread_only": str(bool(unread_only)).lower()}
+        response, payload = await self._request_comment_envelope(
+            "GET", _NOTIFICATIONS_PATH, params=params, authenticated=True
+        )
+        if payload.get("code") == 401:
+            await self._relogin()
+            response, payload = await self._request_comment_envelope(
+                "GET", _NOTIFICATIONS_PATH, params=params, authenticated=True
+            )
+        if payload.get("code") != 200:
+            raise self._error_from_payload(response, payload)
+        raw = payload.get("notifications")
+        notifications: list[CommentNotification] = []
+        if isinstance(raw, list):
+            for item in raw:
+                if not isinstance(item, Mapping):
+                    continue
+                try:
+                    notifications.append(CommentNotification.from_dict(item))
+                except ValueError:
+                    continue
+        raw_page = payload.get("page", page)
+        raw_pages = payload.get("pages", 1)
+        return NotificationPage(
+            notifications=tuple(notifications),
+            page=int(raw_page) if isinstance(raw_page, int) and not isinstance(raw_page, bool) else page,
+            pages=int(raw_pages) if isinstance(raw_pages, int) and not isinstance(raw_pages, bool) else 1,
+            has_next=bool(payload.get("hasNext", False)),
+            unread_count=(
+                int(payload.get("unreadCount"))
+                if isinstance(payload.get("unreadCount"), int)
+                and not isinstance(payload.get("unreadCount"), bool)
+                else 0
+            ),
+        )
+
+    async def mark_notification_read(self, notification_id: str) -> None:
+        """标记单条通知已读；错误按站内信封传播。"""
+        if not isinstance(notification_id, str) or not notification_id:
+            raise ValueError("通知 id 缺失")
+        await self.ensure_session()
+        path = f"{_NOTIFICATIONS_PATH}/{notification_id}/read"
+        response, payload = await self._request_comment_envelope(
+            "POST", path, authenticated=True
+        )
+        if payload.get("code") == 401:
+            await self._relogin()
+            response, payload = await self._request_comment_envelope(
+                "POST", path, authenticated=True
+            )
+        if payload.get("code") != 200:
+            raise self._error_from_payload(response, payload)
+
+    async def post_comment(
+        self, blog_id: str, content: str, *, parent_id: str
+    ) -> CommentNode | None:
+        """发布评论回复；成功判据为信封 code=200，评论对象位于 comment。"""
+        normalized_blog = normalize_uuid(blog_id)
+        normalized_parent = normalize_uuid(parent_id)
+        if normalized_blog is None or normalized_parent is None:
+            raise ValueError("文章 id 或父评论 id 不是 UUID")
+        await self.ensure_session()
+        body = {"content": content, "parent_id": normalized_parent}
+        path = f"{_COMMENTS_PREFIX}/{normalized_blog}/comments"
+        response, payload = await self._request_comment_envelope(
+            "POST", path, json_body=body, authenticated=True
+        )
+        if payload.get("code") == 401:
+            await self._relogin()
+            response, payload = await self._request_comment_envelope(
+                "POST", path, json_body=body, authenticated=True
+            )
+        if payload.get("code") != 200:
+            raise self._error_from_payload(response, payload)
+        raw = payload.get("comment")
+        if not isinstance(raw, Mapping):
+            return None
+        try:
+            return CommentNode.from_dict(raw, max_nodes=self._max_tree_nodes)
+        except CommentTreeTooLarge:
+            raise self._error(200, "comment_tree_too_large")
+        except ValueError:
+            return None
+
+    async def _request_public_json(self, path: str) -> object:
+        """读取公开 spider 响应，严格施加原始字节上限。"""
+        try:
+            async with self._require_client().stream(
+                "GET", path, headers={"Accept": "application/json"}
+            ) as response:
+                status = response.status_code
+                raw = await self._bounded_response_bytes(response)
+        except httpx.HTTPError as exc:
+            raise self._network_error(exc) from exc
+        if status != 200:
+            raise self._error(status, f"http={status}")
+        try:
+            import json
+
+            return json.loads(raw)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise self._error(status, "malformed response") from exc
+
+    async def _request_comment_envelope(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Any = None,
+        json_body: Any = None,
+        authenticated: bool = False,
+    ) -> tuple[httpx.Response, Mapping[str, Any]]:
+        """评论站内接口的有界信封请求。"""
+        headers = {"Accept": "application/json"}
+        if authenticated:
+            headers.update(self._cookie_headers())
+        try:
+            async with self._require_client().stream(
+                method, path, headers=headers, params=params, json=json_body
+            ) as response:
+                raw = await self._bounded_response_bytes(response)
+                status = response.status_code
+        except httpx.HTTPError as exc:
+            raise self._network_error(exc) from exc
+        try:
+            import json
+
+            payload = json.loads(raw)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise self._error(status, "malformed envelope") from exc
+        if not isinstance(payload, Mapping):
+            raise self._error(status, "malformed envelope")
+        code = payload.get("code")
+        if isinstance(code, bool) or not isinstance(code, int):
+            raise self._error(status, "malformed envelope")
+        return response, payload
+
+    async def _bounded_response_bytes(self, response: httpx.Response) -> bytes:
+        """流式累计响应字节，超过上限立即抛出稳定 SiteError。"""
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in response.aiter_bytes():
+            total += len(chunk)
+            if total > self._max_response_bytes:
+                raise self._error(response.status_code, "response_too_large")
+            chunks.append(chunk)
+        return b"".join(chunks)
 
     @asynccontextmanager
     async def open_stream(self, last_event_id: int | None = None) -> AsyncIterator[httpx.Response]:

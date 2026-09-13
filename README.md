@@ -8,6 +8,27 @@
 第一版明确不支持图片理解、博客理解、工具调用、联网搜索与长期用户记忆。
 机器人资料须由人工在站点上标注「机器人」及「消息可能发送至第三方模型处理」。
 
+## 博客评论机器人（默认关闭）
+
+评论能力必须在 `config.yaml` 中显式开启：
+
+```yaml
+comments:
+  enabled: true
+```
+
+开启后服务每 30 秒检查全站最近 100 条评论、每 15 秒检查最多 5 页未读“评论回复”通知。
+首次启动只建立冷启动基线，不会补回复旧评论或旧通知；若冷启动通知超过 5 页，服务会持久
+保存 cutoff 并继续清理旧页，不会过早完成基线。最近列表在两个轮询周期之间溢出 100 条时，
+窗口外评论可能永久漏失。只有精确首次 `@机器人用户名` 或直接回复机器人评论
+才会触发，评论回复会真实通知被回复的用户。评论正文和短文章正文可能发送给第三方模型，
+文章正文超过 1000 字时不会发送。文章评论使用独立队列、配额和状态记录，不占用聊天队列；
+关闭 `comments.enabled` 后聊天行为不变。
+
+启用前必须人工确认机器人资料已披露上述第三方处理、公开评论通知、短期记忆与重启失忆，
+并在测试文章上验证首次 @、直接回复、旁支静默、`/help` 和 `/reset`。详见
+[`docs/COMMENT_BOT_DESIGN.md`](docs/COMMENT_BOT_DESIGN.md) 与 [`docs/comment-bot.md`](docs/comment-bot.md)。
+
 ## 目录结构
 
 ```
@@ -69,8 +90,10 @@ python -m pytest tests -q
 
 ## 配置项说明
 
-配置为只读 YAML，顶层小节有 `site` / `model` / `behavior` / `ops` / `storage` / `logging`
-与必填的 `system_prompt`。完整字段、默认值与校验规则见 `docs/INTERFACES.md` 第 1 节。
+配置为只读 YAML，顶层小节有 `site` / `model` / `behavior` / `ops` / `storage` / `logging` /
+`comments` 与必填的 `system_prompt`。`comments.max_response_bytes` 默认 8 MiB、
+`comments.max_tree_nodes` 默认 10000，分别由 SiteClient 的响应流和显式栈解析执行；完整字段、
+默认值与校验规则见 `docs/INTERFACES.md` 第 1 节。
 `config.example.yaml` 是一份可直接复制的样例。
 
 ## 环境变量
