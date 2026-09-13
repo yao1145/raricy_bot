@@ -1,14 +1,15 @@
 """发送配额守卫：每分钟滑动窗口 + 24 小时滚动总量 + 通知冷却 + 站点退避。
 
-判定口径见 `docs/INTERFACES.md` §10 与 `docs/DESIGN_DECISIONS.md` D-1 / D-2：
+判定口径见 `docs/INTERFACES.md` §10 与 `docs/DESIGN_DECISIONS.md` D-1 / D-2 / D-18：
 
 - 750 只约束 `kind="reply"`；790 是三种 kind 的合计上限；
 - 每分钟是滑动窗口（SQLite 发送时间 + 在途预留），不是内存令牌桶，重启后仍然准确；
 - `kind` 是三值枚举（`"reply"` / `"notice"` / `"notice_local"`）：
-  `"notice"` 是**主动**通知（busy / failure / quota），占用「每频道 24 小时一条」名额
-  并受 `notice_cooldown_seconds` 冷却约束；`"notice_local"` 是应答明确用户动作的
-  本地回复，两条通知约束都不适用，但同样计入 24 小时总量与每分钟窗口。
-  两者必须是**不同的 kind 值**，不能共用一个 kind 再用布尔参数区分（D-1）。
+  `"notice"` 是**主动**通知（busy / failure / quota），受 `notice_cooldown_seconds`
+  冷却约束，冷却按 **(频道, 触发者)** 隔离（D-18）；`"notice_local"` 是应答明确
+  用户动作的本地回复，`"reply"` 是模型回复，两者都不受通知冷却约束，
+  但同样计入 24 小时总量与每分钟窗口。
+  `notice` 与 `notice_local` 必须是**不同的 kind 值**，不能共用一个 kind 再用布尔参数区分（D-1）。
 
 `reserve()` 内部用 `asyncio.Lock` 把「读计数 + 登记预留」做成一个原子步骤，
 并发调用时不会互相看不到对方的在途预留。
@@ -34,8 +35,14 @@ logger = get_logger("quota")
 MINUTE_SECONDS: float = 60.0
 DAY_SECONDS: float = 86400.0
 
-# 通知冷却只参照主动通知本身；本地回复（notice_local）不得消耗该名额（D-1）。
-NOTICE_REFERENCE_KINDS: tuple[str, ...] = ("notice",)
+
+def notice_cooldown_key(channel_id: str, actor_id: str | None) -> str:
+    """主动通知的冷却键：按 (频道, 触发者) 隔离（D-18）。
+
+    唯一写点是 `note_sent()`；上层若要在尝试发送前先挡一次，读同一个键即可。
+    `actor_id` 缺失时退回频道级，保证键的形状稳定。
+    """
+    return f"notice:{channel_id}:{actor_id or '-'}"
 
 
 class Decision(enum.Enum):
@@ -76,8 +83,8 @@ class QuotaGuard:
         self._now = now
         self._mono = mono
         self._lock = asyncio.Lock()
-        # 在途预留：(kind, channel_id) -> 笔数。
-        self._pending: dict[tuple[str, str], int] = {}
+        # 在途预留：(kind, channel_id, actor_id) -> 笔数。
+        self._pending: dict[tuple[str, str, str | None], int] = {}
         # 本进程的发送时刻（monotonic），用于每分钟窗口；与 SQLite 计数取较大者。
         self._recent: deque[float] = deque()
         # 站点 429 退避截止时刻（monotonic）。
@@ -85,14 +92,18 @@ class QuotaGuard:
 
     # --- 对外接口 -----------------------------------------------------------
 
-    async def reserve(self, channel_id: str, kind: str) -> QuotaResult:
+    async def reserve(
+        self, channel_id: str, kind: str, *, actor_id: str | None = None
+    ) -> QuotaResult:
         """原子地判定并登记一笔预留；通过时调用方最终必须 note_sent() 或 release()。
 
         `kind` 是三值枚举，行为完全由它决定（见模块 docstring 与 D-1）：
 
         - `"reply"`：模型回复，受 `daily_normal_limit` 约束；
-        - `"notice"`：主动通知，另受「每频道 24 小时一条」+ 冷却约束；
-        - `"notice_local"`：应答用户动作的本地回复，不受上述两条通知约束。
+        - `"notice"`：主动通知，另受 **(频道, 触发者)** 冷却约束（D-18）；
+        - `"notice_local"`：应答用户动作的本地回复，不受通知冷却约束。
+
+        `actor_id` 是触发这条通知的用户（大区里就是发消息的人）；只对 `"notice"` 有意义。
         """
         async with self._lock:
             # 1. 站点退避：任何 kind 都不放行。
@@ -114,16 +125,14 @@ class QuotaGuard:
             if kind == "reply" and total >= self._cfg.daily_normal_limit:
                 return QuotaResult(Decision.DENY_DAILY)
 
-            # 4. 主动通知的频道级约束：每频道 24 小时一条 + 冷却。
-            #    只统计 kind == "notice"；notice_local 绝不能算进来（D-1）。
+            # 4. 主动通知的冷却：按 (频道, 触发者) 隔离（D-18）。
+            #    大区是全站唯一频道，若按频道计，一个人的失败会封住所有人的提示。
+            #    只约束 kind == "notice"；notice_local 绝不能算进来（D-1）。
             if kind == "notice":
-                notice_count = await self._store.count_channel_sends_since(
-                    channel_id, since_daily, "notice"
-                )
-                if notice_count + self._pending_count("notice", channel_id) >= 1:
+                cooldown_key = notice_cooldown_key(channel_id, actor_id)
+                if await self._store.get_cooldown(cooldown_key, now=now) is not None:
                     return QuotaResult(Decision.DENY_NOTICE)
-                last_at = await self._store.last_notice_at(channel_id, NOTICE_REFERENCE_KINDS)
-                if last_at is not None and now < last_at + self._cfg.notice_cooldown_seconds:
+                if self._pending_count(kind, channel_id, actor_id) >= 1:
                     return QuotaResult(Decision.DENY_NOTICE)
 
             # 5. 每分钟滑动窗口。
@@ -136,25 +145,41 @@ class QuotaGuard:
                 return QuotaResult(Decision.DENY_MINUTE)
 
             # 6. 全部通过：登记预留。
-            key = (kind, channel_id)
+            key = (kind, channel_id, actor_id)
             self._pending[key] = self._pending.get(key, 0) + 1
             return QuotaResult(Decision.ALLOW)
 
-    async def note_sent(self, channel_id: str, reply_to: int | None, kind: str) -> None:
+    async def note_sent(
+        self,
+        channel_id: str,
+        reply_to: int | None,
+        kind: str,
+        *,
+        actor_id: str | None = None,
+    ) -> None:
         """预留转正：写 send_attempts 一行、记一笔内存窗口、释放预留。
 
         调用方在**消息已经发出**之后才调用本方法，因此写库失败时不能向上抛：
         抛异常会把一次已成功的投递误报成失败。此时降级为「只记内存窗口 +
         记一条 error 日志」，并且**必须释放预留**，否则这笔预留会永久占用
-        分钟额度（kind="notice" 时还会永久占掉该频道的通知名额）。
+        分钟额度。
+
+        `kind="notice"` 时还要顺手落下该 (频道, 触发者) 的通知冷却（D-18）：
+        冷却只能在这里写，因为只有这里知道消息**确实发出去了** —— 被拒绝或失败的
+        发送走 `release()`，用户什么都没收到，不该被冷却。
         """
         async with self._lock:
             try:
                 await self._store.record_send_attempt(channel_id, reply_to, kind)
+                if kind == "notice":
+                    await self._store.set_cooldown(
+                        notice_cooldown_key(channel_id, actor_id),
+                        self._now() + self._cfg.notice_cooldown_seconds,
+                    )
             except Exception as exc:  # 任何写库失败都必须走降级路径，不能外抛
                 # 尝试确实发生过，内存窗口照记；预留必须释放，避免泄漏。
                 self._recent.append(self._mono())
-                self._consume_pending(channel_id, kind)
+                self._consume_pending(channel_id, kind, actor_id)
                 log_event(
                     logger,
                     logging.ERROR,
@@ -165,12 +190,12 @@ class QuotaGuard:
                 )
                 return
             self._recent.append(self._mono())
-            self._consume_pending(channel_id, kind)
+            self._consume_pending(channel_id, kind, actor_id)
 
-    async def release(self, channel_id: str, kind: str) -> None:
-        """发送失败/放弃：只释放预留，不写 send_attempts。"""
+    async def release(self, channel_id: str, kind: str, *, actor_id: str | None = None) -> None:
+        """发送失败/放弃：只释放预留，不写 send_attempts，也不落通知冷却。"""
         async with self._lock:
-            self._consume_pending(channel_id, kind)
+            self._consume_pending(channel_id, kind, actor_id)
 
     def backoff(self, seconds: float) -> None:
         """站点 429 之后调用：在指定秒数内拒绝一切发送。"""
@@ -183,12 +208,12 @@ class QuotaGuard:
 
     # --- 内部 ---------------------------------------------------------------
 
-    def _pending_count(self, kind: str, channel_id: str) -> int:
-        return self._pending.get((kind, channel_id), 0)
+    def _pending_count(self, kind: str, channel_id: str, actor_id: str | None) -> int:
+        return self._pending.get((kind, channel_id, actor_id), 0)
 
-    def _consume_pending(self, channel_id: str, kind: str) -> None:
+    def _consume_pending(self, channel_id: str, kind: str, actor_id: str | None) -> None:
         """扣减一笔预留；没有对应预留时记一条日志，绝不让计数变成负数。"""
-        key = (kind, channel_id)
+        key = (kind, channel_id, actor_id)
         count = self._pending.get(key, 0)
         if count <= 0:
             log_event(

@@ -5,8 +5,8 @@
 - 启动顺序：`Store.open` → `SiteClient.start` + `login` → 构造 `SSEReceiver`
   → **用 `store.watermark()` 播种 `Last-Event-ID`（D-16）** → `WorkerPool.start`
   → `OpsServer.start` → `sse.run()` 作为后台 task；
-- 路由结果分派：`reply_now` 用 `notice_local`、`busy` 用 `notice` 并加频道冷却；
-- 模型失败的 `failure` 通知同样用 `notice` + 频道冷却；额度用尽补发一次 `quota` 通知；
+- 路由结果分派：`reply_now` 用 `notice_local`、`busy` 用 `notice` 并加 (频道, 触发者) 冷却；
+- 模型失败的 `failure` 通知同样用 `notice` + 触发者冷却；额度用尽补发一次 `quota` 通知；
 - 403 进入不可用状态，按 `ready_probe_seconds` 探测恢复（D-4）；
 - 优雅关闭总超时 10 秒，`stop()` 可重复调用。
 
@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from collections.abc import Iterable
 
 import httpx
@@ -30,7 +29,7 @@ from .core.sender import MessageSender, SendResult
 from .core.worker import ModelClient, OpenAIModelClient, WorkerPool
 from .logging_setup import get_logger, log_event
 from .ops import OpsServer
-from .quota import QuotaGuard
+from .quota import QuotaGuard, notice_cooldown_key
 from .redact import Redactor
 from .site.client import SiteClient, SiteError
 from .site.models import LOBBY, ChatMessage
@@ -255,37 +254,80 @@ class BotApp:
                 await self._store.mark_handled(result.message_id, "done")
 
     async def _send_busy(self, result: RouteResult) -> None:
-        """队列满提示：kind=notice，按 `busy:{channel_id}` 冷却（D-3）。"""
-        channel_id = result.channel_id
-        key = f"busy:{channel_id}"
+        """队列满提示：kind=notice，按 (频道, 触发者) 冷却（D-3、D-18）。"""
         try:
-            if channel_id is None:
+            if result.channel_id is None:
                 return
-            if await self._store.get_cooldown(key) is not None:
+            if await self._notice_cooling_down(result.channel_id, result.actor_id):
                 return
             if self._unavailable:
                 return
-            outcome = await self._send_notice_text(
-                result, texts.BUSY_NOTICE_TEXT, kind="notice"
+            await self._send_notice_text(
+                result,
+                texts.BUSY_NOTICE_TEXT,
+                kind="notice",
+                actor_id=result.actor_id,
             )
-            # 只有真正送达才记冷却：被拒绝/失败时用户什么都没收到，
-            # 若照样冷却会让他在整整一个冷却期内得不到任何提示。
-            if outcome is not None and outcome.delivered:
-                await self._store.set_cooldown(
-                    key, time.time() + self._config.behavior.notice_cooldown_seconds
-                )
         finally:
             if result.message_id is not None:
                 await self._store.mark_handled(result.message_id, "done")
 
+    async def _notify_failure(self, request: Request) -> None:
+        """模型最终失败提示：kind=notice，按 (频道, 触发者) 冷却（D-3、D-18）。"""
+        if self._unavailable:
+            return
+        actor_id = request.message.author.id
+        if await self._notice_cooling_down(request.channel_id, actor_id):
+            return
+        outcome = await self._sender.send(
+            request.channel_id,
+            texts.FAILURE_NOTICE_TEXT,
+            request.message.id,
+            kind="notice",
+            actor_id=actor_id,
+        )
+        self._note_forbidden(outcome)
+
+    async def _notify_quota(self, request: Request) -> None:
+        """额度用尽提示：尝试发一次 kind=notice 的本地通知（D-18 同冷却口径）。"""
+        if self._unavailable:
+            return
+        actor_id = request.message.author.id
+        if await self._notice_cooling_down(request.channel_id, actor_id):
+            return
+        outcome = await self._sender.send(
+            request.channel_id,
+            texts.QUOTA_NOTICE_TEXT,
+            request.message.id,
+            kind="notice",
+            actor_id=actor_id,
+        )
+        self._note_forbidden(outcome)
+
+    async def _notice_cooling_down(self, channel_id: str, actor_id: str | None) -> bool:
+        """该 (频道, 触发者) 的通知冷却是否仍在生效。
+
+        真正的闸门在 `quota.reserve`（唯一写点是 `quota.note_sent`，只在送达后落冷却）；
+        这里只是同键的一次预读，省掉注定被拒的那次尝试及其日志。
+        """
+        return (
+            await self._store.get_cooldown(notice_cooldown_key(channel_id, actor_id))
+            is not None
+        )
+
     async def _send_notice_text(
-        self, result: RouteResult, text: str, *, kind: str
+        self,
+        result: RouteResult,
+        text: str,
+        *,
+        kind: str,
+        actor_id: str | None = None,
     ) -> SendResult | None:
         """发送一条通知/本地回复；403 按 reason 分流（D-4）。"""
         if result.channel_id is None or not text:
             return None
         outcome = await self._sender.send(
-            result.channel_id, text, result.reply_to, kind=kind
+            result.channel_id, text, result.reply_to, kind=kind, actor_id=actor_id
         )
         self._note_forbidden(outcome)
         return outcome
@@ -388,32 +430,6 @@ class BotApp:
         author = reply.author_name if reply is not None else None
         header = f"[引用 @{author}]" if author else "[引用]"
         return f"{header} {context}"
-
-    async def _notify_failure(self, request: Request) -> None:
-        """模型最终失败提示：kind=notice，按 `failure:{channel_id}` 冷却（D-3）。"""
-        key = f"failure:{request.channel_id}"
-        if self._unavailable:
-            return
-        if await self._store.get_cooldown(key) is not None:
-            return
-        outcome = await self._sender.send(
-            request.channel_id, texts.FAILURE_NOTICE_TEXT, request.message.id, kind="notice"
-        )
-        # 同 busy：只有真正送达才记冷却。
-        if outcome.delivered:
-            await self._store.set_cooldown(
-                key, time.time() + self._config.behavior.notice_cooldown_seconds
-            )
-        self._note_forbidden(outcome)
-
-    async def _notify_quota(self, request: Request) -> None:
-        """额度用尽提示：尝试发一次 kind=notice 的本地通知。"""
-        if self._unavailable:
-            return
-        outcome = await self._sender.send(
-            request.channel_id, texts.QUOTA_NOTICE_TEXT, request.message.id, kind="notice"
-        )
-        self._note_forbidden(outcome)
 
     # --- resync 与不可用探测 ------------------------------------------------
 

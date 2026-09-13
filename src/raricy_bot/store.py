@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from pathlib import Path
 from typing import TypeVar
 
@@ -380,47 +380,16 @@ class Store:
 
         return await self._execute(operation)
 
-    async def count_channel_sends_since(
-        self, channel_id: str, since: float, kind: str | None = None
-    ) -> int:
-        """统计指定频道内的发送尝试数；`kind` 为 None 时不过滤。"""
-
-        def operation(conn: sqlite3.Connection) -> int:
-            sql = (
-                "SELECT COUNT(*) FROM send_attempts"
-                " WHERE channel_id = ? AND attempted_at >= ?"
-            )
-            params: list[object] = [channel_id, since]
-            if kind is not None:
-                sql += " AND kind = ?"
-                params.append(kind)
-            row = conn.execute(sql, params).fetchone()
-            return int(row[0]) if row is not None else 0
-
-        return await self._execute(operation)
-
-    async def last_notice_at(self, channel_id: str, kinds: Sequence[str]) -> float | None:
-        """该频道内 `kinds` 覆盖的最近一次发送时间；无记录返回 None。"""
-
-        selected = tuple(kinds)
-
-        def operation(conn: sqlite3.Connection) -> float | None:
-            if not selected:
-                return None
-            placeholders = ", ".join("?" for _ in selected)
-            row = conn.execute(
-                "SELECT MAX(attempted_at) FROM send_attempts"
-                f" WHERE channel_id = ? AND kind IN ({placeholders})",
-                (channel_id, *selected),
-            ).fetchone()
-            return float(row[0]) if row is not None and row[0] is not None else None
-
-        return await self._execute(operation)
-
     # --- 冷却 ---------------------------------------------------------------
 
-    async def get_cooldown(self, key: str) -> float | None:
-        """未过期时返回到期时间戳，否则返回 None（过期即视为无）。"""
+    async def get_cooldown(self, key: str, *, now: float | None = None) -> float | None:
+        """未过期时返回到期时间戳，否则返回 None（过期即视为无）。
+
+        `now` 供调用方注入可比对的时间（`quota` 用可注入时钟，测试里要与它同一时间轴）；
+        省略时用真实时间，与 `set_cooldown` 的写入口径一致。
+        """
+
+        reference = time.time() if now is None else now
 
         def operation(conn: sqlite3.Connection) -> float | None:
             row = conn.execute(
@@ -429,7 +398,7 @@ class Store:
             if row is None:
                 return None
             until = float(row[0])
-            return until if until > time.time() else None
+            return until if until > reference else None
 
         return await self._execute(operation)
 

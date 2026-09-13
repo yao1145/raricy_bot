@@ -74,8 +74,13 @@ class MessageSender:
         reply_to: int | None,
         *,
         kind: str = "reply",
+        actor_id: str | None = None,
     ) -> SendResult:
-        """脱敏、截断后发送；`kind` 原样透传给 `quota.reserve`（三值见 §10）。"""
+        """脱敏、截断后发送；`kind` 与 `actor_id` 原样透传给 `quota`（三值见 §10）。
+
+        `actor_id` 是触发这条消息的用户，只有 `kind="notice"` 用得上：
+        主动通知的冷却按 (频道, 触发者) 计（D-18）。
+        """
         # 第 1 步：先脱敏，再在自然段边界截断。
         redacted = self._redactor.redact(text)
         content = truncate_at_paragraph(redacted, self._cfg.max_output_chars)[0]
@@ -83,7 +88,7 @@ class MessageSender:
             return SendResult(False, None, "failed")
 
         # 第 2 步：配额预留；三种拒绝都不写 send_attempts。
-        reservation = await self._quota.reserve(channel_id, kind)
+        reservation = await self._quota.reserve(channel_id, kind, actor_id=actor_id)
         if not reservation.allowed:
             result = SendResult(False, None, self._deny_reason(reservation.decision))
             self._log(result, channel_id, kind)
@@ -94,13 +99,13 @@ class MessageSender:
             result, charge = await self._deliver(channel_id, content, reply_to)
         except BaseException:
             # 未预期的异常（含取消）也不能让预留泄漏。
-            await self._quota.release(channel_id, kind)
+            await self._quota.release(channel_id, kind, actor_id=actor_id)
             raise
 
         if charge:
-            await self._quota.note_sent(channel_id, reply_to, kind)
+            await self._quota.note_sent(channel_id, reply_to, kind, actor_id=actor_id)
         else:
-            await self._quota.release(channel_id, kind)
+            await self._quota.release(channel_id, kind, actor_id=actor_id)
         self._log(result, channel_id, kind)
         return result
 

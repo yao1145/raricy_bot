@@ -134,7 +134,9 @@ class OpenAIModelClient:
             return exc
         if isinstance(exc, (openai.APITimeoutError, httpx.TimeoutException)):
             # APITimeoutError 是 APIConnectionError 的子类，必须先判。
-            return ModelError("timeout", True)
+            # 超时不重试（D-19）：这次调用已经等满整个超时预算，立即重试几乎必然再等满一次，
+            # 只把用户看到的静默从 1 个超时周期拖成 2 个。
+            return ModelError("timeout", False)
         if isinstance(exc, openai.APIConnectionError):
             return ModelError("network", True)
         if isinstance(exc, (openai.RateLimitError, openai.InternalServerError)):
@@ -143,9 +145,10 @@ class OpenAIModelClient:
         if isinstance(exc, (openai.AuthenticationError, openai.PermissionDeniedError)):
             return ModelError("auth", False)
         if isinstance(exc, openai.APIStatusError) and getattr(exc, "status_code", None) == 408:
-            # SDK 没有 408 分支，会把它归入通用 APIStatusError；必须在兜底之前显式判出。
-            # 设计文档 §2.2.5 把 408 与网络错误、429、5xx 并列为可重试。
-            return ModelError("timeout", True)
+            # SDK 没有 408 分支，会把它归入通用 APIStatusError；必须在兜底之前显式判出，
+            # 否则它会被下面的「其余 4xx」吃成 bad_request，日志里就看不出是超时了。
+            # 归类为 timeout，因此同样不重试（D-19）。
+            return ModelError("timeout", False)
         if isinstance(exc, openai.APIStatusError):
             # BadRequestError / NotFoundError 及其余确定性的 4xx 状态。
             return ModelError("bad_request", False)

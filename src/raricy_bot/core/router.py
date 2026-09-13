@@ -78,6 +78,7 @@ class RouteResult:
     text: str | None  # reply_now / busy 时的本地文案
     request: Request | None
     reason: str
+    actor_id: str | None = None  # 触发者；主动通知按它计冷却（D-18）
 
 
 class MessageRouter:
@@ -348,6 +349,7 @@ class MessageRouter:
                 message_id=message.id,
                 reply_to=message.id,
                 text=texts.BUSY_NOTICE_TEXT,
+                actor_id=message.author.id,
                 channel_kind=channel_kind,
                 event_id=event_id,
             )
@@ -374,6 +376,7 @@ class MessageRouter:
         reply_to: int | None,
         text: str | None = None,
         request: Request | None = None,
+        actor_id: str | None = None,
         channel_kind: str | None = None,
         event_id: int | None = None,
     ) -> RouteResult:
@@ -386,6 +389,7 @@ class MessageRouter:
             text=text,
             request=request,
             reason=reason,
+            actor_id=actor_id,
         )
         # 只输出 LOG_FIELDS 白名单内的稳定字段，且不打印空值。
         fields: dict[str, object] = {"reason": reason}
