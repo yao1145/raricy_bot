@@ -5,8 +5,13 @@
 大区采用**公开多人共享上下文**：一条回复链上的所有合格消息共享最近若干轮对话，
 回复链内消息即可加入；私聊行为不变。
 
-第一版明确不支持图片理解、博客理解、工具调用、联网搜索与长期用户记忆。
+第一版明确不支持图片理解、博客理解、工具调用、联网搜索与长期用户记忆（可选的博客评论
+能力见下节，它只读取文章标题与不超过 1000 字的正文）。
 机器人资料须由人工在站点上标注「机器人」及「消息可能发送至第三方模型处理」。
+
+聊天侧有两个不调用模型的本地命令：`/help` 返回能力与隐私说明；`/reset` 开一段新对话
+（私聊清空当前会话上下文，大区以该消息为新链起点、旧链不受影响），两者都不重置配额。
+评论区的 `/help` 与 `/reset` 语义相同，但作为公开评论发布。
 
 ## 博客评论机器人（默认关闭）
 
@@ -22,12 +27,14 @@ comments:
 保存 cutoff 并继续清理旧页，不会过早完成基线。最近列表在两个轮询周期之间溢出 100 条时，
 窗口外评论可能永久漏失。只有精确首次 `@机器人用户名` 或直接回复机器人评论
 才会触发，评论回复会真实通知被回复的用户。评论正文和短文章正文可能发送给第三方模型，
-文章正文超过 1000 字时不会发送。文章评论使用独立队列、配额和状态记录，不占用聊天队列；
+文章正文超过 1000 字时不会发送。评论额度与聊天完全独立（默认每分钟 20 次、
+每日 600 条回复、硬上限 630 条，单篇文章冷却 5 秒）；额度耗尽时该条评论静默跳过，
+不会公开发布提示。文章评论使用独立队列、配额和状态记录，不占用聊天队列；
 关闭 `comments.enabled` 后聊天行为不变。
 
 启用前必须人工确认机器人资料已披露上述第三方处理、公开评论通知、短期记忆与重启失忆，
 并在测试文章上验证首次 @、直接回复、旁支静默、`/help` 和 `/reset`。详见
-[`docs/COMMENT_BOT_DESIGN.md`](docs/COMMENT_BOT_DESIGN.md) 与 [`docs/comment-bot.md`](docs/comment-bot.md)。
+[`docs/archive/COMMENT_BOT_DESIGN.md`](docs/archive/COMMENT_BOT_DESIGN.md) 与 [`docs/materials/comment-bot.md`](docs/materials/comment-bot.md)。
 
 ## 目录结构
 
@@ -40,9 +47,10 @@ raricy_bot/
 │   ├── text_utils.py        # @ 解析、token 估算、截断、本地规则
 │   ├── texts.py             # 全部对外文案
 │   ├── store.py             # SQLite 运行状态（正文/密钥不落库）
-│   ├── quota.py             # 每分钟窗口 + 24 小时额度 + 通知冷却
-│   ├── site/                # 站点 HTTP 客户端、SSE 接收器、DTO
-│   ├── core/                # 上下文、路由器、工作器池、发送器
+│   ├── quota.py             # 聊天：每分钟窗口 + 24 小时额度 + 通知冷却
+│   ├── site/                # 站点 HTTP 客户端、SSE 接收器、聊天与评论 DTO
+│   ├── core/                # 聊天：上下文、路由器、工作器池、发送器
+│   ├── comments/            # 评论：发现轮询、匹配、配额、发送器、后台服务
 │   ├── ops.py               # /livez 与 /readyz
 │   ├── app.py               # 组件装配与生命周期
 │   └── __main__.py          # python -m raricy_bot 入口
@@ -91,10 +99,16 @@ python -m pytest tests -q
 ## 配置项说明
 
 配置为只读 YAML，顶层小节有 `site` / `model` / `behavior` / `ops` / `storage` / `logging` /
-`comments` 与必填的 `system_prompt`。`comments.max_response_bytes` 默认 8 MiB、
-`comments.max_tree_nodes` 默认 10000，分别由 SiteClient 的响应流和显式栈解析执行；完整字段、
-默认值与校验规则见 `docs/INTERFACES.md` 第 1 节。
-`config.example.yaml` 是一份可直接复制的样例。
+`comments` 与必填的 `system_prompt`。完整字段、默认值与校验规则见 `docs/design/INTERFACES.md` 第 1 节；
+`config.example.yaml` 是一份可直接复制的样例。几处约束在加载阶段强制，配错直接以退出码 2 失败：
+
+- `storage.wal_journal_limit_bytes`（默认 16 MiB）必须小于 `sqlite_soft_limit_bytes`；
+  `cleanup_interval_seconds` 不得大于 `lobby_thread_retention_seconds`。
+- `comments.concurrency` 首版必须为 1；`daily_reply_limit < daily_absolute_limit < 1200`；
+  `max_output_chars <= 1900`；`max_response_bytes <= 8 MiB`；`max_tree_nodes <= 10000`；
+  `conversation_retention_seconds <= dedupe_retention_seconds`；`retry_base_seconds <= retry_max_seconds`。
+- `comments.max_response_bytes` 由 SiteClient 的响应流执行，`comments.max_tree_nodes`
+  由评论树的显式栈解析执行。
 
 ## 环境变量
 
@@ -144,6 +158,9 @@ docker compose logs -f bot
 `/readyz` 表示「现在能处理消息」，会比 `/livez` 更早、更频繁地变成 `503`
 （例如站点暂时不可达、SSE 断开、队列被打满）。因此健康检查与自动重启只看 `/livez`。
 
+启用 `comments.enabled` 后，`/livez` 还要求评论子系统的后台任务存活；`/readyz` 只反映
+聊天通路，评论轮询的网络故障只记日志并等下一轮，不会让进程或 `/readyz` 掉线。
+
 ## 上线前人工检查清单
 
 - [ ] 在站点把机器人账号的资料改为明确标注：这是机器人、**消息可能发送至第三方模型处理**，
@@ -158,6 +175,8 @@ docker compose logs -f bot
 - [ ] 模拟模型超时、站点 401/403/429 与队列满载，确认提示与冷却符合预期。
 - [ ] 验证 `/livez`、`/readyz`、重启自动拉起与优雅关闭。
 - [ ] 重启容器，确认对话上下文清空而去重、链归属与配额状态保留。
+- [ ] 若启用评论能力：在测试文章上验证首次精确 @、直接回复、旁支静默、`/help` 与 `/reset`，
+      并确认机器人资料已披露第三方模型处理与公开评论通知；不启用时确认评论轮询未启动。
 - [ ] 确认容器日志已按 `docker-compose.yml` 的 `logging` 限额轮转（约 30 MiB）。
 - [ ] 确认数据库大小与清理摘要正常（`app.cleanup_done`），必要时停机 `VACUUM`。
 
@@ -167,6 +186,12 @@ docker compose logs -f bot
 - 不联网，不调用工具，不访问服务器文件，不调用站内管理接口。
 - 没有长期记忆：上下文只存在内存中，进程重启即清空（大区的链归属会保留 7 天，
   但重启后模型看不到重启前的正文）。
+- 评论能力默认关闭；开启后同样只处理评论文本，不支持图片、附件或被引用博客。
+  评论 POST 没有幂等键：结果不确定时按（机器人作者，父评论）对账并最多重发一次，
+  宁可丢一句，也不盲目重复发送。
+- 评论发现依赖「最近 100 条评论」的滚动窗口，两个轮询周期之间溢出会永久漏失；
+  冷启动基线建立前收到的旧评论不会补回复，未读通知最多翻 5 页（更旧的页由持久 cutoff
+  在后续轮次继续清理，但不会触发回复）。
 
 ## 容量与清理
 
@@ -180,9 +205,15 @@ docker compose logs -f bot
 | 发送尝试 | 48 小时（`send_attempt_retention_seconds`） |
 | 到期冷却 | 立即删除 |
 | 已知私聊频道 | 只保留最近活动的 `max_dm_channels`（默认 10000）条 |
+| 评论会话映射 | 30 天（`comments.conversation_retention_seconds`），到期同时作废其内存上下文 |
+| 评论已发回复、通知与去重行 | 90 天（`comments.dedupe_retention_seconds`）；评论非终态事件不按时间删除 |
+| 评论发送尝试 | 48 小时（与聊天共用 `storage.send_attempt_retention_seconds`） |
 
-- SQLite 主库只设**软上限**（`sqlite_soft_limit_bytes`，默认 128 MiB），超过时记一条 error 日志，
-  不做硬截断 —— 硬截断会让去重、水位或配额写入突然失败，后果比库变大严重得多。
+- SQLite 主库只设**软上限**（`sqlite_soft_limit_bytes`，默认 128 MiB，聊天与评论共用同一个库），
+  超过时记一条 error 日志，不做硬截断 —— 硬截断会让去重、水位或配额写入突然失败，
+  后果比库变大严重得多。
+- 评论正文与文章正文都不落库：评论相关表只存 id、会话归属、状态与计数。评论发现水位与
+  冷启动 cutoff 持久保存，重启后不会回补开启前的旧评论或旧通知。
 - 运行期**不自动 `VACUUM`**（它会长时间独占数据库锁）。需要收缩物理文件时，
   停机备份后手工执行。
 - 容器日志由 Docker 的 `json-file` 驱动限制在约 30 MiB；裸机运行时程序只写 `stderr`，

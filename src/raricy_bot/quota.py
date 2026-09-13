@@ -1,6 +1,6 @@
 """发送配额守卫：每分钟滑动窗口 + 24 小时滚动总量 + 通知冷却 + 站点退避。
 
-判定口径见 `docs/INTERFACES.md` §10 与 `docs/DESIGN_DECISIONS.md` D-1 / D-2 / D-18：
+判定口径见 `docs/design/INTERFACES.md` §10 与 `docs/design/DESIGN_DECISIONS.md` D-1 / D-2 / D-18：
 
 - 750 只约束 `kind="reply"`；790 是三种 kind 的合计上限；
 - 每分钟是滑动窗口（SQLite 发送时间 + 在途预留），不是内存令牌桶，重启后仍然准确；

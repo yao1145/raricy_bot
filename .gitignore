@@ -1,5 +1,5 @@
-# 文档（按要求不入库）
-docs/
+# 文档：归档与 AI 约定不入库，其余 docs/ 正常入库
+docs/archive/
 CLAUDE.md
 AGENTS.md
 

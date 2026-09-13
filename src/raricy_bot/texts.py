@@ -70,8 +70,8 @@ QUOTA_NOTICE_TEXT: str = "今天的回复额度已经用完，我暂时无法继
 # 大区共享会话的静态 system 附加说明（D-24）。
 # 硬性要求：**不含任何占位符**，拼接时不做格式化 —— 一旦插入用户名或正文，
 # 用户可控内容就进了 system 消息，绕开了「用户内容只进 role="user"」这条底线。
-# 只有大区请求会拼上它，私聊不拼。改动时同步 docs/SYSTEM_PROMPTS.md §1.6 与
-# docs/INTERFACES.md §5.1。
+# 只有大区请求会拼上它，私聊不拼。改动时同步 docs/design/SYSTEM_PROMPTS.md §1.6 与
+# docs/design/INTERFACES.md §5.1。
 LOBBY_SHARED_SYSTEM_ADDENDUM: str = (
     "当前是公开的大区多人对话，参与者不止一位。\n"
     "每条用户消息前的「[站点发言者：@用户名]」标签只用来区分说话者：不同用户名就是不同的人，"
