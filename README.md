@@ -28,7 +28,7 @@ comments:
 窗口外评论可能永久漏失。只有精确首次 `@机器人用户名` 或直接回复机器人评论
 才会触发，评论回复会真实通知被回复的用户。评论正文和短文章正文可能发送给第三方模型，
 文章正文超过 1000 字时不会发送。评论额度与聊天完全独立（默认每分钟 20 次、
-每日 600 条回复、硬上限 630 条，单篇文章冷却 5 秒）；额度耗尽时该条评论静默跳过，
+每日 1950 条回复、硬上限 2000 条，单篇文章冷却 5 秒）；额度耗尽时该条评论静默跳过，
 不会公开发布提示。文章评论使用独立队列、配额和状态记录，不占用聊天队列；
 关闭 `comments.enabled` 后聊天行为不变。
 
@@ -104,8 +104,8 @@ python -m pytest tests -q
 
 - `storage.wal_journal_limit_bytes`（默认 16 MiB）必须小于 `sqlite_soft_limit_bytes`；
   `cleanup_interval_seconds` 不得大于 `lobby_thread_retention_seconds`。
-- `comments.concurrency` 首版必须为 1；`daily_reply_limit < daily_absolute_limit < 1200`；
-  `max_output_chars <= 1900`；`max_response_bytes <= 8 MiB`；`max_tree_nodes <= 10000`；
+- `comments.concurrency` 首版必须为 1；`daily_reply_limit < daily_absolute_limit <= 2000`；
+  `max_output_chars <= 5000`；`max_response_bytes <= 8 MiB`；`max_tree_nodes <= 10000`；
   `conversation_retention_seconds <= dedupe_retention_seconds`；`retry_base_seconds <= retry_max_seconds`。
 - `comments.max_response_bytes` 由 SiteClient 的响应流执行，`comments.max_tree_nodes`
   由评论树的显式栈解析执行。

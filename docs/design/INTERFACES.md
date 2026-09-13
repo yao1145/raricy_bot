@@ -39,12 +39,12 @@ class BehaviorConfig:
     context_turns: int = 10
     context_input_tokens: int = 8000
     max_input_chars: int = 8000
-    max_output_chars: int = 4000
+    max_output_chars: int = 5000
     concurrency: int = 3
     queue_size: int = 50
     minute_attempt_limit: int = 25
-    daily_normal_limit: int = 750
-    daily_absolute_limit: int = 790
+    daily_normal_limit: int = 1950
+    daily_absolute_limit: int = 2000
     notice_cooldown_seconds: int = 300
     reconnect_base_seconds: float = 3.0
     reconnect_max_seconds: float = 60.0
@@ -77,13 +77,13 @@ class CommentConfig:
     context_turns: int = 10
     context_input_tokens: int = 8000
     article_max_chars: int = 1000
-    max_output_chars: int = 1800
+    max_output_chars: int = 5000
     max_response_bytes: int = 8388608       # SiteClient 硬上限 8 MiB
     max_tree_nodes: int = 10000             # 显式栈硬上限 10000
     unmatched_attempt_limit: int = 5
     minute_attempt_limit: int = 20
-    daily_reply_limit: int = 600
-    daily_absolute_limit: int = 630
+    daily_reply_limit: int = 1950
+    daily_absolute_limit: int = 2000
     article_cooldown_seconds: int = 5
     conversation_retention_seconds: int = 2592000
     dedupe_retention_seconds: int = 7776000
@@ -646,7 +646,7 @@ class QuotaGuard:
         #                  受 `notice_cooldown_seconds` 冷却约束，冷却按 (频道, actor_id) 隔离（D-18）
         #   "notice_local" 应答明确用户动作的本地回复（/help、/reset、用法提示、
         #                  纯媒体提示、超长提示、拒绝索取密钥），**不**受通知冷却约束
-        # 三种 kind 全部计入 24 小时总量（790 带），见 D-1。
+        # 三种 kind 全部计入 24 小时总量（2000 带），见 D-1。
         # actor_id 是触发这条通知的用户，只有 "notice" 用得上。
         # **原子**：内部 asyncio.Lock 串行，把「在途预留」与 SQLite 中的历史合并计数，
         # 避免并发超发。允许时登记一笔预留，调用方**必须**最终调用 note_sent() 或 release()。

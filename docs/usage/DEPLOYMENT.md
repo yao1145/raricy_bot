@@ -136,8 +136,8 @@ system_prompt: |
 ```
 
 其余键保持默认即可。默认值是照设计文档定的：`concurrency: 3`、`queue_size: 50`、
-`minute_attempt_limit: 25`（低于站点 30 次/分的硬限）、`daily_normal_limit: 750`、
-`daily_absolute_limit: 790`。
+`minute_attempt_limit: 25`（低于站点 30 次/分的硬限）、`daily_normal_limit: 1950`、
+`daily_absolute_limit: 2000`。
 
 ### 4.1 启用博客评论能力（可选）
 
@@ -666,7 +666,7 @@ journalctl -u raricy-bot -f          # 跟日志
 | 大区里 @ 机器人没反应          | 确认是**区分大小写的精确** @ `机器人用户名`，且用户名两侧不是字母/数字/`_`/`-`。`@机器人名x` 不算命中                                 |
 | 大区里普通消息（没 @）没反应   | 这是设计如此：大区只回应精确 @，避免烧光每日额度                                                                                                   |
 | 私聊不回                       | 检查是不是空消息、纯图片或纯博客（这些只回一次「不支持」提示）                                                                                     |
-| 一段时间后完全不回             | 可能当日额度用尽（750 条后停止模型回复，790 条后完全静默），或账号被禁言                                                                           |
+| 一段时间后完全不回             | 可能当日额度用尽（1950 条后停止模型回复，2000 条后完全静默），或账号被禁言                                                                           |
 | 回复里出现 `[redacted]`       | 输出命中已加载的机密被替换了。若被替换的是**机器人自己的名字**，说明有人把用户名注册成了机密——用户名不是机密，不该被注册                   |
 | 日志报 `429`                  | 站点限频。程序会遵循 `Retry-After`，没有该头则等 60 秒并退避                                                                                      |
 | 日志只有一行行 `router.route reason=no_mention` | 正常噪音，剔掉再看：`grep -v 'reason=no_mention'`                                                                                      |
@@ -717,7 +717,7 @@ docker compose logs --tail=200 bot | grep -E 'router\.route|sender\.send|app\.'
 | ---------------------------------------------- | ------------------------ | -------------------------------------------------------------- |
 | 大区消息**没有精确 @**                   | `router.py`            | `reason=no_mention`（DEBUG）                                 |
 | 账号 403（没提权/被禁言）→ 全站静默           | `app.py`               | ERROR `app.unavailable`，之后每 300 秒一行 `app.probe_failed` |
-| 当日额度用尽                                   | `quota.py`             | WARNING `sender.send reason=quota`；790 用尽后连这行也没有    |
+| 当日额度用尽                                   | `quota.py`             | WARNING `sender.send reason=quota`；2000 用尽后连这行也没有    |
 | 自己的消息 / 已删除 / 拍一拍                   | `router.py`            | `reason=self_message` / `deleted` / `pat`                  |
 | SSE 重连重放被去重                             | `router.py`            | `reason=duplicate`                                           |
 | 主动提示被冷却吞掉（按 (频道, 触发者) 5 分钟） | `app.py`               | 无日志，直接 return                                            |
@@ -735,7 +735,7 @@ docker compose logs --tail=200 bot | grep -E 'router\.route|sender\.send|app\.'
 | "我没有看到要处理的内容…"             | 空白 / 只 @ 了机器人                     | `reason=empty`          |
 | "当前排队较多…"                       | 队列满（默认 50）                        | `reason=queue_full`     |
 | "抱歉，这次的回复没有生成成功。"       | 模型调用最终失败（超时不重试，D-19）     | `app.model_failed`      |
-| "今天的回复额度已经用完…"             | 触及 750 条                              | 无独立事件，随 quota 通知 |
+| "今天的回复额度已经用完…"             | 触及 1950 条                              | 无独立事件，随 quota 通知 |
 
 **`SECRET_PROBE_PATTERNS` 有误伤**（`text_utils.py`）：里面是 `token`、`config`、
 `env`、`密钥`、`口令`、`配置文件` 这类词，且是**子串匹配 + 大小写不敏感**。
@@ -753,9 +753,9 @@ docker compose logs --tail=200 bot | grep -E 'router\.route|sender\.send|app\.'
 | 层     | 参数                                | 触发点                    | 有无提示                                                                      |
 | ------ | ----------------------------------- | ------------------------- | ----------------------------------------------------------------------------- |
 | 模型侧 | `model.max_output_tokens: 600`    | `worker.py` 传给 API    | **无**。`finish_reason` 全项目只在测试夹具里出现过，`src/` 从不读它 |
-| 本地侧 | `behavior.max_output_chars: 4000` | `sender.py`             | 有，追加 `（内容过长，已截断）`                                              |
+| 本地侧 | `behavior.max_output_chars: 5000` | `sender.py`             | 有，追加 `（内容过长，已截断）`                                              |
 
-中文大致 1 token ≈ 1 字，600 token 会在 600 字左右就切断，而本地那层要超过 4000 字才触发。
+中文大致 1 token ≈ 1 字，600 token 会在 600 字左右就切断，而本地那层要超过 5000 字才触发。
 **所以在默认配置下你看到的截断都是模型侧无标记的那种**——回答到一半戛然而止，没有任何说明。
 
 截断**不会**导致不回复：`truncate_at_paragraph` 截断后必定附带后缀，内容不可能为空
@@ -783,8 +783,8 @@ docker compose logs --tail=200 bot | grep -E 'router\.route|sender\.send|app\.'
 此前按「每频道 24 小时一条」计，而大区是全站唯一频道，于是全天只有第一个触发的人收得到，
 其余人完全静默。那是个缺陷，已修（D-18）。
 
-提示不是免费的：三类提示共同消耗 790 总量的剩余预算。额度用尽后，剩下的预算会被
-"今天的回复额度已经用完"逐条吃掉，吃完即彻底静默（790 的语义未变）。
+提示不是免费的：三类提示共同消耗 2000 总量的剩余预算。额度用尽后，剩下的预算会被
+"今天的回复额度已经用完"逐条吃掉，吃完即彻底静默（2000 的语义未变）。
 
 ### 15.3 站点侧慢
 

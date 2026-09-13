@@ -22,12 +22,12 @@ behavior:
   context_turns: 10
   context_input_tokens: 8000
   max_input_chars: 8000
-  max_output_chars: 4000
+  max_output_chars: 5000
   concurrency: 3
   queue_size: 50
   minute_attempt_limit: 25
-  daily_normal_limit: 750
-  daily_absolute_limit: 790
+  daily_normal_limit: 1950
+  daily_absolute_limit: 2000
   notice_cooldown_seconds: 300
   reconnect_base_seconds: 3.0
   reconnect_max_seconds: 60.0
@@ -73,13 +73,13 @@ comments:
   context_turns: 10
   context_input_tokens: 8000
   article_max_chars: 1000
-  max_output_chars: 1800
+  max_output_chars: 5000
   max_response_bytes: 8388608
   max_tree_nodes: 10000
   unmatched_attempt_limit: 5
   minute_attempt_limit: 20
-  daily_reply_limit: 600
-  daily_absolute_limit: 630
+  daily_reply_limit: 1950
+  daily_absolute_limit: 2000
   article_cooldown_seconds: 5
   conversation_retention_seconds: 2592000
   dedupe_retention_seconds: 7776000

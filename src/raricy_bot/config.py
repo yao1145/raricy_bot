@@ -57,12 +57,12 @@ class BehaviorConfig:
     context_turns: int = 10
     context_input_tokens: int = 8000
     max_input_chars: int = 8000
-    max_output_chars: int = 4000
+    max_output_chars: int = 5000
     concurrency: int = 3
     queue_size: int = 50
     minute_attempt_limit: int = 25
-    daily_normal_limit: int = 750
-    daily_absolute_limit: int = 790
+    daily_normal_limit: int = 1950
+    daily_absolute_limit: int = 2000
     notice_cooldown_seconds: int = 300
     reconnect_base_seconds: float = 3.0
     reconnect_max_seconds: float = 60.0
@@ -91,13 +91,13 @@ class CommentConfig:
     context_turns: int = 10
     context_input_tokens: int = 8000
     article_max_chars: int = 1000
-    max_output_chars: int = 1800
+    max_output_chars: int = 5000
     max_response_bytes: int = 8388608
     max_tree_nodes: int = 10000
     unmatched_attempt_limit: int = 5
     minute_attempt_limit: int = 20
-    daily_reply_limit: int = 600
-    daily_absolute_limit: int = 630
+    daily_reply_limit: int = 1950
+    daily_absolute_limit: int = 2000
     article_cooldown_seconds: int = 5
     conversation_retention_seconds: int = 2592000
     dedupe_retention_seconds: int = 7776000
@@ -327,12 +327,12 @@ def _behavior(container: Mapping[str, Any]) -> BehaviorConfig:
     context_turns = _positive_int(container, "context_turns", "behavior", 10)
     context_input_tokens = _positive_int(container, "context_input_tokens", "behavior", 8000)
     max_input_chars = _positive_int(container, "max_input_chars", "behavior", 8000)
-    max_output_chars = _positive_int(container, "max_output_chars", "behavior", 4000)
+    max_output_chars = _positive_int(container, "max_output_chars", "behavior", 5000)
     concurrency = _positive_int(container, "concurrency", "behavior", 3)
     queue_size = _positive_int(container, "queue_size", "behavior", 50)
     minute_attempt_limit = _positive_int(container, "minute_attempt_limit", "behavior", 25)
-    daily_normal_limit = _positive_int(container, "daily_normal_limit", "behavior", 750)
-    daily_absolute_limit = _positive_int(container, "daily_absolute_limit", "behavior", 790)
+    daily_normal_limit = _positive_int(container, "daily_normal_limit", "behavior", 1950)
+    daily_absolute_limit = _positive_int(container, "daily_absolute_limit", "behavior", 2000)
     notice_cooldown_seconds = _positive_int(container, "notice_cooldown_seconds", "behavior", 300)
 
     if daily_normal_limit >= daily_absolute_limit:
@@ -424,13 +424,13 @@ def _comments(container: Mapping[str, Any]) -> CommentConfig:
     context_turns = integer("context_turns", 10)
     context_input_tokens = integer("context_input_tokens", 8000)
     article_max_chars = integer("article_max_chars", 1000)
-    max_output_chars = integer("max_output_chars", 1800)
+    max_output_chars = integer("max_output_chars", 5000)
     max_response_bytes = integer("max_response_bytes", 8 * 1024 * 1024)
     max_tree_nodes = integer("max_tree_nodes", 10000)
     unmatched_attempt_limit = integer("unmatched_attempt_limit", 5)
     minute_attempt_limit = integer("minute_attempt_limit", 20)
-    daily_reply_limit = integer("daily_reply_limit", 600)
-    daily_absolute_limit = integer("daily_absolute_limit", 630)
+    daily_reply_limit = integer("daily_reply_limit", 1950)
+    daily_absolute_limit = integer("daily_absolute_limit", 2000)
     article_cooldown_seconds = integer("article_cooldown_seconds", 5)
     conversation_retention_seconds = integer("conversation_retention_seconds", 2592000)
     dedupe_retention_seconds = integer("dedupe_retention_seconds", 7776000)
@@ -440,12 +440,12 @@ def _comments(container: Mapping[str, Any]) -> CommentConfig:
 
     if concurrency != 1:
         raise ConfigError("配置 comments.concurrency 首版必须为 1")
-    if not daily_reply_limit < daily_absolute_limit < 1200:
+    if not daily_reply_limit < daily_absolute_limit <= 2000:
         raise ConfigError(
-            "配置 comments.daily_reply_limit 必须小于 daily_absolute_limit 且小于 1200"
+            "配置 comments.daily_reply_limit 必须小于 daily_absolute_limit 且不大于 2000"
         )
-    if max_output_chars > 1900:
-        raise ConfigError("配置 comments.max_output_chars 不能大于 1900")
+    if max_output_chars > 5000:
+        raise ConfigError("配置 comments.max_output_chars 不能大于 5000")
     if max_response_bytes > 8 * 1024 * 1024:
         raise ConfigError("配置 comments.max_response_bytes 不能大于 8 MiB")
     if max_tree_nodes > 10000:

@@ -162,14 +162,14 @@
 | `/help` 不调模型 | `core/router.py` 的 `reply_now` 分支，kind=`notice_local` |
 | 超时 45 秒、超时不重试 | `model.timeout_seconds` 默认 45；`worker._map_error` 把 timeout 映射为不可重试（D-19） |
 | 提示每人每 5 分钟一条 | `behavior.notice_cooldown_seconds`（默认 300），键为 `(频道, 触发者)`（D-18） |
-| 额度是滚动 24 小时窗口 | `quota.py` 的 `count_sends_since(now - 86400)`；750 条模型回复、790 条总量 |
-| 正文长度 | 输入超过 `max_input_chars`（8000）本地拦停；输出超过 `max_output_chars`（4000）按自然段截断并追加 `TRUNCATION_SUFFIX` |
+| 额度是滚动 24 小时窗口 | `quota.py` 的 `count_sends_since(now - 86400)`；1950 条模型回复、2000 条总量 |
+| 正文长度 | 输入超过 `max_input_chars`（8000）本地拦停；输出超过 `max_output_chars`（5000）按自然段截断并追加 `TRUNCATION_SUFFIX` |
 | 博客区首次要精确 @，之后直接回复即可继续 | `comments/router.py`：`contains_bot_mention` 判定首次；父机器人评论映射判定后续，普通评论/旁支返回 `ignored`（`not_addressed`） |
 | 评论每 30 秒轮询全站最近 100 条 | `comments/discovery.py` 的 `RecentCommentPoller`（`comments.recent_poll_seconds` 默认 30；上游最多 100 条，窗口溢出不可恢复） |
 | 每轮读取文章标题，正文 ≤1000 字才提供 | `CommentService._build_model_messages`（`comments.article_max_chars` 默认 1000，按 Unicode 字符数） |
 | 博客会话保留 30 天、去重 90 天 | `comments.conversation_retention_seconds`（2592000）/ `dedupe_retention_seconds`（7776000） |
 | 博客区记忆最近约 10 轮、按 token 再裁 | `comments.context_turns` / `comments.context_input_tokens` |
-| 评论配额独立：20/分钟、600/630 日限、同文章 5 秒 | `comments/quota.py`（`minute_attempt_limit`、`daily_reply_limit`、`daily_absolute_limit`、`article_cooldown_seconds`） |
+| 评论配额独立：20/分钟、1950/2000 日限、同文章 5 秒 | `comments/quota.py`（`minute_attempt_limit`、`daily_reply_limit`、`daily_absolute_limit`、`article_cooldown_seconds`） |
 | 评论区忙碌/失败/额度用尽静默，不发提示 | 设计 §11.2：评论发送只有 `reply` 与 `notice_local`，无主动 `notice` |
 | 每条成功评论都真实通知被回复者 | 站点评论接口写入即通知，无机器人豁免（设计 §3.2 / §20.2） |
 | `/help` `/reset` 在评论区两种写法都有效 | `comments/router.py`：`is_help_command` / `is_reset_command`，整条评论匹配 |
@@ -182,7 +182,7 @@
 2. **输入长度那道闸实际碰不到**：本地限制是 8000 字符，而站点侧的聊天消息上限是 1000 字，
    所以 `TOO_LONG_TEXT` 在正常使用中不会出现。真正会遇到的是模型侧输出上限导致的截断。
 3. **模型侧截断没有任何提示**：`model.max_output_tokens`（默认 600）触发的截断不会追加说明，
-   回复会在句子中间停住；只有本地那层 4000 字符的截断会写「（内容过长，已截断）」。
+   回复会在句子中间停住；只有本地那层 5000 字符的截断会写「（内容过长，已截断）」。
    嫌难看就调大 `max_output_tokens`，详见 `DEPLOYMENT.md` §15.1。
 4. **评论区的"漏失窗口"是上游限制**：发现靠每 30 秒拉一次全站最近 100 条，两次轮询之间新增
    超过 100 条时窗口外评论无法恢复。发布稿已如实写"可能漏失"，没有承诺必达。

@@ -1061,9 +1061,9 @@ class CommentService:
                 if isinstance(redacted, str):
                     value = redacted
         sender_cfg = getattr(sender, "_cfg", None)
-        limit = getattr(sender_cfg, "max_output_chars", 1800)
+        limit = getattr(sender_cfg, "max_output_chars", 5000)
         if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
-            limit = 1800
+            limit = 5000
         return truncate_at_paragraph(value, limit)[0]
 
     async def _set_event_status(
