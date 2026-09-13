@@ -1,6 +1,7 @@
 # 文档（按要求不入库）
 docs/
 CLAUDE.md
+AGENTS.md
 
 # 测试（按要求不入库）
 tests/
