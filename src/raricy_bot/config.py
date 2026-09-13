@@ -11,13 +11,15 @@ import os
 import urllib.parse
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import yaml
 
 # 默认配置文件路径；可被环境变量 BOT_CONFIG_PATH 覆盖。
 DEFAULT_CONFIG_PATH: str = "./config.yaml"
+
+# 配置文件大小硬上限（1 MiB）。是代码常量而不是 YAML 项：必须在解析配置之前就能判定。
+MAX_CONFIG_BYTES: int = 1024 * 1024
 
 # 密钥环境变量名。
 USERNAME_ENV: str = "RARICY_USERNAME"
@@ -92,18 +94,36 @@ class Secrets:
 
 
 @dataclass(frozen=True)
+class StorageConfig:
+    """存储与容量治理参数（D-20 / D-23）。"""
+
+    db_path: str = "./data/bot.db"
+    lobby_thread_retention_seconds: int = 604800
+    cleanup_interval_seconds: int = 3600
+    send_attempt_retention_seconds: int = 172800
+    max_dm_channels: int = 10000
+    sqlite_soft_limit_bytes: int = 134217728
+    wal_journal_limit_bytes: int = 16777216
+
+
+@dataclass(frozen=True)
 class Config:
     """完整配置；不含 Cookie，也不含任何消息正文。"""
 
     site: SiteConfig
     model: ModelConfig
     behavior: BehaviorConfig
+    storage: StorageConfig
     ops: OpsConfig
-    db_path: str
     log_level: str
     system_prompt: str
     system_prompt_sha256: str
     secrets: Secrets
+
+    @property
+    def db_path(self) -> str:
+        """兼容别名，保留一个版本；新代码用 `config.storage.db_path`。"""
+        return self.storage.db_path
 
 
 def default_config_path(env: Mapping[str, str] | None = None) -> str:
@@ -139,6 +159,8 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
         max_output_tokens=_positive_int(model_raw, "max_output_tokens", "model", 600),
     )
     behavior = _behavior(behavior_raw)
+    storage = _storage(storage_raw)
+
     ops = OpsConfig(
         host=_ops_host(ops_raw),
         port=_ops_port(ops_raw),
@@ -149,8 +171,8 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
         site=site,
         model=model,
         behavior=behavior,
+        storage=storage,
         ops=ops,
-        db_path=_text_with_default(storage_raw, "db_path", "storage", "./data/bot.db"),
         log_level=_text_with_default(logging_raw, "level", "logging", "INFO"),
         system_prompt=system_prompt,
         system_prompt_sha256=hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()[:12],
@@ -163,11 +185,25 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
 
 
 def _read_yaml(path: str) -> dict[str, Any]:
-    """读取 YAML 文件并保证顶层是映射；空文件视为空映射。"""
+    """有界读取 YAML 文件并保证顶层是映射；空文件视为空映射。
+
+    上限是**代码常量**（`MAX_CONFIG_BYTES`），不是 YAML 里可改的项 ——
+    它必须在解析配置之前就能判定。因此按字节读 `MAX_CONFIG_BYTES + 1`，
+    多出来的那个字节只用来判断「超限了」。
+    """
     try:
-        text = Path(path).read_text(encoding="utf-8")
+        with open(path, "rb") as handle:
+            raw = handle.read(MAX_CONFIG_BYTES + 1)
     except OSError as exc:
         raise ConfigError(f"无法读取配置文件：{path}") from exc
+
+    if len(raw) > MAX_CONFIG_BYTES:
+        raise ConfigError(
+            f"配置文件超过 {MAX_CONFIG_BYTES} 字节上限：{path}"
+        )
+
+    try:
+        text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ConfigError(f"配置文件不是 UTF-8 文本：{path}") from exc
 
@@ -295,6 +331,49 @@ def _behavior(container: Mapping[str, Any]) -> BehaviorConfig:
         rate_limit_wait_seconds=_number(
             container.get("rate_limit_wait_seconds", 60.0), "behavior", "rate_limit_wait_seconds"
         ),
+    )
+
+
+def _storage(container: Mapping[str, Any]) -> StorageConfig:
+    """构造存储配置：整数字段一律为正整数，并校验字段间的关系。"""
+    lobby_thread_retention_seconds = _positive_int(
+        container, "lobby_thread_retention_seconds", "storage", 604800
+    )
+    cleanup_interval_seconds = _positive_int(
+        container, "cleanup_interval_seconds", "storage", 3600
+    )
+    send_attempt_retention_seconds = _positive_int(
+        container, "send_attempt_retention_seconds", "storage", 172800
+    )
+    max_dm_channels = _positive_int(container, "max_dm_channels", "storage", 10000)
+    sqlite_soft_limit_bytes = _positive_int(
+        container, "sqlite_soft_limit_bytes", "storage", 134217728
+    )
+    wal_journal_limit_bytes = _positive_int(
+        container, "wal_journal_limit_bytes", "storage", 16777216
+    )
+
+    if cleanup_interval_seconds > lobby_thread_retention_seconds:
+        raise ConfigError(
+            "配置 storage.cleanup_interval_seconds 不能大于"
+            " lobby_thread_retention_seconds"
+        )
+    if send_attempt_retention_seconds < 86400:
+        # 至少要覆盖滚动 24 小时的配额窗口
+        raise ConfigError("配置 storage.send_attempt_retention_seconds 不能小于 86400")
+    if wal_journal_limit_bytes >= sqlite_soft_limit_bytes:
+        raise ConfigError(
+            "配置 storage.wal_journal_limit_bytes 必须小于 sqlite_soft_limit_bytes"
+        )
+
+    return StorageConfig(
+        db_path=_text_with_default(container, "db_path", "storage", "./data/bot.db"),
+        lobby_thread_retention_seconds=lobby_thread_retention_seconds,
+        cleanup_interval_seconds=cleanup_interval_seconds,
+        send_attempt_retention_seconds=send_attempt_retention_seconds,
+        max_dm_channels=max_dm_channels,
+        sqlite_soft_limit_bytes=sqlite_soft_limit_bytes,
+        wal_journal_limit_bytes=wal_journal_limit_bytes,
     )
 
 

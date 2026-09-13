@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .. import texts
-from ..config import BehaviorConfig
+from ..config import BehaviorConfig, StorageConfig
 from ..logging_setup import get_logger, log_event
 from ..site.models import LOBBY, ChatMessage, StreamEvent
 from ..store import Store
@@ -27,7 +29,7 @@ from ..text_utils import (
     is_secret_probe,
     strip_bot_mention,
 )
-from .context import ContextManager, dm_session_key, lobby_session_key
+from .context import ContextManager, dm_session_key, lobby_thread_session_key
 
 _logger = get_logger("core.router")
 
@@ -65,6 +67,7 @@ class Request:
     message: ChatMessage
     user_text: str  # 已剔除 @机器人 的正文
     reply_context: str | None  # message.reply 非删除时的正文，否则 None
+    thread_root_id: int | None = None  # 大区共享链的根；**私聊恒为 None**（D-20）
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,7 @@ class RouteResult:
     request: Request | None
     reason: str
     actor_id: str | None = None  # 触发者；主动通知按它计冷却（D-18）
+    thread_root_id: int | None = None  # 同 Request；DM 恒为 None
 
 
 class MessageRouter:
@@ -93,6 +97,8 @@ class MessageRouter:
         store: Store,
         queue: asyncio.Queue[Request],
         cfg: BehaviorConfig,
+        storage: StorageConfig,
+        now: Callable[[], float] = time.time,
     ) -> None:
         self._self_user_id = self_user_id
         self._bot_username = bot_username
@@ -100,6 +106,8 @@ class MessageRouter:
         self._store = store
         self._queue = queue
         self._cfg = cfg
+        self._storage = storage
+        self._now = now
         self._logger = _logger
 
     # --- 事件分派 -----------------------------------------------------------
@@ -153,7 +161,7 @@ class MessageRouter:
     async def handle_message(
         self, channel_id: str, message: ChatMessage, event_id: int | None
     ) -> RouteResult:
-        """消息的 14 步判定（§12）；`record_event` 在第 6 步才调用（D-15）。"""
+        """消息的判定顺序（§12）；`record_event` 在第 6 步才调用（D-15）。"""
         is_lobby = channel_id == LOBBY
 
         # 1. 私聊频道登记（大区不登记）。
@@ -162,6 +170,10 @@ class MessageRouter:
 
         # 2-4. 三类无需落库的候选过滤。
         if message.author.id == self._self_user_id:
+            # 大区里机器人自己的消息要先做一次「回显补登记」，再静默结束：
+            # 站点成功信封没带消息对象、或本地映射写入失败时，这是唯一的兜底。
+            if is_lobby and message.reply is not None and not message.reply.is_deleted:
+                await self._attach_self_echo(message)
             return self._emit(
                 "ignored",
                 "self_message",
@@ -202,8 +214,9 @@ class MessageRouter:
                     event_id=event_id,
                 )
             user_text = strip_bot_mention(message.content, self._bot_username)
-            session_key = lobby_session_key(message.author.id)
             channel_kind = "lobby"
+            # 大区的 session_key 由第 8 步解析出的链决定，这里还不能定。
+            session_key = ""
         else:
             # 私聊同样剔除习惯性的 @机器人（D-6，用户常在此处也 @ 机器人）。
             user_text = strip_bot_mention(message.content, self._bot_username)
@@ -247,7 +260,26 @@ class MessageRouter:
         if message.reply is not None and not message.reply.is_deleted:
             reply_context = message.reply.content
 
-        # 8. 空正文：有媒体给纯媒体提示，否则给用法提示。
+        # 8. 大区解析共享链并登记本条消息（私聊跳过，thread_root_id 恒为 None）。
+        thread_root_id: int | None = None
+        if is_lobby:
+            thread_root_id = await self._resolve_thread(
+                channel_id, message, user_text, event_id
+            )
+            if thread_root_id is None:
+                # 解析失败已经记过日志：不调模型、不回话，事件保持非终态等补发。
+                return self._emit(
+                    "ignored",
+                    "thread_resolve_failed",
+                    channel_id=channel_id,
+                    message_id=message.id,
+                    reply_to=message.id,
+                    channel_kind=channel_kind,
+                    event_id=event_id,
+                )
+            session_key = lobby_thread_session_key(thread_root_id)
+
+        # 9.1 空正文：有媒体给纯媒体提示，否则给用法提示。
         if not user_text:
             if has_media(message):
                 return self._emit(
@@ -258,6 +290,7 @@ class MessageRouter:
                     reply_to=message.id,
                     text=texts.UNSUPPORTED_MEDIA_TEXT,
                     channel_kind=channel_kind,
+                    thread_root_id=thread_root_id,
                     event_id=event_id,
                 )
             return self._emit(
@@ -268,10 +301,11 @@ class MessageRouter:
                 reply_to=message.id,
                 text=texts.USAGE_HINT,
                 channel_kind=channel_kind,
+                thread_root_id=thread_root_id,
                 event_id=event_id,
             )
 
-        # 9. /help 本地应答，不触发模型。
+        # 9.2 /help 本地应答，不触发模型。
         if is_help_command(user_text):
             return self._emit(
                 "reply_now",
@@ -281,12 +315,15 @@ class MessageRouter:
                 reply_to=message.id,
                 text=texts.HELP_TEXT,
                 channel_kind=channel_kind,
+                thread_root_id=thread_root_id,
                 event_id=event_id,
             )
 
-        # 10. /reset 只清当前会话（D-9）。
+        # 9.3 /reset：大区只建新链（第 8 步已用 force_new 建好，旧链不动，D-21）；
+        #     私聊仍是清空当前会话并递增代次（D-9）。
         if is_reset_command(user_text):
-            self._ctx.reset(session_key)
+            if not is_lobby:
+                self._ctx.reset(session_key)
             return self._emit(
                 "reply_now",
                 "reset",
@@ -295,12 +332,13 @@ class MessageRouter:
                 reply_to=message.id,
                 text=texts.RESET_DONE_TEXT,
                 channel_kind=channel_kind,
+                thread_root_id=thread_root_id,
                 event_id=event_id,
             )
 
-        # 11. 有媒体但正文非空：忽略媒体，照常处理文本（无需额外分支）。
+        # 9.4 有媒体但正文非空：忽略媒体，照常处理文本（无需额外分支）。
 
-        # 12. 超长输入本地拦截。
+        # 9.5 超长输入本地拦截。
         if len(user_text) > self._cfg.max_input_chars:
             return self._emit(
                 "reply_now",
@@ -310,10 +348,11 @@ class MessageRouter:
                 reply_to=message.id,
                 text=texts.TOO_LONG_TEXT,
                 channel_kind=channel_kind,
+                thread_root_id=thread_root_id,
                 event_id=event_id,
             )
 
-        # 13. 索取系统提示 / 密钥本地拒绝。
+        # 9.6 索取系统提示 / 密钥本地拒绝。
         if is_secret_probe(user_text):
             return self._emit(
                 "reply_now",
@@ -323,10 +362,11 @@ class MessageRouter:
                 reply_to=message.id,
                 text=texts.SECRET_REFUSAL_TEXT,
                 channel_kind=channel_kind,
+                thread_root_id=thread_root_id,
                 event_id=event_id,
             )
 
-        # 14. 入队交给 worker；队列满则回 busy。
+        # 10. 入队交给 worker；队列满则回 busy。
         request = Request(
             event_id=event_id,
             channel_id=channel_id,
@@ -338,6 +378,7 @@ class MessageRouter:
             message=message,
             user_text=user_text,
             reply_context=reply_context,
+            thread_root_id=thread_root_id,
         )
         try:
             self._queue.put_nowait(request)
@@ -351,6 +392,7 @@ class MessageRouter:
                 text=texts.BUSY_NOTICE_TEXT,
                 actor_id=message.author.id,
                 channel_kind=channel_kind,
+                thread_root_id=thread_root_id,
                 event_id=event_id,
             )
         return self._emit(
@@ -361,8 +403,73 @@ class MessageRouter:
             reply_to=message.id,
             request=request,
             channel_kind=channel_kind,
+            thread_root_id=thread_root_id,
             event_id=event_id,
         )
+
+    # --- 大区共享链 ---------------------------------------------------------
+
+    async def _resolve_thread(
+        self, channel_id: str, message: ChatMessage, user_text: str, event_id: int | None
+    ) -> int | None:
+        """解析这条大区消息属于哪条链，并登记它；失败返回 None 并记一条无正文错误。
+
+        失败时调用方必须**不回话**：事件保持非终态，靠 SSE 补发或下次重启重来（D-16）。
+        用消息 id 而不是引用正文或用户名决定归属（D-20）。
+        """
+        reply_id = (
+            message.reply.id
+            if message.reply is not None and not message.reply.is_deleted
+            else None
+        )
+        try:
+            return await self._store.resolve_lobby_thread(
+                message.id,
+                reply_id,
+                # /reset 无论回复谁，都以自己为根建一条新链（D-21）。
+                force_new=is_reset_command(user_text),
+                now=self._now(),
+                retention_seconds=self._storage.lobby_thread_retention_seconds,
+            )
+        except Exception as exc:  # 写不进去就不处理这条消息，绝不猜测归属
+            log_event(
+                self._logger,
+                logging.ERROR,
+                "router.thread_resolve_failed",
+                channel_id=channel_id,
+                message_id=message.id,
+                error=type(exc).__name__,
+            )
+            return None
+
+    async def _attach_self_echo(self, message: ChatMessage) -> None:
+        """把机器人自己的大区消息补登记到它回复的那条链上。
+
+        兜底两种情形：站点成功信封没带消息对象，或本地映射写入失败。
+        失败只记一条无正文错误：这条回显本来就不该产生任何回复或循环。
+        """
+        reply = message.reply
+        if reply is None:  # pragma: no cover - 调用方已判空
+            return
+        try:
+            now = self._now()
+            root = await self._store.find_active_lobby_thread(
+                reply.id,
+                now=now,
+                retention_seconds=self._storage.lobby_thread_retention_seconds,
+            )
+            if root is None:
+                return
+            await self._store.attach_lobby_message(message.id, root, now=now)
+        except Exception as exc:
+            log_event(
+                self._logger,
+                logging.ERROR,
+                "router.self_echo_attach_failed",
+                channel_id=LOBBY,
+                message_id=message.id,
+                error=type(exc).__name__,
+            )
 
     # --- 内部工具 -----------------------------------------------------------
 
@@ -379,6 +486,7 @@ class MessageRouter:
         actor_id: str | None = None,
         channel_kind: str | None = None,
         event_id: int | None = None,
+        thread_root_id: int | None = None,
     ) -> RouteResult:
         """构造 RouteResult 并按白名单字段记一条日志。"""
         result = RouteResult(
@@ -390,6 +498,7 @@ class MessageRouter:
             request=request,
             reason=reason,
             actor_id=actor_id,
+            thread_root_id=thread_root_id,
         )
         # 只输出 LOG_FIELDS 白名单内的稳定字段，且不打印空值。
         fields: dict[str, object] = {"reason": reason}

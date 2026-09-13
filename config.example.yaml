@@ -38,8 +38,22 @@ ops:
   host: "0.0.0.0"
   port: 8080
 
+# 本配置文件有 1 MiB 硬上限（代码常量，不可在此调整）：超过时进程在启动阶段
+# 直接以配置错误退出，不会部分启动。
 storage:
   db_path: "./data/bot.db"
+  # 大区共享链映射保留 7 天；7 天无活动即过期。
+  lobby_thread_retention_seconds: 604800
+  # 运行期清理周期，必须 <= lobby_thread_retention_seconds。
+  cleanup_interval_seconds: 3600
+  # 发送尝试记录保留 48 小时（覆盖滚动 24 小时配额窗口），不得小于 86400。
+  send_attempt_retention_seconds: 172800
+  # 已知私聊频道只保留最近活动的这么多条。
+  max_dm_channels: 10000
+  # SQLite 主库软上限（只告警，不硬截断）；需要收缩时由运维停机 VACUUM。
+  sqlite_soft_limit_bytes: 134217728
+  # WAL 的 journal_size_limit，必须小于 sqlite_soft_limit_bytes。
+  wal_journal_limit_bytes: 16777216
 
 logging:
   level: "INFO"

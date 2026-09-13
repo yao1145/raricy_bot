@@ -27,6 +27,10 @@ LOG_FIELDS: frozenset[str] = frozenset(
         "count",
         "attempt",
         "delay",
+        # 大区共享链与容量治理（D-20 / D-23）：只放 id 与字节数，绝不放用户名或正文。
+        "thread_root_id",
+        "size_bytes",
+        "limit_bytes",
     }
 )
 

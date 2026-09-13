@@ -17,13 +17,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Iterable
 
 import httpx
 
 from . import texts
 from .config import Config
-from .core.context import ContextManager
+from .core.context import ContextManager, lobby_thread_session_key, speaker_wrapper
 from .core.router import MessageRouter, Request, RouteResult
 from .core.sender import MessageSender, SendResult
 from .core.worker import ModelClient, OpenAIModelClient, WorkerPool
@@ -60,7 +61,10 @@ class BotApp:
             [config.secrets.password, config.secrets.llm_api_key]
         )
 
-        self._store = Store(config.db_path)
+        self._store = Store(
+            config.storage.db_path,
+            wal_journal_limit_bytes=config.storage.wal_journal_limit_bytes,
+        )
         self._client = SiteClient(
             config.site.base_url,
             self._redactor,
@@ -106,6 +110,7 @@ class BotApp:
         self._sse_task: asyncio.Task[None] | None = None
         self._resync_task: asyncio.Task[None] | None = None
         self._probe_task: asyncio.Task[None] | None = None
+        self._cleanup_task: asyncio.Task[None] | None = None
 
         self._started = False
         self._stopped = False
@@ -123,6 +128,9 @@ class BotApp:
         # 必定属于已经死掉的旧进程。标成 recover 之后，它们才能被重新认领。
         # **必须早于 sse.run()**，否则会把本进程刚入队的在途工作误标成孤儿。
         await self._store.mark_orphans_recoverable()
+        # 启动清理一次：过期链、旧事件、到期冷却都在这里收掉（D-23）。
+        # 它失败不得阻止启动 —— 记录后继续，下一个周期还会再来。
+        await self._prune_once()
         await self._client.start()
         try:
             user = await self._client.login()
@@ -139,6 +147,7 @@ class BotApp:
             store=self._store,
             queue=self._queue,
             cfg=self._config.behavior,
+            storage=self._config.storage,
         )
         if self._model is None:
             self._model = OpenAIModelClient(
@@ -176,6 +185,7 @@ class BotApp:
             raise
 
         self._sse_task = asyncio.create_task(self._sse.run(), name="bot-sse")
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop(), name="bot-cleanup")
         self._started = True
         log_event(_logger, logging.INFO, "app.started")
 
@@ -243,11 +253,15 @@ class BotApp:
             self._schedule_resync()
 
     async def _send_local(self, result: RouteResult) -> None:
-        """应答明确用户动作的本地回复：kind=notice_local（D-1，不占通知名额）。"""
+        """应答明确用户动作的本地回复：kind=notice_local（D-1，不落通知冷却）。"""
         try:
             if not self._unavailable and result.channel_id is not None:
                 await self._send_notice_text(
-                    result, result.text or "", kind="notice_local"
+                    result,
+                    result.text or "",
+                    kind="notice_local",
+                    actor_id=result.actor_id,
+                    thread_root_id=result.thread_root_id,
                 )
         finally:
             if result.message_id is not None:
@@ -267,6 +281,7 @@ class BotApp:
                 texts.BUSY_NOTICE_TEXT,
                 kind="notice",
                 actor_id=result.actor_id,
+                thread_root_id=result.thread_root_id,
             )
         finally:
             if result.message_id is not None:
@@ -285,6 +300,7 @@ class BotApp:
             request.message.id,
             kind="notice",
             actor_id=actor_id,
+            thread_root_id=request.thread_root_id,
         )
         self._note_forbidden(outcome)
 
@@ -301,6 +317,7 @@ class BotApp:
             request.message.id,
             kind="notice",
             actor_id=actor_id,
+            thread_root_id=request.thread_root_id,
         )
         self._note_forbidden(outcome)
 
@@ -322,12 +339,18 @@ class BotApp:
         *,
         kind: str,
         actor_id: str | None = None,
+        thread_root_id: int | None = None,
     ) -> SendResult | None:
         """发送一条通知/本地回复；403 按 reason 分流（D-4）。"""
         if result.channel_id is None or not text:
             return None
         outcome = await self._sender.send(
-            result.channel_id, text, result.reply_to, kind=kind, actor_id=actor_id
+            result.channel_id,
+            text,
+            result.reply_to,
+            kind=kind,
+            actor_id=actor_id,
+            thread_root_id=thread_root_id,
         )
         self._note_forbidden(outcome)
         return outcome
@@ -352,10 +375,17 @@ class BotApp:
                     kind="pre_model",
                 )
                 return
-            # D-7：历史里只存干净正文；引用文本只拼在本轮（见 _apply_reply_prefix）。
-            self._ctx.append_user(request.session_key, request.user_text)
+            # D-22：本轮内容先**临时**拼给模型，只有回复真正送达才提交进历史。
+            pending = self._pending_turn(request)
             messages = self._ctx.build_messages(
-                request.session_key, self._config.system_prompt
+                request.session_key,
+                self._config.system_prompt,
+                pending_user=pending,
+                system_addendum=(
+                    texts.LOBBY_SHARED_SYSTEM_ADDENDUM
+                    if request.channel_kind == "lobby"
+                    else None
+                ),
             )
             self._apply_reply_prefix(messages, request)
             model = self._model
@@ -375,8 +405,8 @@ class BotApp:
                 await self._notify_failure(request)
                 return
 
-            # 代次检查之二（§16）：模型调用可能持续几十秒，`/reset` 完全可能在它
-            # 返回之前发生。若已作废，就**不写历史、也不发这条过期回复** ——
+            # 代次检查之二（§16）：模型调用可能持续几十秒，`/reset` 或线程过期完全
+            # 可能在它返回之前发生。若已作废，就**不写历史、也不发这条过期回复** ——
             # 否则它会污染刚清空的会话，并在下一轮被再次外送给模型。
             if self._ctx.generation(request.session_key) != request.generation:
                 log_event(
@@ -388,10 +418,16 @@ class BotApp:
                 )
                 return
 
-            self._ctx.append_assistant(request.session_key, text)
             outcome = await self._sender.send(
-                request.channel_id, text, request.message.id, kind="reply"
+                request.channel_id,
+                text,
+                request.message.id,
+                kind="reply",
+                thread_root_id=request.thread_root_id,
             )
+            if outcome.delivered:
+                # 只有用户真的看见了这一轮，才把它写进历史（D-22）。
+                self._ctx.append_exchange(request.session_key, pending, text)
             if outcome.reason == "quota":
                 await self._notify_quota(request)
             else:
@@ -400,13 +436,25 @@ class BotApp:
             # §16：无论成功失败都必须标记 done，否则水位永远推进不了。
             await self._store.mark_handled(request.message.id, "done")
 
+    @staticmethod
+    def _pending_turn(request: Request) -> str:
+        """构造本轮待提交的用户内容（不含直接引用，见 D-7）。
+
+        - 大区：带上站点发言者标签，模型才分得清谁在说话（D-20）；
+        - 私聊：就是正文本身。
+        """
+        if request.channel_kind != "lobby":
+            return request.user_text
+        return speaker_wrapper(request.message.author.username, request.user_text)
+
     def _apply_reply_prefix(
         self, messages: list[dict[str, str]], request: Request
     ) -> None:
-        """把当前轮的引用前缀拼到最后一条 user 消息上（D-7）。
+        """把当前轮的**直接引用**拼到最后一条 user 消息上（D-7）。
 
         引用文本**绝不**写进 `ContextManager` 历史，否则同一段引用会在该会话后续
         每一轮被反复外送；它只属于引用它的那一轮（设计文档 §2.2.4「当前 reply_to 文本」）。
+        即使被引用正文已在历史里也仍然保留这份前缀：有限的重复优于丢失当前指向。
         """
         prefix = self._reply_prefix(request)
         if not prefix:
@@ -422,14 +470,72 @@ class BotApp:
 
     @staticmethod
     def _reply_prefix(request: Request) -> str | None:
-        """构造本轮引用前缀；没有引用上下文时返回 None。"""
+        """构造本轮的直接引用前缀；没有引用上下文时返回 None。
+
+        大区与私聊用不同的标签（D-25）：只有大区是「直接引用」——
+        它的历史里本来就有别的发言者，需要与发言者标签区分开。
+        """
         context = request.reply_context
         if not context:
             return None
         reply = request.message.reply
         author = reply.author_name if reply is not None else None
-        header = f"[引用 @{author}]" if author else "[引用]"
+        label = "直接引用" if request.channel_kind == "lobby" else "引用"
+        header = f"[{label} @{author}]" if author else f"[{label}]"
         return f"{header} {context}"
+
+    # --- 运行期清理 ---------------------------------------------------------
+
+    async def _prune_once(self) -> None:
+        """清理一次过期运行状态；失败只记录并等下一周期（D-23）。
+
+        过期链的内存上下文必须**同时失效**：否则一个在途请求会把正文写回
+        已经过期的链，下一个人回复旧消息时又变成新链，上下文对不上。
+        """
+        try:
+            result = await self._store.prune_runtime_state(
+                now=time.time(), cfg=self._config.storage
+            )
+        except Exception as exc:
+            log_event(_logger, logging.ERROR, "app.cleanup_failed", error=type(exc).__name__)
+            return
+
+        for root in result.expired_thread_roots:
+            self._ctx.invalidate(lobby_thread_session_key(root))
+
+        deleted = (
+            len(result.expired_thread_roots)
+            + result.deleted_events
+            + result.deleted_sent_replies
+            + result.deleted_send_attempts
+            + result.deleted_cooldowns
+            + result.deleted_dm_channels
+        )
+        limit = self._config.storage.sqlite_soft_limit_bytes
+        log_event(
+            _logger,
+            logging.INFO,
+            "app.cleanup_done",
+            count=deleted,
+            thread_root_id=None,
+            size_bytes=result.db_logical_bytes,
+            limit_bytes=limit,
+        )
+        if result.db_logical_bytes > limit:
+            # 软上限只告警：硬截断会让去重、水位或配额写入突然失败（D-23）。
+            log_event(
+                _logger,
+                logging.ERROR,
+                "app.cleanup_oversize",
+                size_bytes=result.db_logical_bytes,
+                limit_bytes=limit,
+            )
+
+    async def _cleanup_loop(self) -> None:
+        """按 `storage.cleanup_interval_seconds` 周期清理，直到被取消。"""
+        while True:
+            await asyncio.sleep(self._config.storage.cleanup_interval_seconds)
+            await self._prune_once()
 
     # --- resync 与不可用探测 ------------------------------------------------
 
@@ -542,6 +648,8 @@ class BotApp:
         await self._cancel_task("_sse_task")
         await self._cancel_task("_resync_task")
         await self._cancel_task("_probe_task")
+        # 清理 task 必须先结束：晚了它会在 Store 关闭后继续访问数据库。
+        await self._cancel_task("_cleanup_task")
 
         await self._workers.stop()
         await self._ops.stop()

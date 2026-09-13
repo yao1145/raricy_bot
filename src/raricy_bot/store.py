@@ -14,10 +14,173 @@ import asyncio
 import sqlite3
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
 
+from .config import StorageConfig
+
 _T = TypeVar("_T")
+
+# 运行期元数据里安全水位检查点的键名（INTERFACES §9.2）。
+_CHECKPOINT_KEY: str = "safe_event_watermark"
+
+
+def _read_checkpoint(conn: sqlite3.Connection) -> int:
+    """读已提交的安全水位检查点；没有记录时为 0。"""
+    row = conn.execute(
+        "SELECT int_value FROM runtime_meta WHERE key = ?", (_CHECKPOINT_KEY,)
+    ).fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+def _compute_candidate(conn: sqlite3.Connection, checkpoint: int) -> int:
+    """按 INTERFACES §9.2 的规则算出候选水位。
+
+    只看 `event_id > checkpoint` 的行（resync 行 `event_id IS NULL` 不参与）：
+    有非终态行时取最小非终态 `event_id - 1`，否则取这些行里最大的 `event_id`；
+    这类行为空时返回检查点本身，让水位停在原处而不是归零。
+    """
+    rows = conn.execute(
+        "SELECT event_id, status FROM events WHERE event_id IS NOT NULL AND event_id > ?",
+        (checkpoint,),
+    ).fetchall()
+    if not rows:
+        return checkpoint
+
+    pending = [int(row[0]) for row in rows if row[1] not in HANDLED_STATUSES]
+    if pending:
+        return min(pending) - 1
+    return max(int(row[0]) for row in rows)
+
+
+def _read_watermark(conn: sqlite3.Connection) -> int:
+    """`watermark()` 的只读口径：检查点与现场计算值取较大者。"""
+    checkpoint = _read_checkpoint(conn)
+    return max(checkpoint, _compute_candidate(conn, checkpoint))
+
+
+@dataclass(frozen=True)
+class CleanupResult:
+    """一次 `prune_runtime_state()` 的结果（INTERFACES §9.4）。"""
+
+    expired_thread_roots: tuple[int, ...]
+    deleted_events: int
+    deleted_sent_replies: int
+    deleted_send_attempts: int
+    deleted_cooldowns: int
+    deleted_dm_channels: int
+    safe_event_watermark: int
+    db_logical_bytes: int
+    db_physical_bytes: int
+
+
+@dataclass(frozen=True)
+class CommentClaim:
+    """评论候选的原子领取结果。"""
+
+    claimed: bool
+    comment_id: str
+    conversation_id: str | None
+    status: str
+
+
+@dataclass(frozen=True)
+class CommentDiscoveryState:
+    """全站最近评论发现水位及初始化状态。"""
+
+    initialized: bool
+    newest_created_at: float | None
+    boundary: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CommentNotificationState:
+    """通知匹配状态的无正文摘要。"""
+
+    notification_id: str
+    status: str
+    unmatched_attempts: int
+
+
+def _prune(conn: sqlite3.Connection, now: float, cfg: StorageConfig) -> CleanupResult:
+    """在一个事务里完成清理；调用方负责提交与回滚。
+
+    三条不得违反的规则（D-23）：非终态事件永不按时间删除；
+    安全水位之上的终态事件不提前删除；回滚锚点（安全水位内 event_id 最大的终态行）必须保留。
+    """
+    retention = cfg.lobby_thread_retention_seconds
+    cutoff = now - retention
+
+    expired_roots = tuple(
+        int(row[0])
+        for row in conn.execute(
+            "SELECT thread_root_id FROM lobby_threads WHERE updated_at <= ?"
+            " ORDER BY thread_root_id",
+            (cutoff,),
+        )
+    )
+    conn.execute("DELETE FROM lobby_threads WHERE updated_at <= ?", (cutoff,))
+
+    checkpoint = _read_watermark(conn)
+    conn.execute(
+        "INSERT INTO runtime_meta(key, int_value) VALUES (?, ?)"
+        " ON CONFLICT(key) DO UPDATE SET int_value = excluded.int_value",
+        (_CHECKPOINT_KEY, checkpoint),
+    )
+
+    placeholders = ", ".join("?" for _ in HANDLED_STATUSES)
+    anchor_row = conn.execute(
+        "SELECT MAX(event_id) FROM events WHERE event_id IS NOT NULL"
+        f" AND event_id <= ? AND status IN ({placeholders})",
+        (checkpoint, *HANDLED_STATUSES),
+    ).fetchone()
+    anchor = anchor_row[0] if anchor_row is not None and anchor_row[0] is not None else -1
+    deleted_events = conn.execute(
+        "DELETE FROM events WHERE event_id IS NOT NULL AND event_id <= ?"
+        f" AND status IN ({placeholders}) AND received_at <= ? AND event_id != ?",
+        (checkpoint, *HANDLED_STATUSES, cutoff, anchor),
+    ).rowcount
+
+    deleted_sent_replies = conn.execute(
+        "DELETE FROM sent_replies WHERE sent_at <= ?"
+        " AND NOT EXISTS (SELECT 1 FROM events AS e"
+        " WHERE e.message_id = sent_replies.reply_to"
+        f" AND e.status NOT IN ({placeholders}))",
+        (cutoff, *HANDLED_STATUSES),
+    ).rowcount
+
+    deleted_send_attempts = conn.execute(
+        "DELETE FROM send_attempts WHERE attempted_at <= ?",
+        (now - cfg.send_attempt_retention_seconds,),
+    ).rowcount
+
+    deleted_cooldowns = conn.execute(
+        "DELETE FROM cooldowns WHERE until <= ?", (now,)
+    ).rowcount
+
+    deleted_dm_channels = conn.execute(
+        "DELETE FROM dm_channels WHERE channel_id NOT IN ("
+        " SELECT channel_id FROM dm_channels"
+        " ORDER BY updated_at DESC, channel_id DESC LIMIT ?)",
+        (cfg.max_dm_channels,),
+    ).rowcount
+
+    page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+    freelist = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+    page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+
+    return CleanupResult(
+        expired_thread_roots=expired_roots,
+        deleted_events=deleted_events,
+        deleted_sent_replies=deleted_sent_replies,
+        deleted_send_attempts=deleted_send_attempts,
+        deleted_cooldowns=deleted_cooldowns,
+        deleted_dm_channels=deleted_dm_channels,
+        safe_event_watermark=checkpoint,
+        db_logical_bytes=max(0, page_count - freelist) * page_size,
+        db_physical_bytes=page_count * page_size,
+    )
 
 # events.status 的取值。
 #   pending —— 本进程已接收并入队，尚未处理完。
@@ -78,14 +241,133 @@ _SCHEMA: tuple[str, ...] = (
         until REAL NOT NULL
     )
     """,
+    # 大区共享链：只保存「消息 id -> 链根 id」的归属，链根就是开启该链那条消息的 id。
+    # 不保存用户名、用户 id、参与者名单或任何正文（§19.7）。
+    """
+    CREATE TABLE IF NOT EXISTS lobby_threads (
+        thread_root_id INTEGER PRIMARY KEY,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_lobby_threads_updated_at ON lobby_threads (updated_at)",
+    """
+    CREATE TABLE IF NOT EXISTS lobby_thread_messages (
+        message_id INTEGER PRIMARY KEY,
+        thread_root_id INTEGER NOT NULL,
+        mapped_at REAL NOT NULL,
+        FOREIGN KEY(thread_root_id)
+            REFERENCES lobby_threads(thread_root_id)
+            ON DELETE CASCADE
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_lobby_thread_messages_root"
+    " ON lobby_thread_messages (thread_root_id)",
+    # 运行期元数据；目前只放单调的 safe_event_watermark。
+    """
+    CREATE TABLE IF NOT EXISTS runtime_meta (
+        key TEXT PRIMARY KEY,
+        int_value INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS comment_discovery_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        initialized INTEGER NOT NULL DEFAULT 0,
+        newest_created_at REAL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS comment_discovery_boundary (
+        comment_id TEXT PRIMARY KEY,
+        created_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS comment_conversations (
+        conversation_id TEXT PRIMARY KEY,
+        blog_id TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_comment_conversations_updated ON comment_conversations(updated_at)",
+    """
+    CREATE TABLE IF NOT EXISTS comment_events (
+        comment_id TEXT PRIMARY KEY,
+        blog_id TEXT NOT NULL,
+        parent_id TEXT,
+        conversation_id TEXT,
+        source TEXT NOT NULL,
+        status TEXT NOT NULL,
+        observed_created_at REAL,
+        observed_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at REAL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_comment_events_status_due ON comment_events(status, next_attempt_at)",
+    """
+    CREATE TABLE IF NOT EXISTS comment_messages (
+        comment_id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        parent_id TEXT,
+        mapped_at REAL NOT NULL,
+        FOREIGN KEY(conversation_id) REFERENCES comment_conversations(conversation_id) ON DELETE CASCADE
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_comment_messages_conversation ON comment_messages(conversation_id)",
+    """
+    CREATE TABLE IF NOT EXISTS comment_sent_replies (
+        trigger_comment_id TEXT PRIMARY KEY,
+        bot_comment_id TEXT NOT NULL UNIQUE,
+        blog_id TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        sent_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS comment_notifications (
+        notification_id TEXT PRIMARY KEY,
+        blog_id TEXT NOT NULL,
+        actor_fingerprint TEXT,
+        status TEXT NOT NULL,
+        unmatched_attempts INTEGER NOT NULL DEFAULT 0,
+        observed_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS comment_notification_candidates (
+        notification_id TEXT NOT NULL,
+        comment_id TEXT NOT NULL,
+        PRIMARY KEY(notification_id, comment_id),
+        FOREIGN KEY(notification_id) REFERENCES comment_notifications(notification_id) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS comment_send_attempts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        blog_id TEXT NOT NULL,
+        trigger_comment_id TEXT,
+        kind TEXT NOT NULL,
+        attempted_at REAL NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_comment_send_attempts_time ON comment_send_attempts(attempted_at)",
+    "CREATE INDEX IF NOT EXISTS idx_comment_send_attempts_blog_time ON comment_send_attempts(blog_id, attempted_at)",
 )
 
 
 class Store:
     """SQLite 状态存储；全部方法 async，单连接 + 锁串行。"""
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, *, wal_journal_limit_bytes: int = 16777216) -> None:
         self._path = path
+        self._wal_journal_limit_bytes = wal_journal_limit_bytes
         # 构造时不建连接：open() 里才落盘/建表。
         self._conn: sqlite3.Connection | None = None
         self._lock = asyncio.Lock()
@@ -121,6 +403,8 @@ class Store:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
+        # WAL 的目标上限：journal 超过它时 SQLite 会在下次检查点截断（D-23）。
+        conn.execute(f"PRAGMA journal_size_limit={int(self._wal_journal_limit_bytes)}")
         for statement in _SCHEMA:
             conn.execute(statement)
         conn.commit()
@@ -192,42 +476,30 @@ class Store:
         return await self._execute(operation)
 
     async def advance_watermark(self) -> int:
-        """可安全提交给 Last-Event-ID 的水位（只读，不改任何状态）。
+        """把安全水位检查点**单调推进**到当前可安全提交的值，返回新值。
 
-        只看 `event_id` 非 NULL 的行：有 pending 时取 `min(event_id) - 1`，
-        否则取 `max(event_id)`，再与 `max(event_id)` 取小；无记录返回 0。
-        resync 行（event_id 为 NULL）既不推进也不阻挡水位。
+        与只读的 `watermark()` 不同，本方法会写入 `runtime_meta`：清理删掉旧事件行之后，
+        水位仍能从检查点恢复，不会倒退引发大范围重放（见 INTERFACES §9.2、D-23）。
+        算法只看检查点之后的行；没有这类行时保持检查点不变。
         """
-        return await self._execute(self._compute_watermark)
+        return await self._execute(self._advance_checkpoint)
 
     async def watermark(self) -> int:
-        """同 `advance_watermark()`：只读水位，不推进任何状态。"""
-        return await self._execute(self._compute_watermark)
+        """只读，不推进：返回 `max(检查点, 按同一规则现场算出的值)`。"""
+        return await self._execute(_read_watermark)
 
     @staticmethod
-    def _compute_watermark(conn: sqlite3.Connection) -> int:
-        bounds = conn.execute(
-            "SELECT MIN(event_id), MAX(event_id) FROM events WHERE event_id IS NOT NULL"
-        ).fetchone()
-        max_event_id = bounds[1] if bounds is not None else None
-        if max_event_id is None:
-            # 一条带 event_id 的记录都没有（空表或全是 resync 行）。
-            return 0
-
-        placeholders = ", ".join("?" for _ in HANDLED_STATUSES)
-        pending = conn.execute(
-            "SELECT MIN(event_id) FROM events WHERE event_id IS NOT NULL"
-            f" AND status NOT IN ({placeholders})",
-            HANDLED_STATUSES,
-        ).fetchone()
-        pending_min = pending[0] if pending is not None else None
-
-        if pending_min is None:
-            value = int(max_event_id)
-        else:
-            value = int(pending_min) - 1
-        # 水位不得超过见过的最大 event_id，也不为负。
-        return max(0, min(value, int(max_event_id)))
+    def _advance_checkpoint(conn: sqlite3.Connection) -> int:
+        checkpoint = _read_checkpoint(conn)
+        value = max(checkpoint, _compute_candidate(conn, checkpoint))
+        if value != checkpoint:
+            conn.execute(
+                "INSERT INTO runtime_meta(key, int_value) VALUES (?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET int_value = excluded.int_value",
+                (_CHECKPOINT_KEY, value),
+            )
+            conn.commit()
+        return value
 
     async def pending_messages(self) -> list[tuple[int | None, int, str]]:
         """按 message_id 升序返回**所有未完成**事件：(event_id, message_id, channel_id)。
@@ -317,10 +589,23 @@ class Store:
 
     # --- 已发回复 -----------------------------------------------------------
 
-    async def record_sent(self, message_id: int, channel_id: str, reply_to: int | None) -> None:
-        """记录一条已成功发出的站内消息，供「结果不确定」时对账去重。"""
+    async def record_sent(
+        self,
+        message_id: int,
+        channel_id: str,
+        reply_to: int | None,
+        *,
+        thread_root_id: int | None = None,
+    ) -> None:
+        """记录一条已成功发出的站内消息，供「结果不确定」时对账去重。
+
+        `thread_root_id` 非空时，**同一个事务**里把这条出站消息登记进共享链并刷新链的
+        活动时间（INTERFACES §9.4）：出站消息是后续加入该链的锚点，映射与去重记录必须
+        一起成功或一起失败。
+        """
 
         def operation(conn: sqlite3.Connection) -> None:
+            sent_at = time.time()
             conn.execute(
                 "INSERT INTO sent_replies (message_id, channel_id, reply_to, sent_at)"
                 " VALUES (?, ?, ?, ?)"
@@ -328,11 +613,148 @@ class Store:
                 " channel_id = excluded.channel_id,"
                 " reply_to = excluded.reply_to,"
                 " sent_at = excluded.sent_at",
-                (message_id, channel_id, reply_to, time.time()),
+                (message_id, channel_id, reply_to, sent_at),
             )
+            if thread_root_id is not None:
+                conn.execute(
+                    "INSERT INTO lobby_thread_messages(message_id, thread_root_id, mapped_at)"
+                    " VALUES (?, ?, ?)"
+                    " ON CONFLICT(message_id) DO UPDATE SET"
+                    " thread_root_id = excluded.thread_root_id,"
+                    " mapped_at = excluded.mapped_at",
+                    (message_id, thread_root_id, sent_at),
+                )
+                conn.execute(
+                    "UPDATE lobby_threads SET updated_at = ? WHERE thread_root_id = ?",
+                    (sent_at, thread_root_id),
+                )
             conn.commit()
 
         await self._execute(operation)
+
+    # --- 大区共享链 ---------------------------------------------------------
+
+    async def resolve_lobby_thread(
+        self,
+        message_id: int,
+        reply_to: int | None,
+        *,
+        force_new: bool,
+        now: float,
+        retention_seconds: int,
+    ) -> int:
+        """命中活动链或新建链，登记 `message_id`，返回 `thread_root_id`。
+
+        整体在**一个事务**内完成「查目标链是否活动 → 建链或命中 → 登记本条 → 刷新时间」，
+        两个并发回复因此不会各自建出一条链（INTERFACES §9.3）。
+        活动判据是开区间：`updated_at > now - retention_seconds`。
+        """
+
+        def operation(conn: sqlite3.Connection) -> int:
+            root = message_id
+            if not force_new and reply_to is not None:
+                row = conn.execute(
+                    "SELECT thread_root_id FROM lobby_thread_messages WHERE message_id = ?",
+                    (reply_to,),
+                ).fetchone()
+                if row is not None:
+                    candidate = int(row[0])
+                    active = conn.execute(
+                        "SELECT 1 FROM lobby_threads"
+                        " WHERE thread_root_id = ? AND updated_at > ?",
+                        (candidate, now - retention_seconds),
+                    ).fetchone()
+                    if active is not None:
+                        root = candidate
+
+            conn.execute(
+                "INSERT OR IGNORE INTO lobby_threads(thread_root_id, created_at, updated_at)"
+                " VALUES (?, ?, ?)",
+                (root, now, now),
+            )
+            conn.execute(
+                "INSERT INTO lobby_thread_messages(message_id, thread_root_id, mapped_at)"
+                " VALUES (?, ?, ?)"
+                " ON CONFLICT(message_id) DO UPDATE SET"
+                " thread_root_id = excluded.thread_root_id,"
+                " mapped_at = excluded.mapped_at",
+                (message_id, root, now),
+            )
+            conn.execute(
+                "UPDATE lobby_threads SET updated_at = ? WHERE thread_root_id = ?",
+                (now, root),
+            )
+            conn.commit()
+            return root
+
+        return await self._execute(operation)
+
+    async def prune_runtime_state(self, *, now: float, cfg: StorageConfig) -> CleanupResult:
+        """清理过期运行状态并推进安全水位；**整体是一个事务**（INTERFACES §9.4）。
+
+        失败即整体回滚：宁可这一轮什么也没清，也不留下「删了一半」的库。
+        提交后再做一次被动 WAL 检查点；运行期**不做 `VACUUM`**（会长时间独占库锁）。
+        """
+
+        def operation(conn: sqlite3.Connection) -> CleanupResult:
+            try:
+                result = _prune(conn, now, cfg)
+            except BaseException:
+                conn.rollback()
+                raise
+            conn.commit()
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            return result
+
+        return await self._execute(operation)
+
+    async def find_active_lobby_thread(
+        self, message_id: int, *, now: float, retention_seconds: int
+    ) -> int | None:
+        """只读：`message_id` 属于活动链时返回其根，否则 None（过期等同未命中）。"""
+
+        def operation(conn: sqlite3.Connection) -> int | None:
+            row = conn.execute(
+                "SELECT m.thread_root_id FROM lobby_thread_messages AS m"
+                " JOIN lobby_threads AS t ON t.thread_root_id = m.thread_root_id"
+                " WHERE m.message_id = ? AND t.updated_at > ?",
+                (message_id, now - retention_seconds),
+            ).fetchone()
+            return int(row[0]) if row is not None else None
+
+        return await self._execute(operation)
+
+    async def attach_lobby_message(
+        self, message_id: int, thread_root_id: int, *, now: float
+    ) -> bool:
+        """把一条出站或回显消息登记进链并刷新活动时间；链不存在时返回 False。
+
+        幂等：重复登记同一条消息只覆盖归属与时间，不报错。
+        """
+
+        def operation(conn: sqlite3.Connection) -> bool:
+            exists = conn.execute(
+                "SELECT 1 FROM lobby_threads WHERE thread_root_id = ?",
+                (thread_root_id,),
+            ).fetchone()
+            if exists is None:
+                return False
+            conn.execute(
+                "INSERT INTO lobby_thread_messages(message_id, thread_root_id, mapped_at)"
+                " VALUES (?, ?, ?)"
+                " ON CONFLICT(message_id) DO UPDATE SET"
+                " thread_root_id = excluded.thread_root_id,"
+                " mapped_at = excluded.mapped_at",
+                (message_id, thread_root_id, now),
+            )
+            conn.execute(
+                "UPDATE lobby_threads SET updated_at = ? WHERE thread_root_id = ?",
+                (now, thread_root_id),
+            )
+            conn.commit()
+            return True
+
+        return await self._execute(operation)
 
     async def find_sent_for_reply(self, channel_id: str, reply_to: int) -> int | None:
         """查该频道里是否已有针对 `reply_to` 的已发消息；未命中返回 None。"""

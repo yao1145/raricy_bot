@@ -24,6 +24,14 @@ services:
       # 解析为 /app/data/bot.db，所以卷必须挂在 /app/data，默认配置才能开箱持久化。
       # 若改成别的路径（或改这里的挂载点），必须同步修改另一处。
       - bot-data:/app/data
+    # Docker 默认的 json-file 日志没有上限：一个长期运行的容器会把宿主磁盘写满。
+    # 这里限制为 3 × 10 MiB（约 30 MiB/容器）。裸机运行时程序只写 stderr，
+    # 轮转交给 systemd / 进程管理器 / shell 重定向，应用不与宿主争夺这件事（D-23）。
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     # 运维端口只对容器网络暴露，不发布到宿主（D-10）。
     expose:
       - "8080"

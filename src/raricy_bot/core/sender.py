@@ -75,11 +75,15 @@ class MessageSender:
         *,
         kind: str = "reply",
         actor_id: str | None = None,
+        thread_root_id: int | None = None,
     ) -> SendResult:
         """脱敏、截断后发送；`kind` 与 `actor_id` 原样透传给 `quota`（三值见 §10）。
 
         `actor_id` 是触发这条消息的用户，只有 `kind="notice"` 用得上：
         主动通知的冷却按 (频道, 触发者) 计（D-18）。
+
+        `thread_root_id` 是大区共享链的根：非空时随 `record_sent` 一起写入映射，
+        让这条出站消息成为后续加入该链的锚点（D-20）。私聊恒为 None。
         """
         # 第 1 步：先脱敏，再在自然段边界截断。
         redacted = self._redactor.redact(text)
@@ -96,7 +100,9 @@ class MessageSender:
 
         # 从这里开始持有预留：下面每一个出口都必须恰好 note_sent / release 一次。
         try:
-            result, charge = await self._deliver(channel_id, content, reply_to)
+            result, charge = await self._deliver(
+                channel_id, content, reply_to, thread_root_id
+            )
         except BaseException:
             # 未预期的异常（含取消）也不能让预留泄漏。
             await self._quota.release(channel_id, kind, actor_id=actor_id)
@@ -112,15 +118,19 @@ class MessageSender:
     # --- 内部实现 ---
 
     async def _deliver(
-        self, channel_id: str, content: str, reply_to: int | None
+        self,
+        channel_id: str,
+        content: str,
+        reply_to: int | None,
+        thread_root_id: int | None,
     ) -> tuple[SendResult, bool]:
         """执行一次 POST 并处理结果；返回 (结果, 是否应 note_sent)。"""
         try:
             message = await self._post_once(channel_id, content, reply_to)
         except SiteError as exc:
-            return await self._on_error(channel_id, content, reply_to, exc)
+            return await self._on_error(channel_id, content, reply_to, thread_root_id, exc)
 
-        await self._record_sent(message, channel_id, reply_to)
+        await self._record_sent(message, channel_id, reply_to, thread_root_id)
         return SendResult(True, message.id if message is not None else None, "delivered"), True
 
     async def _post_once(
@@ -131,7 +141,12 @@ class MessageSender:
         return await self._client.post_message(channel_id, content, reply_to=reply_to)
 
     async def _on_error(
-        self, channel_id: str, content: str, reply_to: int | None, exc: SiteError
+        self,
+        channel_id: str,
+        content: str,
+        reply_to: int | None,
+        thread_root_id: int | None,
+        exc: SiteError,
     ) -> tuple[SendResult, bool]:
         """把确定性的站点错误映射为发送结果；status == 0 才进入对账。"""
         self._note_site_error(exc)
@@ -143,7 +158,9 @@ class MessageSender:
         if exc.status == 400 and reply_to is not None:
             return SendResult(False, None, "reply_target_gone"), False
         if exc.status == 0:
-            return await self._reconcile(channel_id, content, reply_to)
+            return await self._reconcile(
+                channel_id, content, reply_to, thread_root_id
+            )
         return SendResult(False, None, "failed"), False
 
     def _note_site_error(self, exc: SiteError) -> None:
@@ -158,7 +175,11 @@ class MessageSender:
         self._quota.backoff(wait)
 
     async def _reconcile(
-        self, channel_id: str, content: str, reply_to: int | None
+        self,
+        channel_id: str,
+        content: str,
+        reply_to: int | None,
+        thread_root_id: int | None,
     ) -> tuple[SendResult, bool]:
         """结果不确定时的对账：先查本地记录，再拉 `after=reply_to` 的最新一页。"""
         if reply_to is None:
@@ -186,7 +207,7 @@ class MessageSender:
                 continue
             # 命中的消息确实由本机器人发出，只是此前没记账：补记并转正预留。
             # 补记同样是尽力而为，写库失败不得影响预算记账。
-            await self._record_sent(message, channel_id, reply_to)
+            await self._record_sent(message, channel_id, reply_to, thread_root_id)
             return SendResult(True, message.id, "deduped"), True
 
         # 仍未命中：允许一次重发，仅一次。重发必须完整走第 5 步的错误副作用，
@@ -196,11 +217,15 @@ class MessageSender:
         except SiteError as exc:
             self._note_site_error(exc)
             return SendResult(False, None, "failed"), False
-        await self._record_sent(resent, channel_id, reply_to)
+        await self._record_sent(resent, channel_id, reply_to, thread_root_id)
         return SendResult(True, resent.id if resent is not None else None, "delivered"), True
 
     async def _record_sent(
-        self, message: ChatMessage | None, channel_id: str, reply_to: int | None
+        self,
+        message: ChatMessage | None,
+        channel_id: str,
+        reply_to: int | None,
+        thread_root_id: int | None,
     ) -> None:
         """有消息体时记录已发回复。
 
@@ -211,7 +236,9 @@ class MessageSender:
         if message is None:
             return
         try:
-            await self._store.record_sent(message.id, channel_id, reply_to)
+            await self._store.record_sent(
+                message.id, channel_id, reply_to, thread_root_id=thread_root_id
+            )
         except Exception as exc:  # record_sent 是尽力而为，不得影响预算记账
             log_event(
                 self._logger,
