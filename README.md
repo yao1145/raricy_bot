@@ -9,13 +9,21 @@
 `/search <问题>` 时才会把当前轮交给模型判断是否调用第三方 Exa MCP。博客评论能力见下节，
 它只读取文章标题与不超过 1000 字的正文。图片理解是**可选项**：`model.vision_enabled`
 默认关闭，开启后把当前轮附带的那张图取回内存交给模型，图片不落库、不进历史。
+本地 Markdown 知识库同样是**默认关闭**的可选能力：开启后 `/kb <问题>` 从只读目录递归检索
+`.md`，命中片段只随当前这一轮发给第三方模型，不联网、不落库、不入历史。
 机器人资料须由人工在站点上标注「机器人」及「消息可能发送至第三方模型处理」。
 
-聊天侧有三个命令：`/help` 返回能力与隐私说明；`/reset` 开一段新对话；`/search <问题>`
-只授权当前聊天轮由模型自行决定是否调用 Exa 搜索。`/search` 空参数时本地返回用法，不调用模型。
+聊天侧有四个命令：`/help` 返回能力与隐私说明；`/reset` 开一段新对话；`/search <问题>`
+只授权当前聊天轮由模型自行决定是否调用 Exa 搜索；`/kb <问题>` 只授权当前聊天轮检索本地
+知识库。两者空参数时都本地返回用法，不调用模型；同一条消息里最多一种能力，叠加会被本地拒绝。
 （私聊清空当前会话上下文，大区以该消息为新链起点、旧链不受影响）；`/help`、`/reset` 不重置配额，
-`/search` 的最终模型回复仍按普通回复计入聊天额度。
-评论区只识别 `/help` 与 `/reset`；评论区不会解析 `/search`，也不会调用 MCP。
+`/search`、`/kb` 的最终模型回复仍按普通回复计入聊天额度。
+评论区只识别 `/help` 与 `/reset`；评论区不会解析 `/search` 与 `/kb`，也不会调用 MCP 或读取知识库。
+
+Exa 侧还支持一个**可选的多 Key 池**（`mcp.servers.exa.account_pool`）：多个已获授权的
+API Key 各占一个 stdio 子进程，一次逻辑搜索在它们之间做有界轮询与故障转移，对模型仍然只是
+一个 `exa__web_search_exa`。它提高的是可用性，不是容量绕过：上线前必须确认这些 Key 的授权
+（见 [`docs/usage/DEPLOYMENT.md`](docs/usage/DEPLOYMENT.md) §1）。
 
 ## 博客评论机器人（默认关闭）
 
@@ -54,7 +62,8 @@ raricy_bot/
 │   ├── quota.py             # 聊天：每分钟窗口 + 24 小时额度 + 通知冷却
 │   ├── site/                # 站点 HTTP 客户端、SSE 接收器、聊天与评论 DTO
 │   ├── core/                # 聊天：上下文、路由器、工作器池、发送器
-│   ├── mcp/                 # 通用 MCP Provider、工具注册与 Exa 搜索适配
+│   ├── mcp/                 # 通用 MCP Provider、工具注册、Exa 搜索适配与多 Key 池
+│   ├── kb/                  # 本地 Markdown 知识库：扫描、分块、词法索引与检索
 │   ├── comments/            # 评论：发现轮询、匹配、配额、发送器、后台服务
 │   ├── ops.py               # /livez 与 /readyz
 │   ├── app.py               # 组件装配与生命周期
@@ -107,8 +116,9 @@ python -m pytest tests -q
 
 ## 配置项说明
 
-配置为只读 YAML，顶层小节有 `site` / `model` / `behavior` / `mcp` / `ops` / `storage` / `logging` /
-`comments` 与必填的 `system_prompt`。完整字段、默认值与校验规则见 `docs/design/INTERFACES.md` 第 1 节；
+配置为只读 YAML，顶层小节有 `site` / `model` / `behavior` / `mcp` / `knowledge_base` / `ops` /
+`storage` / `logging` / `comments` 与必填的 `system_prompt`。完整字段、默认值与校验规则见
+`docs/design/INTERFACES.md` 第 1 节；
 `config.example.yaml` 是一份可直接复制的样例。几处约束在加载阶段强制，配错直接以退出码 2 失败：
 
 - `storage.wal_journal_limit_bytes`（默认 16 MiB）必须小于 `sqlite_soft_limit_bytes`；
@@ -127,6 +137,7 @@ python -m pytest tests -q
 | `RARICY_PASSWORD` | 是 | 站点登录密码 |
 | `LLM_API_KEY` | 是 | 模型服务 API Key |
 | `EXA_API_KEY` | 否 | Exa MCP API Key；只在启用 `mcp.enabled` 时使用，缺失时联网功能停用 |
+| `EXA_API_KEY_1..N` | 否 | 多 Key 池的各槽位 Key；变量名由 `account_pool.host_envs` 指定，逐个显式透传 |
 | `BOT_CONFIG_PATH` | 否 | 配置文件路径，缺省为 `./config.yaml` |
 
 密钥只从环境变量读取，不写入 YAML、镜像或日志。站点与模型密钥缺失或为空时程序以退出码 2
@@ -154,7 +165,10 @@ docker compose logs -f bot
   这样默认配置开箱即持久化，容器重建后去重与配额状态保留，但内存中的对话上下文会清空。
   若改动 `storage.db_path` 或卷挂载点，必须同步修改另一处。
 - 密钥通过宿主环境变量注入，`docker-compose.yml` 里只有 `${VAR}` 引用，不含任何取值；
-  `EXA_API_KEY` 只由配置的 `env_from` 转发给 Exa MCP 子进程，不传给站点或模型服务。
+  `EXA_API_KEY`（池模式下是 `EXA_API_KEY_1..N`）只转发给 Exa MCP 子进程，不传给站点或模型服务。
+  池模式必须**逐个**显式透传变量，不要把它们拼成一个逗号分隔的参数——那会被 `ps` 与日志打印。
+- 知识库用 `./knowledge:/app/knowledge:ro` 只读挂载，容器用户（uid 10001）只需可读权限；
+  不要把资料复制进镜像。Rocky/RHEL 上的 `:Z` 见部署指南附录 A。
 - Docker 构建期固定安装 Node 22 与 `exa-mcp-server@3.4.1`；运行期不执行 `npx`、`npm install`
   或访问 npm registry。联网搜索默认关闭，缺少 `EXA_API_KEY` 只停用搜索。
 - Compose 将镜像根文件系统设为只读；SQLite 只写入 `/app/data` 命名卷。
@@ -193,6 +207,10 @@ docker compose logs -f bot
 - [ ] 重启容器，确认对话上下文清空而去重、链归属与配额状态保留。
 - [ ] 若启用评论能力：在测试文章上验证首次精确 @、直接回复、旁支静默、`/help` 与 `/reset`，
       并确认机器人资料已披露第三方模型处理与公开评论通知；不启用时确认评论轮询未启动。
+- [ ] 若启用 Exa 多 Key 池：确认每个 Key 都已获授权（Exa 书面许可，或同一组织依法管理的独立预算，
+      或官方 Team / 付费 / 资助额度），并把批准日期、账号范围与渠道记在案。池不绕过平台额度政策。
+- [ ] 若启用本地知识库：逐文件清点挂载目录，确认不含密钥、隐私、内部提示与无权转交模型的材料；
+      确认目录只读挂载、容器用户可读；确认 `access_mode` 与白名单符合预期的可见范围。
 - [ ] 确认容器日志已按 `docker-compose.yml` 的 `logging` 限额轮转（约 30 MiB）。
 - [ ] 确认数据库大小与清理摘要正常（`app.cleanup_done`），必要时停机 `VACUUM`。
 
@@ -201,8 +219,12 @@ docker compose logs -f bot
 - 图片理解默认关闭（`model.vision_enabled`）。关闭时只处理文本，图片回一条「读不到」的
   提示；开启后图片随当前轮交给模型，只此一轮，且要求模型自身支持视觉。
 - 不具备博客理解能力：只处理文本，纯博客回一条本地提示。
-- 普通聊天不联网、不调用工具；聊天区如需联网，必须显式发送 `/search <问题>`，且模型仍可决定
-  不搜索。搜索由构建期固定的 Exa MCP 提供，每轮最多一次、最多五条摘要；博客评论区始终不联网。
+- 普通聊天不联网、不调用工具，也不会自动读取知识库；聊天区如需要，必须显式发送
+  `/search <问题>` 或 `/kb <问题>`，且一次只有一种能力。搜索由构建期固定的 Exa MCP 提供，
+  每轮最多一次、最多五条摘要；博客评论区始终不联网、不读知识库。
+- 知识库是本地词法检索（标准库实现，无嵌入与向量库），只在当前已构建的快照上匹配：
+  没有命中就直接回本地提示，不会拿常识冒充资料，也不会因此联网。目录改动最长要等一个
+  `knowledge_base.refresh_seconds` 才能检索到；索引失败时保留上一份可用快照。
 - 没有长期记忆：上下文只存在内存中，进程重启即清空（大区的链归属会保留 7 天，
   但重启后模型看不到重启前的正文）。
 - 评论能力默认关闭；开启后同样只处理评论文本，不支持图片、附件或被引用博客。

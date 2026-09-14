@@ -14,6 +14,9 @@ docs
 *.db-wal
 *.db-shm
 config.yaml
+# 知识库只通过只读 bind mount 进入容器：不要把它复制进镜像，
+# 否则镜像层里的旧资料会一直留着，回滚镜像等于回滚资料。
+knowledge
 .venv
 venv
 env

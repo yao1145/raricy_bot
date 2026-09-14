@@ -5,6 +5,9 @@
 #   export RARICY_PASSWORD=...
 #   export LLM_API_KEY=...
 #   export EXA_API_KEY=...       # 仅启用 mcp.enabled 时需要；不要写进本文件
+#   # 多 Key 池（可选）：逐个显式导出，不要在命令行里拼接或打印
+#   export EXA_API_KEY_1=...
+#   export EXA_API_KEY_2=...
 #   docker compose up -d
 services:
   bot:
@@ -22,9 +25,20 @@ services:
       LLM_API_KEY: ${LLM_API_KEY}
       # 只透传给容器，由配置中的 env_from 再交给 Exa MCP 子进程；不写入 YAML。
       EXA_API_KEY: ${EXA_API_KEY}
+      # 多 Key 池的逐个透传。Compose 不会自动带入宿主变量，必须显式列出；
+      # 变量名与 config.yaml 的 mcp.servers.exa.account_pool.host_envs 必须一致。
+      # 不用时把这三行删掉或留空（留空只会禁用对应槽位，不影响单 Key 形态）。
+      EXA_API_KEY_1: ${EXA_API_KEY_1:-}
+      EXA_API_KEY_2: ${EXA_API_KEY_2:-}
+      EXA_API_KEY_3: ${EXA_API_KEY_3:-}
     volumes:
       # 配置只读挂载；其中 storage.db_path 用默认的 ./data/bot.db 即可。
       - ./config.yaml:/app/config.yaml:ro
+      # 知识库：只读挂载，容器 UID 10001 只需可读，绝不给写权限。
+      # Rocky/RHEL 上启用 SELinux 时再加 :Z 后缀（先按部署文档实测标签影响）。
+      # 不要把它复制进镜像：镜像层里的旧资料会一直留在那里。
+      # 不用知识库时保留这一行也无害（目录不存在只会让 KB 标为不可用）。
+      - ./knowledge:/app/knowledge:ro
       # 数据目录不变量：容器 WORKDIR 为 /app，配置默认 storage.db_path=./data/bot.db
       # 解析为 /app/data/bot.db，所以卷必须挂在 /app/data，默认配置才能开箱持久化。
       # 若改成别的路径（或改这里的挂载点），必须同步修改另一处。

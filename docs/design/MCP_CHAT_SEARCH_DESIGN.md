@@ -8,6 +8,11 @@
 本文设计一项显式、单轮、可关闭的联网搜索能力。用户通过 `/search` 授权当前一轮问题使用
 Exa 搜索；模型再根据问题是否需要时效性或外部资料，决定直接回答还是调用一次 MCP 工具。
 
+**后续扩展**：多个已获授权的 Exa API Key 组成的账户池，以及 `/kb` 本地知识库，都写在
+`EXA_ACCOUNT_POOL_AND_KB_DESIGN_PLAN.md` 里，正式合同见 `INTERFACES.md` §22 / §23。
+账户池包装在同一个 `McpProvider` 协议后面，**不改变本文的任何一条工具名、绑定、
+`SearchLimiter` 或模型调用次数约束**；`/kb` 完全不走 MCP。
+
 本文自身不是当前内部接口合同。实现前必须把最终采用的类型、默认值和裁决同步到
 `INTERFACES.md` 与 `DESIGN_DECISIONS.md`，再开始跨模块实现。
 

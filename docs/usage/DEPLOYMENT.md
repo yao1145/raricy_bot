@@ -10,7 +10,7 @@
 
 ---
 
-## 1. 先读这一段：部署前必须确认的四件事
+## 1. 先读这一段：部署前必须确认的六件事
 
 1. **机器人账号必须先手动创建并提权到 core+。**
    `chat-bot.md` §2.1 明确写了机器人账号**不开放脚本自助注册**，且注册若需要人机验证
@@ -28,7 +28,21 @@
    多副本选主不属于首版范围。
 4. **密钥只走环境变量**，不要写进 `config.yaml`、不要写进 `docker-compose.yml`、
    不要提交到任何仓库。站点与模型凭据是 `RARICY_USERNAME`、`RARICY_PASSWORD`、
-   `LLM_API_KEY`；启用联网搜索时另需 `EXA_API_KEY`，它只提供给 Exa MCP 子进程。
+   `LLM_API_KEY`；启用联网搜索时另需 `EXA_API_KEY`（多 Key 池则是 `EXA_API_KEY_1..N`），
+   它们只提供给 Exa MCP 子进程。
+5. **Exa 多 Key 池必须先确认授权，再上线。** 池的作用是在多个**已获授权**的 Key 之间轮询，
+   它不绕过任何平台额度政策。Exa 的服务条款要求 API 使用遵守其技术文档、使用指南与调用量限制，
+   官方团队文档也说明同一 Team 的成员共享该 Team 的限制；官方资料并没有承诺「为叠加免费额度
+   而创建多个个人账号」是允许的。在拿到下面任一证据之前，**保持 `account_pool` 关闭**：
+   - Exa 书面确认本次部署可以轮询这些账号/Key；或
+   - 这些 Key 来自同一组织依法管理的独立预算，且当前合同明确允许；或
+   - 改用官方 Team、充值、教育/创业额度等官方支持的容量方案。
+
+   确认记录只保存**批准日期、适用账号范围与批准渠道**，不要把邮件正文里的 Key 抄进任何地方。
+6. **知识库目录上线前必须人工清点。** 机器人会把命中的片段发给提问者、并发给第三方模型。
+   密钥、Cookie、个人隐私、内部提示词、部署配置、日志、数据库、无权转交模型的版权材料，
+   都不得放进挂载目录；目录名与文件名本身也会展示给提问者，所以命名同样要审。默认配置只对
+   私聊白名单开放，要在大区公开必须显式改配置 —— 见 §4.2.1。
 
 ---
 
@@ -194,6 +208,56 @@ mcp:
 评论、`/livez` 与 `/readyz` 继续运行。更新环境变量后必须执行 `docker compose up -d`，仅
 `restart` 不会重新创建容器并读取新值。
 
+### 4.1.1 Exa 多 Key 池（可选；上线前先读 §1 第 5 条）
+
+确认授权之后，可以把单 Key 换成池：把 `env_from` 那两行注释掉，改用 `account_pool`。
+
+```yaml
+mcp:
+  servers:
+    exa:
+      # env_from:            # 与 account_pool 互斥，二者只能留一个
+      #   EXA_API_KEY: EXA_API_KEY
+      account_pool:
+        child_env: EXA_API_KEY     # 首版必须逐字是这个
+        host_envs:                 # 写的是**环境变量名**，不是 Key 值
+          - EXA_API_KEY_1
+          - EXA_API_KEY_2
+          - EXA_API_KEY_3
+        strategy: round_robin      # 首版必须逐字是这个
+        rate_limit_cooldown_seconds: 60
+        transient_cooldown_seconds: 30
+        quota_cooldown_seconds: 21600
+```
+
+每个槽位是一个独立子进程，池对模型仍然只是一个 `exa__web_search_exa` 工具：
+
+- 一次逻辑搜索从游标之后取下一个可用槽位；某个 Key 明确限流（429）、额度耗尽（402）、
+  失效（401）或其子进程崩溃时，才**有界地**换下一个；同一槽位在一次调用里最多试一次。
+- 401 的槽位在本进程内不再尝试；429 冷却 60 秒；额度耗尽冷却 6 小时后重新探测。
+  冷却与状态只存内存，重启后重新探测 —— 余额是 Exa 侧的外部事实，本地存一份只会变成错的真相。
+- **一次模型可见的搜索可能消耗多个上游请求**（每个失败槽位一次）。超时之后上游可能已经计费，
+  所以不要用「模型调用次数」估算上游用量。
+- 环境变量缺失只禁用对应槽位；全部缺失才使联网搜索不可用，其余功能不受影响。
+- 日志只记槽位序号与稳定原因，不记 Key、不记环境变量名。Key 的值在任何子进程启动前
+  就已登记进脱敏器。
+
+Compose 需要逐个显式透传（`docker-compose.yml` 已给出三行示例）：
+
+```bash
+# .env
+EXA_API_KEY_1=第一个Key
+EXA_API_KEY_2=第二个Key
+EXA_API_KEY_3=第三个Key
+```
+
+**别把多个 Key 拼成一个命令行参数**（例如传 `EXA_API_KEY="k1,k2"`）：那样它会被
+`ps`、日志或错误信息原样打印出来。逐个显式的变量名不会被打印。
+
+上线前应实测确认：多个 Key 是否属于同一个 Team（同 Team 共享预算会让轮换完全没有容量收益），
+以及 429 是按 Key、Team、IP 还是网络出口计的（换 Key 可能无效甚至加剧限流）。
+池只提供可用性上的有界降级，**不承诺**账户、调用量或免费额度上的任何绕过。
+
 ### 4.2 启用博客评论能力（可选）
 
 评论功能默认关闭。只有完成测试文章演练并确认机器人资料披露后，才在配置中开启：
@@ -219,6 +283,62 @@ actor 缺失的评论回复通知仍按 unmatched 计数。Service 在模型调�
 启用前至少验证：历史 @ 不回复、新 @ 回复、直接回复继续上下文、普通旁支静默、通知延迟、
 `/help`、`/reset`、重启后上下文清空但去重状态保留。评论轮询或评论禁言故障不会让聊天
 `/readyz` 失败；评论后台 task 意外退出会使 `/livez` 失败，便于编排器重启。
+
+### 4.2.1 启用本地知识库（可选；上线前先读 §1 第 6 条）
+
+知识库默认关闭。启用前请先确认你已经按 §1 第 6 条清点过目录内容，并明确它的可见范围。
+最小可用配置（只对指定的私聊用户开放）：
+
+```yaml
+knowledge_base:
+  enabled: true
+  root_dir: "./knowledge"        # 容器里解析为 /app/knowledge，即下面的只读挂载点
+  access_mode: allowlist         # 默认值；必须显式列出 allowed_user_ids
+  allowed_channel_kinds:
+    - dm
+  allowed_user_ids:
+    - "站点上的用户id"            # 稳定 id，不是可改名的用户名
+  refresh_seconds: 60
+  top_k: 6
+  max_context_tokens: 4000        # 必须 <= behavior.context_input_tokens
+```
+
+要在大区公开使用（大厅仍需精确 @ 机器人），必须**显式**改成：
+
+```yaml
+  access_mode: all_chat
+  allowed_channel_kinds:
+    - dm
+    - lobby
+```
+
+目录与挂载：
+
+```bash
+mkdir -p /opt/raricy_bot/knowledge/电化学      # 一级目录名就是分类
+chmod -R a+rX /opt/raricy_bot/knowledge        # 容器用户 uid 10001 只需可读
+```
+
+`docker-compose.yml` 里已经有一行 `./knowledge:/app/knowledge:ro`。**必须是只读挂载**，
+也**不要**把资料复制进镜像：镜像层里的旧资料会一直留着，回滚镜像等于回滚资料。
+Rocky/RHEL 启用 SELinux 时，按[附录 A](#附录-arocky-linux-9-差异)的方式评估 `:Z` 后缀
+（先看现有目录的标签，别直接加，可能打乱已有标签）；容器只读这一点在两种发行版上都一样。
+
+行为与边界：
+
+- 只读**递归**目录下的 `.md` 文件（扩展名大小写无关），一级子目录是分类，根目录直接放置的
+  文件归入保留分类 `_root`。不解析 PDF、Word、图片、网页与其它格式。
+- 只接受 UTF-8；非法编码、超大文件、隐藏文件与符号链接会被跳过，其余文件仍可检索。
+- 索引在后台线程重建，成功后**一次性**替换；失败保留上一份可用快照。改完文件不会立刻生效，
+  最长等一个 `refresh_seconds`。单个坏文件不影响其它文件。
+- 命中片段只在**当前这一轮**随问题发给第三方模型，不写进历史、不写进 SQLite、不写进日志；
+  也不会发给 Exa。没有命中时机器人直接回一句本地提示，**不会**调用模型。
+- 知识库不可用、无权限或目录被删，只影响 `/kb`；普通聊天、评论、`/livez`、`/readyz` 照常。
+- 未授权的用户只会收到一句固定文案，不会知道目录是否存在、有多少文件或有哪些分类。
+
+启用后建议至少验证：私聊白名单用户 `/kb <问题>` 能拿到带来源的答案；不在白名单的用户收到
+无权限提示；大区（若开放）仍需精确 @；`/search /kb x` 返回冲突提示；改一个 `.md` 后
+等一个刷新周期能看到新内容；`docker exec` 里确认 `/app/knowledge` 是只读的。
 
 ### 4.3 两个不要动的默认值
 
@@ -287,6 +407,10 @@ RARICY_PASSWORD=机器人密码
 LLM_API_KEY=模型服务的Key
 # 仅 mcp.enabled=true 时需要；填写实际值，不要提交此文件
 EXA_API_KEY=Exa服务的Key
+# 用多 Key 池时改成逐个列出，变量名与 config.yaml 的 account_pool.host_envs 一一对应
+# EXA_API_KEY_1=第一个Key
+# EXA_API_KEY_2=第二个Key
+# EXA_API_KEY_3=第三个Key
 EOF
 chmod 600 .env
 ```
@@ -423,6 +547,20 @@ logging:
   level: "DEBUG"               # 排查期临时开，完了改回 INFO
 system_prompt: |
   ...
+```
+
+把 `mcp.enabled` 与 `knowledge_base.enabled` 关掉，等于退回「普通聊天 + 评论」，
+对应模块的队列、子进程与目录扫描都不会启动。
+
+`/kb` 的检索质量随 `knowledge_base` 的这几个键变化，改完重启即可生效（不需要改代码）：
+
+```yaml
+knowledge_base:
+  top_k: 6                     # 每轮最多给模型几段资料，上限 10
+  chunk_chars: 2400            # 单块字符数；资料偏长可调大，密集短文档可调小
+  chunk_overlap_chars: 200     # 必须小于 chunk_chars
+  max_context_tokens: 4000     # 必须 <= behavior.context_input_tokens
+  refresh_seconds: 60          # 改完文件多久能被检索到
 ```
 
 ### 9.2 图片输入（可选，默认关闭）
@@ -694,6 +832,10 @@ RARICY_PASSWORD=机器人密码
 LLM_API_KEY=模型服务的Key
 # 仅 mcp.enabled=true 时需要；填写实际值，不要提交此文件
 EXA_API_KEY=Exa服务的Key
+# 用多 Key 池时改成逐个列出，变量名与 config.yaml 的 account_pool.host_envs 一一对应
+# EXA_API_KEY_1=第一个Key
+# EXA_API_KEY_2=第二个Key
+# EXA_API_KEY_3=第三个Key
 EOF
 sudo chmod 600 /etc/raricy-bot.env
 ```
