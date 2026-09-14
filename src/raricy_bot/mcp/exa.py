@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 import urllib.parse
@@ -10,8 +11,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from ..logging_setup import get_logger, log_event
 from ..text_utils import estimate_tokens
 from ..texts import TRUNCATION_SUFFIX
+
+_logger = get_logger("mcp.exa")
 
 
 @dataclass(frozen=True)
@@ -132,6 +136,8 @@ class ExaSearchAdapter:
             result_item_token_limit=self.result_item_token_limit,
             history_item_token_limit=self.history_item_token_limit,
         )
+        # 只记条数：标题、URL 与摘要都不进日志（设计 §8.3）。
+        log_event(_logger, logging.INFO, "mcp.search_done", count=len(output.results))
         return ToolExecution(
             call_id=call_id,
             content=output.content,

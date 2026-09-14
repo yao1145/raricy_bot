@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import Mapping
 from contextlib import AsyncExitStack
-from datetime import timedelta
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -105,7 +105,11 @@ class StdioMcpProvider:
                     ClientSession(
                         read_stream,
                         write_stream,
-                        read_timeout_seconds=timedelta(seconds=self._call_timeout),
+                        # 单位是**秒**（float），不是 timedelta：SDK 把它原样交给
+                        # anyio.fail_after，而 fail_after 内部做 current_time() + delay。
+                        # mcp 1.x 期望 timedelta（自己调 .total_seconds()），2.x 才改成
+                        # 秒数；本项目固定 mcp>=2.2，所以这里只能传数值。
+                        read_timeout_seconds=self._call_timeout,
                     )
                 )
                 await asyncio.wait_for(session.initialize(), self._connect_timeout)
@@ -150,7 +154,7 @@ class StdioMcpProvider:
                 tool_name=tool.name,
                 model_name="",
                 description=tool.description or "",
-                input_schema=dict(tool.inputSchema),
+                input_schema=dict(_tool_input_schema(tool)),
             )
             for tool in result.tools
         )
@@ -179,3 +183,22 @@ class StdioMcpProvider:
         if self._stderr_handle is not None:
             self._stderr_handle.close()
             self._stderr_handle = None
+
+
+def _tool_input_schema(tool: object) -> Mapping[str, Any]:
+    """读取工具的入参 schema，兼容两个大版本的字段名。
+
+    mcp 1.x 的 ``Tool`` 字段名与线格式同为 ``inputSchema``，2.x 改成了
+    ``input_schema``。这里两种都试，避免把版本差异变成运行期的 AttributeError
+    ——它会让整个 Provider 变成不可用，而用户只会看到"搜索暂不可用"。
+    """
+    for field in ("input_schema", "inputSchema"):
+        value = getattr(tool, field, None)
+        if isinstance(value, Mapping):
+            return value
+        if value is not None:
+            try:
+                return dict(value)
+            except (TypeError, ValueError):
+                continue
+    return {}

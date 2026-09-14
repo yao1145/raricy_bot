@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import Any
 
 from ..config import McpFeatureConfig
+from ..logging_setup import get_logger, log_event
 from ..text_utils import estimate_tokens
 from .contracts import (
     McpCallTimeoutError,
@@ -20,6 +22,8 @@ from .contracts import (
 from .exa import ExaNoResultsError, SearchLimiter
 
 _MODEL_NAME_RE = re.compile(r"[^A-Za-z0-9_-]")
+
+_logger = get_logger("mcp.registry")
 
 
 def model_tool_name(server_name: str, tool_name: str) -> str:
@@ -52,13 +56,28 @@ class InMemoryToolRegistry:
         failures: set[str] = set()
         for server_name, provider in self._providers.items():
             if not provider.available:
+                log_event(
+                    _logger,
+                    logging.DEBUG,
+                    "mcp.discovery_skipped",
+                    server=server_name,
+                    reason="provider_unavailable",
+                )
                 continue
             try:
                 definitions = await provider.list_tools()
-            except Exception:
+            except Exception as exc:
                 self._notify_provider_failure(server_name)
                 failures.add(server_name)
+                log_event(
+                    _logger,
+                    logging.WARNING,
+                    "mcp.discovery_failed",
+                    server=server_name,
+                    error=type(exc).__name__,
+                )
                 continue
+            accepted = 0
             for definition in definitions:
                 try:
                     tool_name = definition.tool_name
@@ -82,9 +101,21 @@ class InMemoryToolRegistry:
                     conflicts.add(model_name)
                 else:
                     discovered[model_name] = normalized
+                    accepted += 1
+            # "连上了但一个工具都没发现"是事故现场最容易踩的坑之一：
+            # 它让 feature 判为不可用，而此前日志里没有任何痕迹。
+            log_event(
+                _logger,
+                logging.INFO,
+                "mcp.discovered",
+                server=server_name,
+                count=accepted,
+            )
         self._tools = discovered
         self._conflicts = conflicts
         self._last_refresh_failures = failures
+        for conflict in sorted(conflicts):
+            log_event(_logger, logging.WARNING, "mcp.tool_conflict", tool=conflict)
         return not failures
 
     @property
@@ -140,13 +171,23 @@ class InMemoryToolRegistry:
             call.model_name
         )
         if definition is None:
-            return ToolExecution(call.call_id, "tool_not_allowed", True, "tool_not_allowed")
+            # 这里刻意不记录 call.model_name：那是模型自报的字符串，
+            # 可能包含它复述的用户正文，不属于可以进日志的字段。
+            return self._decline(
+                call, "tool_not_allowed", "tool_not_allowed", feature=feature_name
+            )
         try:
             arguments = json.loads(call.arguments_json)
         except (TypeError, ValueError, json.JSONDecodeError):
-            return ToolExecution(call.call_id, "invalid_arguments", True, "invalid_arguments")
+            return self._decline(
+                call, "invalid_arguments", "invalid_arguments", definition=definition,
+                feature=feature_name, level=logging.INFO,
+            )
         if not isinstance(arguments, dict):
-            return ToolExecution(call.call_id, "invalid_arguments", True, "invalid_arguments")
+            return self._decline(
+                call, "invalid_arguments", "invalid_arguments", definition=definition,
+                feature=feature_name, level=logging.INFO,
+            )
         adapter = self._adapters.get(definition.model_name)
         # 适配器可以在 Provider 边界实现产品级参数策略。绑定 Exa 时，
         # 这里只接受 query，并由适配器强制写入配置中的 numResults；未来工具
@@ -156,13 +197,22 @@ class InMemoryToolRegistry:
             try:
                 arguments = preparer(arguments, self._features[feature_name])
             except (KeyError, TypeError, ValueError):
-                return ToolExecution(call.call_id, "invalid_arguments", True, "invalid_arguments")
+                return self._decline(
+                    call, "invalid_arguments", "invalid_arguments",
+                    definition=definition, feature=feature_name, level=logging.INFO,
+                )
             if not isinstance(arguments, dict):
-                return ToolExecution(call.call_id, "invalid_arguments", True, "invalid_arguments")
+                return self._decline(
+                    call, "invalid_arguments", "invalid_arguments",
+                    definition=definition, feature=feature_name, level=logging.INFO,
+                )
         provider = self._providers.get(definition.server_name)
         if provider is None or not provider.available:
             self._notify_provider_failure(definition.server_name)
-            return ToolExecution(call.call_id, "tool_unavailable", True, "search_unavailable")
+            return self._decline(
+                call, "search_unavailable", "tool_unavailable",
+                definition=definition, feature=feature_name,
+            )
 
         async def call_provider() -> Any:
             return await provider.call_tool(definition.tool_name, arguments)
@@ -174,55 +224,111 @@ class InMemoryToolRegistry:
                     call_provider, should_run=generation_is_current
                 )
                 if raw is SearchLimiter.SKIPPED:
-                    return ToolExecution(
-                        call.call_id,
-                        "search cancelled",
-                        True,
-                        "generation_cancelled",
+                    # 生成已被 /reset 作废：正常竞态，不是故障。
+                    return self._decline(
+                        call, "generation_cancelled", "search cancelled",
+                        definition=definition, feature=feature_name, level=logging.DEBUG,
                     )
             else:
                 if generation_is_current is not None and not generation_is_current():
-                    return ToolExecution(
-                        call.call_id,
-                        "search cancelled",
-                        True,
-                        "generation_cancelled",
+                    return self._decline(
+                        call, "generation_cancelled", "search cancelled",
+                        definition=definition, feature=feature_name, level=logging.DEBUG,
                     )
                 raw = await call_provider()
         except McpCallTimeoutError:
             self._notify_provider_failure(definition.server_name)
-            return ToolExecution(call.call_id, "search timed out", True, "search_timeout")
+            return self._decline(
+                call, "search_timeout", "search timed out",
+                definition=definition, feature=feature_name,
+            )
         except Exception:
             self._notify_provider_failure(definition.server_name)
-            return ToolExecution(call.call_id, "tool_unavailable", True, "search_unavailable")
+            return self._decline(
+                call, "search_unavailable", "tool_unavailable",
+                definition=definition, feature=feature_name,
+            )
         if _result_is_error(raw):
-            return ToolExecution(call.call_id, "tool unavailable", True, "search_unavailable")
+            return self._decline(
+                call, "search_unavailable", "tool unavailable",
+                definition=definition, feature=feature_name,
+            )
         if adapter is not None:
             try:
-                return adapter(raw, call.call_id)
+                execution = adapter(raw, call.call_id)
             except ExaNoResultsError:
-                return ToolExecution(call.call_id, "no results", True, "no_results")
+                return self._decline(
+                    call, "no_results", "no results",
+                    definition=definition, feature=feature_name,
+                )
             except ValueError:
-                return ToolExecution(call.call_id, "invalid_result", True, "invalid_result")
+                return self._decline(
+                    call, "invalid_result", "invalid_result",
+                    definition=definition, feature=feature_name,
+                )
             except Exception:
-                return ToolExecution(call.call_id, "invalid_result", True, "invalid_result")
+                return self._decline(
+                    call, "invalid_result", "invalid_result",
+                    definition=definition, feature=feature_name,
+                )
+            if not execution.is_error:
+                log_event(
+                    _logger, logging.INFO, "mcp.tool_done",
+                    tool=definition.model_name, server=definition.server_name,
+                )
+            return execution
         if isinstance(raw, str):
             content = raw
         else:
             try:
                 content = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
             except (TypeError, ValueError):
-                return ToolExecution(call.call_id, "invalid_result", True, "invalid_result")
+                return self._decline(
+                    call, "invalid_result", "invalid_result",
+                    definition=definition, feature=feature_name,
+                )
         # 未提供专用适配器的未来工具也不能把任意 MCP 响应无界地交给模型。
         # 以该 feature 的结果预算作为保守上限；专用适配器（如 Exa）在此之前
         # 已按更细的逐条规则处理。
         feature = self._features.get(feature_name)
         if feature is None:
-            return ToolExecution(call.call_id, "invalid_result", True, "invalid_result")
+            return self._decline(
+                call, "invalid_result", "invalid_result",
+                definition=definition, feature=feature_name,
+            )
         max_tokens = max(1, feature.result_count * feature.result_item_token_limit)
         if estimate_tokens(content) > max_tokens:
             content = _clip_tokens(content, max_tokens)
+        log_event(
+            _logger, logging.INFO, "mcp.tool_done",
+            tool=definition.model_name, server=definition.server_name,
+        )
         return ToolExecution(call.call_id, content, False)
+
+    def _decline(
+        self,
+        call: ToolCall,
+        error_kind: str,
+        content: str,
+        *,
+        definition: ToolDefinition | None = None,
+        feature: str = "",
+        level: int = logging.WARNING,
+    ) -> ToolExecution:
+        """记录一次未成功的调用并返回稳定错误结果。
+
+        日志里的 ``reason`` 与返回给模型的 ``error_kind`` 同名，便于按一条
+        稳定字符串同时 grep 日志与推演行为。工具参数、模型自报的工具名与
+        上游返回正文都不在这里出现。
+        """
+        fields: dict[str, object] = {"reason": error_kind}
+        if feature:
+            fields["feature"] = feature
+        if definition is not None:
+            fields["tool"] = definition.model_name
+            fields["server"] = definition.server_name
+        log_event(_logger, level, "mcp.tool_failed", **fields)
+        return ToolExecution(call.call_id, content, True, error_kind)
 
     def _notify_provider_failure(self, server_name: str) -> None:
         """通知生命周期管理器安排重连；回调异常不得影响用户请求。"""

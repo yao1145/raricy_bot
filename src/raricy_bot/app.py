@@ -59,6 +59,19 @@ _logger = get_logger("app")
 _SHUTDOWN_TIMEOUT_SECONDS: float = 10.0
 
 
+class SearchUnavailable(Exception):
+    """搜索授权前的本地能力门判否，并携带可判别的稳定原因码。
+
+    它不是 ``ModelError``：模型压根没被调用，且用户侧文案相同、只有原因不同。
+    用独立的异常类型可以让"我们自己的门"和"模型端点说它不支持 tools"
+    在日志里各记一行、互不重复。
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
 class BotApp:
     """一个机器人实例的完整装配与生命周期。"""
 
@@ -548,7 +561,7 @@ class BotApp:
             model = self._model
             if model is None:
                 if "search" in request.enabled_features:
-                    await self._send_search_unavailable(request)
+                    await self._send_search_unavailable(request, "model_missing")
                 else:
                     await self._notify_failure(request)
                 return
@@ -564,12 +577,16 @@ class BotApp:
             except ToolGenerationCancelled:
                 # /reset 在工具循环的任一异步边界作废了本轮；不发通知、不写历史。
                 return
+            except SearchUnavailable as exc:
+                # 本地能力门判否；reason 已在 _complete_search 的判定点确定。
+                await self._send_search_unavailable(request, exc.reason)
+                return
             except ModelError as exc:
                 if "search" in request.enabled_features and exc.kind in {
                     "tools_unavailable",
                     "tools_unsupported",
                 }:
-                    await self._send_search_unavailable(request)
+                    await self._send_search_unavailable(request, exc.kind)
                     return
                 log_event(
                     _logger,
@@ -643,20 +660,23 @@ class BotApp:
         request: Request,
     ) -> tuple[str, str | None]:
         """执行一轮显式搜索授权；MCP 调用不占用模型并发门。"""
+        # 每道门都必须给出可判别的 reason：用户看到的都是同一句本地文案，
+        # 没有 reason 时"总开关关了 / Provider 没起来 / 没发现工具 / 模型不认 tools"
+        # 在日志里完全一样 —— 2026-09-14 的线上排查正是卡在这里。
         if not self._config.mcp.enabled:
-            raise ModelError("tools_unavailable", False)
+            raise SearchUnavailable("mcp_disabled")
         registry = self._mcp_manager.registry
         if not registry.feature_available("search"):
-            raise ModelError("tools_unavailable", False)
+            raise SearchUnavailable("feature_unavailable")
         complete_with_tools = getattr(model, "complete_with_tools", None)
         if not callable(complete_with_tools):
-            raise ModelError("tools_unavailable", False)
+            raise SearchUnavailable("model_without_tools")
         feature = self._config.mcp.features.get("search")
         if feature is None:
-            raise ModelError("tools_unavailable", False)
+            raise SearchUnavailable("feature_missing")
         tools = tuple(registry.tools_for("search"))
         if not tools:
-            raise ModelError("tools_unavailable", False)
+            raise SearchUnavailable("no_tools")
 
         async def execute(call):
             return await registry.execute(
@@ -701,10 +721,18 @@ class BotApp:
             raise
         return completion.text, completion.history_context
 
-    async def _send_search_unavailable(self, request: Request) -> None:
-        """搜索显式授权但能力不可用时只发本地提示。"""
+    async def _send_search_unavailable(self, request: Request, reason: str) -> None:
+        """搜索显式授权但能力不可用时只发本地提示，并记下可判别的 reason。"""
         if self._ctx.generation(request.session_key) != request.generation:
             return
+        log_event(
+            _logger,
+            logging.INFO,
+            "app.search_unavailable",
+            reason=reason,
+            channel_id=request.channel_id,
+            channel_kind=request.channel_kind,
+        )
         outcome = await self._sender.send(
             request.channel_id,
             texts.SEARCH_UNAVAILABLE_TEXT,

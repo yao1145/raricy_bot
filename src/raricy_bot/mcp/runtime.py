@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
 from ..config import McpConfig
+from ..logging_setup import get_logger, log_event
 from ..redact import Redactor
 from .contracts import McpProvider
 from .registry import InMemoryToolRegistry
 from .stdio import MissingEnvironmentError, StdioMcpProvider
+
+_logger = get_logger("mcp.runtime")
 
 
 class McpManager:
@@ -57,6 +61,7 @@ class McpManager:
         """最佳努力启动全部服务器；失败的服务器进入重连状态。"""
         self._stopping = False
         if not self.config.enabled:
+            log_event(_logger, logging.INFO, "mcp.disabled")
             return
         for name, provider in self.providers.items():
             try:
@@ -65,8 +70,27 @@ class McpManager:
                 # 环境映射是进程级静态配置；缺失时只停用该服务器，
                 # 不启动无意义的指数重连循环，也不把变量名/值写入日志。
                 self._disabled_missing_environment.add(name)
-            except Exception:
+                log_event(
+                    _logger,
+                    logging.WARNING,
+                    "mcp.provider_disabled",
+                    server=name,
+                    reason="missing_env",
+                )
+            except Exception as exc:
+                # 这里原来是完全静默的：启动失败只换来一个后台重连任务，
+                # 用户侧只表现为"/search 说联网不可用"。异常正文不入日志
+                # （可能含子进程 stderr），只记类型名。
+                log_event(
+                    _logger,
+                    logging.WARNING,
+                    "mcp.provider_start_failed",
+                    server=name,
+                    error=type(exc).__name__,
+                )
                 self.ensure_reconnect(name)
+            else:
+                log_event(_logger, logging.INFO, "mcp.provider_started", server=name)
         await self._refresh_registry()
         # 发现阶段也可能使 session 失效（例如子进程启动后立即退出）；不要把
         # 这种故障误认为已连接，否则永远不会创建后台重连任务。
@@ -102,11 +126,13 @@ class McpManager:
     async def _reconnect(self, name: str) -> None:
         provider = self.providers[name]
         delay = self.config.reconnect_base_seconds
+        attempt = 0
         try:
             while not self._stopping:
                 await self._sleep(delay)
                 if self._stopping:
                     return
+                attempt += 1
                 try:
                     await provider.stop()
                     await provider.start()
@@ -116,11 +142,36 @@ class McpManager:
                         or name in self.registry.last_refresh_failures
                     ):
                         raise RuntimeError("MCP provider unavailable after discovery")
+                    log_event(
+                        _logger,
+                        logging.INFO,
+                        "mcp.provider_recovered",
+                        server=name,
+                        attempt=attempt,
+                    )
                     return
                 except MissingEnvironmentError:
                     self._disabled_missing_environment.add(name)
+                    log_event(
+                        _logger,
+                        logging.WARNING,
+                        "mcp.provider_disabled",
+                        server=name,
+                        reason="missing_env",
+                    )
                     return
-                except Exception:
+                except Exception as exc:
+                    # 退避期间必须留痕：否则"重连一直在失败"和"压根没触发重连"
+                    # 在日志里完全一样。
+                    log_event(
+                        _logger,
+                        logging.WARNING,
+                        "mcp.reconnect_failed",
+                        server=name,
+                        attempt=attempt,
+                        delay=delay,
+                        error=type(exc).__name__,
+                    )
                     delay = min(delay * 2, self.config.reconnect_max_seconds)
         except asyncio.CancelledError:
             raise

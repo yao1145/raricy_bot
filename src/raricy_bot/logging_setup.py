@@ -37,6 +37,11 @@ LOG_FIELDS: frozenset[str] = frozenset(
         "source",
         "size_bytes",
         "limit_bytes",
+        # MCP：设计 §8.3 允许记录服务器名、工具名与 feature 名。三者都来自配置，
+        # 不是用户数据；模型自己生成的工具名**不在**此处（拒绝路径只记 reason）。
+        "server",
+        "tool",
+        "feature",
     }
 )
 
