@@ -240,6 +240,7 @@ raricy_bot/
 | 全部文档的索引 | [`docs/README.md`](docs/README.md) |
 | 怎么部署、升级、排障 | [`docs/usage/DEPLOYMENT.md`](docs/usage/DEPLOYMENT.md) |
 | 站内用户会看到什么、怎么跟他们解释 | [`docs/usage/USAGE.md`](docs/usage/USAGE.md) |
+| Exa 多 Key 池与本地知识库怎么配、怎么看日志、怎么排障 | [`docs/usage/EXA_POOL_AND_KB.md`](docs/usage/EXA_POOL_AND_KB.md) |
 | 模块之间锁定的接口与判定顺序 | [`docs/design/INTERFACES.md`](docs/design/INTERFACES.md) |
 | 某处行为为什么是这样 | [`docs/design/DESIGN_DECISIONS.md`](docs/design/DESIGN_DECISIONS.md) |
 | 上游站点 API 的原始契约 | [`docs/materials/chat-bot.md`](docs/materials/chat-bot.md) |

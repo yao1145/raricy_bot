@@ -28,6 +28,7 @@
 |------|--------|
 | `usage/USAGE.md` | 写给**跟机器人聊天的人**：怎么唤起、能问什么、为什么有时不回、隐私与额度。第一部分可直接发布到站点，第二部分才是给维护者看的 |
 | `usage/DEPLOYMENT.md` | 从零到上线的远程 Linux 部署指南。正文以 Ubuntu/Debian 为例，**附录 A** 是 Rocky Linux 9 / RHEL 系的差异 |
+| `usage/EXA_POOL_AND_KB.md` | 两项可选能力的配置与使用说明：Exa 多 Key 池、本地 Markdown 知识库。字段表、运行期行为、日志、验收与排障都在这里 |
 
 ## design/ —— 设计与规范
 
