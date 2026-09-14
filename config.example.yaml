@@ -6,8 +6,9 @@
 #   RARICY_PASSWORD   站点登录密码
 #   LLM_API_KEY       模型服务的 API Key
 #   EXA_API_KEY       Exa MCP API Key（仅启用 mcp.enabled 时需要）
+#   EXA_API_KEY_1..N  多 Key 池模式下的各槽位 Key（可选；见下面的 account_pool）
 # RARICY_USERNAME、RARICY_PASSWORD、LLM_API_KEY 缺失或为空时程序会直接以配置错误退出；
-# EXA_API_KEY 缺失时仅停用 Exa MCP，普通聊天仍可启动。
+# EXA_API_KEY（或池里的槽位变量）缺失时仅停用 Exa MCP，普通聊天仍可启动。
 
 site:
   base_url: "https://example.com"
@@ -41,8 +42,28 @@ mcp:
       # Docker 镜像在构建期固定安装 exa-mcp-server@3.4.1，运行期不执行 npx/npm。
       command: exa-mcp-server
       args: []
+      # 单 Key 形态：把宿主环境变量映射进子进程。它与下面的 account_pool 互斥，
+      # 二者只能留一个。
       env_from:
         EXA_API_KEY: EXA_API_KEY
+      # 多 Key 池形态（可选）。把上面两行 env_from 注释掉，再打开这一段即可：
+      # 每个槽位一个独立子进程，一次逻辑搜索按轮询在槽位间做有界故障转移。
+      # host_envs 里写的是**环境变量名**，不是 Key 值；真实值只在运行时从宿主环境读取，
+      # 从不写进 YAML、日志或数据库。
+      #
+      # 上线前必须确认这些 Key 都已获得 Exa 授权（见 docs/usage/DEPLOYMENT.md
+      # 的「Exa 授权合规门禁」）。池不会绕过平台额度政策。
+      #
+      # account_pool:
+      #   child_env: EXA_API_KEY
+      #   host_envs:
+      #     - EXA_API_KEY_1
+      #     - EXA_API_KEY_2
+      #     - EXA_API_KEY_3
+      #   strategy: round_robin
+      #   rate_limit_cooldown_seconds: 60
+      #   transient_cooldown_seconds: 30
+      #   quota_cooldown_seconds: 21600
       env:
         ENABLED_TOOLS: web_search_exa
         DEBUG: "false"
@@ -103,6 +124,29 @@ logging:
 system_prompt: |
   你是站内通用聊天机器人。明确自己的机器人身份，
   跟随用户语言，保持简洁友好，不代表站方作正式承诺。
+
+# 本地 Markdown 知识库默认关闭。启用后，聊天区的显式 `/kb <问题>` 会从 root_dir
+# 递归读取 .md 文件并检索；命中的片段会随当前轮问题一起发送给第三方模型。
+# 默认只允许私聊，且只允许 allowed_user_ids 中列出的站点用户 id；要在大区公开使用
+# 必须显式写 access_mode: all_chat（大厅仍需精确 @ 机器人）。
+# 上线前必须完成挂载目录的人工清点，确认其中没有密钥、隐私或无权转交模型的内容。
+knowledge_base:
+  enabled: false
+  # 容器部署时这是只读挂载点；不要把它放在镜像里或可写数据卷里。
+  root_dir: "./knowledge"
+  access_mode: allowlist
+  allowed_channel_kinds:
+    - dm
+  allowed_user_ids: []
+  refresh_seconds: 60
+  max_files: 2000
+  max_file_bytes: 1048576
+  max_total_bytes: 67108864
+  chunk_chars: 2400
+  chunk_overlap_chars: 200
+  top_k: 6
+  # 必须 <= behavior.context_input_tokens。
+  max_context_tokens: 4000
 
 # 博客评论机器人默认关闭；启用前请确认机器人资料已披露第三方模型处理。
 comments:

@@ -26,6 +26,8 @@ from ..text_utils import (
     has_image,
     has_media,
     is_help_command,
+    leading_capability_command,
+    parse_kb_command,
     parse_search_command,
     is_reset_command,
     is_secret_probe,
@@ -54,6 +56,8 @@ _ACTIONABLE_REASONS: frozenset[str] = frozenset(
         "image_only",
         "too_long",
         "secret_probe",
+        "kb_usage",
+        "capability_conflict",
     }
 )
 
@@ -104,6 +108,7 @@ class MessageRouter:
         storage: StorageConfig,
         now: Callable[[], float] = time.time,
         vision_enabled: bool = False,
+        kb_enabled: bool = False,
     ) -> None:
         self._self_user_id = self_user_id
         self._bot_username = bot_username
@@ -114,6 +119,8 @@ class MessageRouter:
         self._storage = storage
         self._now = now
         self._vision_enabled = vision_enabled
+        # 只影响 /help 说不说实话：知识库没开时不得宣传 /kb。判定本身不依赖它。
+        self._kb_enabled = kb_enabled
         self._logger = _logger
 
     # --- 事件分派 -----------------------------------------------------------
@@ -285,32 +292,54 @@ class MessageRouter:
                 )
             session_key = lobby_thread_session_key(thread_root_id)
 
-        # 9.1 解析单轮能力命令。命令本身不是聊天正文，不进入模型；只有
-        # 解析成功且正文通过后续本地检查，才会把能力标记放入 Request。
+        # 9.1 解析单轮能力命令（D-39）。命令本身不是聊天正文，不进入模型；一条消息里
+        # **最多剥离一个**前缀，剥离后若正文又以能力命令开头就本地拒绝 —— 用户只理解
+        # 一套披露时，`/search /kb ...` 会同时把查询发给 Exa、把本地资料发给模型。
         enabled_features: frozenset[str] = frozenset()
+        capability: str | None = None
         search_text = parse_search_command(user_text)
-        search_command = search_text is not None
         if search_text is not None:
-            enabled_features = frozenset({"search"})
-            user_text = search_text
+            capability, user_text = "search", search_text
+        else:
+            kb_text = parse_kb_command(user_text)
+            if kb_text is not None:
+                capability, user_text = "kb", kb_text
+        if capability is not None:
+            enabled_features = frozenset({capability})
+            if not user_text:
+                return self._emit(
+                    "reply_now",
+                    "kb_usage" if capability == "kb" else "empty",
+                    channel_id=channel_id,
+                    message_id=message.id,
+                    reply_to=message.id,
+                    text=(
+                        texts.KB_USAGE_TEXT
+                        if capability == "kb"
+                        else texts.SEARCH_USAGE_TEXT
+                    ),
+                    channel_kind=channel_kind,
+                    thread_root_id=thread_root_id,
+                    event_id=event_id,
+                )
+            if leading_capability_command(user_text) is not None:
+                return self._emit(
+                    "reply_now",
+                    "capability_conflict",
+                    channel_id=channel_id,
+                    message_id=message.id,
+                    reply_to=message.id,
+                    text=texts.CAPABILITY_CONFLICT_TEXT,
+                    channel_kind=channel_kind,
+                    thread_root_id=thread_root_id,
+                    event_id=event_id,
+                )
 
         # 9.2 空正文：能看图就交给模型，否则给本地提示。
         # 空正文不会命中下面 9.2-9.6 的任何一个分支（命令判定与探测词都要求非空内容），
         # 因此 `image_only` 置位之后直落第 10 步入队是安全的。
         image_only = False
         if not user_text:
-            if search_command:
-                return self._emit(
-                    "reply_now",
-                    "empty",
-                    channel_id=channel_id,
-                    message_id=message.id,
-                    reply_to=message.id,
-                    text=texts.SEARCH_USAGE_TEXT,
-                    channel_kind=channel_kind,
-                    thread_root_id=thread_root_id,
-                    event_id=event_id,
-                )
             if self._vision_enabled and has_image(message):
                 # 纯图消息入队。取图与降级由 app 的 worker 负责（设计 §3.5）：
                 # 路由器不做 I/O，也就无从知道这张图能不能取到。
@@ -361,12 +390,9 @@ class MessageRouter:
                 channel_id=channel_id,
                 message_id=message.id,
                 reply_to=message.id,
-                # 能不能看图是配置决定的，帮助文案必须说实话（默认关闭）。
-                text=(
-                    texts.HELP_TEXT_WITH_VISION
-                    if self._vision_enabled
-                    else texts.HELP_TEXT
-                ),
+                # 能不能看图、有没有知识库都是配置决定的；帮助文案必须说实话
+                # （两者的默认值都是关闭）。
+                text=self._help_text(),
                 channel_kind=channel_kind,
                 thread_root_id=thread_root_id,
                 event_id=event_id,
@@ -461,6 +487,30 @@ class MessageRouter:
             event_id=event_id,
         )
 
+    @staticmethod
+    def _inner_text(user_text: str) -> str:
+        """剥掉开头最多一个能力命令，供第 8 步判定内层是不是 `/reset`。
+
+        这里的剥离只为「要不要新建链」服务：第 9.1 步才真正决定这条消息的能力归属，
+        而且一条消息里最多剥离一个前缀（D-39）。`/search /kb /reset` 会在 9.1 被
+        判成能力冲突，这里也自然看不到 `/reset`。
+        """
+        for parser in (parse_search_command, parse_kb_command):
+            inner = parser(user_text)
+            if inner is not None:
+                return inner
+        return user_text
+
+    def _help_text(self) -> str:
+        """按 vision / kb 两个开关四选一，文案不夸大当前真正具备的能力。"""
+        if self._vision_enabled and self._kb_enabled:
+            return texts.HELP_TEXT_WITH_VISION_AND_KB
+        if self._kb_enabled:
+            return texts.HELP_TEXT_WITH_KB
+        if self._vision_enabled:
+            return texts.HELP_TEXT_WITH_VISION
+        return texts.HELP_TEXT
+
     # --- 大区共享链 ---------------------------------------------------------
 
     async def _resolve_thread(
@@ -477,15 +527,13 @@ class MessageRouter:
             else None
         )
         try:
-            # `/search /reset` 仍是本地 reset；虽然 feature 命令按整体路由顺序
+            # `/search /reset`、`/kb /reset` 仍是本地 reset；虽然能力命令按整体路由顺序
             # 在登记回复链之后才正式剥离，这里必须用其内层正文决定是否新建链。
-            search_text = parse_search_command(user_text)
-            reset_text = search_text if search_text is not None else user_text
             return await self._store.resolve_lobby_thread(
                 message.id,
                 reply_id,
                 # /reset 无论回复谁，都以自己为根建一条新链（D-21）。
-                force_new=is_reset_command(reset_text),
+                force_new=is_reset_command(self._inner_text(user_text)),
                 now=self._now(),
                 retention_seconds=self._storage.lobby_thread_retention_seconds,
             )

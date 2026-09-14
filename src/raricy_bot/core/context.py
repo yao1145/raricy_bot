@@ -105,6 +105,7 @@ class ContextManager:
         *,
         pending_user: str | None = None,
         system_addendum: str | None = None,
+        feature_context: bool = False,
     ) -> list[dict[str, str]]:
         """拼装模型消息：第一条 system，其后是裁剪后的历史，最后是本轮未提交的用户内容。
 
@@ -112,6 +113,12 @@ class ContextManager:
         用 `append_exchange()` 提交。`system_addendum` 只拼进 system 消息，
         且必须是静态文本（D-24）。历史按 `max_input_tokens` 从最旧整对丢弃，
         至少保留最后一组；`pending_user` 永远保留（即使超限）。
+
+        `feature_context=True` 表示本轮带着能力数据块（当前只有 `/kb`）：此时
+        `max_input_tokens` 被当作**硬上限**，历史可以整对丢到一条不剩（D-38）。
+        理由见 D-38：数据块已经被 `kb.max_context_tokens` 限死，丢了它就等于该轮
+        无资料可答；而历史是可丢弃的 —— 宁可让模型少一点旧上下文，也不要出现
+        「超预算又丢不掉」的中间态。普通聊天路径这一个参数保持 False，语义不变。
         """
         system = system_prompt
         system_tokens = estimate_tokens(system_prompt)
@@ -125,13 +132,21 @@ class ContextManager:
         base_tokens = system_tokens
         if pending_user is not None:
             base_tokens += estimate_tokens(pending_user)
-        # len(history) > 2 保证「最后一组」一定留下：整对丢弃到只剩最旧一轮为止。
-        while (
-            len(history) > 2
-            and base_tokens + sum(estimate_tokens(turn.content) for turn in history)
-            > self._max_input_tokens
-        ):
-            del history[:2]
+
+        def over_budget() -> bool:
+            return (
+                base_tokens + sum(estimate_tokens(turn.content) for turn in history)
+                > self._max_input_tokens
+            )
+
+        if feature_context:
+            # 硬上限：历史整对丢到一条不剩也要让本轮内容装进去（D-38）。
+            while history and over_budget():
+                del history[:2]
+        else:
+            # len(history) > 2 保证「最后一组」一定留下：整对丢弃到只剩最旧一轮为止。
+            while len(history) > 2 and over_budget():
+                del history[:2]
 
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend({"role": turn.role, "content": turn.content} for turn in history)

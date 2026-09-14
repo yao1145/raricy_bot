@@ -146,21 +146,51 @@ def is_reset_command(text: str) -> bool:
     return text.strip().lower() == "/reset"
 
 
-def parse_search_command(text: str) -> str | None:
-    """解析开头的独立 /search，返回去掉命令后的正文。
+# 单轮能力命令：命令字面量 -> 写入 Request.enabled_features 的通用能力名。
+# 顺序即 Router 的判定顺序；两个命令互斥，一条消息里最多剥离一个（D-39）。
+_CAPABILITY_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("/search", "search"),
+    ("/kb", "kb"),
+)
 
-    命令只在消息开头生效，命令名与 ``/search`` 之间必须是空白或正文结束，
-    因此 ``/searching`` 不会误触发。命令本身大小写不敏感，正文原样保留，
-    由调用方继续执行既有的本地命令、长度和秘密探测优先级。
+
+def _parse_capability_command(text: str, command: str) -> str | None:
+    """解析开头的独立能力命令，返回去掉命令后的正文；不命中返回 None。
+
+    命令只在消息开头生效，命令名与正文之间必须是空白或正文结束，
+    因此 ``/searching``、``/kbase``、``/kb-x`` 都不会误触发。命令本身大小写不敏感。
     """
     stripped = text.strip()
-    if len(stripped) < len("/search") or stripped[:7].lower() != "/search":
+    length = len(command)
+    if len(stripped) < length or stripped[:length].lower() != command:
         return None
-    if len(stripped) == 7:
+    if len(stripped) == length:
         return ""
-    if not stripped[7].isspace():
+    if not stripped[length].isspace():
         return None
-    return stripped[7:].strip()
+    return stripped[length:].strip()
+
+
+def parse_search_command(text: str) -> str | None:
+    """解析开头的独立 /search，返回去掉命令后的正文。"""
+    return _parse_capability_command(text, "/search")
+
+
+def parse_kb_command(text: str) -> str | None:
+    """解析开头的独立 /kb，返回去掉命令后的正文。"""
+    return _parse_capability_command(text, "/kb")
+
+
+def leading_capability_command(text: str) -> str | None:
+    """正文开头若是独立的能力命令，返回其能力名（"search" / "kb"），否则 None。
+
+    只服务于「一条消息最多一个能力」的冲突判定：剥离一个前缀之后剩余正文若仍以
+    能力命令开头，就说明用户想在一轮里叠加两种能力，Router 直接本地拒绝。
+    """
+    for command, feature in _CAPABILITY_COMMANDS:
+        if _parse_capability_command(text, command) is not None:
+            return feature
+    return None
 
 
 def has_media(message: Any) -> bool:

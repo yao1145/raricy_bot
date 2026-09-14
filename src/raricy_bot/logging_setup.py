@@ -42,6 +42,12 @@ LOG_FIELDS: frozenset[str] = frozenset(
         "server",
         "tool",
         "feature",
+        # Exa 池与知识库：都是进程内序号或计数，既不含 Key / 环境变量名，
+        # 也不含查询、路径、标题或正文（INTERFACES §22 / §23）。
+        "slot",
+        "snapshot_version",
+        "chunk_count",
+        "available_count",
     }
 )
 
