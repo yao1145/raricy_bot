@@ -1,54 +1,192 @@
 # Raricy 站内聊天机器人
 
-一个独立运行的站内通用助手：以普通 core+ 账号登录 Raricy，订阅 `/api/chat/stream`，
-精确响应大区里 `@机器人用户名` 的消息与全部私聊文本，调用 OpenAI 兼容的模型服务生成回复。
-大区采用**公开多人共享上下文**：一条回复链上的所有合格消息共享最近若干轮对话，
-回复链内消息即可加入；私聊行为不变。
+以普通 core+ 账号登录 Raricy，用**和真人完全一样的公开接口**收发消息：在大区里只回应精确
+`@机器人用户名` 的消息，在私聊里有问必答，回复始终引用触发它的那条消息。它不修改站点，
+也不需要站点的任何特殊接口。**它不是真人，也不代表站方立场。**
 
-博客评论区不获得工具或联网能力；聊天区的联网搜索是**默认关闭**的可选能力，只有发送
-`/search <问题>` 时才会把当前轮交给模型判断是否调用第三方 Exa MCP。博客评论能力见下节，
-它只读取文章标题与不超过 1000 字的正文。图片理解是**可选项**：`model.vision_enabled`
-默认关闭，开启后把当前轮附带的那张图取回内存交给模型，图片不落库、不进历史。
-本地 Markdown 知识库同样是**默认关闭**的可选能力：开启后 `/kb <问题>` 从只读目录递归检索
-`.md`，命中片段只随当前这一轮发给第三方模型，不联网、不落库、不入历史。
-机器人资料须由人工在站点上标注「机器人」及「消息可能发送至第三方模型处理」。
+- 大区是**公开多人对话**：一条回复链上的所有人共享最近十来轮上下文，回复链内的消息就能加入。
+- 聊天默认**不联网、也不读本地资料**：要联网就发 `/search <问题>`，要查本地资料就发
+  `/kb <问题>` —— 每条命令只授权它自己那一轮，下一条普通消息不会被这层授权牵连。
+- 上下文只存在内存里，进程重启即清空；去重、额度与回复链归属会保留。
 
-聊天侧有四个命令：`/help` 返回能力与隐私说明；`/reset` 开一段新对话；`/search <问题>`
-只授权当前聊天轮由模型自行决定是否调用 Exa 搜索；`/kb <问题>` 只授权当前聊天轮检索本地
-知识库。两者空参数时都本地返回用法，不调用模型；同一条消息里最多一种能力，叠加会被本地拒绝。
-（私聊清空当前会话上下文，大区以该消息为新链起点、旧链不受影响）；`/help`、`/reset` 不重置配额，
-`/search`、`/kb` 的最终模型回复仍按普通回复计入聊天额度。
-评论区只识别 `/help` 与 `/reset`；评论区不会解析 `/search` 与 `/kb`，也不会调用 MCP 或读取知识库。
+## 在聊天里怎么用它
 
-Exa 侧还支持一个**可选的多 Key 池**（`mcp.servers.exa.account_pool`）：多个已获授权的
-API Key 各占一个 stdio 子进程，一次逻辑搜索在它们之间做有界轮询与故障转移，对模型仍然只是
-一个 `exa__web_search_exa`。它提高的是可用性，不是容量绕过：上线前必须确认这些 Key 的授权
-（见 [`docs/usage/DEPLOYMENT.md`](docs/usage/DEPLOYMENT.md) §1）。
+| 场合 | 怎么触发 |
+|---|---|
+| 大区 | 精确 `@机器人用户名`。区分大小写，`@机器人名x` 不算叫它 |
+| 私聊 | 直接发消息，不用 @ |
+| 博客评论（可选） | 首次精确 @，之后直接回复它的评论就能接着聊 |
 
-## 博客评论机器人（默认关闭）
+| 命令 | 作用 |
+|---|---|
+| `/help` | 能力、隐私与限制说明（本地回复，不调用模型） |
+| `/reset` | 开一段新对话，旧的还在 |
+| `/search <问题>` | 授权当前这一轮由模型判断是否调用 Exa 联网搜索；最多一次、最多五条摘要 |
+| `/kb <问题>` | 授权当前这一轮从本地 Markdown 资料里检索（需开启） |
 
-评论能力必须在 `config.yaml` 中显式开启：
+`/search` 与 `/kb` 不能写在同一条消息里，叠加会被本地拒绝。两者都只在私聊和大厅生效，
+博客评论区不解析它们，也不调用搜索或读取知识库。
 
-```yaml
-comments:
-  enabled: true
+**关于你的消息**：发给它的内容会被转交给第三方模型服务；`/search` 的查询可能转交给 Exa，
+`/kb` 命中的本地资料片段**不会**发给 Exa。写给站内用户的完整说明（可直接发布到站点）
+见 [`docs/usage/USAGE.md`](docs/usage/USAGE.md)。
+
+## 快速开始
+
+需要 Python 3.12+。
+
+```bash
+cp config.example.yaml config.yaml
+# 至少改三处：site.base_url、model.base_url、model.model
+
+export RARICY_USERNAME=机器人账号
+export RARICY_PASSWORD=机器人密码
+export LLM_API_KEY=模型服务Key
+
+PYTHONPATH=src python -m raricy_bot --config config.yaml
 ```
 
-开启后服务每 30 秒检查全站最近 100 条评论、每 15 秒检查最多 5 页未读“评论回复”通知。
-首次启动只建立冷启动基线，不会补回复旧评论或旧通知；若冷启动通知超过 5 页，服务会持久
-保存 cutoff 并继续清理旧页，不会过早完成基线。最近列表在两个轮询周期之间溢出 100 条时，
-窗口外评论可能永久漏失。只有精确首次 `@机器人用户名` 或直接回复机器人评论
-才会触发，评论回复会真实通知被回复的用户。评论正文和短文章正文可能发送给第三方模型，
-文章正文超过 1000 字时不会发送。评论额度与聊天完全独立（默认每分钟 20 次、
-每日 1950 条回复、硬上限 2000 条，单篇文章冷却 5 秒）；额度耗尽时该条评论静默跳过，
-不会公开发布提示。文章评论使用独立队列、配额和状态记录，不占用聊天队列；
-关闭 `comments.enabled` 后聊天行为不变。
+或者安装后运行（不传 `--config` 时依次读 `BOT_CONFIG_PATH`、`./config.yaml`）：
 
-启用前必须人工确认机器人资料已披露上述第三方处理、公开评论通知、短期记忆与重启失忆，
-并在测试文章上验证首次 @、直接回复、旁支静默、`/help` 和 `/reset`。详见
-[`docs/archive/COMMENT_BOT_DESIGN.md`](docs/archive/COMMENT_BOT_DESIGN.md) 与 [`docs/materials/comment-bot.md`](docs/materials/comment-bot.md)。
+```bash
+pip install -e ".[dev]"
+python -m raricy_bot
+```
 
-## 目录结构
+跑测试：
+
+```bash
+python -m pytest tests -q
+```
+
+测试不发起任何真实网络请求：站点层用 `httpx.MockTransport` 伪造，模型层注入假客户端。
+
+## 配置与密钥
+
+配置是只读 YAML，`config.example.yaml` 是一份可直接复制的样例（字段旁都有中文注释）。
+顶层小节为 `site` / `model` / `behavior` / `mcp` / `knowledge_base` / `ops` / `storage` /
+`logging` / `comments`，外加必填的 `system_prompt`。完整字段、默认值与校验规则见
+[`docs/design/INTERFACES.md`](docs/design/INTERFACES.md) 第 1 节。
+
+**密钥永远只从环境变量读取**，不写进 YAML、镜像或日志：
+
+| 变量 | 必填 | 说明 |
+| --- | --- | --- |
+| `RARICY_USERNAME` | 是 | 站点登录用户名 |
+| `RARICY_PASSWORD` | 是 | 站点登录密码 |
+| `LLM_API_KEY` | 是 | 模型服务 API Key |
+| `EXA_API_KEY` | 否 | Exa MCP API Key；只在启用联网搜索时使用 |
+| `EXA_API_KEY_1..N` | 否 | 多 Key 池的各槽位 Key，名字由 `account_pool.host_envs` 指定 |
+| `BOT_CONFIG_PATH` | 否 | 配置文件路径，缺省 `./config.yaml` |
+
+配置有错时进程在启动阶段以退出码 2 结束，并在 stderr 打印一行原因（不打印取值）。
+密钥缺失或为空同样如此；只有 Exa 相关的变量缺失属于软故障，仅停用联网搜索。
+
+## 可选能力（默认全部关闭）
+
+四项都默认关闭，默认只跑普通聊天与私聊。不打开就不会有额外的子进程、目录扫描或站点请求。
+
+### 联网搜索 `/search`
+
+在 `config.yaml` 里设 `mcp.enabled: true`，并准备 `EXA_API_KEY`。搜索由构建期固定的
+`exa-mcp-server@3.4.1` 提供，每轮最多一次、最多五条摘要，只读摘要不抓网页全文。
+
+多个**已获授权的** Key 可以配成池（`mcp.servers.exa.account_pool`）：每个 Key 一个子进程，
+一次搜索在其中做有界轮询与故障转移，对模型仍然只是一个工具。它提高的是可用性，**不是
+容量绕过**——上线前必须确认这些 Key 的授权，见「上线前人工检查」。
+
+### 本地知识库 `/kb`
+
+在 `config.yaml` 里开启 `knowledge_base.enabled`，并把 Markdown 目录只读挂载进容器。
+一级子目录就是分类，递归读取 `.md`；命中片段只随当前这一轮发给模型，不联网、不落库、
+不进历史。没有命中时直接回一句本地提示，不会拿常识冒充资料。
+
+默认只对**私聊 + 白名单用户**开放；要在大厅公开必须显式配置（大厅仍需精确 @）。检索是
+标准库实现的词法匹配，不是语义检索；目录改动最长要等 `refresh_seconds` 才能被检索到。
+
+### 图片理解
+
+`model.vision_enabled: true` 且模型自身支持视觉时，用户当前这一轮发的图会随这一轮交给模型。
+图片不落库、不进历史；关闭时只处理文本，并明确告诉用户图没读到。
+
+### 博客评论
+
+`comments.enabled: true` 后，机器人每 30 秒轮询一次全站最近评论，每 15 秒检查一次未读通知。
+只需精确首次 `@机器人用户名` 或直接回复它的评论即可触发；评论与聊天使用独立队列和配额，
+每条成功的评论回复都会真实通知被回复的人。评论轮询故障不影响聊天与健康端点。
+
+## Docker
+
+```bash
+export RARICY_USERNAME=你的账号
+export RARICY_PASSWORD=你的密码
+export LLM_API_KEY=你的模型Key
+# 启用联网搜索时再设置；不要提交，也不要写进 docker-compose.yml
+export EXA_API_KEY=你的ExaKey
+
+docker compose up -d
+docker compose logs -f bot
+```
+
+几个要点：
+
+- **固定单副本运行。** 去重、水位与配额都是「每个实例各自的内存 + 各自 SQLite」，
+  跑两个副本会让同一条消息被回复两遍。
+- `config.yaml` 与知识库目录都以**只读**方式挂载（`/app/config.yaml`、`/app/knowledge`）；
+  SQLite 只写 `/app/data` 命名卷。密钥由宿主环境变量注入，Compose 文件里只有 `${VAR}` 引用。
+- 上游 Node 与 `exa-mcp-server` 在构建期固定安装，运行期不访问 npm。
+- 容器根文件系统只读，运维端口只在容器内 `expose 8080`，不发布到宿主。
+
+首次部署、升级、SELinux、备份与排障的完整步骤见
+[`docs/usage/DEPLOYMENT.md`](docs/usage/DEPLOYMENT.md)。
+
+## 运维
+
+| 路径 | 含义 | 通过 | 不通过 |
+| --- | --- | --- | --- |
+| `/livez` | 进程存活：事件循环在跑，关键后台任务没死 | `200 ok` | `503 down` |
+| `/readyz` | 现在能接单：已登录、SSE 已连上、队列没满、未被禁言 | `200 ready` | `503 not ready` |
+
+`/readyz` 会比 `/livez` 更早、更频繁地变成 `503`（站点临时不可达、SSE 断开、队列打满）。
+所以**健康检查与自动重启只看 `/livez`**。
+
+日志只写结构化白名单字段：消息 id、频道、结果、原因、计数这类状态量。正文、查询、
+Cookie、密码与 API Key 在任何级别都不会落进日志或数据库。
+
+## 上线前人工检查
+
+- [ ] 在站点把机器人账号的资料改为明确标注：这是机器人、**消息可能发送至第三方模型处理**，
+      并说明大区是公开多人上下文；启用博客评论前还要写明评论与短文章正文可能发送给第三方模型。
+      程序无法代劳这件事。
+- [ ] 确认机器人账号已提升为 core+，且登录用户名与 `@机器人用户名` 完全一致。
+- [ ] 确认密钥只存在于运行环境，没有写进任何会被提交或打包的文件。
+- [ ] **启用 Exa 多 Key 池前**：确认每个 Key 都已获授权（Exa 书面许可，或同一组织依法管理的
+      独立预算，或官方 Team / 付费 / 资助额度），并把批准日期、账号范围与渠道记在案。
+      池不绕过任何平台额度政策。
+- [ ] **启用知识库前**：逐文件清点挂载目录，确认不含密钥、隐私、内部提示词、部署配置、
+      日志、数据库或无权转交第三方模型的材料。目录名与文件名本身也会展示给提问者，
+      所以命名同样要审；资料负责人要签字确认可见范围。
+
+部署后的验证步骤（大区与私聊各自触发、回显不成环、模拟 401/403/429 与队列满载、
+重启后去重保留而上下文清空、容器日志与数据库检查）见
+[`docs/usage/DEPLOYMENT.md`](docs/usage/DEPLOYMENT.md) 第 8 节；上线前的六条前置确认见同一份文档
+第 1 节。
+
+## 已知限制
+
+- **没有长期记忆**：上下文只在内存里，重启即清空；大区的回复链归属保留 7 天。
+- **不主动联网、不能运行代码、查不到站内数据**：别人的余额、鱼干流水、通知、申诉进度，
+  都要用户自己去对应页面看。
+- **图片与博客正文的边界**：图片默认关闭；博客与故事正文从来读不到，博客评论区只读文章标题
+  和不超过 1000 字的正文。
+- **知识库是词法检索**：没有嵌入模型与向量库，措辞差太远就可能检索不到；没有命中就不回答，
+  也不会因此联网。
+- **评论发现有一个上游限制的漏失窗口**：靠每 30 秒拉一次「全站最近 100 条」，两次轮询之间
+  新增超过 100 条时，窗口外的评论无法恢复；启用功能之前的旧评论也不会补回复。
+- **严格来说不是 exactly-once**：上游发送没有幂等键，极端网络故障下只做可恢复的尽力去重，
+  宁可丢一句，也不盲目重复发送。
+
+## 项目结构
 
 ```
 raricy_bot/
@@ -62,7 +200,7 @@ raricy_bot/
 │   ├── quota.py             # 聊天：每分钟窗口 + 24 小时额度 + 通知冷却
 │   ├── site/                # 站点 HTTP 客户端、SSE 接收器、聊天与评论 DTO
 │   ├── core/                # 聊天：上下文、路由器、工作器池、发送器
-│   ├── mcp/                 # 通用 MCP Provider、工具注册、Exa 搜索适配与多 Key 池
+│   ├── mcp/                 # 通用 MCP Provider、工具注册、Exa 适配与多 Key 池
 │   ├── kb/                  # 本地 Markdown 知识库：扫描、分块、词法索引与检索
 │   ├── comments/            # 评论：发现轮询、匹配、配额、发送器、后台服务
 │   ├── ops.py               # /livez 与 /readyz
@@ -74,169 +212,10 @@ raricy_bot/
 └── docker-compose.yml
 ```
 
-## 本地运行
-
-先准备配置与密钥：
-
-```bash
-cp config.example.yaml config.yaml
-# 按需修改 config.yaml 中的 site.base_url、model.base_url、model.model 等
-export RARICY_USERNAME=你的账号
-export RARICY_PASSWORD=你的密码
-export LLM_API_KEY=你的模型Key
-# 仅当 config.yaml 中 mcp.enabled=true 时需要；不要把 key 写进 YAML
-export EXA_API_KEY=你的ExaKey
-```
-
-PowerShell 等价写法是 `$env:EXA_API_KEY = "你的 Exa Key"`；密钥只从环境变量读取，不能写进 YAML。
-
-方式一，直接从源码运行（无需安装）：
-
-```bash
-PYTHONPATH=src python -m raricy_bot --config config.example.yaml
-```
-
-方式二，可编辑安装后运行：
-
-```bash
-pip install -e ".[dev]"
-python -m raricy_bot --config config.yaml
-```
-
-不传 `--config` 时，程序先读环境变量 `BOT_CONFIG_PATH`，再退回到 `./config.yaml`。
-
-## 运行测试
-
-```bash
-pip install -e ".[dev]"
-python -m pytest tests -q
-```
-
-测试不发起任何真实网络请求：站点层用 `httpx.MockTransport` 伪造，模型层注入假客户端。
-
-## 配置项说明
-
-配置为只读 YAML，顶层小节有 `site` / `model` / `behavior` / `mcp` / `knowledge_base` / `ops` /
-`storage` / `logging` / `comments` 与必填的 `system_prompt`。完整字段、默认值与校验规则见
-`docs/design/INTERFACES.md` 第 1 节；
-`config.example.yaml` 是一份可直接复制的样例。几处约束在加载阶段强制，配错直接以退出码 2 失败：
-
-- `storage.wal_journal_limit_bytes`（默认 16 MiB）必须小于 `sqlite_soft_limit_bytes`；
-  `cleanup_interval_seconds` 不得大于 `lobby_thread_retention_seconds`。
-- `comments.concurrency` 首版必须为 1；`daily_reply_limit < daily_absolute_limit <= 2000`；
-  `max_output_chars <= 5000`；`max_response_bytes <= 8 MiB`；`max_tree_nodes <= 10000`；
-  `conversation_retention_seconds <= dedupe_retention_seconds`；`retry_base_seconds <= retry_max_seconds`。
-- `comments.max_response_bytes` 由 SiteClient 的响应流执行，`comments.max_tree_nodes`
-  由评论树的显式栈解析执行。
-
-## 环境变量
-
-| 变量 | 必填 | 说明 |
-| --- | --- | --- |
-| `RARICY_USERNAME` | 是 | 站点登录用户名 |
-| `RARICY_PASSWORD` | 是 | 站点登录密码 |
-| `LLM_API_KEY` | 是 | 模型服务 API Key |
-| `EXA_API_KEY` | 否 | Exa MCP API Key；只在启用 `mcp.enabled` 时使用，缺失时联网功能停用 |
-| `EXA_API_KEY_1..N` | 否 | 多 Key 池的各槽位 Key；变量名由 `account_pool.host_envs` 指定，逐个显式透传 |
-| `BOT_CONFIG_PATH` | 否 | 配置文件路径，缺省为 `./config.yaml` |
-
-密钥只从环境变量读取，不写入 YAML、镜像或日志。站点与模型密钥缺失或为空时程序以退出码 2
-结束，并只在 stderr 打印缺失的变量名；`EXA_API_KEY` 缺失时仅停用联网搜索，不影响普通聊天。
-
-## Docker 部署
-
-```bash
-export RARICY_USERNAME=你的账号
-export RARICY_PASSWORD=你的密码
-export LLM_API_KEY=你的模型Key
-# 启用 mcp.enabled=true 时再设置；不要提交或写进 docker-compose.yml
-export EXA_API_KEY=你的ExaKey
-docker compose up -d
-docker compose logs -f bot
-```
-
-要点：
-
-- 固定单副本运行，`restart: unless-stopped`。
-- `config.yaml` 以只读方式挂载到 `/app/config.yaml`，容器内 `BOT_CONFIG_PATH` 指向它；
-  `storage.db_path` 保持默认的 `./data/bot.db` 即可。
-- 数据目录不变量：容器 `WORKDIR` 为 `/app`，默认 `./data/bot.db` 解析为
-  `/app/data/bot.db`，因此 `docker-compose.yml` 把命名卷 `bot-data` 挂到 `/app/data`。
-  这样默认配置开箱即持久化，容器重建后去重与配额状态保留，但内存中的对话上下文会清空。
-  若改动 `storage.db_path` 或卷挂载点，必须同步修改另一处。
-- 密钥通过宿主环境变量注入，`docker-compose.yml` 里只有 `${VAR}` 引用，不含任何取值；
-  `EXA_API_KEY`（池模式下是 `EXA_API_KEY_1..N`）只转发给 Exa MCP 子进程，不传给站点或模型服务。
-  池模式必须**逐个**显式透传变量，不要把它们拼成一个逗号分隔的参数——那会被 `ps` 与日志打印。
-- 知识库用 `./knowledge:/app/knowledge:ro` 只读挂载，容器用户（uid 10001）只需可读权限；
-  不要把资料复制进镜像。Rocky/RHEL 上的 `:Z` 见部署指南附录 A。
-- Docker 构建期固定安装 Node 22 与 `exa-mcp-server@3.4.1`；运行期不执行 `npx`、`npm install`
-  或访问 npm registry。联网搜索默认关闭，缺少 `EXA_API_KEY` 只停用搜索。
-- Compose 将镜像根文件系统设为只读；SQLite 只写入 `/app/data` 命名卷。
-- 运维端口在容器内 `expose 8080`，**不**发布到宿主；由 Compose 健康检查在容器内访问。
-- 健康检查用 `/livez`，`start_period` 为 30 秒，避免启动期与站点临时故障造成重启。
-- 运维端口不变量：Dockerfile 与 `docker-compose.yml` 的 `healthcheck` 都硬编码访问容器内
-  的 `8080`，与 `ops.port` 默认值一致。若把 `ops.port` 改成其他值，必须同步修改这两处
-  健康检查，否则容器会一直不健康而程序其实完全正常。
-
-## 运维端点
-
-| 路径 | 含义 | 通过 | 不通过 |
-| --- | --- | --- | --- |
-| `/livez` | 进程存活：事件循环在跑，SSE 与工作器池等关键任务未死 | `200 ok` | `503 down` |
-| `/readyz` | 可以接单：已登录、SSE 已连接、队列未满、未处于 403 不可用状态 | `200 ready` | `503 not ready` |
-
-`/readyz` 表示「现在能处理消息」，会比 `/livez` 更早、更频繁地变成 `503`
-（例如站点暂时不可达、SSE 断开、队列被打满）。因此健康检查与自动重启只看 `/livez`。
-
-启用 `comments.enabled` 后，`/livez` 还要求评论子系统的后台任务存活；`/readyz` 只反映
-聊天通路，评论轮询的网络故障只记日志并等下一轮，不会让进程或 `/readyz` 掉线。
-
-## 上线前人工检查清单
-
-- [ ] 在站点把机器人账号的资料改为明确标注：这是机器人、**消息可能发送至第三方模型处理**，
-      并说明**大区是公开多人上下文**（同一回复链内的历史会再次发送给模型）。
-- [ ] 确认机器人账号已提升为 core+，否则聊天读取与发送会被拒绝。
-- [ ] 确认登录用户名与 `@机器人用户名` 完全一致（大区提及区分大小写且要求用户名边界）。
-- [ ] 确认 `config.yaml` 中的 `site.base_url`、`model.base_url`、`model.model` 均为目标环境实际取值。
-- [ ] 确认密钥只存在于运行环境，未写入任何被提交或被打包的文件。
-- [ ] 确认 `storage.db_path` 位于持久化卷内（容器里默认即 `/app/data/bot.db`）。
-- [ ] 验证大区普通消息不触发、精确 `@机器人` 触发、私聊触发，回复都引用了原消息。
-- [ ] 验证机器人自己的消息回显不会形成回复循环。
-- [ ] 模拟模型超时、站点 401/403/429 与队列满载，确认提示与冷却符合预期。
-- [ ] 验证 `/livez`、`/readyz`、重启自动拉起与优雅关闭。
-- [ ] 重启容器，确认对话上下文清空而去重、链归属与配额状态保留。
-- [ ] 若启用评论能力：在测试文章上验证首次精确 @、直接回复、旁支静默、`/help` 与 `/reset`，
-      并确认机器人资料已披露第三方模型处理与公开评论通知；不启用时确认评论轮询未启动。
-- [ ] 若启用 Exa 多 Key 池：确认每个 Key 都已获授权（Exa 书面许可，或同一组织依法管理的独立预算，
-      或官方 Team / 付费 / 资助额度），并把批准日期、账号范围与渠道记在案。池不绕过平台额度政策。
-- [ ] 若启用本地知识库：逐文件清点挂载目录，确认不含密钥、隐私、内部提示与无权转交模型的材料；
-      确认目录只读挂载、容器用户可读；确认 `access_mode` 与白名单符合预期的可见范围。
-- [ ] 确认容器日志已按 `docker-compose.yml` 的 `logging` 限额轮转（约 30 MiB）。
-- [ ] 确认数据库大小与清理摘要正常（`app.cleanup_done`），必要时停机 `VACUUM`。
-
-## 已知限制
-
-- 图片理解默认关闭（`model.vision_enabled`）。关闭时只处理文本，图片回一条「读不到」的
-  提示；开启后图片随当前轮交给模型，只此一轮，且要求模型自身支持视觉。
-- 不具备博客理解能力：只处理文本，纯博客回一条本地提示。
-- 普通聊天不联网、不调用工具，也不会自动读取知识库；聊天区如需要，必须显式发送
-  `/search <问题>` 或 `/kb <问题>`，且一次只有一种能力。搜索由构建期固定的 Exa MCP 提供，
-  每轮最多一次、最多五条摘要；博客评论区始终不联网、不读知识库。
-- 知识库是本地词法检索（标准库实现，无嵌入与向量库），只在当前已构建的快照上匹配：
-  没有命中就直接回本地提示，不会拿常识冒充资料，也不会因此联网。目录改动最长要等一个
-  `knowledge_base.refresh_seconds` 才能检索到；索引失败时保留上一份可用快照。
-- 没有长期记忆：上下文只存在内存中，进程重启即清空（大区的链归属会保留 7 天，
-  但重启后模型看不到重启前的正文）。
-- 评论能力默认关闭；开启后同样只处理评论文本，不支持图片、附件或被引用博客。
-  评论 POST 没有幂等键：结果不确定时按（机器人作者，父评论）对账并最多重发一次，
-  宁可丢一句，也不盲目重复发送。
-- 评论发现依赖「最近 100 条评论」的滚动窗口，两个轮询周期之间溢出会永久漏失；
-  冷启动基线建立前收到的旧评论不会补回复，未读通知最多翻 5 页（更旧的页由持久 cutoff
-  在后续轮次继续清理，但不会触发回复）。
-
 ## 容量与清理
 
-运行期每 `storage.cleanup_interval_seconds`（默认 1 小时）清理一次，启动时也清理一次：
+运行期每 `storage.cleanup_interval_seconds`（默认 1 小时）清理一次，启动时也清理一次。
+聊天与评论共用同一个 SQLite 库；**正文一律不落库**，表里只有 id、状态、归属与计数。
 
 | 数据 | 保留 |
 | --- | --- |
@@ -247,20 +226,25 @@ docker compose logs -f bot
 | 到期冷却 | 立即删除 |
 | 已知私聊频道 | 只保留最近活动的 `max_dm_channels`（默认 10000）条 |
 | 评论会话映射 | 30 天（`comments.conversation_retention_seconds`），到期同时作废其内存上下文 |
-| 评论已发回复、通知与去重行 | 90 天（`comments.dedupe_retention_seconds`）；评论非终态事件不按时间删除 |
+| 评论已发回复、通知与去重行 | 90 天（`comments.dedupe_retention_seconds`）；非终态事件不按时间删除 |
 | 评论发送尝试 | 48 小时（与聊天共用 `storage.send_attempt_retention_seconds`） |
 
-- SQLite 主库只设**软上限**（`sqlite_soft_limit_bytes`，默认 128 MiB，聊天与评论共用同一个库），
-  超过时记一条 error 日志，不做硬截断 —— 硬截断会让去重、水位或配额写入突然失败，
-  后果比库变大严重得多。
-- 评论正文与文章正文都不落库：评论相关表只存 id、会话归属、状态与计数。评论发现水位与
-  冷启动 cutoff 持久保存，重启后不会回补开启前的旧评论或旧通知。
-- 运行期**不自动 `VACUUM`**（它会长时间独占数据库锁）。需要收缩物理文件时，
-  停机备份后手工执行。
-- 容器日志由 Docker 的 `json-file` 驱动限制在约 30 MiB；裸机运行时程序只写 `stderr`，
-  文件轮转交给 systemd / 进程管理器 / shell 重定向，应用不与宿主争夺轮转职责。
-- 配置文件有 **1 MiB 硬上限**（代码常量，不可通过 YAML 调整），超过则在启动阶段直接失败。
-- 上游 POST 没有幂等键，极端网络故障下无法保证严格 exactly-once，只做可恢复的尽力去重。
-- 当前接口无法列出机器人尚未知晓的私聊频道，因此积压超过 100 条期间首次出现的新私聊
-  可能无法通过 resync 恢复。
-- 运维端点不发布到宿主，仅容器内可见；如需外部监控，请由编排层或其他方式转发。
+主库只设**软上限**（默认 128 MiB）：超过时日志里出现 `app.cleanup_oversize`，**不会**硬截断
+——硬截断会让去重、水位或配额写入突然失败，后果比库变大严重得多。需要收缩物理文件时停机
+手工 `VACUUM`，步骤见 [`docs/usage/DEPLOYMENT.md`](docs/usage/DEPLOYMENT.md) §10.3。
+
+## 文档怎么读
+
+| 想了解 | 读 |
+|---|---|
+| 全部文档的索引 | [`docs/README.md`](docs/README.md) |
+| 怎么部署、升级、排障 | [`docs/usage/DEPLOYMENT.md`](docs/usage/DEPLOYMENT.md) |
+| 站内用户会看到什么、怎么跟他们解释 | [`docs/usage/USAGE.md`](docs/usage/USAGE.md) |
+| 模块之间锁定的接口与判定顺序 | [`docs/design/INTERFACES.md`](docs/design/INTERFACES.md) |
+| 某处行为为什么是这样 | [`docs/design/DESIGN_DECISIONS.md`](docs/design/DESIGN_DECISIONS.md) |
+| 上游站点 API 的原始契约 | [`docs/materials/chat-bot.md`](docs/materials/chat-bot.md) |
+| 联网搜索的设计与验收口径 | [`docs/design/MCP_CHAT_SEARCH_DESIGN.md`](docs/design/MCP_CHAT_SEARCH_DESIGN.md) |
+| 密钥池与知识库的设计及实施状态 | [`docs/design/EXA_ACCOUNT_POOL_AND_KB_DESIGN_PLAN.md`](docs/design/EXA_ACCOUNT_POOL_AND_KB_DESIGN_PLAN.md) |
+| 推荐的系统提示词 | [`docs/design/SYSTEM_PROMPTS.md`](docs/design/SYSTEM_PROMPTS.md) |
+
+改代码前请先读 `INTERFACES.md`：它是本仓库唯一锁定的内部合同，改签名要同时检查所有消费者。

@@ -677,7 +677,8 @@ docker compose logs --since 30m bot | grep -E 'router\.route|sender\.send|app\.'
 
 ### 10.3 数据库容量与清理
 
-运行期每小时清理一次（启动时也清理一次），保留规则见根目录 README 的「容量与清理」。
+运行期每小时清理一次（启动时也清理一次），保留规则见根目录
+[README 的「容量与清理」](../README.md#容量与清理)。
 聊天与评论共用同一个库，评论正文与文章正文都不落库。
 
 - SQLite 主库有 **128 MiB 软上限**（`storage.sqlite_soft_limit_bytes`）：
