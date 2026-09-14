@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any, TextIO
@@ -159,8 +159,18 @@ class StdioMcpProvider:
             for tool in result.tools
         )
 
-    async def call_tool(self, tool_name: str, arguments: dict[str, object]) -> object:
-        """执行一个已发现的工具；异常交由 Registry 映射为稳定错误。"""
+    async def call_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, object],
+        *,
+        should_run: Callable[[], bool] | None = None,
+    ) -> object:
+        """执行一个已发现的工具；异常交由 Registry 映射为稳定错误。
+
+        ``should_run`` 由多 Key 池在轮换点之间调用；单个 stdio 子进程没有轮换点，
+        因此接受后直接忽略——它让池与单进程实现共用同一份 ``McpProvider`` 调用约定。
+        """
         session = self._require_session()
         try:
             return await asyncio.wait_for(

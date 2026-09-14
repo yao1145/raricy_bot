@@ -59,11 +59,21 @@ class McpProvider(Protocol):
 
     async def list_tools(self) -> tuple[ToolDefinition, ...]: ...
 
-    async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any: ...
+    async def call_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        should_run: Callable[[], bool] | None = None,
+    ) -> Any: ...
 
 
 class McpCallTimeoutError(TimeoutError):
     """MCP 工具调用超过配置时限；供 Registry 映射稳定错误码。"""
+
+
+class McpCallCancelled(Exception):
+    """池或 Registry 在尝试前发现本轮已被作废；不得映射为故障。"""
 
 
 ToolExecutor = Callable[[ToolCall], Awaitable[ToolExecution]]
