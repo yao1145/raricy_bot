@@ -146,6 +146,23 @@ def is_reset_command(text: str) -> bool:
     return text.strip().lower() == "/reset"
 
 
+def parse_search_command(text: str) -> str | None:
+    """解析开头的独立 /search，返回去掉命令后的正文。
+
+    命令只在消息开头生效，命令名与 ``/search`` 之间必须是空白或正文结束，
+    因此 ``/searching`` 不会误触发。命令本身大小写不敏感，正文原样保留，
+    由调用方继续执行既有的本地命令、长度和秘密探测优先级。
+    """
+    stripped = text.strip()
+    if len(stripped) < len("/search") or stripped[:7].lower() != "/search":
+        return None
+    if len(stripped) == 7:
+        return ""
+    if not stripped[7].isspace():
+        return None
+    return stripped[7:].strip()
+
+
 def has_media(message: Any) -> bool:
     """判断消息是否附带图片或博客引用。"""
     return message.image is not None or message.blog is not None

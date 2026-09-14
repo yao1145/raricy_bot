@@ -4,12 +4,15 @@
 #   export RARICY_USERNAME=...
 #   export RARICY_PASSWORD=...
 #   export LLM_API_KEY=...
+#   export EXA_API_KEY=...       # 仅启用 mcp.enabled 时需要；不要写进本文件
 #   docker compose up -d
 services:
   bot:
     build: .
     image: raricy-bot:latest
     restart: unless-stopped
+    # 应用状态只写入 /app/data 命名卷；其余镜像文件系统保持只读。
+    read_only: true
     environment:
       # 容器内固定读取只读挂载的配置。
       BOT_CONFIG_PATH: /app/config.yaml
@@ -17,6 +20,8 @@ services:
       RARICY_USERNAME: ${RARICY_USERNAME}
       RARICY_PASSWORD: ${RARICY_PASSWORD}
       LLM_API_KEY: ${LLM_API_KEY}
+      # 只透传给容器，由配置中的 env_from 再交给 Exa MCP 子进程；不写入 YAML。
+      EXA_API_KEY: ${EXA_API_KEY}
     volumes:
       # 配置只读挂载；其中 storage.db_path 用默认的 ./data/bot.db 即可。
       - ./config.yaml:/app/config.yaml:ro

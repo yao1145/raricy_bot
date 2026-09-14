@@ -12,7 +12,8 @@
 
 ## Global Constraints
 
-- 运行期依赖仅有 `httpx`、`openai`、`PyYAML`、`aiohttp`。**本计划不新增任何依赖**（base64 与 urllib.parse 都是标准库）。
+- **本计划不新增图片相关依赖**（base64 与 urllib.parse 都是标准库）；当前项目的可选 MCP 依赖见
+  `INTERFACES.md` §0 与 `MCP_CHAT_SEARCH_DESIGN.md`。
 - 注释与 docstring 用中文，标识符用英文，**任何地方不得出现 emoji**。
 - 用户内容只放在 `role="user"` 的消息里，绝不拼进 system prompt。
 - HTTP 客户端绝不设置 `Origin` / `Referer`；成功判据只看信封 `code == 200`。
@@ -1083,12 +1084,14 @@ _HELP_HEAD: str = (
 )
 
 _HELP_CAPABILITY_TEXT_ONLY: str = (
-    "我无法联网，不能查看图片、附件或被引用的博客内容；博客正文不超过 1000 字时，"
+    "默认不会联网；如需查询当前信息，可发送 /search 加上问题。搜索问题可能发送给第三方 Exa，"
+    "每次只处理当前一轮，评论区不支持搜索。不能查看图片、附件或被引用的博客内容；博客正文不超过 1000 字时，"
     "可能随当前轮次一并发送给第三方模型，超过 1000 字时不会提供正文。\n"
 )
 
 _HELP_CAPABILITY_TEXT_VISION: str = (
-    "我无法联网，但可以查看你发来的图片：图片同样会转交给第三方模型处理。"
+    "默认不会联网；如需查询当前信息，可发送 /search 加上问题。搜索问题可能发送给第三方 Exa，"
+    "每次只处理当前一轮，评论区不支持搜索。可以查看你发来的图片：图片同样会转交给第三方模型处理。"
     "不能读附件或被引用的博客正文；博客正文不超过 1000 字时，"
     "可能随当前轮次一并发送给第三方模型，超过 1000 字时不会提供正文。\n"
 )
@@ -1848,8 +1851,9 @@ Expected: PASS。用例里那句 `assert "reason=too_large" in output` 是防空
 6. §14 `ModelClient.complete` 的注解放宽为 `list[dict[str, Any]]`，并说明只有当前轮的
    user 消息可能是内容块列表。
 7. §16 worker 流程插入取图、纯图降级、标记与 `attach_image` 的顺序约束。
-8. §19 第 5 条改写为：不实现博客理解、工具调用、联网、长期记忆；图片理解仅在
-   `model.vision_enabled` 为真时提供，且只把当前轮那一张图取回内存转交模型。
+8. §19 第 5 条改写为：不实现博客理解、自动联网（联网仅由聊天区显式 `/search` 授权）或站内工具调用、长期记忆；聊天区
+   显式 `/search` 是单轮联网入口，图片理解仅在 `model.vision_enabled` 为真时提供，
+   且只把当前轮那一张图取回内存转交模型。
 9. 新增 §20（或按现有编号续）`core/vision.py`：`IMAGE_MIME_ALLOWLIST`、四个纯函数、
    `ImageLoader` 的七个 reason 与两条硬约束（不信任 DTO 的 mime、不转发 SVG）。
 

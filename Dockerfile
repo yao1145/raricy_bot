@@ -1,13 +1,27 @@
 # Raricy 站内聊天机器人镜像。
-# 单阶段构建；运行用户非 root；密钥只通过环境变量注入，绝不写进镜像。
-FROM python:3.12-slim
+# Exa MCP 在构建期固定安装；运行用户非 root；密钥只通过环境变量注入，绝不写进镜像。
+FROM node:22-bookworm-slim AS exa-mcp
+
+WORKDIR /opt/exa-mcp
+
+# 只在构建阶段访问 npm。最终镜像只复制 node、Exa 包和入口，不包含 npm，
+# 运行期也不会执行 npx、npm install 或访问 npm registry。
+RUN npm install --omit=dev --no-audit --no-fund exa-mcp-server@3.4.1
+
+FROM python:3.12-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    BOT_CONFIG_PATH=/app/config.yaml
+    BOT_CONFIG_PATH=/app/config.yaml \
+    PATH=/opt/exa-mcp/node_modules/.bin:/usr/local/bin:${PATH}
 
 WORKDIR /app
+
+# node:22-bookworm-slim 与 python:3.12-slim-bookworm 使用同一 Debian 系列；
+# 只复制运行 Exa stdio MCP 所需的 Node 二进制与固定依赖。
+COPY --from=exa-mcp /usr/local/bin/node /usr/local/bin/node
+COPY --from=exa-mcp /opt/exa-mcp /opt/exa-mcp
 
 # 先拷构建清单与源码，再安装，避免把测试、文档与本地配置带进镜像。
 COPY pyproject.toml ./

@@ -36,8 +36,9 @@
 | 文件 | 是什么 | 权威性 |
 |------|--------|--------|
 | `design/INTERFACES.md` | 本项目内部契约：锁定的签名、字段名、默认值、判定谓词 | 改签名前先查全部消费者 |
-| `design/DESIGN_DECISIONS.md` | 设计未明确处的裁决记录（D-1 … D-27） | 觉得某处行为怪，先读对应条目——不少「看起来像 bug」的选择是刻意的 |
+| `design/DESIGN_DECISIONS.md` | 设计未明确处的裁决记录（D-1 … D-35） | 觉得某处行为怪，先读对应条目——不少「看起来像 bug」的选择是刻意的 |
 | `design/SYSTEM_PROMPTS.md` | 系统提示词的正式来源 + 站点速查表 | 提示词正文的权威副本，**但它不参与运行**：改完必须手动同步到 `config.yaml` |
+| `design/MCP_CHAT_SEARCH_DESIGN.md` | 聊天区 Exa MCP 搜索的总述、架构、接口与实现任务 | MCP 搜索的现行设计与验收口径 |
 
 ## archive/ —— 归档（历史，不是现行口径）
 

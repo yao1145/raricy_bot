@@ -4,13 +4,14 @@
 若认为某处不合理，先在报告里提出，不要自行改动后让下游跟着改。
 
 上游契约见 `docs/materials/chat-bot.md`；设计依据见 `docs/archive/BACKGROUND.md`。
-歧义裁决见 `docs/archive/DESIGN_DECISIONS.md`。
+歧义裁决见 `docs/design/DESIGN_DECISIONS.md`。
 
 ## 0. 工程约定
 
 - Python `>=3.12`（开发机为 3.13）。包根目录 `src/raricy_bot/`，包名 `raricy_bot`。
-- 运行期依赖仅：`httpx`、`openai`、`PyYAML`、`aiohttp`。SQLite 用标准库 `sqlite3`，
-  **不引入 aiosqlite**。测试用 `pytest` + `pytest-asyncio`。
+- 运行期依赖：`httpx`、`openai`、`PyYAML`、`aiohttp`、官方 Python MCP SDK（当前约束
+  `mcp>=2.2,<3`）。SQLite 用标准库 `sqlite3`，**不引入 aiosqlite**。测试用 `pytest`+
+  `pytest-asyncio`。
 - 全异步（asyncio）。除 `Store` 外不得使用线程。
 - 所有对外可见的字符串常量集中在 `texts.py`，不得散落在业务代码里。
 - 注释与 docstring 用中文，标识符用英文。
@@ -94,10 +95,50 @@ class CommentConfig:
     server_backoff_seconds: int = 3600
 
 @dataclass(frozen=True)
+class McpBindingConfig:
+    server: str
+    tool: str
+
+@dataclass(frozen=True)
+class McpServerConfig:
+    name: str
+    enabled: bool = True
+    transport: str = "stdio"
+    command: str = ""
+    args: tuple[str, ...] = ()
+    env_from: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict)
+
+@dataclass(frozen=True)
+class McpFeatureConfig:
+    name: str
+    enabled: bool = True
+    bindings: tuple[McpBindingConfig, ...] = ()
+    result_count: int = 5
+    result_item_token_limit: int = 3000
+    history_item_token_limit: int = 500
+    max_query_chars: int = 500
+    max_tool_calls_per_turn: int = 1
+    max_concurrency: int = 1
+    min_interval_seconds: float = 2.0
+
+@dataclass(frozen=True)
+class McpConfig:
+    enabled: bool = False
+    connect_timeout_seconds: float = 10.0
+    call_timeout_seconds: float = 20.0
+    reconnect_base_seconds: float = 3.0
+    reconnect_max_seconds: float = 60.0
+    servers: dict[str, McpServerConfig] = field(default_factory=dict)
+    features: dict[str, McpFeatureConfig] = field(default_factory=dict)
+
+@dataclass(frozen=True)
 class Secrets:
     username: str
     password: str
     llm_api_key: str
+
+# McpConfig、McpServerConfig、McpFeatureConfig 和 McpBindingConfig 的完整定义见 §21。
 
 @dataclass(frozen=True)
 class Config:
@@ -111,6 +152,7 @@ class Config:
     system_prompt: str
     system_prompt_sha256: str          # 便于日志核对，不含正文
     secrets: Secrets
+    mcp: McpConfig = field(default_factory=McpConfig)
 
     @property
     def db_path(self) -> str           # 兼容别名，保留一个版本；新代码用 config.storage.db_path
@@ -135,8 +177,10 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
   `wal_journal_limit_bytes < sqlite_soft_limit_bytes`；任一不满足 → `ConfigError`。
   `storage` 段缺失时全部取默认值。
 - 密钥只从环境变量读取：`RARICY_USERNAME`、`RARICY_PASSWORD`、`LLM_API_KEY`；缺失或空 → `ConfigError`。
+  Exa 的 `EXA_API_KEY` 通过 `mcp.servers.exa.env_from` 映射给 stdio 子进程；缺失时只停用 Exa，
+  不阻止普通聊天、评论或健康检查。
 - YAML 顶层键：`site` / `model` / `behavior` / `ops` / `storage`（`db_path`）/ `logging`（`level`）/
-  `comments` / `system_prompt`。`comments.enabled` 默认 `false`；关闭时不创建评论队列、
+  `comments` / `mcp` / `system_prompt`。`comments.enabled` 默认 `false`；关闭时不创建评论队列、
   poller 或 quota，但 SiteClient 仍接收 `comments.max_response_bytes` 与 `max_tree_nodes`
   默认上限（旧窄客户端替身可省略这两个关键字）。
   未知键**忽略**；缺失键用上表默认值（`site.base_url`、`model.base_url`、`model.model`、`system_prompt` 必填）。
@@ -245,6 +289,9 @@ def has_image(message: Any) -> bool     # message.image is not None and not mess
   **不要**加入任何会命中普通寒暄的模式（例如询问机器人名字、打招呼）；
   这一层的目标是挡住索取系统提示与运行密钥的请求，不是审查闲聊。
 - `is_help_command` / `is_reset_command`：`text.strip().lower()` 后等于 `"/help"` / `"/reset"`。
+- `parse_search_command`：仅识别消息开头独立的 `/search`（大小写不敏感），返回去掉前缀后的正文；
+  `/searching`、`/search-x` 与正文中间出现的 `/search` 均不命中。该能力只由聊天 Router
+  写入 `Request.enabled_features`，评论路径不得调用它。
 - `has_image` 与 `has_media` 回答的是两个不同的问题：前者是「这一轮能不能把图交给模型」
   （因此 `image_missing` 为真时不算），后者是「有没有我读不了的东西」（保持原义）。
 
@@ -254,7 +301,7 @@ def has_image(message: Any) -> bool     # message.image is not None and not mess
 
 ```python
 TRUNCATION_SUFFIX: str      # 追加在被截断输出末尾的省略提示
-HELP_TEXT: str              # 能力、隐私、无联网/无图片输入说明（vision 关闭时）
+HELP_TEXT: str              # 能力、隐私、默认离线与无图片输入说明（vision 关闭时）
 HELP_TEXT_WITH_VISION: str  # 同上，但能力句声明可以查看用户发来的图片（vision 开启时）
 USAGE_HINT: str             # 空白内容或只有 @bot 时的用法提示
 UNSUPPORTED_MEDIA_TEXT: str # 只有博客、没有可读图片
@@ -265,16 +312,19 @@ RESET_DONE_TEXT: str        # /reset 后的确认
 BUSY_NOTICE_TEXT: str       # 队列满
 FAILURE_NOTICE_TEXT: str    # 模型最终失败
 QUOTA_NOTICE_TEXT: str      # 当日额度用尽
+SEARCH_USAGE_TEXT: str      # `/search` 无参数时的本地用法
+SEARCH_UNAVAILABLE_TEXT: str # MCP/模型 tools 能力不可用时的本地提示
 LOBBY_SHARED_SYSTEM_ADDENDUM: str   # 共享大区请求的静态 system 附加说明（见 5.1）
+MCP_SEARCH_SYSTEM_ADDENDUM: str     # 搜索结果不可信边界的静态 system 附加说明
 ```
 
 `HELP_TEXT` 与 `HELP_TEXT_WITH_VISION` **共用同一份首尾文字**，只有中间那句能力描述
 二选一（实现上是三段模块级常量拼接）。因此两份文案的事实披露必须逐字一致：身份、
-第三方模型处理、不联网、无长期记忆、`/help` 与 `/reset`，以及大区共享上下文的四点。
+第三方模型处理、默认离线、无长期记忆、`/help`、`/reset` 与 `/search`，以及大区共享上下文的四点。
 新增或修改其中任何一处都必须同时作用于两者。
 
 `HELP_TEXT` 必须包含：机器人身份声明、能力范围、**消息可能发送至第三方模型处理**、
-不联网、不能看图/博客、`/help` 与 `/reset` 用法；以及大区共享上下文的四点说明
+默认离线、不能看图/博客、`/help`、`/reset` 与 `/search` 用法；以及大区共享上下文的四点说明
 （公开多人上下文、只有精确 `@bot` 的消息进入、新参与者加入后最近的链内历史会
 再次发送给第三方模型、回复链内消息才能延续上下文，且 `/reset` 创建新链而非删除旧链）。
 `HELP_TEXT_WITH_VISION` 的差别只有一句：可以查看用户发来的图片，且**图片同样会转交
@@ -802,6 +852,7 @@ class Request:
     message: ChatMessage
     user_text: str           # 已剔除 @机器人 的正文
     reply_context: str | None  # message.reply 非删除时的正文，否则 None
+    enabled_features: frozenset[str] = frozenset()  # 当前轮显式授权的通用能力
 
 @dataclass(frozen=True)
 class RouteResult:
@@ -1021,11 +1072,18 @@ class OpenAIModelClient:
         # transport 非 None 时传给 httpx.AsyncClient(transport=...) 再交给
         # AsyncOpenAI(http_client=...)，使测试无需真实网络（§18）
     async def complete(self, messages: list[dict[str, Any]]) -> str
+    async def complete_with_tools(self, messages: list[dict[str, Any]], *,
+                                  tools: tuple[ToolDefinition, ...],
+                                  execute: ToolExecutor,
+                                  max_tool_calls: int,
+                                  generation_is_current: Callable[[], bool],
+                                  model_gate: Any | None = None) -> ToolCompletion
     async def aclose(self) -> None
 
 class ModelError(Exception):
     def __init__(self, kind: str, retryable: bool) -> None   # kind: "timeout"|"network"|"http"|"empty"
                                                              #      |"auth"|"bad_request"
+                                                             #      |"tools_unavailable"|"tools_unsupported"
 
 class WorkerPool:
     def __init__(self, *, queue: asyncio.Queue[Request], handler: Callable[[Request], Awaitable[None]],
@@ -1084,7 +1142,8 @@ class OpsServer:
 ```python
 class BotApp:
     def __init__(self, config: Config, *, transport: httpx.AsyncBaseTransport | None = None,
-                 model_client: ModelClient | None = None) -> None
+                 model_client: ModelClient | None = None,
+                 mcp_manager: McpManager | None = None) -> None
     async def start(self) -> None
     async def run_forever(self) -> None
     async def stop(self) -> None
@@ -1276,9 +1335,11 @@ worker、ops、模型、client、Store；每个取消动作必须 await。
 2. 用户内容只放在 `role="user"` 的消息里，绝不拼进 system prompt。
 3. HTTP 客户端不设 `Origin` / `Referer`。
 4. 成功判据只看 `code == 200`。
-5. 不实现博客理解、工具调用、联网、长期记忆。**图片理解仅在 `model.vision_enabled`
-   为真时提供**，且只把当前轮那一张图取回内存转交模型：不落 SQLite、不写日志、
-   不写文件、不进 `ContextManager` 历史。默认关闭。不转发 SVG。
+5. 不实现博客理解、通用自动联网、长期记忆或站内工具调用。聊天区显式的 `/search <问题>`
+   是唯一的单轮联网入口：仅在私聊和精确 @ 机器人的大厅消息中生效，由模型决定是否调用
+   已绑定的 Exa `web_search_exa`，每轮最多一次；评论区永不获得该入口。**图片理解仅在
+   `model.vision_enabled` 为真时提供**，且只把当前轮那一张图取回内存转交模型：不落
+   SQLite、不写日志、不写文件、不进 `ContextManager` 历史。默认关闭。不转发 SVG。
 6. 不调用站内管理接口，不执行代码，不访问服务器文件。
 7. 大区共享链的持久化只存 `message_id -> thread_root_id`：**不存** `author.id`、用户名、
    参与者名单、任何正文；发言者一律从实时 DTO 取。日志里也不得出现用户名或用户 id。
@@ -1332,3 +1393,23 @@ class ImageLoader:
 - 不做图片缓存：同一条消息被处理一次取一次，重试或补发会重新下载。
 - 图片 token **不计入** `context_input_tokens` 预算。每条消息最多一张图、当前轮永不被
   裁剪，因此超支有界；这是一个已知且被接受的取舍，不是遗漏。
+
+## 21. 聊天区 MCP 工具合同
+
+MCP 是可选的运行时扩展。`Request.enabled_features: frozenset[str]` 是 Router 到 App
+的唯一能力通道；普通聊天和评论保持原有 `ModelClient.complete(messages) -> str`。
+`/search` 请求只有在 `mcp.enabled`、`search` feature 及其绑定的 `exa__web_search_exa`
+均可用时，才调用可选的 `complete_with_tools(...)`：第一轮 `tool_choice="auto"`，模型不
+调用即直接回答；调用时宿主只执行一个合法工具，随后以 `tool_choice="none"` 生成最终回答。
+MCP 等待和执行不持有普通模型 semaphore；两次模型请求各自占一个 gate 位。
+
+稳定数据契约位于 `raricy_bot.mcp.contracts`：`ToolDefinition`、`ToolCall`、`ToolExecution`、
+`ToolCompletion` 与 `McpProvider`。工具名统一为 `<server>__<tool>`；发现到的工具必须经过
+feature binding 白名单后才可见。Exa 适配器只向模型公开 `query`，宿主强制 `numResults`
+和查询上限，并把结果清洗为 HTTP(S) 的 `title`、`url`、`snippet`。当前轮每条默认 3000
+估算 token，跨轮摘要每条默认 500 token；原始 MCP 内容、assistant tool-call 消息和孤立
+`role="tool"` 消息不得进入 SQLite 或内存历史。
+
+MCP Provider/Node/Exa/API Key 故障只将对应 feature 标为不可用；不得改变 `readyz`、`livez`
+或普通对话。缺失 `env_from` 环境变量只停用对应服务器，日志仅可记录稳定错误类型，不可
+记录变量名映射值、查询、URL、摘要、工具参数或模型正文。

@@ -26,6 +26,7 @@ from ..text_utils import (
     has_image,
     has_media,
     is_help_command,
+    parse_search_command,
     is_reset_command,
     is_secret_probe,
     strip_bot_mention,
@@ -70,6 +71,7 @@ class Request:
     user_text: str  # 已剔除 @机器人 的正文
     reply_context: str | None  # message.reply 非删除时的正文，否则 None
     thread_root_id: int | None = None  # 大区共享链的根；**私聊恒为 None**（D-20）
+    enabled_features: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -283,11 +285,32 @@ class MessageRouter:
                 )
             session_key = lobby_thread_session_key(thread_root_id)
 
-        # 9.1 空正文：能看图就交给模型，否则给本地提示。
+        # 9.1 解析单轮能力命令。命令本身不是聊天正文，不进入模型；只有
+        # 解析成功且正文通过后续本地检查，才会把能力标记放入 Request。
+        enabled_features: frozenset[str] = frozenset()
+        search_text = parse_search_command(user_text)
+        search_command = search_text is not None
+        if search_text is not None:
+            enabled_features = frozenset({"search"})
+            user_text = search_text
+
+        # 9.2 空正文：能看图就交给模型，否则给本地提示。
         # 空正文不会命中下面 9.2-9.6 的任何一个分支（命令判定与探测词都要求非空内容），
         # 因此 `image_only` 置位之后直落第 10 步入队是安全的。
         image_only = False
         if not user_text:
+            if search_command:
+                return self._emit(
+                    "reply_now",
+                    "empty",
+                    channel_id=channel_id,
+                    message_id=message.id,
+                    reply_to=message.id,
+                    text=texts.SEARCH_USAGE_TEXT,
+                    channel_kind=channel_kind,
+                    thread_root_id=thread_root_id,
+                    event_id=event_id,
+                )
             if self._vision_enabled and has_image(message):
                 # 纯图消息入队。取图与降级由 app 的 worker 负责（设计 §3.5）：
                 # 路由器不做 I/O，也就无从知道这张图能不能取到。
@@ -330,7 +353,7 @@ class MessageRouter:
                     event_id=event_id,
                 )
 
-        # 9.2 /help 本地应答，不触发模型。
+        # 9.3 /help 本地应答，不触发模型。
         if is_help_command(user_text):
             return self._emit(
                 "reply_now",
@@ -349,7 +372,7 @@ class MessageRouter:
                 event_id=event_id,
             )
 
-        # 9.3 /reset：大区只建新链（第 8 步已用 force_new 建好，旧链不动，D-21）；
+        # 9.4 /reset：大区只建新链（第 8 步已用 force_new 建好，旧链不动，D-21）；
         #     私聊仍是清空当前会话并递增代次（D-9）。
         if is_reset_command(user_text):
             if not is_lobby:
@@ -366,9 +389,9 @@ class MessageRouter:
                 event_id=event_id,
             )
 
-        # 9.4 有媒体但正文非空：忽略媒体，照常处理文本（无需额外分支）。
+        # 9.5 有媒体但正文非空：忽略媒体，照常处理文本（无需额外分支）。
 
-        # 9.5 超长输入本地拦截。
+        # 9.6 超长输入本地拦截。
         if len(user_text) > self._cfg.max_input_chars:
             return self._emit(
                 "reply_now",
@@ -382,7 +405,7 @@ class MessageRouter:
                 event_id=event_id,
             )
 
-        # 9.6 索取系统提示 / 密钥本地拒绝。
+        # 9.7 索取系统提示 / 密钥本地拒绝。
         if is_secret_probe(user_text):
             return self._emit(
                 "reply_now",
@@ -409,6 +432,7 @@ class MessageRouter:
             user_text=user_text,
             reply_context=reply_context,
             thread_root_id=thread_root_id,
+            enabled_features=enabled_features,
         )
         try:
             self._queue.put_nowait(request)
@@ -453,11 +477,15 @@ class MessageRouter:
             else None
         )
         try:
+            # `/search /reset` 仍是本地 reset；虽然 feature 命令按整体路由顺序
+            # 在登记回复链之后才正式剥离，这里必须用其内层正文决定是否新建链。
+            search_text = parse_search_command(user_text)
+            reset_text = search_text if search_text is not None else user_text
             return await self._store.resolve_lobby_thread(
                 message.id,
                 reply_id,
                 # /reset 无论回复谁，都以自己为根建一条新链（D-21）。
-                force_new=is_reset_command(user_text),
+                force_new=is_reset_command(reset_text),
                 now=self._now(),
                 retention_seconds=self._storage.lobby_thread_retention_seconds,
             )

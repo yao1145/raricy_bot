@@ -27,8 +27,8 @@
    已经回复过，结果是同一条消息被回复两遍、并双倍消耗站点配额。
    多副本选主不属于首版范围。
 4. **密钥只走环境变量**，不要写进 `config.yaml`、不要写进 `docker-compose.yml`、
-   不要提交到任何仓库。站点与模型凭据只有三个：`RARICY_USERNAME`、`RARICY_PASSWORD`、
-   `LLM_API_KEY`。
+   不要提交到任何仓库。站点与模型凭据是 `RARICY_USERNAME`、`RARICY_PASSWORD`、
+   `LLM_API_KEY`；启用联网搜索时另需 `EXA_API_KEY`，它只提供给 Exa MCP 子进程。
 
 ---
 
@@ -38,8 +38,8 @@
 - 出网可达两个地方：站点域名、模型服务地址。**不需要任何入站端口**——
   机器人只主动外连，运维端点不发布到宿主（见第 7 节）。
 - 建议配置：1 核 / 512MB 内存 / 1GB 磁盘足够。SQLite 只存元数据，不存对话正文。
-- **宿主机不需要装 Python 3.12**：镜像是 `python:3.12-slim`，自带运行时。
-  代价是构建期要能访问 Docker Hub 与 PyPI。
+- **宿主机不需要装 Python 3.12 或 Node**：镜像自带 `python:3.12-slim-bookworm` 与 Node 22。
+  代价是构建期要能访问 Docker Hub、PyPI 与 npm registry；运行期不访问 npm。
 
 ### 2.1 安装 Docker
 
@@ -64,11 +64,14 @@ docker compose version      # 需要 v2，命令是 `docker compose` 而不是 `
 
 ### 2.2 构建期网络
 
-`docker compose build` 会拉 `python:3.12-slim` 并在容器里 `pip install`。
+`docker compose build` 会拉 Python/Node 基础镜像，在构建阶段安装 Python 依赖及固定的
+`exa-mcp-server@3.4.1`。运行阶段只使用镜像内的 Node 与 Exa 文件，不执行 `npx`、`npm install`
+或访问 npm registry。Compose 同时启用只读根文件系统，运行状态只写入 `/app/data` 命名卷。
 国内网络可能很慢或超时。两个不改逻辑的缓解办法：
 
 - 配 `/etc/docker/daemon.json` 的 `registry-mirrors`（可用镜像站变动频繁，自行确认）；
 - 或在 `Dockerfile` 的 `RUN pip install --no-cache-dir .` 后补 `-i <可用的 PyPI 镜像>`。
+- 如果 npm registry 访问不稳定，应在 Docker 构建网络层解决；不要把运行时下载改回 `npx`。
 
 ---
 
@@ -171,7 +174,27 @@ system_prompt: |
 `minute_attempt_limit: 25`（低于站点 30 次/分的硬限）、`daily_normal_limit: 1950`、
 `daily_absolute_limit: 2000`。
 
-### 4.1 启用博客评论能力（可选）
+### 4.1 聊天区联网搜索（可选）
+
+`config.example.yaml` 中的 `mcp.enabled` 默认是 `false`。保持默认值时，机器人完全不启动
+MCP，普通聊天行为不变。启用 Exa 摘要搜索时，在 `config.yaml` 中打开：
+
+```yaml
+mcp:
+  enabled: true
+```
+
+并在环境中提供 `EXA_API_KEY`。配置里的 `env_from.EXA_API_KEY: EXA_API_KEY` 只表示把宿主
+环境变量映射给 Exa 子进程，不是 API Key 的存储位置；不要把真实值写入 YAML、Compose、日志
+或仓库。搜索仅在私聊和大厅中由用户显式发送 `/search <问题>` 触发，模型可以判断不搜索；
+每轮最多执行一次 `web_search_exa`，最多返回 5 条摘要，每条最多 3000 个估算 token。评论区
+不会解析 `/search`，也不会调用 MCP。
+
+缺少 `EXA_API_KEY`、Node、Exa 进程或 MCP 连接失败时，联网功能会提示暂不可用，但普通聊天、
+评论、`/livez` 与 `/readyz` 继续运行。更新环境变量后必须执行 `docker compose up -d`，仅
+`restart` 不会重新创建容器并读取新值。
+
+### 4.2 启用博客评论能力（可选）
 
 评论功能默认关闭。只有完成测试文章演练并确认机器人资料披露后，才在配置中开启：
 
@@ -197,7 +220,7 @@ actor 缺失的评论回复通知仍按 unmatched 计数。Service 在模型调�
 `/help`、`/reset`、重启后上下文清空但去重状态保留。评论轮询或评论禁言故障不会让聊天
 `/readyz` 失败；评论后台 task 意外退出会使 `/livez` 失败，便于编排器重启。
 
-### 4.2 两个不要动的默认值
+### 4.3 两个不要动的默认值
 
 改了会出问题（原因见第 7 节）：
 
@@ -211,7 +234,7 @@ storage:
 改任意一个都必须同步改 `Dockerfile` 与 `docker-compose.yml` 里对应的那一处，
 两处文件里都写了这条不变式的注释。
 
-### 4.3 权限：`config.yaml` 与 `.env` 要求不同，不要搞混
+### 4.4 权限：`config.yaml` 与 `.env` 要求不同，不要搞混
 
 |          | `config.yaml`                    | `.env`                   |
 | -------- | ---------------------------------- | -------------------------- |
@@ -229,7 +252,7 @@ chmod 644 config.yaml
 > 只有走[第 12 节](#12-不用-docker-的部署方式systemd)的 systemd 路径时，
 > 配置文件由服务用户自己读，才应该收紧到 600。
 
-### 4.4 改完先验证配置再启动
+### 4.5 改完先验证配置再启动
 
 用临时容器试加载配置，不影响正在跑的那个（首次部署可跳过，直接进第 6 节）：
 
@@ -262,6 +285,8 @@ cat > .env <<'EOF'
 RARICY_USERNAME=机器人用户名
 RARICY_PASSWORD=机器人密码
 LLM_API_KEY=模型服务的Key
+# 仅 mcp.enabled=true 时需要；填写实际值，不要提交此文件
+EXA_API_KEY=Exa服务的Key
 EOF
 chmod 600 .env
 ```
@@ -272,9 +297,10 @@ chmod 600 .env
 
 `.env` 已在 `.gitignore` 里，不会被误提交。
 
-**如果忘了这一步**：compose 会把变量替换成空字符串，程序以配置错误退出（退出码 2），
+**如果忘了站点或模型密钥**：compose 会把变量替换成空字符串，程序以配置错误退出（退出码 2），
 而 `restart: unless-stopped` 会让容器**反复重启**。看到容器不断重启、日志里是
-`配置错误：...` 时，先检查 `.env` 是否存在、变量名是否拼对。
+`配置错误：...` 时，先检查 `.env` 是否存在、变量名是否拼对。若只忘了 `EXA_API_KEY`，
+不会导致容器退出；仅 `/search` 返回联网暂不可用。
 
 ---
 
@@ -379,7 +405,7 @@ docker inspect -f '{{.RestartCount}}  {{.State.Status}}  {{.State.ExitCode}}' ra
 | 新值怎么生效 | `docker compose restart bot` | **必须** `docker compose up -d`      |
 | 原因         | 程序启动时读一次               | 环境变量在容器创建时固化，`restart` 读不到 |
 
-改完**先按第 4.4 节验证，再重启**，避开重启循环。
+改完**先按第 4.5 节验证，再重启**，避开重启循环。
 
 ### 9.1 可以随便改的
 
@@ -615,6 +641,17 @@ docker compose ps
 
 只有在服务器不方便装 Docker 时才用这条路。
 
+启用 Exa 搜索时，systemd 主机还需预先安装 Node 22，并在构建/部署阶段固定安装 MCP 包：
+
+```bash
+node --version                    # 需为 v22.x
+sudo npm install --global --omit=dev --no-audit --no-fund exa-mcp-server@3.4.1
+command -v exa-mcp-server         # 应能找到配置中的 stdio 命令
+```
+
+这是一次性的部署步骤；服务运行时不执行 `npx`、`npm install`，也不依赖 npm registry。
+若不启用 `mcp.enabled`，无需安装 Exa 或 Node。
+
 ```bash
 # 1) Python 3.12+（Ubuntu 22.04 自带 3.10，需要另装）
 python3 --version        # 需 >= 3.12
@@ -655,6 +692,8 @@ sudo tee /etc/raricy-bot.env >/dev/null <<'EOF'
 RARICY_USERNAME=机器人用户名
 RARICY_PASSWORD=机器人密码
 LLM_API_KEY=模型服务的Key
+# 仅 mcp.enabled=true 时需要；填写实际值，不要提交此文件
+EXA_API_KEY=Exa服务的Key
 EOF
 sudo chmod 600 /etc/raricy-bot.env
 ```
@@ -859,7 +898,8 @@ docker compose logs --tail=200 bot | grep -E 'router\.route|sender\.send|app\.'
 - [ ] 机器人资料已人工标注「机器人」与「消息可能发送至第三方模型处理」
 - [ ] `config.yaml` 里 `site.base_url`、`model.base_url`、`model.model` 已改成真实值
 - [ ] `config.yaml` 权限是 **644**，`.env` 权限是 **600**
-- [ ] `.env` 存在且 `chmod 600`，三个密钥都非空，变量名未改
+- [ ] `.env` 存在且 `chmod 600`，站点与模型三个必需密钥都非空，变量名未改
+- [ ] 若启用 `mcp.enabled`：`EXA_API_KEY` 已注入，且 `/search` 能完成一次摘要搜索；未启用时可保持为空
 - [ ] `docker compose ps` 显示 `(healthy)`，`RestartCount` 不再增长
 - [ ] `/readyz` 返回 `ready`
 - [ ] 大区里精确 @ 机器人能得到回复，且回复引用了原消息
@@ -875,7 +915,8 @@ docker compose logs --tail=200 bot | grep -E 'router\.route|sender\.send|app\.'
 
 ## 17. 已知限制（不是部署问题，是首版范围）
 
-- 不支持博客理解、工具调用、联网搜索、长期用户记忆。图片理解是**可选项**：
+- 不支持博客理解、通用工具调用和长期用户记忆。聊天区联网搜索是**默认关闭**的可选项，
+  仅 `/search <问题>` 触发 Exa 摘要查询；评论区不联网。图片理解是**可选项**：
   `model.vision_enabled` 默认 `false`，开启后也只把当前轮那一张图取回内存交给模型
   （不落库、不写日志、不进历史），且要求模型本身支持视觉。
 - 对话上下文只存内存，**进程重启即清空**（去重、大区链归属与配额状态保留）。
@@ -902,8 +943,8 @@ Rocky Linux 9（及 RHEL 系）与 Ubuntu/Debian 有三处硬差异，另附若�
    会因标签不对而读不到文件，容器反复重启、退出码 2。必须加 `Z`（见 A.3）。
    这是 Rocky 与 Ubuntu 最大的一处不同。
 2. **系统仓库里没有 docker**，AppStream 只有 podman。必须加 Docker 官方源（见 A.2）。
-3. **宿主机不需要 Python 3.12**。镜像是 `python:3.12-slim`，自带。代价是构建期要能访问
-   Docker Hub 与 PyPI。
+3. **宿主机不需要 Python 3.12 或 Node 22**。镜像自带 Python 与 Node；代价是构建期要能访问
+   Docker Hub、PyPI 与 npm registry。运行中的容器不访问 npm。
 
 另外两点在 Rocky 上是好消息：
 

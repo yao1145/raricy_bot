@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import urllib.parse
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -33,6 +34,56 @@ LLM_API_KEY_ENV: str = "LLM_API_KEY"
 
 class ConfigError(Exception):
     """配置缺失、格式非法或取值越界。"""
+
+
+@dataclass(frozen=True)
+class McpBindingConfig:
+    """一个 feature 允许调用的 MCP 工具。"""
+
+    server: str
+    tool: str
+
+
+@dataclass(frozen=True)
+class McpServerConfig:
+    """MCP 服务器配置；值只包含非敏感配置，不保存解析后的密钥。"""
+
+    name: str
+    enabled: bool = True
+    transport: str = "stdio"
+    command: str = ""
+    args: tuple[str, ...] = ()
+    env_from: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class McpFeatureConfig:
+    """面向产品功能的 MCP 白名单与资源限制。"""
+
+    name: str
+    enabled: bool = True
+    bindings: tuple[McpBindingConfig, ...] = ()
+    result_count: int = 5
+    result_item_token_limit: int = 3000
+    history_item_token_limit: int = 500
+    max_query_chars: int = 500
+    max_tool_calls_per_turn: int = 1
+    max_concurrency: int = 1
+    min_interval_seconds: float = 2.0
+
+
+@dataclass(frozen=True)
+class McpConfig:
+    """MCP 总开关、服务器和 feature 配置；默认完全关闭。"""
+
+    enabled: bool = False
+    connect_timeout_seconds: float = 10.0
+    call_timeout_seconds: float = 20.0
+    reconnect_base_seconds: float = 3.0
+    reconnect_max_seconds: float = 60.0
+    servers: dict[str, McpServerConfig] = field(default_factory=dict)
+    features: dict[str, McpFeatureConfig] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -158,6 +209,7 @@ class Config:
     system_prompt_sha256: str
     secrets: Secrets
     comments: CommentConfig = field(default_factory=CommentConfig)
+    mcp: McpConfig = field(default_factory=McpConfig)
 
     @property
     def db_path(self) -> str:
@@ -183,6 +235,7 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
     ops_raw = _section(raw, "ops")
     storage_raw = _section(raw, "storage")
     logging_raw = _section(raw, "logging")
+    mcp = _mcp(_section(raw, "mcp"))
 
     site = SiteConfig(
         base_url=_base_url(site_raw, "site"),
@@ -223,6 +276,7 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
             llm_api_key=_secret(source, LLM_API_KEY_ENV),
         ),
         comments=comments,
+        mcp=mcp,
     )
 
 
@@ -510,6 +564,198 @@ def _comments(container: Mapping[str, Any]) -> CommentConfig:
         retry_base_seconds=retry_base_seconds,
         retry_max_seconds=retry_max_seconds,
         server_backoff_seconds=server_backoff_seconds,
+    )
+
+
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SECRET_ENV_PARTS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "COOKIE")
+
+
+def _mcp(container: Mapping[str, Any]) -> McpConfig:
+    """构造 MCP 配置；不解析或保存环境变量中的密钥值。"""
+    enabled = _bool_flag(container, "enabled", "mcp", False)
+    connect_timeout = _positive_number(
+        container, "connect_timeout_seconds", "mcp", 10.0
+    )
+    call_timeout = _positive_number(container, "call_timeout_seconds", "mcp", 20.0)
+    reconnect_base = _positive_number(
+        container, "reconnect_base_seconds", "mcp", 3.0
+    )
+    reconnect_max = _positive_number(container, "reconnect_max_seconds", "mcp", 60.0)
+    if reconnect_base > reconnect_max:
+        raise ConfigError(
+            "配置 mcp.reconnect_base_seconds 不能大于 reconnect_max_seconds"
+        )
+
+    raw_servers = container.get("servers", {})
+    if not isinstance(raw_servers, dict):
+        raise ConfigError("配置 mcp.servers 必须是映射")
+    servers: dict[str, McpServerConfig] = {}
+    for raw_name, raw_value in raw_servers.items():
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raise ConfigError("配置 mcp.servers 的服务器名必须是非空字符串")
+        name = raw_name.strip()
+        if name in servers:
+            raise ConfigError(f"配置 mcp.servers 重复服务器：{name}")
+        if not isinstance(raw_value, dict):
+            raise ConfigError(f"配置 mcp.servers.{name} 必须是映射")
+        server_enabled = _bool_flag(raw_value, "enabled", f"mcp.servers.{name}", True)
+        transport = raw_value.get("transport", "stdio")
+        if not isinstance(transport, str) or transport.strip().lower() != "stdio":
+            raise ConfigError(f"配置 mcp.servers.{name}.transport 首版必须是 stdio")
+        command = raw_value.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise ConfigError(f"缺少必填配置 mcp.servers.{name}.command")
+        args = _mcp_args(raw_value.get("args", []), name)
+        env_from = _mcp_env_map(raw_value.get("env_from", {}), name, allow_secret=True)
+        env = _mcp_env_map(raw_value.get("env", {}), name, allow_secret=False)
+        overlap = set(env_from) & set(env)
+        if overlap:
+            raise ConfigError(
+                f"配置 mcp.servers.{name} 的环境变量不能同时出现在 env_from 与 env"
+            )
+        servers[name] = McpServerConfig(
+            name=name,
+            enabled=server_enabled,
+            transport="stdio",
+            command=command.strip(),
+            args=args,
+            env_from=env_from,
+            env=env,
+        )
+
+    raw_features = container.get("features", {})
+    if not isinstance(raw_features, dict):
+        raise ConfigError("配置 mcp.features 必须是映射")
+    features: dict[str, McpFeatureConfig] = {}
+    for raw_name, raw_value in raw_features.items():
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raise ConfigError("配置 mcp.features 的名称必须是非空字符串")
+        name = raw_name.strip()
+        if name in features:
+            raise ConfigError(f"配置 mcp.features 重复 feature：{name}")
+        if not isinstance(raw_value, dict):
+            raise ConfigError(f"配置 mcp.features.{name} 必须是映射")
+        features[name] = _mcp_feature(raw_value, name, servers)
+
+    return McpConfig(
+        enabled=enabled,
+        connect_timeout_seconds=connect_timeout,
+        call_timeout_seconds=call_timeout,
+        reconnect_base_seconds=reconnect_base,
+        reconnect_max_seconds=reconnect_max,
+        servers=servers,
+        features=features,
+    )
+
+
+def _mcp_args(value: Any, server: str) -> tuple[str, ...]:
+    """校验 stdio 命令参数。"""
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ConfigError(f"配置 mcp.servers.{server}.args 必须是字符串列表")
+    return tuple(value)
+
+
+def _mcp_env_map(value: Any, server: str, *, allow_secret: bool) -> dict[str, str]:
+    """校验子进程环境映射；敏感字段只允许通过 env_from 提供。"""
+    if not isinstance(value, dict):
+        key = "env_from" if allow_secret else "env"
+        raise ConfigError(f"配置 mcp.servers.{server}.{key} 必须是映射")
+    result: dict[str, str] = {}
+    key_name = "env_from" if allow_secret else "env"
+    for raw_key, raw_value in value.items():
+        if (
+            not isinstance(raw_key, str)
+            or not _ENV_NAME_RE.fullmatch(raw_key)
+            or not isinstance(raw_value, str)
+            or not _ENV_NAME_RE.fullmatch(raw_value.strip())
+        ):
+            raise ConfigError(
+                f"配置 mcp.servers.{server}.{key_name} 必须使用合法的环境变量名和值"
+            )
+        if not allow_secret and any(part in raw_key.upper() for part in _SECRET_ENV_PARTS):
+            raise ConfigError(
+                f"配置 mcp.servers.{server}.env 不得直接包含疑似敏感环境变量"
+            )
+        result[raw_key] = raw_value.strip() if allow_secret else raw_value
+    return result
+
+
+def _mcp_feature(
+    container: Mapping[str, Any],
+    name: str,
+    servers: Mapping[str, McpServerConfig],
+) -> McpFeatureConfig:
+    """构造 feature 配置并执行首版安全上限校验。"""
+    enabled = _bool_flag(container, "enabled", f"mcp.features.{name}", True)
+    raw_bindings = container.get("bindings", [])
+    if not isinstance(raw_bindings, list):
+        raise ConfigError(f"配置 mcp.features.{name}.bindings 必须是列表")
+    bindings: list[McpBindingConfig] = []
+    seen: set[tuple[str, str]] = set()
+    for item in raw_bindings:
+        if not isinstance(item, dict):
+            raise ConfigError(f"配置 mcp.features.{name}.bindings 项必须是映射")
+        server = item.get("server")
+        tool = item.get("tool")
+        if not isinstance(server, str) or not server.strip() or not isinstance(tool, str) or not tool.strip():
+            raise ConfigError(f"配置 mcp.features.{name}.bindings 必须包含 server/tool")
+        server, tool = server.strip(), tool.strip()
+        if server not in servers:
+            raise ConfigError(f"配置 mcp.features.{name} 引用了未知服务器：{server}")
+        pair = (server, tool)
+        if pair in seen:
+            raise ConfigError(f"配置 mcp.features.{name} 存在重复工具绑定：{server}/{tool}")
+        seen.add(pair)
+        bindings.append(McpBindingConfig(server=server, tool=tool))
+
+    if name == "search" and enabled and (
+        len(bindings) != 1 or bindings[0].tool != "web_search_exa"
+    ):
+        raise ConfigError(
+            "配置 mcp.features.search 首版必须只绑定一个 web_search_exa 工具"
+        )
+
+    result_count = _positive_int(container, "result_count", f"mcp.features.{name}", 5)
+    if result_count > 5:
+        raise ConfigError(f"配置 mcp.features.{name}.result_count 不能大于 5")
+    item_limit = _positive_int(
+        container, "result_item_token_limit", f"mcp.features.{name}", 3000
+    )
+    history_limit = _positive_int(
+        container, "history_item_token_limit", f"mcp.features.{name}", 500
+    )
+    if history_limit > item_limit:
+        raise ConfigError(
+            f"配置 mcp.features.{name}.history_item_token_limit 不能大于 result_item_token_limit"
+        )
+    max_query_chars = _positive_int(
+        container, "max_query_chars", f"mcp.features.{name}", 500
+    )
+    max_tool_calls = _positive_int(
+        container, "max_tool_calls_per_turn", f"mcp.features.{name}", 1
+    )
+    if max_tool_calls != 1:
+        raise ConfigError(f"配置 mcp.features.{name}.max_tool_calls_per_turn 必须为 1")
+    max_concurrency = _positive_int(
+        container, "max_concurrency", f"mcp.features.{name}", 1
+    )
+    if max_concurrency != 1:
+        raise ConfigError(f"配置 mcp.features.{name}.max_concurrency 首版必须为 1")
+    min_interval = _positive_number(
+        container, "min_interval_seconds", f"mcp.features.{name}", 2.0
+    )
+    return McpFeatureConfig(
+        name=name,
+        enabled=enabled,
+        bindings=tuple(bindings),
+        result_count=result_count,
+        result_item_token_limit=item_limit,
+        history_item_token_limit=history_limit,
+        max_query_chars=max_query_chars,
+        max_tool_calls_per_turn=max_tool_calls,
+        max_concurrency=max_concurrency,
+        min_interval_seconds=min_interval,
     )
 
 

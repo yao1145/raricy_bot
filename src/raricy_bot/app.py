@@ -34,8 +34,17 @@ from .core.context import ContextManager, lobby_thread_session_key, speaker_wrap
 from .core.router import MessageRouter, Request, RouteResult
 from .core.sender import MessageSender, SendResult
 from .core.vision import ImageLoader, attach_image
-from .core.worker import ModelClient, OpenAIModelClient, WorkerPool
+from .core.worker import (
+    ModelClient,
+    ModelError,
+    OpenAIModelClient,
+    ToolGenerationCancelled,
+    WorkerPool,
+)
 from .logging_setup import get_logger, log_event
+from .mcp.exa import ExaSearchAdapter, SearchLimiter
+from .mcp.registry import model_tool_name
+from .mcp.runtime import McpManager
 from .ops import OpsServer
 from .quota import QuotaGuard, notice_cooldown_key
 from .redact import Redactor
@@ -59,6 +68,7 @@ class BotApp:
         *,
         transport: httpx.AsyncBaseTransport | None = None,
         model_client: ModelClient | None = None,
+        mcp_manager: McpManager | None = None,
     ) -> None:
         self._config = config
         self._transport = transport
@@ -129,6 +139,9 @@ class BotApp:
         # 注入的假模型不归本对象关闭；内部构造的才需要 aclose。
         self._model = model_client
         self._owns_model = model_client is None
+        self._mcp_manager = (
+            mcp_manager if mcp_manager is not None else self._build_mcp_manager()
+        )
 
         self._workers = WorkerPool(
             queue=self._queue,
@@ -165,6 +178,28 @@ class BotApp:
         self._stopped = False
         self._unavailable = False  # 403 权限/禁言导致的不就绪状态（D-4）
         self._shutdown_event = asyncio.Event()
+
+    def _build_mcp_manager(self) -> McpManager:
+        """装配 Exa feature 适配器；Provider/Registry 本身保持通用。"""
+        feature = self._config.mcp.features.get("search")
+        adapters: dict[str, Any] = {}
+        if feature is not None:
+            limiter = SearchLimiter(feature.min_interval_seconds)
+            adapter = ExaSearchAdapter(
+                result_count=feature.result_count,
+                result_item_token_limit=feature.result_item_token_limit,
+                history_item_token_limit=feature.history_item_token_limit,
+                max_query_chars=feature.max_query_chars,
+                limiter=limiter,
+            )
+            for binding in feature.bindings:
+                if binding.tool == "web_search_exa":
+                    adapters[model_tool_name(binding.server, binding.tool)] = adapter.adapt
+        return McpManager(
+            self._config.mcp,
+            redactor=self._redactor,
+            adapters=adapters,
+        )
 
     # --- 生命周期 -----------------------------------------------------------
 
@@ -211,6 +246,12 @@ class BotApp:
                 redactor=self._redactor,
                 transport=self._transport,
             )
+        # MCP 是可选扩展：任何连接、发现或子进程错误只让对应 feature 不可用，
+        # 不得阻止普通聊天、评论或健康端点启动。
+        try:
+            await self._mcp_manager.start()
+        except Exception as exc:
+            log_event(_logger, logging.WARNING, "app.mcp_start_failed", error=type(exc).__name__)
 
         self._sse = SSEReceiver(
             self._client,
@@ -233,6 +274,7 @@ class BotApp:
             await self._ops.start()
         except BaseException:
             await self._workers.stop()
+            await self._mcp_manager.stop()
             if self._owns_model and self._model is not None:
                 await self._model.aclose()
             await self._client.aclose()
@@ -488,15 +530,16 @@ class BotApp:
                 return
             # D-22：本轮内容先**临时**拼给模型，只有回复真正送达才提交进历史。
             pending = self._pending_turn(request, image_state)
+            system_addenda: list[str] = []
+            if request.channel_kind == "lobby":
+                system_addenda.append(texts.LOBBY_SHARED_SYSTEM_ADDENDUM)
+            if "search" in request.enabled_features:
+                system_addenda.append(texts.MCP_SEARCH_SYSTEM_ADDENDUM)
             messages = self._ctx.build_messages(
                 request.session_key,
                 self._config.system_prompt,
                 pending_user=pending,
-                system_addendum=(
-                    texts.LOBBY_SHARED_SYSTEM_ADDENDUM
-                    if request.channel_kind == "lobby"
-                    else None
-                ),
+                system_addendum="\n\n".join(system_addenda) or None,
             )
             self._apply_reply_prefix(messages, request)
             # 必须排在 _apply_reply_prefix 之后：那一步按字符串拼接 content。
@@ -504,11 +547,39 @@ class BotApp:
                 attach_image(messages, image_part)
             model = self._model
             if model is None:
+                if "search" in request.enabled_features:
+                    await self._send_search_unavailable(request)
+                else:
+                    await self._notify_failure(request)
+                return
+            history_context: str | None = None
+            try:
+                if "search" in request.enabled_features:
+                    text, history_context = await self._complete_search(
+                        model, messages, request
+                    )
+                else:
+                    async with self._model_gate:
+                        text = await model.complete(messages)
+            except ToolGenerationCancelled:
+                # /reset 在工具循环的任一异步边界作废了本轮；不发通知、不写历史。
+                return
+            except ModelError as exc:
+                if "search" in request.enabled_features and exc.kind in {
+                    "tools_unavailable",
+                    "tools_unsupported",
+                }:
+                    await self._send_search_unavailable(request)
+                    return
+                log_event(
+                    _logger,
+                    logging.WARNING,
+                    "app.model_failed",
+                    channel_id=request.channel_id,
+                    error=type(exc).__name__,
+                )
                 await self._notify_failure(request)
                 return
-            try:
-                async with self._model_gate:
-                    text = await model.complete(messages)
             except Exception as exc:  # 模型最终失败（含重试后仍失败）
                 log_event(
                     _logger,
@@ -533,6 +604,10 @@ class BotApp:
                 )
                 return
 
+            # 发送器也是异步边界；/reset 在此期间到达时，旧请求不得再发送。
+            if self._ctx.generation(request.session_key) != request.generation:
+                return
+
             outcome = await self._sender.send(
                 request.channel_id,
                 text,
@@ -542,7 +617,11 @@ class BotApp:
             )
             if outcome.delivered:
                 # 只有用户真的看见了这一轮，才把它写进历史（D-22）。
-                self._ctx.append_exchange(request.session_key, pending, text)
+                if self._ctx.generation(request.session_key) == request.generation:
+                    history_user = pending
+                    if history_context:
+                        history_user = f"{pending}\n\n{history_context}"
+                    self._ctx.append_exchange(request.session_key, history_user, text)
             if outcome.reason == "quota":
                 await self._notify_quota(request)
             else:
@@ -556,6 +635,84 @@ class BotApp:
         if not self._vision_enabled:
             return None, "none"
         return await self._image_loader.load(request.message)
+
+    async def _complete_search(
+        self,
+        model: ModelClient,
+        messages: list[dict[str, Any]],
+        request: Request,
+    ) -> tuple[str, str | None]:
+        """执行一轮显式搜索授权；MCP 调用不占用模型并发门。"""
+        if not self._config.mcp.enabled:
+            raise ModelError("tools_unavailable", False)
+        registry = self._mcp_manager.registry
+        if not registry.feature_available("search"):
+            raise ModelError("tools_unavailable", False)
+        complete_with_tools = getattr(model, "complete_with_tools", None)
+        if not callable(complete_with_tools):
+            raise ModelError("tools_unavailable", False)
+        feature = self._config.mcp.features.get("search")
+        if feature is None:
+            raise ModelError("tools_unavailable", False)
+        tools = tuple(registry.tools_for("search"))
+        if not tools:
+            raise ModelError("tools_unavailable", False)
+
+        async def execute(call):
+            return await registry.execute(
+                "search",
+                call,
+                generation_is_current=lambda: (
+                    self._ctx.generation(request.session_key) == request.generation
+                ),
+            )
+
+        kwargs: dict[str, Any] = {
+            "tools": tools,
+            "execute": execute,
+            "max_tool_calls": feature.max_tool_calls_per_turn,
+            "generation_is_current": lambda: (
+                self._ctx.generation(request.session_key) == request.generation
+            ),
+        }
+        # 兼容测试替身或旧的可选客户端；正式 OpenAI 客户端支持 model_gate，
+        # 只在两次模型请求周围占门，等待/执行 MCP 时不占普通聊天槽位。
+        try:
+            signature = inspect.signature(complete_with_tools)
+            accepts_gate = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            ) or "model_gate" in signature.parameters
+        except (TypeError, ValueError):
+            # 某些代理对象没有可反射签名；它们采用旧兼容路径。
+            accepts_gate = False
+        if accepts_gate:
+            kwargs["model_gate"] = self._model_gate
+
+        try:
+            if accepts_gate:
+                completion = await complete_with_tools(messages, **kwargs)
+            else:
+                async with self._model_gate:
+                    completion = await complete_with_tools(messages, **kwargs)
+        except ModelError as exc:
+            if exc.kind == "bad_request" and getattr(model, "tools_unsupported", False):
+                raise ModelError("tools_unsupported", False) from exc
+            raise
+        return completion.text, completion.history_context
+
+    async def _send_search_unavailable(self, request: Request) -> None:
+        """搜索显式授权但能力不可用时只发本地提示。"""
+        if self._ctx.generation(request.session_key) != request.generation:
+            return
+        outcome = await self._sender.send(
+            request.channel_id,
+            texts.SEARCH_UNAVAILABLE_TEXT,
+            request.message.id,
+            kind="notice_local",
+            thread_root_id=request.thread_root_id,
+        )
+        self._note_forbidden(outcome)
 
     async def _send_image_unavailable(self, request: Request) -> None:
         """纯图但读不到：本地提示，不调模型。
@@ -829,6 +986,7 @@ class BotApp:
 
         await self._workers.stop()
         await self._ops.stop()
+        await self._mcp_manager.stop()
 
         if self._owns_model and self._model is not None:
             await self._model.aclose()

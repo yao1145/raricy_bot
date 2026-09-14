@@ -5,7 +5,9 @@
 #   RARICY_USERNAME   站点登录用户名
 #   RARICY_PASSWORD   站点登录密码
 #   LLM_API_KEY       模型服务的 API Key
-# 缺失或为空时程序会直接以配置错误退出。
+#   EXA_API_KEY       Exa MCP API Key（仅启用 mcp.enabled 时需要）
+# RARICY_USERNAME、RARICY_PASSWORD、LLM_API_KEY 缺失或为空时程序会直接以配置错误退出；
+# EXA_API_KEY 缺失时仅停用 Exa MCP，普通聊天仍可启动。
 
 site:
   base_url: "https://example.com"
@@ -22,6 +24,41 @@ model:
   vision_enabled: false
   # 单张图的下载期硬上限（字节），不得超过站点图床的 10 MiB 上限。
   max_image_bytes: 5242880
+
+# MCP 联网搜索默认关闭。启用后，只有聊天区的显式 `/search <问题>` 会把当前轮交给
+# 模型判断是否调用 Exa；评论区永远不会获得 MCP 工具。
+# API Key 不写在 YAML 中：env_from 的值只是宿主环境变量名，实际值由环境注入。
+mcp:
+  enabled: false
+  connect_timeout_seconds: 10
+  call_timeout_seconds: 20
+  reconnect_base_seconds: 3
+  reconnect_max_seconds: 60
+  servers:
+    exa:
+      enabled: true
+      transport: stdio
+      # Docker 镜像在构建期固定安装 exa-mcp-server@3.4.1，运行期不执行 npx/npm。
+      command: exa-mcp-server
+      args: []
+      env_from:
+        EXA_API_KEY: EXA_API_KEY
+      env:
+        ENABLED_TOOLS: web_search_exa
+        DEBUG: "false"
+  features:
+    search:
+      enabled: true
+      bindings:
+        - server: exa
+          tool: web_search_exa
+      result_count: 5
+      result_item_token_limit: 3000
+      history_item_token_limit: 500
+      max_query_chars: 500
+      max_tool_calls_per_turn: 1
+      max_concurrency: 1
+      min_interval_seconds: 2
 
 behavior:
   context_turns: 10

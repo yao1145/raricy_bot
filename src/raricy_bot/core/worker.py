@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, Generic, Protocol, TypeVar
 
 import httpx
@@ -20,6 +21,14 @@ import openai
 
 from ..config import ModelConfig
 from ..logging_setup import get_logger, log_event
+from ..mcp.contracts import (
+    McpProvider,
+    ToolCall,
+    ToolCompletion,
+    ToolDefinition,
+    ToolExecution,
+    ToolExecutor,
+)
 from ..redact import Redactor
 
 logger = get_logger("worker")
@@ -37,10 +46,48 @@ RequestT = TypeVar("RequestT", bound=SessionRequest)
 _MAX_ATTEMPTS: int = 2
 
 
+class ToolGenerationCancelled(Exception):
+    """请求在工具循环的异步边界已被 /reset 作废。"""
+
+
+class ToolRegistry(Protocol):
+    """功能绑定与工具白名单的最小协议。"""
+
+    def tools_for(self, feature_name: str) -> tuple[ToolDefinition, ...]: ...
+
+    def feature_available(self, feature_name: str) -> bool: ...
+
+    async def execute(self, feature_name: str, call: ToolCall) -> ToolExecution: ...
+
+
+@dataclass(frozen=True)
+class _ToolRound:
+    """OpenAI 一轮响应的内部提取结果。"""
+
+    text: str
+    tool_calls: tuple[ToolCall, ...]
+    raw_message: dict[str, Any]
+
+
 class ModelClient(Protocol):
     """模型客户端协议；只需实现 `complete`。"""
 
-    async def complete(self, messages: list[dict[str, str]]) -> str: ...
+    async def complete(self, messages: list[dict[str, Any]]) -> str: ...
+
+
+class ToolCapableModelClient(ModelClient, Protocol):
+    """支持 Chat Completions function tools 的可选模型协议。"""
+
+    async def complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: tuple[ToolDefinition, ...],
+        execute: ToolExecutor,
+        max_tool_calls: int,
+        generation_is_current: Callable[[], bool],
+        model_gate: Any | None = None,
+    ) -> ToolCompletion: ...
 
 
 class ModelError(Exception):
@@ -64,6 +111,7 @@ class OpenAIModelClient:
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._cfg = cfg
+        self._tools_unsupported = False
         # 密钥登记进脱敏器，确保任何出站文本与日志都不会泄露它。
         redactor.add_secret(api_key)
         kwargs: dict[str, Any] = {
@@ -77,7 +125,7 @@ class OpenAIModelClient:
             kwargs["http_client"] = httpx.AsyncClient(transport=transport)
         self._client = openai.AsyncOpenAI(**kwargs)
 
-    async def complete(self, messages: list[dict[str, str]]) -> str:
+    async def complete(self, messages: list[dict[str, Any]]) -> str:
         """调用 chat.completions；可重试错误只重试一次，最终失败抛 `ModelError`。"""
         attempt = 0
         while True:
@@ -115,9 +163,269 @@ class OpenAIModelClient:
 
             return text
 
+    @property
+    def tools_unsupported(self) -> bool:
+        """当前模型端点是否已确认不支持 tools；只缓存首轮 400/404。"""
+        return self._tools_unsupported
+
+    async def complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: tuple[ToolDefinition, ...],
+        execute: ToolExecutor,
+        max_tool_calls: int,
+        generation_is_current: Callable[[], bool],
+        model_gate: Any | None = None,
+    ) -> ToolCompletion:
+        """执行至多一次工具的两轮 Chat Completions 工具循环。
+
+        第一轮让模型自动决定是否调用工具并关闭并行调用；工具结果随后以
+        ``role=tool`` 回传，第二轮明确设置 ``tool_choice=none``。MCP 内容由
+        executor 负责清洗，本方法只把不可信字符串作为工具消息传递。
+        """
+        if not tools:
+            raise ModelError("tools_unavailable", False)
+        if self._tools_unsupported:
+            raise ModelError("tools_unsupported", False)
+        if max_tool_calls < 1:
+            raise ModelError("tools_unavailable", False)
+
+        self._check_generation(generation_is_current)
+        first = await self._create_tool_completion(
+            messages,
+            tools=tools,
+            tool_choice="auto",
+            parallel_tool_calls=False,
+            model_gate=model_gate,
+            detect_tools_unsupported=True,
+        )
+        self._check_generation(generation_is_current)
+        if not first.tool_calls:
+            if not first.text:
+                raise ModelError("empty", True)
+            return ToolCompletion(first.text, (), None)
+
+        # 即使模型违反 parallel_tool_calls=False，也只执行第一个名称与参数均合法的
+        # 绑定工具。未知名称不消耗搜索预算；已执行一个合法调用后，其余合法调用只
+        # 生成预算耗尽错误，使第二轮请求仍满足 SDK 的消息配对合同。
+        executions: list[ToolExecution] = []
+        allowed_names = {tool.model_name for tool in tools}
+        executed_tool_names: list[str] = []
+        for call in first.tool_calls:
+            self._check_generation(generation_is_current)
+            if call.model_name not in allowed_names:
+                execution = ToolExecution(
+                    call_id=call.call_id,
+                    content="tool not allowed",
+                    is_error=True,
+                    error_kind="tool_not_allowed",
+                    history_context=None,
+                )
+            elif len(executed_tool_names) >= max_tool_calls:
+                execution = ToolExecution(
+                    call_id=call.call_id,
+                    content="tool call budget exhausted",
+                    is_error=True,
+                    error_kind="tool_budget_exhausted",
+                    history_context=None,
+                )
+            else:
+                try:
+                    execution = await execute(call)
+                except ToolGenerationCancelled:
+                    raise
+                except Exception:
+                    # executor 是外部边界；不把异常正文或参数带入模型。
+                    execution = ToolExecution(
+                        call_id=call.call_id,
+                        content="tool unavailable",
+                        is_error=True,
+                        error_kind="tool_unavailable",
+                        history_context=None,
+                    )
+                # Registry 的 invalid_arguments 表示该候选尚未实际执行，允许
+                # 后续返回的合法候选竞争本轮唯一预算；其他结果都算已尝试。
+                if execution.error_kind != "invalid_arguments":
+                    executed_tool_names.append(call.model_name)
+            executions.append(execution)
+            self._check_generation(generation_is_current)
+
+        assistant_message = first.raw_message
+        tool_messages: list[dict[str, Any]] = [
+            {
+                "role": "tool",
+                "tool_call_id": execution.call_id,
+                "content": execution.content,
+            }
+            for execution in executions
+        ]
+        followup_messages = list(messages)
+        followup_messages.append(assistant_message)
+        followup_messages.extend(tool_messages)
+
+        self._check_generation(generation_is_current)
+        final = await self._create_tool_completion(
+            followup_messages,
+            # 第二轮只让模型生成正文；不再把任何可调用工具定义发回端点。
+            tools=(),
+            tool_choice="none",
+            parallel_tool_calls=False,
+            model_gate=model_gate,
+            detect_tools_unsupported=False,
+        )
+        self._check_generation(generation_is_current)
+        if not final.text:
+            raise ModelError("empty", True)
+        history_context = next(
+            (
+                execution.history_context
+                for execution in executions
+                if execution.history_context is not None
+            ),
+            None,
+        )
+        return ToolCompletion(
+            final.text,
+            tuple(executed_tool_names),
+            history_context,
+        )
+
     async def aclose(self) -> None:
         """关闭底层 SDK 与其 http 客户端。"""
         await self._client.close()
+
+    async def _create_tool_completion(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: tuple[ToolDefinition, ...],
+        tool_choice: str,
+        parallel_tool_calls: bool,
+        model_gate: Any | None,
+        detect_tools_unsupported: bool,
+    ) -> "_ToolRound":
+        """发起一轮带工具请求并复用现有错误重试映射。"""
+        payload = tuple(self._tool_payload(tool) for tool in tools)
+        attempt = 0
+        while True:
+            try:
+                request_kwargs: dict[str, Any] = {
+                    "model": self._cfg.model,
+                    "messages": messages,
+                    "temperature": self._cfg.temperature,
+                    "max_tokens": self._cfg.max_output_tokens,
+                    "tool_choice": tool_choice,
+                }
+                # 工具循环的最终轮不提供空工具列表；某些兼容端点把空数组
+                # 误当成非法 tools 参数，但仍接受明确的 tool_choice=none。
+                if payload:
+                    request_kwargs["tools"] = list(payload)
+                    request_kwargs["parallel_tool_calls"] = parallel_tool_calls
+                if model_gate is None:
+                    response = await self._client.chat.completions.create(
+                        **request_kwargs,
+                    )
+                else:
+                    async with model_gate:
+                        response = await self._client.chat.completions.create(
+                            **request_kwargs,
+                        )
+                result = self._extract_tool_round(response)
+            except Exception as exc:
+                error = self._map_error(exc)
+                if (
+                    detect_tools_unsupported
+                    and isinstance(exc, openai.APIStatusError)
+                    and getattr(exc, "status_code", None) in {400, 404}
+                ):
+                    self._tools_unsupported = True
+                if not error.retryable or attempt + 1 >= _MAX_ATTEMPTS:
+                    raise error from exc
+                attempt += 1
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "model.retry",
+                    kind=error.kind,
+                    attempt=attempt,
+                )
+                continue
+            if not result.text and not result.tool_calls:
+                error = ModelError("empty", True)
+                if attempt + 1 >= _MAX_ATTEMPTS:
+                    raise error
+                attempt += 1
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "model.retry",
+                    kind=error.kind,
+                    attempt=attempt,
+                )
+                continue
+            return result
+
+    @staticmethod
+    def _check_generation(predicate: Callable[[], bool]) -> None:
+        """generation 失效时抛专用异常，App 不得发送失败通知。"""
+        if not predicate():
+            raise ToolGenerationCancelled()
+
+    @staticmethod
+    def _tool_payload(tool: ToolDefinition) -> dict[str, Any]:
+        """把领域工具转换为 OpenAI function tool 定义。"""
+        return {
+            "type": "function",
+            "function": {
+                "name": tool.model_name,
+                "description": tool.description,
+                "parameters": tool.input_schema,
+            },
+        }
+
+    @classmethod
+    def _extract_tool_round(cls, response: Any) -> "_ToolRound":
+        """从 SDK 对象或兼容的 dict 中提取正文、调用和原始 assistant 消息。"""
+        choices = cls._field(response, "choices") or []
+        if not choices:
+            return _ToolRound("", (), {"role": "assistant", "content": None})
+        message = cls._field(choices[0], "message")
+        text = cls._field(message, "content")
+        text = text.strip() if isinstance(text, str) else ""
+        raw_calls = cls._field(message, "tool_calls") or []
+        calls: list[ToolCall] = []
+        serial_calls: list[dict[str, Any]] = []
+        for item in raw_calls:
+            function = cls._field(item, "function")
+            call_id = cls._field(item, "id")
+            name = cls._field(function, "name")
+            arguments = cls._field(function, "arguments")
+            if not isinstance(call_id, str) or not call_id:
+                continue
+            if not isinstance(name, str) or not name:
+                name = ""
+            if not isinstance(arguments, str):
+                arguments = ""
+            calls.append(ToolCall(call_id, name, arguments))
+            serial_calls.append(
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }
+            )
+        assistant: dict[str, Any] = {"role": "assistant", "content": text or None}
+        if serial_calls:
+            assistant["tool_calls"] = serial_calls
+        return _ToolRound(text, tuple(calls), assistant)
+
+    @staticmethod
+    def _field(value: Any, name: str) -> Any:
+        """兼容 openai SDK 对象与测试用 dict；不递归暴露未知字段。"""
+        if isinstance(value, dict):
+            return value.get(name)
+        return getattr(value, name, None)
 
     # --- 内部实现 ---
 
