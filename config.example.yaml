@@ -17,6 +17,11 @@ model:
   temperature: 0.4
   timeout_seconds: 45
   max_output_tokens: 600
+  # 图片输入默认关闭。仅当本模型确实支持视觉时才打开：否则每一条带图的消息
+  # 都会以 400 失败并回一条失败提示。
+  vision_enabled: false
+  # 单张图的下载期硬上限（字节），不得超过站点图床的 10 MiB 上限。
+  max_image_bytes: 5242880
 
 behavior:
   context_turns: 10
