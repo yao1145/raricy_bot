@@ -33,6 +33,8 @@ class ModelConfig:
     temperature: float = 0.4
     timeout_seconds: float = 45.0
     max_output_tokens: int = 600
+    vision_enabled: bool = False          # 图片输入，默认关闭（§20）
+    max_image_bytes: int = 5242880        # 5 MiB，单图下载期硬上限
 
 @dataclass(frozen=True)
 class BehaviorConfig:
@@ -141,6 +143,9 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
 - 校验：`base_url` 必须 http/https 且非空；`0 <= temperature <= 2`；`timeout_seconds > 0`；
   `max_output_tokens >= 1`；所有 `behavior` 整数字段 `>= 1`；`daily_normal_limit < daily_absolute_limit`；
   `minute_attempt_limit >= 1`；`ops.port` 在 1..65535。
+- `model.vision_enabled` 必须是**布尔**（YAML 里写成 `"true"` 字符串即 `ConfigError`）；
+  `model.max_image_bytes` 是正整数（布尔不算整数）且 `<= 10485760`（站点图床单图上限是
+  上游常量，配更大只会掩盖意图）。两者都缺省：`false` / `5242880`。
 - `system_prompt_sha256` = `hashlib.sha256(system_prompt.encode()).hexdigest()[:12]`。
 - `Config` 内**不含** Cookie、不含消息正文。`repr(Config)` 不得泄露密钥。
 
@@ -213,6 +218,7 @@ def is_secret_probe(text: str) -> bool
 def is_help_command(text: str) -> bool
 def is_reset_command(text: str) -> bool
 def has_media(message: Any) -> bool     # message.image is not None or message.blog is not None
+def has_image(message: Any) -> bool     # message.image is not None and not message.image_missing
 ```
 
 规则（逐条照实现，测试按此断言）：
@@ -239,6 +245,8 @@ def has_media(message: Any) -> bool     # message.image is not None or message.b
   **不要**加入任何会命中普通寒暄的模式（例如询问机器人名字、打招呼）；
   这一层的目标是挡住索取系统提示与运行密钥的请求，不是审查闲聊。
 - `is_help_command` / `is_reset_command`：`text.strip().lower()` 后等于 `"/help"` / `"/reset"`。
+- `has_image` 与 `has_media` 回答的是两个不同的问题：前者是「这一轮能不能把图交给模型」
+  （因此 `image_missing` 为真时不算），后者是「有没有我读不了的东西」（保持原义）。
 
 ## 5. `texts.py`
 
@@ -246,9 +254,11 @@ def has_media(message: Any) -> bool     # message.image is not None or message.b
 
 ```python
 TRUNCATION_SUFFIX: str      # 追加在被截断输出末尾的省略提示
-HELP_TEXT: str              # 能力、隐私、无联网/图片能力说明
+HELP_TEXT: str              # 能力、隐私、无联网/无图片输入说明（vision 关闭时）
+HELP_TEXT_WITH_VISION: str  # 同上，但能力句声明可以查看用户发来的图片（vision 开启时）
 USAGE_HINT: str             # 空白内容或只有 @bot 时的用法提示
-UNSUPPORTED_MEDIA_TEXT: str # 纯图片/纯博客
+UNSUPPORTED_MEDIA_TEXT: str # 只有博客、没有可读图片
+IMAGE_UNAVAILABLE_TEXT: str # 有图但读不到（未启用图片输入 / 图已失效 / 取图失败）
 TOO_LONG_TEXT: str          # 超过 max_input_chars
 SECRET_REFUSAL_TEXT: str    # 本地拒绝索取系统提示/密钥
 RESET_DONE_TEXT: str        # /reset 后的确认
@@ -258,11 +268,18 @@ QUOTA_NOTICE_TEXT: str      # 当日额度用尽
 LOBBY_SHARED_SYSTEM_ADDENDUM: str   # 共享大区请求的静态 system 附加说明（见 5.1）
 ```
 
+`HELP_TEXT` 与 `HELP_TEXT_WITH_VISION` **共用同一份首尾文字**，只有中间那句能力描述
+二选一（实现上是三段模块级常量拼接）。因此两份文案的事实披露必须逐字一致：身份、
+第三方模型处理、不联网、无长期记忆、`/help` 与 `/reset`，以及大区共享上下文的四点。
+新增或修改其中任何一处都必须同时作用于两者。
+
 `HELP_TEXT` 必须包含：机器人身份声明、能力范围、**消息可能发送至第三方模型处理**、
 不联网、不能看图/博客、`/help` 与 `/reset` 用法；以及大区共享上下文的四点说明
 （公开多人上下文、只有精确 `@bot` 的消息进入、新参与者加入后最近的链内历史会
 再次发送给第三方模型、回复链内消息才能延续上下文，且 `/reset` 创建新链而非删除旧链）。
-`HELP_TEXT` 调用于 `/help` 命令，**不得**触发模型调用。
+`HELP_TEXT_WITH_VISION` 的差别只有一句：可以查看用户发来的图片，且**图片同样会转交
+第三方模型处理**。两者都调用于 `/help` 命令，**不得**触发模型调用；整条都必须能塞进
+站点单条消息上限（1000 字）。
 
 ### 5.1 `LOBBY_SHARED_SYSTEM_ADDENDUM`
 
@@ -327,6 +344,11 @@ class SiteError(Exception):
     message: str            # 已脱敏
     retry_after: float | None
 
+class ImageFetchError(Exception):
+    def __init__(self, reason: str, status: int = 0) -> None
+    reason: str             # "host_not_allowed"|"too_large"|"http"|"network"
+    status: int             # 仅 "http" 有意义
+
 class SiteClient:
     def __init__(self, base_url: str, redactor: Redactor, *, timeout: float = 20.0,
                  transport: httpx.AsyncBaseTransport | None = None,
@@ -370,6 +392,23 @@ class SiteClient:
 
     async def probe_chat(self) -> None
         # GET lobby messages?limit=1；用于探测 403 禁言/权限是否恢复；异常抛 SiteError
+
+    async def fetch_image(self, url: str, *, max_bytes: int) -> bytes
+        # 取回一条消息附带的图片原始字节（§20）。
+        # url 用 urljoin(base_url + "/", url) 解析：站点给的是相对路径
+        # `/api/images/<id>/raw`（chat-bot.md §11.1 写成绝对 URL，与源码不符，
+        # 按该文档 §0「以源码为准」）。
+        # **同源硬约束**：解析结果必须是 http/https 且 scheme + host + 有效端口与
+        # base_url 完全一致，否则 ImageFetchError("host_not_allowed") 且**不发出请求**。
+        # 理由：一旦允许「照站点给的 url 带着 Cookie 去 GET」，任何能让站点返回任意 url
+        # 的路径都会变成凭据外泄通道。同源请求照常带 Cookie 与 Accept: image/*。
+        # 字节上限在**流式累计过程中**执行：超过 max_bytes 立即抛
+        # ImageFetchError("too_large")，**不读完整个响应**。
+        # 非 200 -> ImageFetchError("http", status)；零字节响应体同样算 http(200)；
+        # 网络错误/超时 -> ImageFetchError("network")。
+        # **401 不重新登录、不重试**：取图失败只是一次降级，不值得多一次登录。
+        # **本方法不写任何日志**（URL 不得进日志），失败原因由调用方记稳定字段。
+        # 返回原始字节，**不返回 Content-Type**：格式判定以字节嗅探为准（§20）。
 
     @asynccontextmanager
     async def open_stream(self, last_event_id: int | None = None) -> AsyncIterator[httpx.Response]
@@ -780,7 +819,8 @@ class MessageRouter:
     def __init__(self, *, self_user_id: str, bot_username: str,
                  ctx: ContextManager, store: Store,
                  queue: asyncio.Queue[Request], cfg: BehaviorConfig,
-                 storage: StorageConfig, now: Callable[[], float] = time.time) -> None
+                 storage: StorageConfig, now: Callable[[], float] = time.time,
+                 vision_enabled: bool = False) -> None
 
     async def handle_stream(self, event: StreamEvent) -> RouteResult
     async def handle_message(self, channel_id: str, message: ChatMessage,
@@ -844,13 +884,28 @@ class MessageRouter:
    不调模型、不发消息，并且**不** `mark_handled` —— 该事件保持非终态，
    靠重连补发或下次重启恢复（与 D-16 的恢复机制一致）。
 9. 本地判定（全部沿用现有顺序，文案见 §5）：
-   - `user_text` 为空：有媒体 → `reply_now`（`media_only`）；无媒体 → `reply_now`（`empty`）。
+   - `user_text` 为空，按顺序三分支：
+     - `vision_enabled` 且 `has_image(message)` → **不回复**，直落第 10 步入队，
+       最终 `reason` 为 `image_only`（取图与降级由 worker 负责，路由器不做 I/O）；
+     - 否则 `message.image is not None` → `reply_now`（`media_only`），
+       文案 `IMAGE_UNAVAILABLE_TEXT`（图片输入未开启，或 `image_missing`）；
+     - 否则 `message.blog is not None` → `reply_now`（`media_only`），
+       文案 `UNSUPPORTED_MEDIA_TEXT`；
+     - 否则 → `reply_now`（`empty`），文案 `USAGE_HINT`。
+     空正文不会命中 9.2-9.6 的任何一个分支（命令判定与探测词都要求非空内容），
+     因此「不回复直接入队」不会误判。
+     注意大区里纯图消息仍然必须**带 `@bot`**（第 5 步的 mention 过滤在前），
+     即用户输入 `@bot` 并附图；私聊不需要。
+   - `/help` 的文案按 `vision_enabled` 在 `HELP_TEXT_WITH_VISION` 与 `HELP_TEXT`
+     之间二选一。
    - `is_help_command` → `reply_now`（`help`），文案 `HELP_TEXT`。
    - `is_reset_command`：
      - **大区**：**不**调用 `ctx.reset`（原链不受影响，见 D-21），直接 `reply_now`（`reset`），
        文案 `RESET_DONE_TEXT`。第 8 步已经用 `force_new=True` 把本条命令建成了新链。
      - **私聊**：`ctx.reset(session_key)`（清空并递增代次）→ `reply_now`（`reset`）。
-   - 有媒体且 `user_text` 非空 → 照常处理文本（媒体忽略），继续往下。
+   - 有媒体且 `user_text` 非空 → 照常处理文本，继续往下。图片是否随本轮外送由
+     worker 决定（`vision_enabled` 且图可读时附上，见 §16），路由器在这一步不分流。
+     博客一律只当作「有东西读不了」，不给模型。
    - `len(user_text) > cfg.max_input_chars` → `reply_now`（`too_long`），文案 `TOO_LONG_TEXT`。
    - `is_secret_probe(user_text)` → `reply_now`（`secret_probe`），文案 `SECRET_REFUSAL_TEXT`。
 10. 构造 `Request` 并入队：成功 → `queued`；`asyncio.QueueFull` → `busy`
@@ -958,14 +1013,14 @@ class MessageSender:
 
 ```python
 class ModelClient(Protocol):
-    async def complete(self, messages: list[dict[str, str]]) -> str: ...
+    async def complete(self, messages: list[dict[str, Any]]) -> str: ...
 
 class OpenAIModelClient:
     def __init__(self, cfg: ModelConfig, api_key: str, *, redactor: Redactor,
                  transport: httpx.AsyncBaseTransport | None = None) -> None
         # transport 非 None 时传给 httpx.AsyncClient(transport=...) 再交给
         # AsyncOpenAI(http_client=...)，使测试无需真实网络（§18）
-    async def complete(self, messages: list[dict[str, str]]) -> str
+    async def complete(self, messages: list[dict[str, Any]]) -> str
     async def aclose(self) -> None
 
 class ModelError(Exception):
@@ -983,6 +1038,9 @@ class WorkerPool:
 
 `OpenAIModelClient.complete`：
 
+- 参数类型放宽为 `list[dict[str, Any]]`：只有**当前轮**那条 `role="user"` 消息的
+  `content` 可能是内容块列表（`[{"type":"text",...}, {"type":"image_url",...}]`，§20），
+  历史与 system 一律仍是字符串。
 - 用 `openai.AsyncOpenAI(base_url=..., api_key=..., timeout=cfg.timeout_seconds, max_retries=0)`
   （重试由本模块自己控制）。`temperature=cfg.temperature`、`max_tokens=cfg.max_output_tokens`。
 - 返回 `choices[0].message.content`，`strip()`；为空 → `ModelError("empty", retryable=True)`。
@@ -1089,13 +1147,35 @@ class BotApp:
 
   私聊的标签维持 `[引用 @作者]` 不变（只有大区用 `[直接引用 @作者]`，见 D-25）。
   即使被引用正文已经在历史里，本轮仍然保留这份直接引用：有限的重复优于丢失当前指向。
+
+  **图片标记（§20，D-28）**：本轮带图时，`user_text` 先加上一行标记再包装，
+  三种形状与上一段共用同一个字符串（发给模型的就是提交进历史的）：
+
+  | `image_state` | 有正文 | 无正文 |
+  |---------------|--------|--------|
+  | `"ok"` | `[图片]\n---\n正文` | `[图片]` |
+  | 其余失败值 | `[图片未提供]\n---\n正文` | （不会到模型：纯图读不到走本地提示） |
+  | `"none"` | 正文（不加标记） | — |
+
+  大区的顺序是「直接引用 → 发言者包装 → 图片标记 → 正文」，即标记在
+  `speaker_wrapper` **内部**：图属于发言人这条消息。
+  `attach_image` 必须排在 `_apply_reply_prefix` **之后**，因为后者按字符串拼接 content。
 - worker 的 handler（**两处代次检查不能省**）：
+  0. `vision_enabled` 为假时**完全不碰** `ImageLoader`（`_load_image` 直接返回
+     `(None, "none")`），因此关闭图片输入的进程里没有任何新增的图床请求。
   1. 开始处理前先比对 `ctx.generation(request.session_key) != request.generation`
      → 该请求已被 `/reset` 或线程过期作废：**不调模型、不发消息**，
      `mark_handled(..., "done")` 后返回。
-  2. 组装本轮 `pending`（上表左列），`messages = ctx.build_messages(
+  1.5 取图（`ImageLoader.load`，在模型门**之外**，超时由站点请求超时兜住）→
+     `(image_part, image_state)`。三种去向：
+     - `image_part is None` 且 `image_state != "none"` 且 `user_text` 为空（纯图读不到）
+       → 发一次 `IMAGE_UNAVAILABLE_TEXT`（kind=`"notice_local"`，见 D-30），
+       **不调模型**，然后走 finally 的 `mark_handled`；
+     - 其余情况继续往下。
+  2. 组装本轮 `pending`（上表左列，**加上图片标记**），`messages = ctx.build_messages(
      request.session_key, cfg_system_prompt, pending_user=pending,
      system_addendum=LOBBY_SHARED_SYSTEM_ADDENDUM if channel_kind == "lobby" else None)`
+     → `_apply_reply_prefix`（仍是字符串拼接）→ `attach_image`（`image_part` 非空时）
      → 模型（含一次重试）→ **再次**比对代次：
      - 代次已变 → **不提交历史**、**不**发送这条过期回复，只记一条日志
        （`app.stale_generation`，白名单字段），最后同样 `mark_handled(..., "done")`。
@@ -1196,8 +1276,59 @@ worker、ops、模型、client、Store；每个取消动作必须 await。
 2. 用户内容只放在 `role="user"` 的消息里，绝不拼进 system prompt。
 3. HTTP 客户端不设 `Origin` / `Referer`。
 4. 成功判据只看 `code == 200`。
-5. 不实现图片理解、博客理解、工具调用、联网、长期记忆（第一版明确不支持）。
+5. 不实现博客理解、工具调用、联网、长期记忆。**图片理解仅在 `model.vision_enabled`
+   为真时提供**，且只把当前轮那一张图取回内存转交模型：不落 SQLite、不写日志、
+   不写文件、不进 `ContextManager` 历史。默认关闭。不转发 SVG。
 6. 不调用站内管理接口，不执行代码，不访问服务器文件。
 7. 大区共享链的持久化只存 `message_id -> thread_root_id`：**不存** `author.id`、用户名、
    参与者名单、任何正文；发言者一律从实时 DTO 取。日志里也不得出现用户名或用户 id。
 8. 直接引用正文只进当前轮，绝不写进 `ContextManager` 历史（D-7 仍然有效）。
+
+## 20. `core/vision.py`
+
+图片输入的全部实现。**图片字节只存在于内存**：不落 SQLite、不写日志、不写文件、
+不进 `ContextManager` 历史。`model.vision_enabled` 为假时本模块不被调用。
+
+```python
+IMAGE_MIME_ALLOWLIST: tuple[str, ...]   # ("image/png", "image/jpeg", "image/gif", "image/webp")
+
+def sniff_image_mime(data: bytes) -> str | None
+    # 只按 magic bytes 判定：PNG 89 50 4E 47 0D 0A 1A 0A；JPEG FF D8 FF；
+    # GIF "GIF8"；WEBP data[0:4]==b"RIFF" and data[8:12]==b"WEBP"。
+    # 其余（含 SVG、空串、截断字节）一律 None。
+def build_data_url(data: bytes, mime: str) -> str          # "data:<mime>;base64,<...>"
+def build_image_part(data_url: str) -> dict[str, Any]      # {"type":"image_url","image_url":{"url":...}}
+def attach_image(messages: list[dict[str, Any]], part: dict[str, Any]) -> None
+    # 就地改写**最后一条** role=="user" 的 content：str -> [{"type":"text",...}, part]；
+    # 已是 list -> 追加；找不到 user 消息 -> 不动。必须在 _apply_reply_prefix 之后调用。
+
+class ImageLoader:
+    def __init__(self, client: SiteClient, *, max_bytes: int,
+                 logger: logging.Logger | None = None) -> None
+    async def load(self, message: ChatMessage) -> tuple[dict[str, Any] | None, str]
+```
+
+`load` 的 `reason` 取值（稳定短标识）：
+
+| reason | 含义 | 调用方行为 |
+|--------|------|-----------|
+| `"none"` | 没有可读的图（`image is None` 或 `image_missing`） | 按现状处理，不加标记、不记日志 |
+| `"ok"` | 已取到并编码，第一个返回值是内容块 | 附到当前轮；历史记 `[图片]` |
+| `"host_not_allowed"` | 目标与站点不同源 | 降级 |
+| `"too_large"` | 超过 `model.max_image_bytes` | 降级 |
+| `"http"` | 站点返回非 200（含 404 的私有图、零字节响应体） | 降级 |
+| `"network"` | 传输层错误或超时 | 降级 |
+| `"unsupported_type"` | 嗅探结果不在白名单（含 SVG、非图片字节） | 降级 |
+
+硬性要求：
+
+- **不信任 DTO 的 `mime_type`**：data URL 里的 mime 一律取自字节嗅探。让远端数据决定
+  我们发给模型的内容类型，是把一个可伪造的字段当成事实。
+- **不转发 SVG**：图床上传白名单里有 `image/svg+xml`，它是唯一带脚本能力的格式，
+  且模型对它的 data URL 也没有有效理解。
+- 降级时记一条 `vision.image_unavailable`，字段只有 `reason`、`size_bytes`
+  （`too_large` 时补 `limit_bytes`）——三者都在 `LOG_FIELDS` 白名单内。
+  **URL 绝不进日志**。`reason == "none"` 不是失败，不记。
+- 不做图片缓存：同一条消息被处理一次取一次，重试或补发会重新下载。
+- 图片 token **不计入** `context_input_tokens` 预算。每条消息最多一张图、当前轮永不被
+  裁剪，因此超支有界；这是一个已知且被接受的取舍，不是遗漏。

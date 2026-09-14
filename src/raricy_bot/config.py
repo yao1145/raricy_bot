@@ -21,6 +21,10 @@ DEFAULT_CONFIG_PATH: str = "./config.yaml"
 # 配置文件大小硬上限（1 MiB）。是代码常量而不是 YAML 项：必须在解析配置之前就能判定。
 MAX_CONFIG_BYTES: int = 1024 * 1024
 
+# 站点图床的单图硬上限（10 MiB）。来源：raricy.com src/lib/image-upload.ts 的
+# MAX_IMAGE_SIZE。配得比它更大的话站点根本不会给出那么大的图，只会掩盖意图。
+MAX_IMAGE_BYTES: int = 10 * 1024 * 1024
+
 # 密钥环境变量名。
 USERNAME_ENV: str = "RARICY_USERNAME"
 PASSWORD_ENV: str = "RARICY_PASSWORD"
@@ -48,6 +52,12 @@ class ModelConfig:
     temperature: float = 0.4
     timeout_seconds: float = 45.0
     max_output_tokens: int = 600
+    # 图片输入：默认关闭。配的模型未必支持视觉，开启而模型不支持时每一轮带图的消息
+    # 都会以 400 失败并回一条失败提示；默认关闭让既有部署升级后行为逐字节不变。
+    vision_enabled: bool = False
+    # 单张图的下载期硬上限（字节）。默认 5 MiB：base64 后约 6.7 MiB，
+    # 在 concurrency=3 时峰值可控。
+    max_image_bytes: int = 5 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -186,6 +196,8 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
         temperature=_temperature(model_raw),
         timeout_seconds=_positive_number(model_raw, "timeout_seconds", "model", 45.0),
         max_output_tokens=_positive_int(model_raw, "max_output_tokens", "model", 600),
+        vision_enabled=_bool_flag(model_raw, "vision_enabled", "model", False),
+        max_image_bytes=_max_image_bytes(model_raw),
     )
     behavior = _behavior(behavior_raw)
     storage = _storage(storage_raw)
@@ -319,6 +331,24 @@ def _temperature(container: Mapping[str, Any]) -> float:
     value = _number(container.get("temperature", 0.4), "model", "temperature")
     if not 0 <= value <= 2:
         raise ConfigError("配置 model.temperature 必须在 0 到 2 之间")
+    return value
+
+
+def _bool_flag(
+    container: Mapping[str, Any], key: str, where: str, default: bool
+) -> bool:
+    """取布尔开关；缺失用默认值，非布尔（含 "true" 这类字符串）一律报错。"""
+    value = container.get(key, default)
+    if not isinstance(value, bool):
+        raise ConfigError(f"配置 {where}.{key} 必须是 true 或 false")
+    return value
+
+
+def _max_image_bytes(container: Mapping[str, Any]) -> int:
+    """单图字节上限：正整数且不超过站点图床的 10 MiB 硬上限。"""
+    value = _positive_int(container, "max_image_bytes", "model", 5 * 1024 * 1024)
+    if value > MAX_IMAGE_BYTES:
+        raise ConfigError(f"配置 model.max_image_bytes 不得超过 {MAX_IMAGE_BYTES}")
     return value
 
 

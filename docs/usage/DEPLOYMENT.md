@@ -74,35 +74,67 @@ docker compose version      # 需要 v2，命令是 `docker compose` 而不是 `
 
 ## 3. 把代码放到服务器
 
-本项目的仓库**没有配置远程远端**，且 `.gitignore` 排除了 `docs/`、`tests/`、`CLAUDE.md`。
-因此有两条路：
+`.gitignore` 排除了 `tests/`、`docs/archive/`、`CLAUDE.md` 与 `config.yaml`/`.env`/`data/`，
+同步时要自己把后三项挡在外面。三条路，按推荐顺序：
 
-### 3.1 直接整体同步（推荐）
+### 3.1 `tar | ssh`（推荐，两边都不需要额外装东西）
 
 在**本机**（Windows，用 Git Bash）执行：
 
 ```bash
-# 只传运行与构建需要的部分；docs/ 与 tests/ 在容器里用不到
-# 必须排除 config.yaml/.env/data：否则服务器上的配置会被本机配置覆盖，本地测试库也会白传上去
-rsync -avz --delete \
-  --exclude '.git' --exclude '__pycache__' --exclude '.pytest_cache' \
-  --exclude 'config.yaml' --exclude '.env' --exclude 'data' \
-  "/c/Users/yaozi/Desktop/code/raricy_bot/" \
-  user@服务器IP:/opt/raricy_bot/
+cd /d/Study/Code/raricy_bot
+
+tar czf - \
+  --exclude='./.git' --exclude='*/__pycache__' --exclude='./.pytest_cache' \
+  --exclude='./.pytest-tmp-final' \
+  --exclude='./config.yaml' --exclude='./.env' --exclude='./data' \
+  . | ssh user@服务器IP 'mkdir -p /opt/raricy_bot && tar xzf - -C /opt/raricy_bot'
 ```
 
-`--exclude` 过的文件不会被 `--delete` 删掉，所以服务器上已有的 `config.yaml` / `.env` 是安全的。
-服务器没装 rsync 就 `sudo apt install -y rsync`（Rocky 上 `sudo dnf install -y rsync`），
-或改用 `scp -r`（但 scp 没有 exclude）。
+- **不需要 rsync**。Windows 10+ 自带 `tar`（Git Bash 里是 GNU tar 1.35），
+  `ssh` 也是 Git Bash 自带的 OpenSSH；服务器侧只要有 `sshd` 和 `tar`，所有发行版都有。
+- `--exclude` 与 rsync 的 `--exclude` 同义。**必须排除 `config.yaml`/`.env`/`data`**：
+  否则服务器上已经配好的 `config.yaml` 会被本机的覆盖，本地测试库也会白传上去。
+- 整个包约 400 KB（含 docs/ 与 tests/），一次传完，不需要增量。
+  `tests/` 会一起过去（`tar` 不受 `.gitignore` 影响），所以服务器上可以直接跑
+  `python -m pytest tests`；`Dockerfile` 只 `COPY pyproject.toml` 与 `COPY src`，
+  多出来的这些不会进镜像。
 
-> 为什么可以不带 `docs/` 和 `tests/`：`Dockerfile` 只 `COPY pyproject.toml` 和 `COPY src`，
-> 其余一律不进镜像。但**如果你想在服务器上跑测试**，把 `tests/` 一起带上，
-> 否则 `python -m pytest tests` 无从跑起。
+**一条要记住的差别**：`tar` 没有 `--delete` 的等价物 —— 本机删掉的文件不会在服务器上消失。
+要严格对齐就先删源码目录再解包：
 
-### 3.2 走 Git
+```bash
+ssh user@服务器IP 'rm -rf /opt/raricy_bot/src'
+```
 
-如果你愿意把仓库推到某个远端，注意 `.gitignore` 会让 `docs/` 与 `tests/` **不被跟踪**，
-克隆下来不会有它们。这不是错误，是既有的仓库设置。
+只删 `src`，不要删根目录（`config.yaml` / `.env` / `data/` 都在那里）。
+
+### 3.2 管道被禁时：先传包再解开
+
+跳板机或受限网络不允许 `ssh` 直接吃 stdin 时，拆成两步：
+
+```bash
+tar czf /tmp/raricy_bot.tgz \
+  --exclude='./.git' --exclude='*/__pycache__' --exclude='./.pytest_cache' \
+  --exclude='./.pytest-tmp-final' \
+  --exclude='./config.yaml' --exclude='./.env' --exclude='./data' \
+  .
+
+scp /tmp/raricy_bot.tgz user@服务器IP:/tmp/
+ssh user@服务器IP 'mkdir -p /opt/raricy_bot && tar xzf /tmp/raricy_bot.tgz -C /opt/raricy_bot && rm /tmp/raricy_bot.tgz'
+```
+
+**不要用 `scp -r`**：它没有排除功能，会把本机的 `config.yaml` / `.env` / `data/` 一起推上去，
+静默覆盖服务器上已经能用的配置。
+
+### 3.3 走 Git
+
+仓库已配置远端 `origin`（`github.com/yao1145/raricy_bot.git`）；`git push` 之后在服务器上
+`git clone` 即可。本机能否连通该远端请自己用 `git ls-remote origin` 确认。
+
+注意 `.gitignore` 让 `tests/` 与 `docs/archive/` **不被跟踪**，克隆下来不会有它们；
+`docs/` 的其余部分（含本文件）是入库的。若要在服务器上跑测试，
+`tests/` 得另外想办法带过去。
 
 同步完成后：
 
@@ -181,10 +213,10 @@ storage:
 
 ### 4.3 权限：`config.yaml` 与 `.env` 要求不同，不要搞混
 
-|          | `config.yaml`                   | `.env`                       |
-| -------- | ------------------------------- | ---------------------------- |
-| 谁读它   | 容器里的程序（uid **10001**） | 宿主上的 `docker compose`  |
-| 正确权限 | **644**                         | **600**                      |
+|          | `config.yaml`                    | `.env`                   |
+| -------- | ---------------------------------- | -------------------------- |
+| 谁读它   | 容器里的程序（uid**10001**） | 宿主上的`docker compose` |
+| 正确权限 | **644**                      | **600**              |
 
 `config.yaml` 按设计不含任何密钥（密钥全在 `.env`），所以 644 是安全的。
 把它设成 600 会让容器用户读不到配置，容器反复重启、退出码 2 ——
@@ -343,9 +375,9 @@ docker inspect -f '{{.RestartCount}}  {{.State.Status}}  {{.State.ExitCode}}' ra
 两个文件的生效机制**完全不同**：
 
 |              | `config.yaml`                | `.env`                                     |
-| ------------ | ---------------------------- | ------------------------------------------ |
+| ------------ | ------------------------------ | -------------------------------------------- |
 | 新值怎么生效 | `docker compose restart bot` | **必须** `docker compose up -d`      |
-| 原因         | 程序启动时读一次              | 环境变量在容器创建时固化，`restart` 读不到 |
+| 原因         | 程序启动时读一次               | 环境变量在容器创建时固化，`restart` 读不到 |
 
 改完**先按第 4.4 节验证，再重启**，避开重启循环。
 
@@ -357,6 +389,8 @@ model:
   temperature: 0.4
   timeout_seconds: 20          # 调小会让超时更快暴露，见第 15.2 节
   max_output_tokens: 2000      # 调大避免回复被切断，见第 15.1 节
+  vision_enabled: false        # 图片输入，默认关；仅当本模型支持视觉时才开
+  max_image_bytes: 5242880     # 单图下载上限（5 MiB），不得超过站点图床的 10 MiB
 behavior:
   notice_cooldown_seconds: 60
 logging:
@@ -365,7 +399,30 @@ system_prompt: |
   ...
 ```
 
-### 9.2 改了必须同步改 Dockerfile 与 docker-compose.yml
+### 9.2 图片输入（可选，默认关闭）
+
+```yaml
+model:
+  vision_enabled: true         # 打开前先确认模型真的支持视觉
+  max_image_bytes: 5242880     # 单图上限，1 .. 10485760
+```
+
+打开后，用户消息里附带的那张图会由机器人自己从站点取回（`GET /api/images/<id>/raw`，
+同源、带会话 Cookie）、按字节判定格式、编码成 base64 data URL，**只随当前这一轮**交给模型。
+图片不落 SQLite、不写日志、不写文件，也不进对话历史（历史里留一行 `[图片]` 标记）。
+
+要点：
+
+- **必须确认模型支持视觉。** 配了纯文本模型时，每一条带图的消息都会以 400 失败并回一条
+  失败提示。程序**不会**自动降级成纯文本重试 —— 那会把配置错误伪装成偶发故障。
+- **关闭时进程不会对图床发出任何请求**，行为与没有这个功能时逐字一致。
+- 取图不消耗站点限频（图床接口不限频）；但纯图消息会从「一条本地提示」变成
+  「一次模型调用 + 一次回复配额」，这是开启后唯一新增的用量面。
+- 图床文件上限是 10 MiB；超过 `max_image_bytes` 的图会按「读不到」处理，回本地提示。
+- 不转发 SVG（图床上传白名单里有它，但它是唯一带脚本能力的格式）。
+- 日志里只会有 `vision.image_unavailable reason=... size_bytes=...`，**不会有图片 URL**。
+
+### 9.3 改了必须同步改 Dockerfile 与 docker-compose.yml
 
 ```yaml
 ops:
@@ -472,12 +529,12 @@ docker compose logs --since 30m bot | grep -E 'router\.route|sender\.send|app\.'
 
 ### 10.4 重启 / 停止
 
-| 命令                        | 做什么              | 容器 | 数据卷         |
-| --------------------------- | ------------------- | ---- | -------------- |
-| `docker compose restart bot` | 只重启进程        | 保留 | 保留           |
-| `docker compose stop bot` | 只停进程            | 保留 | 保留           |
-| `docker compose down`     | 停进程并删容器/网络 | 删除 | **保留** |
-| `docker compose down -v`  | 上面 + 删数据卷     | 删除 | **删除** |
+| 命令                           | 做什么              | 容器 | 数据卷         |
+| ------------------------------ | ------------------- | ---- | -------------- |
+| `docker compose restart bot` | 只重启进程          | 保留 | 保留           |
+| `docker compose stop bot`    | 只停进程            | 保留 | 保留           |
+| `docker compose down`        | 停进程并删容器/网络 | 删除 | **保留** |
+| `docker compose down -v`     | 上面 + 删数据卷     | 删除 | **删除** |
 
 推荐 `down`。**不要用 `down -v`**，它会丢掉去重记录、SSE 水位与当日配额计数，
 后果是当天额度从零重算，且可能重复回复已经回过的消息。
@@ -653,23 +710,23 @@ journalctl -u raricy-bot -f          # 跟日志
 | `1`  | 运行期致命错误                                      | 日志里只有异常**类型名**（不泄露取值），据此定位                                    |
 | `0`  | 正常停止（收到 SIGTERM/SIGINT）                     | 正常                                                                                      |
 
-| 现象                           | 原因与处理                                                                                                                                         |
-| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 容器不断重启                   | 多半是环境变量没给上（退出码 2），或 `config.yaml` 没挂载。检查 `.env` 与卷挂载                                                                 |
-| `配置错误：无法读取配置文件：/app/config.yaml` | 两个原因会给出**完全相同**的日志，都要查：(1) `config.yaml` 被 `chmod 600`，容器用户 uid 10001 读不到 → 改回 644；(2) SELinux 标签没打（Rocky）→ 挂载加 `,Z`。两者常常同时存在 |
-| `docker compose exec` 报 `container is restarting` | 容器在重启循环，先修文件再重建，别指望 exec 进去                                                                                              |
-| `readyz` 刚启动时 `Connection refused` | 正常。运维端点在登录成功之后才监听，等 30 秒                                                                                                   |
-| `/readyz` 返回 `not ready` | 看日志分辨：登录失败 / SSE 未连上 / 队列满 / 权限不可用                                                                                            |
-| 日志里 `403 需要核心用户权限` | 账号还是 `user`，没提权到 core+，见第 1 节第 1 条                                                                                                 |
-| 日志里出现 CSRF 相关错误       | 说明客户端错发了 `Origin`/`Referer`。程序本身**不会**设置这两个头，若出现说明代码被改动过。它不会被当作权限问题去反复探测，只记一条 error |
-| `docker compose version` 报 unknown command | 装的是老 v1，补装 `docker-compose-plugin`                                                                                                |
-| 大区里 @ 机器人没反应          | 确认是**区分大小写的精确** @ `机器人用户名`，且用户名两侧不是字母/数字/`_`/`-`。`@机器人名x` 不算命中                                 |
-| 大区里普通消息（没 @）没反应   | 这是设计如此：大区只回应精确 @，避免烧光每日额度                                                                                                   |
-| 私聊不回                       | 检查是不是空消息、纯图片或纯博客（这些只回一次「不支持」提示）                                                                                     |
-| 一段时间后完全不回             | 可能当日额度用尽（1950 条后停止模型回复，2000 条后完全静默），或账号被禁言                                                                           |
-| 回复里出现 `[redacted]`       | 输出命中已加载的机密被替换了。若被替换的是**机器人自己的名字**，说明有人把用户名注册成了机密——用户名不是机密，不该被注册                   |
-| 日志报 `429`                  | 站点限频。程序会遵循 `Retry-After`，没有该头则等 60 秒并退避                                                                                      |
-| 日志只有一行行 `router.route reason=no_mention` | 正常噪音，剔掉再看：`grep -v 'reason=no_mention'`                                                                                      |
+| 现象                                                   | 原因与处理                                                                                                                                                                                   |
+| ------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 容器不断重启                                           | 多半是环境变量没给上（退出码 2），或`config.yaml` 没挂载。检查 `.env` 与卷挂载                                                                                                           |
+| `配置错误：无法读取配置文件：/app/config.yaml`       | 两个原因会给出**完全相同**的日志，都要查：(1) `config.yaml` 被 `chmod 600`，容器用户 uid 10001 读不到 → 改回 644；(2) SELinux 标签没打（Rocky）→ 挂载加 `,Z`。两者常常同时存在 |
+| `docker compose exec` 报 `container is restarting` | 容器在重启循环，先修文件再重建，别指望 exec 进去                                                                                                                                             |
+| `readyz` 刚启动时 `Connection refused`             | 正常。运维端点在登录成功之后才监听，等 30 秒                                                                                                                                                 |
+| `/readyz` 返回 `not ready`                         | 看日志分辨：登录失败 / SSE 未连上 / 队列满 / 权限不可用                                                                                                                                      |
+| 日志里`403 需要核心用户权限`                         | 账号还是`user`，没提权到 core+，见第 1 节第 1 条                                                                                                                                           |
+| 日志里出现 CSRF 相关错误                               | 说明客户端错发了`Origin`/`Referer`。程序本身**不会**设置这两个头，若出现说明代码被改动过。它不会被当作权限问题去反复探测，只记一条 error                                           |
+| `docker compose version` 报 unknown command          | 装的是老 v1，补装`docker-compose-plugin`                                                                                                                                                   |
+| 大区里 @ 机器人没反应                                  | 确认是**区分大小写的精确** @ `机器人用户名`，且用户名两侧不是字母/数字/`_`/`-`。`@机器人名x` 不算命中                                                                          |
+| 大区里普通消息（没 @）没反应                           | 这是设计如此：大区只回应精确 @，避免烧光每日额度                                                                                                                                             |
+| 私聊不回                                               | 检查是不是空消息或纯博客（这些只回一次「读不了」提示）；纯图在开了图片输入时会进模型                                                                                                         |
+| 一段时间后完全不回                                     | 可能当日额度用尽（1950 条后停止模型回复，2000 条后完全静默），或账号被禁言                                                                                                                   |
+| 回复里出现`[redacted]`                               | 输出命中已加载的机密被替换了。若被替换的是**机器人自己的名字**，说明有人把用户名注册成了机密——用户名不是机密，不该被注册                                                             |
+| 日志报`429`                                          | 站点限频。程序会遵循`Retry-After`，没有该头则等 60 秒并退避                                                                                                                                |
+| 日志只有一行行`router.route reason=no_mention`       | 正常噪音，剔掉再看：`grep -v 'reason=no_mention'`                                                                                                                                          |
 
 ### 13.1 诊断配置读取问题
 
@@ -687,7 +744,7 @@ getenforce
 
 | 现象                                               | 结论                                                |
 | -------------------------------------------------- | --------------------------------------------------- |
-| `No such file or directory`                      | 没挂上，查 compose 的 volumes 与 `BOT_CONFIG_PATH` |
+| `No such file or directory`                      | 没挂上，查 compose 的 volumes 与`BOT_CONFIG_PATH` |
 | `ls -l` 正常但 `head` 报 `Permission denied` | 权限或 SELinux                                      |
 | `ls -lZ` 是 `-rw-------` 且 owner 不是 10001   | 权限问题                                            |
 | `ls -lZ` 上下文不是 `container_file_t`         | SELinux 问题                                        |
@@ -713,29 +770,30 @@ docker compose logs --tail=200 bot | grep -E 'router\.route|sender\.send|app\.'
 
 ### 14.1 完全静默
 
-| 触发条件                                       | 代码位置                 | 日志判据                                                       |
-| ---------------------------------------------- | ------------------------ | -------------------------------------------------------------- |
-| 大区消息**没有精确 @**                   | `router.py`            | `reason=no_mention`（DEBUG）                                 |
-| 账号 403（没提权/被禁言）→ 全站静默           | `app.py`               | ERROR `app.unavailable`，之后每 300 秒一行 `app.probe_failed` |
-| 当日额度用尽                                   | `quota.py`             | WARNING `sender.send reason=quota`；2000 用尽后连这行也没有    |
-| 自己的消息 / 已删除 / 拍一拍                   | `router.py`            | `reason=self_message` / `deleted` / `pat`                  |
-| SSE 重连重放被去重                             | `router.py`            | `reason=duplicate`                                           |
-| 主动提示被冷却吞掉（按 (频道, 触发者) 5 分钟） | `app.py`               | 无日志，直接 return                                            |
+| 触发条件                                       | 代码位置      | 日志判据                                                         |
+| ---------------------------------------------- | ------------- | ---------------------------------------------------------------- |
+| 大区消息**没有精确 @**                   | `router.py` | `reason=no_mention`（DEBUG）                                   |
+| 账号 403（没提权/被禁言）→ 全站静默           | `app.py`    | ERROR`app.unavailable`，之后每 300 秒一行 `app.probe_failed` |
+| 当日额度用尽                                   | `quota.py`  | WARNING`sender.send reason=quota`；2000 用尽后连这行也没有     |
+| 自己的消息 / 已删除 / 拍一拍                   | `router.py` | `reason=self_message` / `deleted` / `pat`                  |
+| SSE 重连重放被去重                             | `router.py` | `reason=duplicate`                                             |
+| 主动提示被冷却吞掉（按 (频道, 触发者) 5 分钟） | `app.py`    | 无日志，直接 return                                              |
 
 **@ 的精确性**：区分大小写，且用户名两侧不能是字母/数字/`_`/`-`
 （`text_utils.py`）。`@Bot` 与 `@bot` 是两个东西，`@机器人名x` 不算命中。
 
 ### 14.2 回了一句固定话
 
-| 固定话                                 | 触发条件                                 | 判据                      |
-| -------------------------------------- | ---------------------------------------- | ------------------------- |
-| "我不能提供系统提示、密钥或内部配置。" | 命中 `SECRET_PROBE_PATTERNS`            | `reason=secret_probe`   |
-| "这条消息太长了…"                     | 正文超过 `max_input_chars`（8000 字符） | `reason=too_long`       |
-| "我暂时不能查看图片或博客内容…"       | 只有图片/博客、没有正文                  | `reason=media_only`     |
-| "我没有看到要处理的内容…"             | 空白 / 只 @ 了机器人                     | `reason=empty`          |
-| "当前排队较多…"                       | 队列满（默认 50）                        | `reason=queue_full`     |
-| "抱歉，这次的回复没有生成成功。"       | 模型调用最终失败（超时不重试，D-19）     | `app.model_failed`      |
-| "今天的回复额度已经用完…"             | 触及 1950 条                              | 无独立事件，随 quota 通知 |
+| 固定话                                 | 触发条件                                         | 判据                                                         |
+| -------------------------------------- | ------------------------------------------------ | ------------------------------------------------------------ |
+| "我不能提供系统提示、密钥或内部配置。" | 命中`SECRET_PROBE_PATTERNS`                    | `reason=secret_probe`                                      |
+| "这条消息太长了…"                     | 正文超过`max_input_chars`（8000 字符）         | `reason=too_long`                                          |
+| "这张图片我没能读取…"                 | 有图但读不到：未开图片输入 / 图已失效 / 取图失败 | `reason=media_only`（纯图）或 `vision.image_unavailable` |
+| "我暂时不能查看博客内容…"             | 只有博客、没有可读图片                           | `reason=media_only`                                        |
+| "我没有看到要处理的内容…"             | 空白 / 只 @ 了机器人                             | `reason=empty`                                             |
+| "当前排队较多…"                       | 队列满（默认 50）                                | `reason=queue_full`                                        |
+| "抱歉，这次的回复没有生成成功。"       | 模型调用最终失败（超时不重试，D-19）             | `app.model_failed`                                         |
+| "今天的回复额度已经用完…"             | 触及 1950 条                                     | 无独立事件，随 quota 通知                                    |
 
 **`SECRET_PROBE_PATTERNS` 有误伤**（`text_utils.py`）：里面是 `token`、`config`、
 `env`、`密钥`、`口令`、`配置文件` 这类词，且是**子串匹配 + 大小写不敏感**。
@@ -750,10 +808,10 @@ docker compose logs --tail=200 bot | grep -E 'router\.route|sender\.send|app\.'
 
 有**两层**截断，只有一层会留痕迹：
 
-| 层     | 参数                                | 触发点                    | 有无提示                                                                      |
-| ------ | ----------------------------------- | ------------------------- | ----------------------------------------------------------------------------- |
-| 模型侧 | `model.max_output_tokens: 600`    | `worker.py` 传给 API    | **无**。`finish_reason` 全项目只在测试夹具里出现过，`src/` 从不读它 |
-| 本地侧 | `behavior.max_output_chars: 5000` | `sender.py`             | 有，追加 `（内容过长，已截断）`                                              |
+| 层     | 参数                                | 触发点                 | 有无提示                                                                      |
+| ------ | ----------------------------------- | ---------------------- | ----------------------------------------------------------------------------- |
+| 模型侧 | `model.max_output_tokens: 600`    | `worker.py` 传给 API | **无**。`finish_reason` 全项目只在测试夹具里出现过，`src/` 从不读它 |
+| 本地侧 | `behavior.max_output_chars: 5000` | `sender.py`          | 有，追加`（内容过长，已截断）`                                              |
 
 中文大致 1 token ≈ 1 字，600 token 会在 600 字左右就切断，而本地那层要超过 5000 字才触发。
 **所以在默认配置下你看到的截断都是模型侧无标记的那种**——回答到一半戛然而止，没有任何说明。
@@ -817,7 +875,9 @@ docker compose logs --tail=200 bot | grep -E 'router\.route|sender\.send|app\.'
 
 ## 17. 已知限制（不是部署问题，是首版范围）
 
-- 不支持图片理解、博客理解、工具调用、联网搜索、长期用户记忆。
+- 不支持博客理解、工具调用、联网搜索、长期用户记忆。图片理解是**可选项**：
+  `model.vision_enabled` 默认 `false`，开启后也只把当前轮那一张图取回内存交给模型
+  （不落库、不写日志、不进历史），且要求模型本身支持视觉。
 - 对话上下文只存内存，**进程重启即清空**（去重、大区链归属与配额状态保留）。
 - 上游没有发送幂等键，极端网络故障下无法保证严格 exactly-once；
   程序用「查询该频道 `after=<触发消息id>` 的消息、比对 `reply.id`」来对账，最多补发一次。

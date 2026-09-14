@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import urllib.parse
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from typing import Any
@@ -78,6 +79,21 @@ def _parse_retry_after(response: httpx.Response) -> float | None:
     return seconds
 
 
+def _effective_port(parsed: urllib.parse.SplitResult) -> int | None:
+    """解析有效端口；非法端口（`:abc`、越界值）返回 None，从而判为不同源。"""
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is not None:
+        return port
+    if parsed.scheme == "https":
+        return 443
+    if parsed.scheme == "http":
+        return 80
+    return None
+
+
 class SiteError(Exception):
     """站点接口错误；`status` 为站点 code，0 表示网络层错误（结果不确定）。"""
 
@@ -86,6 +102,22 @@ class SiteError(Exception):
         self.status = status
         self.message = message
         self.retry_after = retry_after
+
+
+class ImageFetchError(Exception):
+    """图片取回失败。
+
+    `reason` 是稳定短标识，供调用方判定降级路径与写日志用：
+    - `host_not_allowed`：目标与站点不同源（**未发出任何请求**）
+    - `too_large`：字节数超过调用方给定的上限
+    - `http`：站点返回非 200（`status` 为 HTTP 状态码；空响应体也算）
+    - `network`：传输层错误或超时
+    """
+
+    def __init__(self, reason: str, status: int = 0) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.status = status
 
 
 class SiteClient:
@@ -467,6 +499,58 @@ class SiteClient:
                 raise self._error(response.status_code, "response_too_large")
             chunks.append(chunk)
         return b"".join(chunks)
+
+    async def fetch_image(self, url: str, *, max_bytes: int) -> bytes:
+        """取回一条消息附带的图片原始字节（INTERFACES §7）。
+
+        只允许与 `base_url` **完全同源**（scheme + host + 有效端口）的地址。站点给的是
+        相对路径 `/api/images/<id>/raw`，用 `urljoin` 解析；一旦允许「照站点给的 url
+        带着 Cookie 去 GET」，任何能让站点返回任意 url 的路径都会变成凭据外泄通道。
+        跨源直接拒绝，**不发出任何请求**。
+
+        字节上限在**流式累计过程中**执行：超限立即放弃，不读完整个响应。
+        本方法**不写任何日志**（URL 不得进日志），失败原因由调用方以稳定字段记录。
+        401 不重新登录、不重试：取图失败只是一次降级，不值得为它多一次登录。
+        """
+        base = urllib.parse.urlsplit(self._base_url)
+        target = urllib.parse.urljoin(self._base_url + "/", url)
+        parsed = urllib.parse.urlsplit(target)
+        if not self._same_origin(base, parsed):
+            raise ImageFetchError("host_not_allowed")
+
+        headers: dict[str, str] = {"Accept": "image/*"}
+        headers.update(self._cookie_headers())
+        chunks: list[bytes] = []
+        total = 0
+        try:
+            async with self._require_client().stream(
+                "GET", target, headers=headers
+            ) as response:
+                if response.status_code != 200:
+                    raise ImageFetchError("http", int(response.status_code))
+                async for chunk in response.aiter_bytes():
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ImageFetchError("too_large")
+                    chunks.append(chunk)
+        except httpx.HTTPError as exc:
+            raise ImageFetchError("network") from exc
+
+        data = b"".join(chunks)
+        if not data:
+            raise ImageFetchError("http", 200)
+        return data
+
+    @staticmethod
+    def _same_origin(
+        base: urllib.parse.SplitResult, target: urllib.parse.SplitResult
+    ) -> bool:
+        """两者是否同源。非 http/https 或端口非法一律判为不同源。"""
+        if target.scheme not in ("http", "https"):
+            return False
+        if target.scheme != base.scheme or target.hostname != base.hostname:
+            return False
+        return _effective_port(target) == _effective_port(base)
 
     @asynccontextmanager
     async def open_stream(self, last_event_id: int | None = None) -> AsyncIterator[httpx.Response]:
