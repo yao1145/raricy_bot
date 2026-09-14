@@ -10,7 +10,14 @@
 from __future__ import annotations
 
 import base64
+import logging
 from typing import Any
+
+from ..logging_setup import get_logger, log_event
+from ..site.client import ImageFetchError, SiteClient
+from ..site.models import ChatMessage
+
+_logger = get_logger("vision")
 
 # 允许转交给模型的图片格式。判定一律以字节嗅探为准，DTO 的 mime_type 只作参考。
 IMAGE_MIME_ALLOWLIST: tuple[str, ...] = (
@@ -75,3 +82,52 @@ def attach_image(messages: list[dict[str, Any]], part: dict[str, Any]) -> None:
                 ],
             }
         return
+
+
+class ImageLoader:
+    """把一条消息里的图片取回并编码成模型可用的内容块。
+
+    图片字节只在这里短暂存在：不进历史、不落库、不写日志。失败一律降级为
+    `(None, reason)`，由调用方决定是转纯文本轮还是回一条本地提示。
+    """
+
+    def __init__(
+        self,
+        client: SiteClient,
+        *,
+        max_bytes: int,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        self._client = client
+        self._max_bytes = max_bytes
+        self._logger = logger if logger is not None else _logger
+
+    async def load(self, message: ChatMessage) -> tuple[dict[str, Any] | None, str]:
+        """返回 `(image_part | None, reason)`；reason 见 INTERFACES §20。"""
+        image = message.image
+        if image is None or message.image_missing:
+            return None, "none"
+
+        try:
+            data = await self._client.fetch_image(image.url, max_bytes=self._max_bytes)
+        except ImageFetchError as exc:
+            self._log_failure(exc.reason)
+            return None, exc.reason
+
+        mime = sniff_image_mime(data)
+        if mime is None or mime not in IMAGE_MIME_ALLOWLIST:
+            # 嗅探目前只会返回白名单里的四种，这个判断是策略的单一来源：
+            # 将来嗅探支持更多格式时，仍由白名单决定「发给模型」这一侧放行什么。
+            self._log_failure("unsupported_type", size_bytes=len(data))
+            return None, "unsupported_type"
+
+        return build_image_part(build_data_url(data, mime)), "ok"
+
+    def _log_failure(self, reason: str, *, size_bytes: int | None = None) -> None:
+        """记一条降级日志；字段只有 reason / size_bytes / limit_bytes，**不记 URL**。"""
+        fields: dict[str, object] = {"reason": reason}
+        if size_bytes is not None:
+            fields["size_bytes"] = size_bytes
+        if reason == "too_large":
+            fields["limit_bytes"] = self._max_bytes
+        log_event(self._logger, logging.INFO, "vision.image_unavailable", **fields)
