@@ -20,6 +20,7 @@ import inspect
 import logging
 import time
 from collections.abc import Iterable
+from typing import Any
 
 import httpx
 
@@ -32,6 +33,7 @@ from .config import Config
 from .core.context import ContextManager, lobby_thread_session_key, speaker_wrapper
 from .core.router import MessageRouter, Request, RouteResult
 from .core.sender import MessageSender, SendResult
+from .core.vision import ImageLoader, attach_image
 from .core.worker import ModelClient, OpenAIModelClient, WorkerPool
 from .logging_setup import get_logger, log_event
 from .ops import OpsServer
@@ -60,6 +62,9 @@ class BotApp:
     ) -> None:
         self._config = config
         self._transport = transport
+        # 图片输入：默认关闭。关闭时 worker 完全不碰 ImageLoader，
+        # 进程里也就没有任何新增的图床请求（设计 §3.5）。
+        self._vision_enabled = config.model.vision_enabled
 
         # 只登记真正的机密：密码与模型 Key；机器人用户名不是机密（redact.py §3）。
         self._redactor = Redactor(
@@ -101,6 +106,9 @@ class BotApp:
         except (TypeError, ValueError):
             pass
         self._client = SiteClient(config.site.base_url, self._redactor, **client_kwargs)
+        self._image_loader = ImageLoader(
+            self._client, max_bytes=config.model.max_image_bytes
+        )
         self._queue: asyncio.Queue[Request] = asyncio.Queue(
             maxsize=config.behavior.queue_size
         )
@@ -194,6 +202,7 @@ class BotApp:
             queue=self._queue,
             cfg=self._config.behavior,
             storage=self._config.storage,
+            vision_enabled=self._vision_enabled,
         )
         if self._model is None:
             self._model = OpenAIModelClient(
@@ -469,8 +478,16 @@ class BotApp:
                     kind="pre_model",
                 )
                 return
+            # 取图在模型门之外：三个 worker 各自下载互不阻塞，
+            # 超时由站点请求超时兜住（设计 §3.5）。
+            image_part, image_state = await self._load_image(request)
+            if image_part is None and image_state != "none" and not request.user_text:
+                # 纯图但读不到：用户明确发来一张图，必须给个交代，
+                # 但不值得为它占用一次模型调用。
+                await self._send_image_unavailable(request)
+                return
             # D-22：本轮内容先**临时**拼给模型，只有回复真正送达才提交进历史。
-            pending = self._pending_turn(request)
+            pending = self._pending_turn(request, image_state)
             messages = self._ctx.build_messages(
                 request.session_key,
                 self._config.system_prompt,
@@ -482,6 +499,9 @@ class BotApp:
                 ),
             )
             self._apply_reply_prefix(messages, request)
+            # 必须排在 _apply_reply_prefix 之后：那一步按字符串拼接 content。
+            if image_part is not None:
+                attach_image(messages, image_part)
             model = self._model
             if model is None:
                 await self._notify_failure(request)
@@ -531,16 +551,57 @@ class BotApp:
             # §16：无论成功失败都必须标记 done，否则水位永远推进不了。
             await self._store.mark_handled(request.message.id, "done")
 
+    async def _load_image(self, request: Request) -> tuple[dict[str, Any] | None, str]:
+        """取回本轮图片并编码；关闭图片输入时**完全不碰图床**。"""
+        if not self._vision_enabled:
+            return None, "none"
+        return await self._image_loader.load(request.message)
+
+    async def _send_image_unavailable(self, request: Request) -> None:
+        """纯图但读不到：本地提示，不调模型。
+
+        kind 用 `notice_local` 而不是 `notice`：它与路由第 9.1 步的纯媒体提示同类，
+        都是应答明确用户动作的本地回复（D-1）。用 notice 会占掉该用户 24 小时的
+        主动通知名额，把一次「图没读到」变成「今天别再提醒他」（D-30）。
+        """
+        if self._unavailable:
+            return
+        outcome = await self._sender.send(
+            request.channel_id,
+            texts.IMAGE_UNAVAILABLE_TEXT,
+            request.message.id,
+            kind="notice_local",
+            thread_root_id=request.thread_root_id,
+        )
+        self._note_forbidden(outcome)
+
     @staticmethod
-    def _pending_turn(request: Request) -> str:
+    def _with_image_marker(user_text: str, image_state: str) -> str:
+        """给本轮正文加上图片标记（设计 §4）。
+
+        `[图片]` 表示这一轮确实带了图；`[图片未提供]` 表示本来有图但没取到 ——
+        让模型知道自己没看到图，而不是以为用户什么都没发。
+        """
+        if image_state == "ok" and user_text:
+            return f"[图片]\n---\n{user_text}"
+        if image_state == "ok":
+            return "[图片]"
+        if image_state != "none" and user_text:
+            return f"[图片未提供]\n---\n{user_text}"
+        return user_text
+
+    @staticmethod
+    def _pending_turn(request: Request, image_state: str) -> str:
         """构造本轮待提交的用户内容（不含直接引用，见 D-7）。
 
-        - 大区：带上站点发言者标签，模型才分得清谁在说话（D-20）；
+        - 大区：带上站点发言者标签，模型才分得清谁在说话（D-20），
+          图片标记在包装**内部**（图属于发言人这条消息）；
         - 私聊：就是正文本身。
         """
+        text = BotApp._with_image_marker(request.user_text, image_state)
         if request.channel_kind != "lobby":
-            return request.user_text
-        return speaker_wrapper(request.message.author.username, request.user_text)
+            return text
+        return speaker_wrapper(request.message.author.username, text)
 
     def _apply_reply_prefix(
         self, messages: list[dict[str, str]], request: Request
