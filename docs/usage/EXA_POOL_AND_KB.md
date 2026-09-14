@@ -8,14 +8,14 @@
 
 ## 0. 一分钟速览
 
-| | Exa 多 Key 池 | 本地知识库 |
-|---|---|---|
-| 默认 | 关闭（默认是单 Key 或完全不开搜索） | 关闭 |
-| 开关 | `mcp.servers.exa.account_pool`（且 `mcp.enabled: true`） | `knowledge_base.enabled: true` |
-| 用户怎么用 | `/search <问题>`（不变） | `/kb <问题>` |
-| 数据去哪 | 问题 → 模型；模型决定的查询 → Exa | 问题 + 命中片段 → 模型（**不发** Exa） |
-| 前置门禁 | Exa 授权确认（§1.2） | 目录清点 + 可见范围确认（§2.2） |
-| 故障时的用户观感 | `/search` 说「联网搜索暂时不可用」 | `/kb` 说「知识库不可用 / 没有权限 / 没找到资料」 |
+|                  | Exa 多 Key 池                                                | 本地知识库                                         |
+| ---------------- | ------------------------------------------------------------ | -------------------------------------------------- |
+| 默认             | 关闭（默认是单 Key 或完全不开搜索）                          | 关闭                                               |
+| 开关             | `mcp.servers.exa.account_pool`（且 `mcp.enabled: true`） | `knowledge_base.enabled: true`                   |
+| 用户怎么用       | `/search <问题>`（不变）                                   | `/kb <问题>`                                     |
+| 数据去哪         | 问题 → 模型；模型决定的查询 → Exa                          | 问题 + 命中片段 → 模型（**不发** Exa）      |
+| 前置门禁         | Exa 授权确认（§1.2）                                        | 目录清点 + 可见范围确认（§2.2）                   |
+| 故障时的用户观感 | `/search` 说「联网搜索暂时不可用」                         | `/kb` 说「知识库不可用 / 没有权限 / 没找到资料」 |
 
 ---
 
@@ -97,14 +97,14 @@ mcp:
 
 ### 1.3.2 字段
 
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `child_env` | `EXA_API_KEY` | 注入给 Exa 子进程的变量名。首版只能是这个 |
-| `host_envs` | 无（必填） | 宿主环境变量**名**的列表，每个名字对应一个槽位。个数 2–16，不得重复 |
-| `strategy` | `round_robin` | 首版只能是这个 |
-| `rate_limit_cooldown_seconds` | `60` | 收到 429 后该槽位冷却多久 |
-| `transient_cooldown_seconds` | `30` | 5xx、超时、子进程退出后的冷却，也是重启失败后的重试间隔 |
-| `quota_cooldown_seconds` | `21600` | 明确额度耗尽（402 等）后的重新探测间隔 |
+| 字段                            | 默认            | 说明                                                                       |
+| ------------------------------- | --------------- | -------------------------------------------------------------------------- |
+| `child_env`                   | `EXA_API_KEY` | 注入给 Exa 子进程的变量名。首版只能是这个                                  |
+| `host_envs`                   | 无（必填）      | 宿主环境变量**名**的列表，每个名字对应一个槽位。个数 2–16，不得重复 |
+| `strategy`                    | `round_robin` | 首版只能是这个                                                             |
+| `rate_limit_cooldown_seconds` | `60`          | 收到 429 后该槽位冷却多久                                                  |
+| `transient_cooldown_seconds`  | `30`          | 5xx、超时、子进程退出后的冷却，也是重启失败后的重试间隔                    |
+| `quota_cooldown_seconds`      | `21600`       | 明确额度耗尽（402 等）后的重新探测间隔                                     |
 
 槽位数就是 `host_envs` 的条数：3 个名字 = 3 个子进程 = 3 个槽位。
 
@@ -161,13 +161,13 @@ print('知识库:', c.knowledge_base.enabled, c.knowledge_base.access_mode, c.kn
 每个槽位在内存里有一份状态，**从不写进 SQLite**：余额和 Key 状态是 Exa 侧的外部事实，
 本地存一份只会在充值或月度刷新之后变成错的真相。进程重启后重新探测。
 
-| 状态 | 什么时候进入 | 什么时候恢复 |
-|---|---|---|
-| `ready` | 子进程起来且发现了绑定的工具 | 调用成功后保持 |
-| `cooldown` | 429；5xx、超时、子进程退出 | 冷却到期后由池自己重启并探测 |
-| `exhausted` | 402 / `NO_MORE_CREDITS` / `API_KEY_BUDGET_EXCEEDED` / `TEAM_BUDGET_EXCEEDED` | `quota_cooldown_seconds` 到期后探测，或重启进程 |
-| `invalid` | 401 / `INVALID_API_KEY` | **本进程内不再尝试**；换 Key 后重启生效 |
-| `disabled` | 环境变量缺失、Key 值与其他槽位重复、找不到绑定工具、schema 与其他槽位不一致 | 修正配置或环境后重启 |
+| 状态          | 什么时候进入                                                                      | 什么时候恢复                                      |
+| ------------- | --------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `ready`     | 子进程起来且发现了绑定的工具                                                      | 调用成功后保持                                    |
+| `cooldown`  | 429；5xx、超时、子进程退出                                                        | 冷却到期后由池自己重启并探测                      |
+| `exhausted` | 402 /`NO_MORE_CREDITS` / `API_KEY_BUDGET_EXCEEDED` / `TEAM_BUDGET_EXCEEDED` | `quota_cooldown_seconds` 到期后探测，或重启进程 |
+| `invalid`   | 401 /`INVALID_API_KEY`                                                          | **本进程内不再尝试**；换 Key 后重启生效     |
+| `disabled`  | 环境变量缺失、Key 值与其他槽位重复、找不到绑定工具、schema 与其他槽位不一致       | 修正配置或环境后重启                              |
 
 一次 `/search` 里发生的事：
 
@@ -192,15 +192,15 @@ print('知识库:', c.knowledge_base.enabled, c.knowledge_base.access_mode, c.kn
 
 ## 1.5 日志怎么看
 
-| 事件 | 级别 | 能看出什么 |
-|---|---|---|
-| `mcp.pool_started` | INFO | `count=` 起来的槽位数；`count=0` 说明一个都没起来 |
-| `mcp.pool_slot_disabled` | WARNING | 哪个槽位（`slot=`）因为什么（`reason=`）被停用 |
-| `mcp.pool_slot_recover_wait` | INFO | 某槽位还在失败，`delay=` 秒后再试 |
-| `mcp.pool_slot_recovered` | INFO | 某槽位恢复可用 |
-| `mcp.pool_slot_state` | DEBUG | 每次状态迁移（要看这个得把 `logging.level` 调到 `DEBUG`） |
-| `mcp.pool_call_failed` / `mcp.pool_call_unavailable` | DEBUG | 一次逻辑调用全部失败 / 一个可用槽位都没有 |
-| `mcp.pool_restart_failed` | DEBUG | 恢复时重启子进程失败（异常类名） |
+| 事件                                                     | 级别    | 能看出什么                                                   |
+| -------------------------------------------------------- | ------- | ------------------------------------------------------------ |
+| `mcp.pool_started`                                     | INFO    | `count=` 起来的槽位数；`count=0` 说明一个都没起来        |
+| `mcp.pool_slot_disabled`                               | WARNING | 哪个槽位（`slot=`）因为什么（`reason=`）被停用           |
+| `mcp.pool_slot_recover_wait`                           | INFO    | 某槽位还在失败，`delay=` 秒后再试                          |
+| `mcp.pool_slot_recovered`                              | INFO    | 某槽位恢复可用                                               |
+| `mcp.pool_slot_state`                                  | DEBUG   | 每次状态迁移（要看这个得把`logging.level` 调到 `DEBUG`） |
+| `mcp.pool_call_failed` / `mcp.pool_call_unavailable` | DEBUG   | 一次逻辑调用全部失败 / 一个可用槽位都没有                    |
+| `mcp.pool_restart_failed`                              | DEBUG   | 恢复时重启子进程失败（异常类名）                             |
 
 **永远看不到**：Key 的值、环境变量名、查询内容、URL、摘要、上游错误正文。日志里只有槽位
 序号（进程内编号，重启会变）和稳定的原因字符串，例如 `missing_env`、`duplicate_secret`、
@@ -227,12 +227,12 @@ docker compose logs bot | grep "event=mcp.pool_slot_state"
 5. 确认多个 Key 是否属于同一个 Team：同 Team 共享预算时轮换在容量上完全无效；
    429 是按 Key、按 Team、按 IP 还是按出口计也需要实测。
 
-| 现象 | 先看 | 多半是 |
-|---|---|---|
-| `/search` 说不可用，但普通聊天正常 | `mcp.pool_call_unavailable`、`mcp.pool_started count=` | 所有槽位都在冷却里，或一个都没起来 |
-| 某几个 Key 再也没被用过 | `mcp.pool_slot_disabled reason=` | `invalid_key`（换 Key 后要重启）、`schema_mismatch` 或 `required_tools_missing` |
-| 日志里完全没有池的事件 | `logging.level` | 默认 INFO 看不到 DEBUG 的状态迁移；先确认 `mcp.enabled: true` 且用的是池配置 |
-| 换了 Key 但行为没变 | 容器是否重建 | 改环境变量后要 `docker compose up -d`，仅 `restart` 不会重新读取 |
+| 现象                                 | 先看                                                       | 多半是                                                                                |
+| ------------------------------------ | ---------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `/search` 说不可用，但普通聊天正常 | `mcp.pool_call_unavailable`、`mcp.pool_started count=` | 所有槽位都在冷却里，或一个都没起来                                                    |
+| 某几个 Key 再也没被用过              | `mcp.pool_slot_disabled reason=`                         | `invalid_key`（换 Key 后要重启）、`schema_mismatch` 或 `required_tools_missing` |
+| 日志里完全没有池的事件               | `logging.level`                                          | 默认 INFO 看不到 DEBUG 的状态迁移；先确认`mcp.enabled: true` 且用的是池配置         |
+| 换了 Key 但行为没变                  | 容器是否重建                                               | 改环境变量后要`docker compose up -d`，仅 `restart` 不会重新读取                   |
 
 ---
 
@@ -299,16 +299,16 @@ knowledge_base:
   max_context_tokens: 4000       # 必须 <= behavior.context_input_tokens
 ```
 
-| 字段 | 作用 | 硬上限（代码常量，配不上去） |
-|---|---|---|
-| `max_files` | 最多收录多少个文件 | 20000 |
-| `max_file_bytes` | 单文件字节上限，超过即跳过 | 8 MiB |
-| `max_total_bytes` | 全库累计字节上限，超过即整次失败 | 512 MiB |
-| `chunk_chars` | 单块字符数 | 20000 |
-| `chunk_overlap_chars` | 相邻块的重叠字符，必须小于 `chunk_chars` | — |
-| `top_k` | 每轮最多给模型几段资料 | 10 |
-| `max_context_tokens` | 资料块的 token 预算，必须 ≤ `behavior.context_input_tokens` | 32000 |
-| `refresh_seconds` | 重建索引的周期 | 86400 |
+| 字段                    | 作用                                                          | 硬上限（代码常量，配不上去） |
+| ----------------------- | ------------------------------------------------------------- | ---------------------------- |
+| `max_files`           | 最多收录多少个文件                                            | 20000                        |
+| `max_file_bytes`      | 单文件字节上限，超过即跳过                                    | 8 MiB                        |
+| `max_total_bytes`     | 全库累计字节上限，超过即整次失败                              | 512 MiB                      |
+| `chunk_chars`         | 单块字符数                                                    | 20000                        |
+| `chunk_overlap_chars` | 相邻块的重叠字符，必须小于`chunk_chars`                     | —                           |
+| `top_k`               | 每轮最多给模型几段资料                                        | 10                           |
+| `max_context_tokens`  | 资料块的 token 预算，必须 ≤`behavior.context_input_tokens` | 32000                        |
+| `refresh_seconds`     | 重建索引的周期                                                | 86400                        |
 
 要在大厅公开使用（大厅仍必须精确 @ 机器人）：
 
@@ -358,15 +358,15 @@ chmod -R a+rX /opt/raricy_bot/knowledge      # 容器用户 uid 10001 只需可�
 
 ## 2.7 用户侧：命令与访问策略
 
-| 输入 | 结果 |
-|---|---|
-| 私聊 `/kb 迁移数是什么` | 检索全部分类（受访问策略限制） |
-| 大厅 `@机器人 /kb 迁移数是什么` | 先满足精确提及，再检索 |
-| `/kb` | 本地回用法，不检索、不调模型 |
-| `/kb /help`、`/kb /reset` | 本地命令优先，照常执行 |
-| `/search /kb 问题` | 能力冲突：一条消息只能有一种能力，本地拒绝 |
-| 博客评论里写 `/kb` | 当普通评论正文，不检索 |
-| 未授权用户 `/kb 问题` | 固定文案，不泄露目录、分类、文件数或命中情况 |
+| 输入                             | 结果                                         |
+| -------------------------------- | -------------------------------------------- |
+| 私聊`/kb 迁移数是什么`         | 检索全部分类（受访问策略限制）               |
+| 大厅`@机器人 /kb 迁移数是什么` | 先满足精确提及，再检索                       |
+| `/kb`                          | 本地回用法，不检索、不调模型                 |
+| `/kb /help`、`/kb /reset`    | 本地命令优先，照常执行                       |
+| `/search /kb 问题`             | 能力冲突：一条消息只能有一种能力，本地拒绝   |
+| 博客评论里写`/kb`              | 当普通评论正文，不检索                       |
+| 未授权用户`/kb 问题`           | 固定文案，不泄露目录、分类、文件数或命中情况 |
 
 访问判据是站点**稳定的用户 id**（`author.id`），不是可以改的用户名。命中片段拼在本轮最后一条
 `role="user"` 消息里，system 里只有一段静态说明；回复送达后历史里保存的是**去掉资料块**的
@@ -374,14 +374,14 @@ chmod -R a+rX /opt/raricy_bot/knowledge      # 容器用户 uid 10001 只需可�
 
 ## 2.8 日志怎么看
 
-| 事件 | 级别 | 能看出什么 |
-|---|---|---|
-| `kb.ready` | INFO | `snapshot_version=` 版本号、`chunk_count=` 块数、`count=` 文档数、`size_bytes=` 总字节 |
-| `kb.index_failed` | WARNING | `reason=`：`root_missing` / `root_unreadable` / `too_many_files` / `total_too_large` / `empty` / `unexpected` |
-| `kb.search_failed` | WARNING | 检索本身出了意外（正常路径不会出现） |
-| `kb.query_done` | INFO | 本轮返回了几段（`count=`）与快照版本 |
-| `app.kb_unavailable` | INFO | 本地拒绝的原因：`disabled` / `access` / `unavailable` / `no_results` |
-| `app.kb_start_failed` | WARNING | 启动知识库时的意外异常 |
+| 事件                    | 级别    | 能看出什么                                                                                                                  |
+| ----------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `kb.ready`            | INFO    | `snapshot_version=` 版本号、`chunk_count=` 块数、`count=` 文档数、`size_bytes=` 总字节                              |
+| `kb.index_failed`     | WARNING | `reason=`：`root_missing` / `root_unreadable` / `too_many_files` / `total_too_large` / `empty` / `unexpected` |
+| `kb.search_failed`    | WARNING | 检索本身出了意外（正常路径不会出现）                                                                                        |
+| `kb.query_done`       | INFO    | 本轮返回了几段（`count=`）与快照版本                                                                                      |
+| `app.kb_unavailable`  | INFO    | 本地拒绝的原因：`disabled` / `access` / `unavailable` / `no_results`                                                |
+| `app.kb_start_failed` | WARNING | 启动知识库时的意外异常                                                                                                      |
 
 **永远看不到**：分类名、文件名、相对/绝对路径、标题、正文、查询内容或命中片段。
 判断「新资料有没有生效」看 `snapshot_version` 是否递增，而不是看文件名。
@@ -399,14 +399,14 @@ chmod -R a+rX /opt/raricy_bot/knowledge      # 容器用户 uid 10001 只需可�
 6. 目录里放一个非法 UTF-8 的文件，确认其余文件仍可检索。
 7. `docker exec` 进去确认 `/app/knowledge` 是只读的、uid 10001 能读。
 
-| 现象 | 先看 | 多半是 |
-|---|---|---|
-| 用户说「没有权限」 | `app.kb_unavailable reason=access` | `allowed_user_ids` 没包含他的 id，或频道类型不在 `allowed_channel_kinds` 里 |
-| 一直「没找到资料」 | `app.kb_unavailable reason=no_results` | 词法检索匹配不上：换个措辞，或确认资料里确实有相关词 |
-| 「知识库不可用」 | `kb.index_failed reason=` | 目录不存在、为空、超限，或整个目录都不是 UTF-8 |
-| 改了文件没生效 | `kb.ready snapshot_version` | 正常现象，等一个刷新周期；版本号不动说明构建一直在失败 |
-| 启动明显变慢 | `/livez` 之前的时间 | 首次索引是同步的：调小 `max_files` / `max_total_bytes` |
-| 回答里有资料但答非所问 | `kb.query_done count=` | `top_k` 太大或资料切分太碎，调 `top_k` / `chunk_chars` |
+| 现象                   | 先看                                     | 多半是                                                                          |
+| ---------------------- | ---------------------------------------- | ------------------------------------------------------------------------------- |
+| 用户说「没有权限」     | `app.kb_unavailable reason=access`     | `allowed_user_ids` 没包含他的 id，或频道类型不在 `allowed_channel_kinds` 里 |
+| 一直「没找到资料」     | `app.kb_unavailable reason=no_results` | 词法检索匹配不上：换个措辞，或确认资料里确实有相关词                            |
+| 「知识库不可用」       | `kb.index_failed reason=`              | 目录不存在、为空、超限，或整个目录都不是 UTF-8                                  |
+| 改了文件没生效         | `kb.ready snapshot_version`            | 正常现象，等一个刷新周期；版本号不动说明构建一直在失败                          |
+| 启动明显变慢           | `/livez` 之前的时间                    | 首次索引是同步的：调小`max_files` / `max_total_bytes`                       |
+| 回答里有资料但答非所问 | `kb.query_done count=`                 | `top_k` 太大或资料切分太碎，调 `top_k` / `chunk_chars`                    |
 
 ---
 
@@ -422,14 +422,14 @@ chmod -R a+rX /opt/raricy_bot/knowledge      # 容器用户 uid 10001 只需可�
 
 ## 3.2 数据边界对照
 
-| 数据 | 发给模型 | 发给 Exa | 进日志 | 进 SQLite | 进历史 |
-|---|---|---|---|---|---|
-| 普通聊天正文 | 是 | 否 | 否 | 否 | 是（送达后） |
-| `/search` 的问题 | 是 | 模型决定要搜时，由模型生成的查询 | 否 | 否 | 是（送达后） |
-| `/search` 的搜索摘要 | 是 | — | 否 | 否 | 压缩摘要（送达后） |
-| `/kb` 的问题 | 是 | **否** | 否 | 否 | 是（送达后） |
-| `/kb` 的命中片段 | 是 | **否** | 否 | 否 | **否** |
-| 密钥、Cookie | 否 | 否 | 否 | 否 | 否 |
+| 数据                   | 发给模型 | 发给 Exa                         | 进日志 | 进 SQLite | 进历史             |
+| ---------------------- | -------- | -------------------------------- | ------ | --------- | ------------------ |
+| 普通聊天正文           | 是       | 否                               | 否     | 否        | 是（送达后）       |
+| `/search` 的问题     | 是       | 模型决定要搜时，由模型生成的查询 | 否     | 否        | 是（送达后）       |
+| `/search` 的搜索摘要 | 是       | —                               | 否     | 否        | 压缩摘要（送达后） |
+| `/kb` 的问题         | 是       | **否**                     | 否     | 否        | 是（送达后）       |
+| `/kb` 的命中片段     | 是       | **否**                     | 否     | 否        | **否**       |
+| 密钥、Cookie           | 否       | 否                               | 否     | 否        | 否                 |
 
 ## 3.3 成本与配额
 
