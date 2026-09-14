@@ -39,6 +39,7 @@
 | `design/DESIGN_DECISIONS.md` | 设计未明确处的裁决记录（D-1 … D-35） | 觉得某处行为怪，先读对应条目——不少「看起来像 bug」的选择是刻意的 |
 | `design/SYSTEM_PROMPTS.md` | 系统提示词的正式来源 + 站点速查表 | 提示词正文的权威副本，**但它不参与运行**：改完必须手动同步到 `config.yaml` |
 | `design/MCP_CHAT_SEARCH_DESIGN.md` | 聊天区 Exa MCP 搜索的总述、架构、接口与实现任务 | MCP 搜索的现行设计与验收口径 |
+| `design/EXA_ACCOUNT_POOL_AND_KB_DESIGN_PLAN.md` | Exa 授权密钥池与 `/kb` Markdown 知识库的架构、问题日志和文件级分工 | 设计草案；P0 问题关闭并同步正式合同后才可实施 |
 
 ## archive/ —— 归档（历史，不是现行口径）
 
