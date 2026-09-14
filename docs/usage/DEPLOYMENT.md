@@ -74,35 +74,67 @@ docker compose version      # 需要 v2，命令是 `docker compose` 而不是 `
 
 ## 3. 把代码放到服务器
 
-本项目的仓库**没有配置远程远端**，且 `.gitignore` 排除了 `docs/`、`tests/`、`CLAUDE.md`。
-因此有两条路：
+`.gitignore` 排除了 `tests/`、`docs/archive/`、`CLAUDE.md` 与 `config.yaml`/`.env`/`data/`，
+同步时要自己把后三项挡在外面。三条路，按推荐顺序：
 
-### 3.1 直接整体同步（推荐）
+### 3.1 `tar | ssh`（推荐，两边都不需要额外装东西）
 
 在**本机**（Windows，用 Git Bash）执行：
 
 ```bash
-# 只传运行与构建需要的部分；docs/ 与 tests/ 在容器里用不到
-# 必须排除 config.yaml/.env/data：否则服务器上的配置会被本机配置覆盖，本地测试库也会白传上去
-rsync -avz --delete \
-  --exclude '.git' --exclude '__pycache__' --exclude '.pytest_cache' \
-  --exclude 'config.yaml' --exclude '.env' --exclude 'data' \
-  "/c/Users/yaozi/Desktop/code/raricy_bot/" \
-  user@服务器IP:/opt/raricy_bot/
+cd /d/Study/Code/raricy_bot
+
+tar czf - \
+  --exclude='./.git' --exclude='*/__pycache__' --exclude='./.pytest_cache' \
+  --exclude='./.pytest-tmp-final' \
+  --exclude='./config.yaml' --exclude='./.env' --exclude='./data' \
+  . | ssh user@服务器IP 'mkdir -p /opt/raricy_bot && tar xzf - -C /opt/raricy_bot'
 ```
 
-`--exclude` 过的文件不会被 `--delete` 删掉，所以服务器上已有的 `config.yaml` / `.env` 是安全的。
-服务器没装 rsync 就 `sudo apt install -y rsync`（Rocky 上 `sudo dnf install -y rsync`），
-或改用 `scp -r`（但 scp 没有 exclude）。
+- **不需要 rsync**。Windows 10+ 自带 `tar`（Git Bash 里是 GNU tar 1.35），
+  `ssh` 也是 Git Bash 自带的 OpenSSH；服务器侧只要有 `sshd` 和 `tar`，所有发行版都有。
+- `--exclude` 与 rsync 的 `--exclude` 同义。**必须排除 `config.yaml`/`.env`/`data`**：
+  否则服务器上已经配好的 `config.yaml` 会被本机的覆盖，本地测试库也会白传上去。
+- 整个包约 400 KB（含 docs/ 与 tests/），一次传完，不需要增量。
+  `tests/` 会一起过去（`tar` 不受 `.gitignore` 影响），所以服务器上可以直接跑
+  `python -m pytest tests`；`Dockerfile` 只 `COPY pyproject.toml` 与 `COPY src`，
+  多出来的这些不会进镜像。
 
-> 为什么可以不带 `docs/` 和 `tests/`：`Dockerfile` 只 `COPY pyproject.toml` 和 `COPY src`，
-> 其余一律不进镜像。但**如果你想在服务器上跑测试**，把 `tests/` 一起带上，
-> 否则 `python -m pytest tests` 无从跑起。
+**一条要记住的差别**：`tar` 没有 `--delete` 的等价物 —— 本机删掉的文件不会在服务器上消失。
+要严格对齐就先删源码目录再解包：
 
-### 3.2 走 Git
+```bash
+ssh user@服务器IP 'rm -rf /opt/raricy_bot/src'
+```
 
-如果你愿意把仓库推到某个远端，注意 `.gitignore` 会让 `docs/` 与 `tests/` **不被跟踪**，
-克隆下来不会有它们。这不是错误，是既有的仓库设置。
+只删 `src`，不要删根目录（`config.yaml` / `.env` / `data/` 都在那里）。
+
+### 3.2 管道被禁时：先传包再解开
+
+跳板机或受限网络不允许 `ssh` 直接吃 stdin 时，拆成两步：
+
+```bash
+tar czf /tmp/raricy_bot.tgz \
+  --exclude='./.git' --exclude='*/__pycache__' --exclude='./.pytest_cache' \
+  --exclude='./.pytest-tmp-final' \
+  --exclude='./config.yaml' --exclude='./.env' --exclude='./data' \
+  .
+
+scp /tmp/raricy_bot.tgz user@服务器IP:/tmp/
+ssh user@服务器IP 'mkdir -p /opt/raricy_bot && tar xzf /tmp/raricy_bot.tgz -C /opt/raricy_bot && rm /tmp/raricy_bot.tgz'
+```
+
+**不要用 `scp -r`**：它没有排除功能，会把本机的 `config.yaml` / `.env` / `data/` 一起推上去，
+静默覆盖服务器上已经能用的配置。
+
+### 3.3 走 Git
+
+仓库已配置远端 `origin`（`github.com/yao1145/raricy_bot.git`）；`git push` 之后在服务器上
+`git clone` 即可。本机能否连通该远端请自己用 `git ls-remote origin` 确认。
+
+注意 `.gitignore` 让 `tests/` 与 `docs/archive/` **不被跟踪**，克隆下来不会有它们；
+`docs/` 的其余部分（含本文件）是入库的。若要在服务器上跑测试，
+`tests/` 得另外想办法带过去。
 
 同步完成后：
 
