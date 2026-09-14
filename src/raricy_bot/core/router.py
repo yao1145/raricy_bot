@@ -23,6 +23,7 @@ from ..site.models import LOBBY, ChatMessage, StreamEvent
 from ..store import Store
 from ..text_utils import (
     contains_bot_mention,
+    has_image,
     has_media,
     is_help_command,
     is_reset_command,
@@ -49,6 +50,7 @@ _ACTIONABLE_REASONS: frozenset[str] = frozenset(
         "reset",
         "empty",
         "media_only",
+        "image_only",
         "too_long",
         "secret_probe",
     }
@@ -99,6 +101,7 @@ class MessageRouter:
         cfg: BehaviorConfig,
         storage: StorageConfig,
         now: Callable[[], float] = time.time,
+        vision_enabled: bool = False,
     ) -> None:
         self._self_user_id = self_user_id
         self._bot_username = bot_username
@@ -108,6 +111,7 @@ class MessageRouter:
         self._cfg = cfg
         self._storage = storage
         self._now = now
+        self._vision_enabled = vision_enabled
         self._logger = _logger
 
     # --- 事件分派 -----------------------------------------------------------
@@ -279,9 +283,29 @@ class MessageRouter:
                 )
             session_key = lobby_thread_session_key(thread_root_id)
 
-        # 9.1 空正文：有媒体给纯媒体提示，否则给用法提示。
+        # 9.1 空正文：能看图就交给模型，否则给本地提示。
+        # 空正文不会命中下面 9.2-9.6 的任何一个分支（命令判定与探测词都要求非空内容），
+        # 因此 `image_only` 置位之后直落第 10 步入队是安全的。
+        image_only = False
         if not user_text:
-            if has_media(message):
+            if self._vision_enabled and has_image(message):
+                # 纯图消息入队。取图与降级由 app 的 worker 负责（设计 §3.5）：
+                # 路由器不做 I/O，也就无从知道这张图能不能取到。
+                image_only = True
+            elif message.image is not None:
+                # 有图但读不到：图片输入未开启，或 image_missing。
+                return self._emit(
+                    "reply_now",
+                    "media_only",
+                    channel_id=channel_id,
+                    message_id=message.id,
+                    reply_to=message.id,
+                    text=texts.IMAGE_UNAVAILABLE_TEXT,
+                    channel_kind=channel_kind,
+                    thread_root_id=thread_root_id,
+                    event_id=event_id,
+                )
+            elif message.blog is not None:
                 return self._emit(
                     "reply_now",
                     "media_only",
@@ -293,17 +317,18 @@ class MessageRouter:
                     thread_root_id=thread_root_id,
                     event_id=event_id,
                 )
-            return self._emit(
-                "reply_now",
-                "empty",
-                channel_id=channel_id,
-                message_id=message.id,
-                reply_to=message.id,
-                text=texts.USAGE_HINT,
-                channel_kind=channel_kind,
-                thread_root_id=thread_root_id,
-                event_id=event_id,
-            )
+            else:
+                return self._emit(
+                    "reply_now",
+                    "empty",
+                    channel_id=channel_id,
+                    message_id=message.id,
+                    reply_to=message.id,
+                    text=texts.USAGE_HINT,
+                    channel_kind=channel_kind,
+                    thread_root_id=thread_root_id,
+                    event_id=event_id,
+                )
 
         # 9.2 /help 本地应答，不触发模型。
         if is_help_command(user_text):
@@ -313,7 +338,12 @@ class MessageRouter:
                 channel_id=channel_id,
                 message_id=message.id,
                 reply_to=message.id,
-                text=texts.HELP_TEXT,
+                # 能不能看图是配置决定的，帮助文案必须说实话（默认关闭）。
+                text=(
+                    texts.HELP_TEXT_WITH_VISION
+                    if self._vision_enabled
+                    else texts.HELP_TEXT
+                ),
                 channel_kind=channel_kind,
                 thread_root_id=thread_root_id,
                 event_id=event_id,
@@ -397,7 +427,7 @@ class MessageRouter:
             )
         return self._emit(
             "queued",
-            "queued",
+            "image_only" if image_only else "queued",
             channel_id=channel_id,
             message_id=message.id,
             reply_to=message.id,
