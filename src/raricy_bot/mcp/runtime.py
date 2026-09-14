@@ -11,10 +11,29 @@ from ..config import McpConfig
 from ..logging_setup import get_logger, log_event
 from ..redact import Redactor
 from .contracts import McpProvider
+from .pool import ExaPooledProvider
 from .registry import InMemoryToolRegistry
 from .stdio import MissingEnvironmentError, StdioMcpProvider
 
 _logger = get_logger("mcp.runtime")
+
+
+def _required_tools(config: McpConfig, server_name: str) -> tuple[str, ...]:
+    """该服务器被 feature 绑定到的工具名；池用它校验每个槽位的发现结果一致。
+
+    binding 是配置里的白名单，不是用户数据：把它交给池只为了让 schema 不一致或
+    缺工具的子进程在启动阶段就被禁用，而不是等到模型调用时才失败。
+    """
+    return tuple(
+        sorted(
+            {
+                binding.tool
+                for feature in config.features.values()
+                for binding in feature.bindings
+                if binding.server == server_name
+            }
+        )
+    )
 
 
 class McpManager:
@@ -27,6 +46,7 @@ class McpManager:
         host_env: dict[str, str] | None = None,
         redactor: Redactor | None = None,
         provider_factory: Callable[..., McpProvider] = StdioMcpProvider,
+        pooled_provider_factory: Callable[..., McpProvider] = ExaPooledProvider,
         adapters: Mapping[str, Callable[[Any, str], Any]] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
@@ -36,17 +56,28 @@ class McpManager:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._disabled_missing_environment: set[str] = set()
         self._refresh_lock = asyncio.Lock()
-        self.providers: dict[str, McpProvider] = {
-            name: provider_factory(
-                server,
-                host_env=host_env,
-                redactor=redactor,
-                connect_timeout_seconds=config.connect_timeout_seconds,
-                call_timeout_seconds=config.call_timeout_seconds,
-            )
-            for name, server in config.servers.items()
-            if server.enabled
-        }
+        # 服务器配了 account_pool 就用池，否则仍是单进程 Provider：对 Registry 与
+        # 模型侧完全一样，只是幕后多了若干槽位（INTERFACES §22.4）。
+        self.providers: dict[str, McpProvider] = {}
+        for name, server in config.servers.items():
+            if not server.enabled:
+                continue
+            common: dict[str, Any] = {
+                "host_env": host_env,
+                "redactor": redactor,
+                "connect_timeout_seconds": config.connect_timeout_seconds,
+                "call_timeout_seconds": config.call_timeout_seconds,
+            }
+            if server.account_pool is None:
+                self.providers[name] = provider_factory(server, **common)
+            else:
+                self.providers[name] = pooled_provider_factory(
+                    server,
+                    required_tools=_required_tools(config, name),
+                    provider_factory=provider_factory,
+                    sleep=sleep,
+                    **common,
+                )
         # Adapter 按模型侧工具名注入，避免 Runtime 层把 Exa 绑死；App 可将
         # ``exa__web_search_exa`` 映射到 ExaSearchAdapter.adapt，未来服务器只需
         # 增加对应适配器而不改 Provider/Registry 合同。

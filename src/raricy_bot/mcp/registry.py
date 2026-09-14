@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
@@ -13,6 +14,7 @@ from ..config import McpFeatureConfig
 from ..logging_setup import get_logger, log_event
 from ..text_utils import estimate_tokens
 from .contracts import (
+    McpCallCancelled,
     McpCallTimeoutError,
     McpProvider,
     ToolCall,
@@ -215,6 +217,12 @@ class InMemoryToolRegistry:
             )
 
         async def call_provider() -> Any:
+            # 多 Key 池要在槽位之间重查代次；单进程 Provider 没有轮换点，忽略即可。
+            # 只接受两个位置参数的旧替身仍按原样调用（与 app 探测 model_gate 同一手法）。
+            if generation_is_current is not None and _accepts_should_run(provider):
+                return await provider.call_tool(
+                    definition.tool_name, arguments, should_run=generation_is_current
+                )
             return await provider.call_tool(definition.tool_name, arguments)
 
         limiter = getattr(_adapter_target(adapter), "limiter", None)
@@ -236,6 +244,13 @@ class InMemoryToolRegistry:
                         definition=definition, feature=feature_name, level=logging.DEBUG,
                     )
                 raw = await call_provider()
+        except McpCallCancelled:
+            # 池在换槽位之前发现本轮已被 `/reset` 作废：正常竞态，不是故障，
+            # 也不该触发「整个 Provider 不可用」的重连。
+            return self._decline(
+                call, "generation_cancelled", "search cancelled",
+                definition=definition, feature=feature_name, level=logging.DEBUG,
+            )
         except McpCallTimeoutError:
             self._notify_provider_failure(definition.server_name)
             return self._decline(
@@ -351,6 +366,24 @@ def _result_is_error(value: Any) -> bool:
     if isinstance(value, dict):
         return bool(value.get("isError", value.get("is_error", False)))
     return bool(getattr(value, "isError", getattr(value, "is_error", False)))
+
+
+def _accepts_should_run(provider: McpProvider) -> bool:
+    """判断 Provider 的 `call_tool` 是否接受 `should_run`。
+
+    多 Key 池需要它来在尝试之间重查代次；只实现旧两参数签名的替身仍然可用。
+    """
+    try:
+        signature = inspect.signature(provider.call_tool)
+    except (TypeError, ValueError):
+        return False
+    parameters = signature.parameters
+    if any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    ):
+        return True
+    return "should_run" in parameters
 
 
 def _adapter_target(adapter: Any) -> Any:

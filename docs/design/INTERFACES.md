@@ -1590,6 +1590,8 @@ class ExaPooledProvider:
     def available(self) -> bool          # 至少一个槽位 ready
     @property
     def slot_states(self) -> tuple[str, ...]   # 诊断与测试用，顺序即槽位序号
+        # `start()` 之前可能有内部态 `"pending"`（已配好 Key、尚未启动）；
+        # 启动或停止之后只出现上面五个状态字符串之一。
     async def start(self) -> None
     async def stop(self) -> None
     async def list_tools(self) -> tuple[ToolDefinition, ...]
@@ -1804,6 +1806,8 @@ class KnowledgeService:
 - 拉丁字母/数字连续串 `casefold()` 后作为词项；
 - CJK 文本同时生成**单字**与**相邻双字**词项（兼顾短查询与召回，P1-11）；
 - 分类、相对路径、文档标题、`heading_path`、正文分别建词项；
+  `KnowledgeChunk` 没有独立的标题字段，文档标题在索引侧取 `heading_path` 的第一段
+  （没有 H1 时该文档的文件名仍在相对路径里参与匹配）；
 - 正文用 BM25（`k1=1.5`、`b=0.75`）；分类/路径/标题/标题路径命中用固定小幅加权；
 - 同一 `relative_path` 最多返回 2 个块（P2-03）；
 - 分数相同时按 `(relative_path, ordinal)` 稳定升序；

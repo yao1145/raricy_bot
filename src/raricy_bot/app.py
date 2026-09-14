@@ -41,6 +41,7 @@ from .core.worker import (
     ToolGenerationCancelled,
     WorkerPool,
 )
+from .kb.service import KnowledgeService
 from .logging_setup import get_logger, log_event
 from .mcp.exa import ExaSearchAdapter, SearchLimiter
 from .mcp.registry import model_tool_name
@@ -82,6 +83,7 @@ class BotApp:
         transport: httpx.AsyncBaseTransport | None = None,
         model_client: ModelClient | None = None,
         mcp_manager: McpManager | None = None,
+        knowledge_service: KnowledgeService | None = None,
     ) -> None:
         self._config = config
         self._transport = transport
@@ -154,6 +156,12 @@ class BotApp:
         self._owns_model = model_client is None
         self._mcp_manager = (
             mcp_manager if mcp_manager is not None else self._build_mcp_manager()
+        )
+        # 知识库是本地只读能力：构造它不做任何 I/O，`enabled=false` 时连目录都不会被扫。
+        self._kb = (
+            knowledge_service
+            if knowledge_service is not None
+            else KnowledgeService(config.knowledge_base)
         )
 
         self._workers = WorkerPool(
@@ -251,6 +259,7 @@ class BotApp:
             cfg=self._config.behavior,
             storage=self._config.storage,
             vision_enabled=self._vision_enabled,
+            kb_enabled=self._config.knowledge_base.enabled,
         )
         if self._model is None:
             self._model = OpenAIModelClient(
@@ -265,6 +274,12 @@ class BotApp:
             await self._mcp_manager.start()
         except Exception as exc:
             log_event(_logger, logging.WARNING, "app.mcp_start_failed", error=type(exc).__name__)
+        # 知识库同样是软故障扩展：目录不可读、索引为空都只让 `/kb` 本地提示，
+        # 不得阻止普通聊天、评论或健康端点启动（D-45）。
+        try:
+            await self._kb.start()
+        except Exception as exc:
+            log_event(_logger, logging.WARNING, "app.kb_start_failed", error=type(exc).__name__)
 
         self._sse = SSEReceiver(
             self._client,
@@ -541,18 +556,32 @@ class BotApp:
                 # 但不值得为它占用一次模型调用。
                 await self._send_image_unavailable(request)
                 return
+            # `/kb`：访问门 → 检索 → 数据块；任何本地拒绝都在这里收口，不进模型。
+            kb_text: str | None = None
+            if "kb" in request.enabled_features:
+                kb_text = await self._prepare_kb(request)
+                if kb_text is None:
+                    return
             # D-22：本轮内容先**临时**拼给模型，只有回复真正送达才提交进历史。
+            # KB 数据块只属于当前轮，历史里提交的是不带它的问题（D-43）。
             pending = self._pending_turn(request, image_state)
+            if kb_text is not None:
+                pending = f"{pending}\n\n{kb_text}" if pending else kb_text
             system_addenda: list[str] = []
             if request.channel_kind == "lobby":
                 system_addenda.append(texts.LOBBY_SHARED_SYSTEM_ADDENDUM)
             if "search" in request.enabled_features:
                 system_addenda.append(texts.MCP_SEARCH_SYSTEM_ADDENDUM)
+            elif "kb" in request.enabled_features:
+                # 与搜索说明互斥：一条消息里最多一种能力（D-39）。
+                system_addenda.append(texts.KB_SYSTEM_ADDENDUM)
             messages = self._ctx.build_messages(
                 request.session_key,
                 self._config.system_prompt,
                 pending_user=pending,
                 system_addendum="\n\n".join(system_addenda) or None,
+                # 能力数据块不可丢弃，历史可以（D-38）。
+                feature_context="kb" in request.enabled_features,
             )
             self._apply_reply_prefix(messages, request)
             # 必须排在 _apply_reply_prefix 之后：那一步按字符串拼接 content。
@@ -635,9 +664,11 @@ class BotApp:
             if outcome.delivered:
                 # 只有用户真的看见了这一轮，才把它写进历史（D-22）。
                 if self._ctx.generation(request.session_key) == request.generation:
-                    history_user = pending
+                    # 历史里只留问题本身：搜索摘要有自己的压缩形式，KB 命中原文
+                    # 则完全不保留（D-35 / D-43）——下一轮本来就没有读知识库的授权。
+                    history_user = self._pending_turn(request, image_state)
                     if history_context:
-                        history_user = f"{pending}\n\n{history_context}"
+                        history_user = f"{history_user}\n\n{history_context}"
                     self._ctx.append_exchange(request.session_key, history_user, text)
             if outcome.reason == "quota":
                 await self._notify_quota(request)
@@ -720,6 +751,69 @@ class BotApp:
                 raise ModelError("tools_unsupported", False) from exc
             raise
         return completion.text, completion.history_context
+
+    async def _prepare_kb(self, request: Request) -> str | None:
+        """执行一轮 `/kb`：访问门 → 检索；返回数据块，本地拒绝时返回 None。
+
+        返回 None 表示这一轮已经在本地收口（发了 `notice_local`，或者请求在检索
+        期间被 `/reset` 作废）：调用方必须直接返回，既不调模型也不写历史。
+        """
+        cfg = self._config.knowledge_base
+        if not cfg.enabled:
+            await self._send_kb_local(request, "disabled", texts.KB_UNAVAILABLE_TEXT)
+            return None
+        # 授权判据只用站点稳定 id，不按可改名的用户名（D-44）。
+        if not self._kb.permits(
+            channel_kind=request.channel_kind, user_id=request.message.author.id
+        ):
+            await self._send_kb_local(request, "access", texts.KB_ACCESS_DENIED_TEXT)
+            return None
+        if self._ctx.generation(request.session_key) != request.generation:
+            return None
+        result = await self._kb.search(request.user_text)
+        if result.status != "ok":
+            if result.status == "no_results":
+                await self._send_kb_local(request, "no_results", texts.KB_NO_RESULTS_TEXT)
+            else:
+                await self._send_kb_local(request, "unavailable", texts.KB_UNAVAILABLE_TEXT)
+            return None
+        # 检索结束到调模型之间是另一个异步边界：`/reset` 可能刚好落在这里。
+        if self._ctx.generation(request.session_key) != request.generation:
+            return None
+        # 只记条数与快照版本，不记分类、路径、标题或正文（INTERFACES §23）。
+        log_event(
+            _logger,
+            logging.INFO,
+            "kb.query_done",
+            count=result.block_count,
+            snapshot_version=result.snapshot_version,
+            channel_id=request.channel_id,
+            channel_kind=request.channel_kind,
+        )
+        return result.text
+
+    async def _send_kb_local(self, request: Request, reason: str, text: str) -> None:
+        """`/kb` 的本地提示：kind=`notice_local`，不占主动通知冷却（D-1）。"""
+        if self._ctx.generation(request.session_key) != request.generation:
+            return
+        log_event(
+            _logger,
+            logging.INFO,
+            "app.kb_unavailable",
+            reason=reason,
+            channel_id=request.channel_id,
+            channel_kind=request.channel_kind,
+        )
+        if self._unavailable:
+            return
+        outcome = await self._sender.send(
+            request.channel_id,
+            text,
+            request.message.id,
+            kind="notice_local",
+            thread_root_id=request.thread_root_id,
+        )
+        self._note_forbidden(outcome)
 
     async def _send_search_unavailable(self, request: Request, reason: str) -> None:
         """搜索显式授权但能力不可用时只发本地提示，并记下可判别的 reason。"""
@@ -1015,6 +1109,7 @@ class BotApp:
         await self._workers.stop()
         await self._ops.stop()
         await self._mcp_manager.stop()
+        await self._kb.stop()
 
         if self._owns_model and self._model is not None:
             await self._model.aclose()
