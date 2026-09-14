@@ -42,8 +42,13 @@ class KnowledgeResult:
     snapshot_version: int
 
 
-def _render_block(label: int, hit: KnowledgeHit) -> str:
-    """渲染单个 `[KBn]` 数据块。"""
+def _render_parts(label: int, hit: KnowledgeHit) -> tuple[str, str]:
+    """拆出单个 `[KBn]` 块的前缀与正文，供截断使用。
+
+    前缀与正文在这里**结构化**拼装，截断时绝不回到渲染结果上做字符串查找：分类名、
+    相对路径或标题都来自不可信的资料，里面完全可能含 `内容: ` 字面量；用查找定位
+    会命中表头内部，把预算耗在错误的位置、整段截掉正文。返回的前缀以 `内容: ` 结尾。
+    """
     chunk = hit.chunk
     lines = [
         f"[KB{label}]",
@@ -52,21 +57,14 @@ def _render_block(label: int, hit: KnowledgeHit) -> str:
     ]
     if chunk.heading_path:
         lines.append(f"标题: {chunk.heading_path}")
-    lines.append(f"内容: {chunk.content}")
-    return "\n".join(lines)
+    return "\n".join([*lines, "内容: "]), chunk.content
 
 
-def _fit_first_block(block: str, budget: int) -> str | None:
+def _fit_first_block(prefix: str, content: str, budget: int) -> str | None:
     """把最高分块截断到预算内；塞不下标签时返回 None。
 
     二分内容长度，保留头部、标签与截断提示，必要时追加 `TRUNCATION_SUFFIX`。
     """
-    marker = "内容: "
-    cut = block.find(marker)
-    if cut == -1:
-        return None
-    prefix = block[: cut + len(marker)]
-    content = block[cut + len(marker) :]
     best: str | None = None
     low, high = 0, len(content)
     while low <= high:
@@ -88,9 +86,10 @@ def format_hits(
     头部、标签、分类、路径、标题、正文与截断提示全部计入预算；超预算时按块
     整块丢弃（保留分数最高的块），必要时对第一块追加 `TRUNCATION_SUFFIX`。
     """
-    blocks = [_render_block(label, hit) for label, hit in enumerate(hits, start=1)]
+    parts = [_render_parts(label, hit) for label, hit in enumerate(hits, start=1)]
     kept: list[str] = []
-    for block in blocks:
+    for index, (prefix, content) in enumerate(parts):
+        block = prefix + content
         if kept:
             candidate = KB_HEADER + "\n" + "\n\n".join([*kept, block])
         else:
@@ -99,7 +98,7 @@ def format_hits(
             kept.append(block)
             continue
         if not kept:
-            fitted = _fit_first_block(block, max_context_tokens)
+            fitted = _fit_first_block(prefix, content, max_context_tokens)
             if fitted is not None:
                 kept.append(fitted)
         break

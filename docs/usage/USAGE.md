@@ -200,7 +200,7 @@
 | 评论区忙碌/失败/额度用尽静默，不发提示 | 设计 §11.2：评论发送只有 `reply` 与 `notice_local`，无主动 `notice` |
 | 每条成功评论都真实通知被回复者 | 站点评论接口写入即通知，无机器人豁免（设计 §3.2 / §20.2） |
 | `/help` `/reset` 在评论区两种写法都有效 | `comments/router.py`：`is_help_command` / `is_reset_command`，整条评论匹配 |
-| `/kb` 只授权当前轮、从本地资料检索 | `core/router.py` 第 9.1 步写入 `enabled_features`；`app.py` 的 `_complete_kb` 走 `KnowledgeService.search`（D-41、D-43） |
+| `/kb` 只授权当前轮、从本地资料检索 | `core/router.py` 第 9.1 步写入 `enabled_features`；`app.py` 的 `_prepare_kb` 走 `KnowledgeService.search`（D-41、D-43） |
 | `/search` 与 `/kb` 不能叠加 | `text_utils.leading_capability_command` + 路由器的能力冲突分支（D-39） |
 | 命中片段不发往 Exa | `/kb` 用普通 `complete()`，完全不走 MCP/`SearchLimiter`（D-41） |
 | 知识库默认只对私聊白名单开放 | `config.knowledge_base`：`enabled=false`、`access_mode=allowlist`、`allowed_channel_kinds=["dm"]`（D-44） |

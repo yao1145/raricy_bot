@@ -72,6 +72,15 @@ class McpCallTimeoutError(TimeoutError):
     """MCP 工具调用超过配置时限；供 Registry 映射稳定错误码。"""
 
 
+class McpProviderUnavailable(RuntimeError):
+    """一次尝试都还没发生就没有可用 Provider（池里零个 ready 槽位）。
+
+    它与「真的超时」是不同的事实：没有超时，也没有失败的上游调用，只是当前没有
+    可以发起调用的槽位。因此它只带稳定类型、不带池结构或上游正文，也**不**触发
+    Registry 的整台 Provider 重连——池自己的后台恢复任务会处理。
+    """
+
+
 class McpCallCancelled(Exception):
     """池或 Registry 在尝试前发现本轮已被作废；不得映射为故障。"""
 

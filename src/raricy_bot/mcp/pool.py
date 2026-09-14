@@ -26,7 +26,13 @@ from typing import Any
 from ..config import McpServerConfig
 from ..logging_setup import get_logger, log_event
 from ..redact import Redactor
-from .contracts import McpCallCancelled, McpCallTimeoutError, McpProvider, ToolDefinition
+from .contracts import (
+    McpCallCancelled,
+    McpCallTimeoutError,
+    McpProvider,
+    McpProviderUnavailable,
+    ToolDefinition,
+)
 from .stdio import MissingEnvironmentError, StdioMcpProvider
 
 _logger = get_logger("mcp.pool")
@@ -242,9 +248,20 @@ def classify_exa_error(result: Any) -> str:
 
 
 def _schema_fingerprint(definitions: tuple[ToolDefinition, ...]) -> str:
-    """工具定义（名字 + 入参 schema）的规范化指纹，用于跨槽位一致性比对。"""
-    payload = [[item.tool_name, item.input_schema] for item in definitions]
-    return json.dumps(payload, sort_keys=True, default=str, ensure_ascii=True)
+    """工具定义（名字 + 入参 schema）的规范化指纹，用于跨槽位一致性比对。
+
+    先对每一项各自归一化，再按 `(名字, schema)` 排序后拼接：同一组工具无论上游以
+    什么顺序报出来，指纹都相同。否则一次无关的列表换序会让第二个槽位被误判为
+    `schema_mismatch` 并静默退化成单 Key。
+    """
+    entries = sorted(
+        (
+            item.tool_name,
+            json.dumps(item.input_schema, sort_keys=True, default=str, ensure_ascii=True),
+        )
+        for item in definitions
+    )
+    return json.dumps(entries, ensure_ascii=True)
 
 
 async def _quiet_stop(provider: McpProvider) -> None:
@@ -297,6 +314,8 @@ class ExaPooledProvider:
         self._select_lock = asyncio.Lock()
         self._stopping = False
         self._cursor = 0
+        # 停用槽位的回收任务：取消其恢复任务并关闭子进程。集中跟踪以便 stop() 收尾。
+        self._retire_tasks: set[asyncio.Task[None]] = set()
         self._slots = self._build_slots()
 
     # ---- 生命周期 -------------------------------------------------------
@@ -366,6 +385,10 @@ class ExaPooledProvider:
             task.cancel()
         if tasks:
             await asyncio.wait(tasks)
+        # 等停用槽位的回收任务收尾，避免它们的 stop() 与本方法的收尾交错。
+        retire = [task for task in self._retire_tasks if not task.done()]
+        if retire:
+            await asyncio.gather(*retire, return_exceptions=True)
         providers = [slot.provider for slot in self._slots if slot.provider is not None]
         if providers:
             await asyncio.gather(*(_quiet_stop(provider) for provider in providers))
@@ -468,6 +491,16 @@ class ExaPooledProvider:
                 # request / unknown_upstream：不轮换，把原始结果原样交回 Registry（D-46）。
                 return result
             last_result, last_error = result, None
+        # 一个 ready 槽位都没有：一次尝试都没发生，这不是超时。用不带池结构的稳定
+        # 错误告诉 Registry 当前不可用，让它映射成 search_unavailable（F1）。
+        if not tried:
+            log_event(
+                _logger,
+                logging.DEBUG,
+                "mcp.pool_call_unavailable",
+                server=self.config.name,
+            )
+            raise McpProviderUnavailable()
         # 全部槽位失败：只暴露稳定的错误类型，绝不带槽位数、槽位序号或上游原文。
         if last_error is not None:
             if isinstance(last_error, McpCallTimeoutError):
@@ -569,14 +602,19 @@ class ExaPooledProvider:
             self._schedule_recovery(slot)
 
     def _disable(self, slot: _Slot, reason: str) -> None:
+        """停用一个槽位：状态转 disabled，并回收它的恢复任务与子进程。
+
+        取消恢复任务与关闭子进程都交给一个独立小任务完成，绝不在这里同步取消当前
+        任务——`_disable` 可能正跑在恢复任务自己的栈上（`_try_restart`），那样等于
+        让任务取消自己，只能靠 `finally` 兜底。独立任务还会顺手 `provider.stop()`：
+        槽位转 disabled 后它的子进程与 FD 必须立刻回收，而不是等整池 `stop()`。
+        """
         if slot.state == SLOT_DISABLED:
             return
         slot.state = SLOT_DISABLED
         slot.reason = reason
         slot.wake_at = None
-        if slot.task is not None:
-            slot.task.cancel()
-            slot.task = None
+        task, slot.task = slot.task, None
         log_event(
             _logger,
             logging.WARNING,
@@ -585,6 +623,36 @@ class ExaPooledProvider:
             slot=slot.index,
             reason=reason,
         )
+        self._schedule_retire(slot, task)
+
+    def _schedule_retire(
+        self, slot: _Slot, task: asyncio.Task[None] | None
+    ) -> None:
+        """排一个独立的回收任务；没有事件循环时静默跳过（构造期不可能走到这里）。"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - 所有调用点都在协程里
+            return
+        retire = loop.create_task(self._retire_slot(slot, task))
+        self._retire_tasks.add(retire)
+        retire.add_done_callback(self._retire_tasks.discard)
+
+    async def _retire_slot(
+        self, slot: _Slot, task: asyncio.Task[None] | None
+    ) -> None:
+        """回收一个已转 disabled 的槽位：先等恢复任务结束，再关闭子进程。"""
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                # 被取消的恢复任务本身：这正是期望结果，不是本任务被取消。
+                pass
+            except Exception:
+                # 恢复任务自身吞掉业务异常，这里只做兜底。
+                pass
+        if slot.provider is not None:
+            await _quiet_stop(slot.provider)
 
     # ---- 内部：后台恢复 --------------------------------------------------
 

@@ -133,6 +133,8 @@ def _read_file(
     """读取并严格解码一个文件，返回 `(正文, 跳过原因, 字节数)`。
 
     打开前后各查一次大小（P1-10）：大小不一致视为文件被替换，跳过该文件。
+    读取本身有上限（多读一字节用于判超），避免扫描与读取之间文件被换成超大文件时
+    整份读进内存：合同要求只读挂载，这是纵深防御。
     """
     try:
         before = path.stat()
@@ -141,9 +143,12 @@ def _read_file(
     if before.st_size > cfg.max_file_bytes:
         return None, "too_large", 0
     try:
-        data = path.read_bytes()
+        with open(path, "rb") as handle:
+            data = handle.read(cfg.max_file_bytes + 1)
     except OSError:
         return None, "read_failed", 0
+    if len(data) > cfg.max_file_bytes:
+        return None, "too_large", 0
     try:
         after = path.stat()
     except OSError:

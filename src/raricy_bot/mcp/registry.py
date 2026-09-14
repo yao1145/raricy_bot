@@ -17,6 +17,7 @@ from .contracts import (
     McpCallCancelled,
     McpCallTimeoutError,
     McpProvider,
+    McpProviderUnavailable,
     ToolCall,
     ToolDefinition,
     ToolExecution,
@@ -250,6 +251,14 @@ class InMemoryToolRegistry:
             return self._decline(
                 call, "generation_cancelled", "search cancelled",
                 definition=definition, feature=feature_name, level=logging.DEBUG,
+            )
+        except McpProviderUnavailable:
+            # 零个可用槽位：一次尝试都没发生，不是超时。这是池自己的瞬态（槽位都在
+            # 冷却里），由池的后台恢复任务处理，因此**不**通知 Manager 重连整个
+            # Provider——那会把还在冷却的槽位提前拉起，属于额外升级。
+            return self._decline(
+                call, "search_unavailable", "tool_unavailable",
+                definition=definition, feature=feature_name,
             )
         except McpCallTimeoutError:
             self._notify_provider_failure(definition.server_name)
