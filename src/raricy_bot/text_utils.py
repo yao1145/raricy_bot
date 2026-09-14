@@ -149,3 +149,13 @@ def is_reset_command(text: str) -> bool:
 def has_media(message: Any) -> bool:
     """判断消息是否附带图片或博客引用。"""
     return message.image is not None or message.blog is not None
+
+
+def has_image(message: Any) -> bool:
+    """判断这条消息是否带了一张**可以读**的图。
+
+    与 `has_media` 的区别是 `image_missing`：那个字段表示「引用了图但图已不存在」，
+    这种消息没有东西可以交给模型，因此不算有图。`has_media` 回答的是另一个问题
+    （「有没有我读不了的东西」），保持原义不动。
+    """
+    return message.image is not None and not message.image_missing
