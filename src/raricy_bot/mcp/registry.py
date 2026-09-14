@@ -211,7 +211,7 @@ class InMemoryToolRegistry:
                 )
         provider = self._providers.get(definition.server_name)
         if provider is None or not provider.available:
-            self._notify_provider_failure(definition.server_name)
+            self._notify_provider_failure(definition.server_name, provider)
             return self._decline(
                 call, "search_unavailable", "tool_unavailable",
                 definition=definition, feature=feature_name,
@@ -261,13 +261,13 @@ class InMemoryToolRegistry:
                 definition=definition, feature=feature_name,
             )
         except McpCallTimeoutError:
-            self._notify_provider_failure(definition.server_name)
+            self._notify_provider_failure(definition.server_name, provider)
             return self._decline(
                 call, "search_timeout", "search timed out",
                 definition=definition, feature=feature_name,
             )
         except Exception:
-            self._notify_provider_failure(definition.server_name)
+            self._notify_provider_failure(definition.server_name, provider)
             return self._decline(
                 call, "search_unavailable", "tool_unavailable",
                 definition=definition, feature=feature_name,
@@ -354,8 +354,18 @@ class InMemoryToolRegistry:
         log_event(_logger, level, "mcp.tool_failed", **fields)
         return ToolExecution(call.call_id, content, True, error_kind)
 
-    def _notify_provider_failure(self, server_name: str) -> None:
-        """通知生命周期管理器安排重连；回调异常不得影响用户请求。"""
+    def _notify_provider_failure(
+        self, server_name: str, provider: McpProvider | None = None
+    ) -> None:
+        """通知生命周期管理器安排重连；回调异常不得影响用户请求。
+
+        带 ``manages_own_recovery`` 标记的 Provider（Exa 池，§22.3）自己负责槽位
+        冷却与后台恢复，执行路径上的瞬态不可用（预检、全部槽位超时、全部槽位异常）
+        不通知整台重连——外层 ``stop()`` + ``start()`` 会把冷却一并抹掉。工具发现
+        失败是硬故障，走不带 provider 的调用路径，仍然照常通知。
+        """
+        if provider is not None and getattr(provider, "manages_own_recovery", False):
+            return
         if self._on_provider_failure is None:
             return
         try:

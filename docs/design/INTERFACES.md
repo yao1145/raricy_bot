@@ -1626,6 +1626,11 @@ class ExaPooledProvider:
 - `stop()` 先取消全部恢复任务，再并发关闭子进程；重复调用安全。
 - 单个槽位故障由池自己的后台恢复任务处理，**不触发** `McpManager` 重连整个逻辑 Provider；
   恢复任务失败按 `transient_cooldown_seconds` 重新排队（有界，不无退避重试）。
+- 上一条的实现方式：池声明类属性 `manages_own_recovery = True`，`InMemoryToolRegistry`
+  在执行路径上（调用前预检不可用、全部槽位超时、全部槽位异常）据此抑制
+  `on_provider_failure` 通知；工具发现失败仍照常通知重连。
+- `available` 为假对池只是「当前没有 ready 槽位」的瞬态（例如全部在冷却里），
+  不代表需要外层重启。
 - 池不参与 `livez` / `readyz`（D-34）。
 
 `mcp/contracts.py` 增加：

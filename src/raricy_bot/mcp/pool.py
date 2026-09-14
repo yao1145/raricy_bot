@@ -277,6 +277,12 @@ async def _quiet_stop(provider: McpProvider) -> None:
 class ExaPooledProvider:
     """多个已授权 Exa Key 的池，对外是**一个** McpProvider。"""
 
+    # 池内槽位的冷却与恢复由池自己的后台恢复任务负责；外层若按「整个逻辑 Provider
+    # 不可用」重连（stop() + start()），会把还在冷却里的槽位一并拉起，抹掉冷却语义
+    # （例如刚因 429 冷却 60 秒、刚因额度耗尽冷却 6 小时的槽位会被立刻再打一次）。
+    # Registry 执行路径见到这个标记就不再通知 McpManager 重连（INTERFACES §22.3）。
+    manages_own_recovery = True
+
     def __init__(
         self,
         config: McpServerConfig,
