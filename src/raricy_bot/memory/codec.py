@@ -347,16 +347,38 @@ def _check_front(front: Mapping[str, object], expected: tuple[str, ...]) -> None
         raise CodecError("malformed")
 
 
-def _check_depth(value: object, limit: int) -> None:
-    """映射深度有界（§29.2 第 5 条）：超过 `limit` 层的映射或序列一律拒绝。"""
+def _check_depth(value: object, limit: int, visited: dict[int, int] | None = None) -> None:
+    """映射深度有界（§29.2 第 5 条）：超过 `limit` 层的映射或序列一律拒绝。
+
+    `visited` 记下每个容器对象**已走完**的最小 `limit`，也就是「这棵子树有多深」的已知上界：
+    YAML 别名让同一个对象在文档里出现多次，没有它时 `y: [*a, *a, …]` 会按出现次数把同一棵子树
+    重走 n 遍（n 个元素就是 n² 次 `isinstance`，一百 KB 的 front matter 能把解析卡上几分钟）。
+    有它时，只有「当前 limit 比已知上界更严」才重走，而 limit 的取值只有 0 … MAX_FRONT_DEPTH，
+    每个容器最多走 `MAX_FRONT_DEPTH + 1` 遍，总工作量与文档大小成线性。已知上界严格递减，
+    因此「更严」的重走最多四次；不会出现「先松后严」把超深文档放过去的情况。
+
+    只有走完的子树才进 `visited`，而含环的子树永远走不完——循环锚点（`&a [*a]`）仍由「limit 逐层
+    递减、`limit < 0` 即抛 `malformed`」终止，这条保护不因本表而失效。`id()` 只作本次遍历内的键：
+    整张图都被根对象引用着，遍历期间不会有容器被回收后让新对象复用同一个 id。
+    """
     if limit < 0:
         raise CodecError("malformed")
+    if not isinstance(value, (Mapping, list, tuple)):
+        return
+    if visited is None:
+        visited = {}
+    marker = id(value)
+    bound = visited.get(marker)
+    if bound is not None and bound <= limit:
+        # 这棵子树已被更严（更小）的预算走完过：当前预算更宽松，结论照用。
+        return
     if isinstance(value, Mapping):
         for item in value.values():
-            _check_depth(item, limit - 1)
-    elif isinstance(value, (list, tuple)):
+            _check_depth(item, limit - 1, visited)
+    else:
         for item in value:
-            _check_depth(item, limit - 1)
+            _check_depth(item, limit - 1, visited)
+    visited[marker] = limit
 
 
 def _skip_blank(lines: list[str], index: int) -> int:
