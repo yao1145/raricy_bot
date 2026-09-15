@@ -61,6 +61,8 @@ _logger = get_logger("app")
 # 被引用消息的三种边角标记。它们是**模型可见**的文本，不是给用户看的文案，
 # 所以不进 texts.py（那里放的是用户可见的回复）。
 _REPLY_IMAGE_MARKER: str = "[图片]"
+# 被引用消息本来有图但没取到：与 `with_image_marker` 的 `[图片未提供]` 同一句话。
+_REPLY_IMAGE_NOT_PROVIDED: str = "[图片未提供]"
 _REPLY_DELETED_MARKER: str = "[该消息已删除]"
 _REPLY_EMPTY_MARKER: str = "[无正文]"
 
@@ -587,6 +589,8 @@ class BotApp:
             # 取图在模型门之外：三个 worker 各自下载互不阻塞，
             # 超时由站点请求超时兜住（设计 §3.5）。
             image_part, image_state = await self._load_image(request)
+            # 被引用消息的缩略图与它并列：同样是取图，同样在模型门之外。
+            reply_image_part, reply_image_state = await self._load_reply_image(request)
             # 引用博客同样在模型门之外：与取图并列，两边互不阻塞。
             blog = await self._load_blog(request)
             blog_block, blog_state = blog.block, blog.state
@@ -601,6 +605,10 @@ class BotApp:
                 # 整条消息就是引用、且一样都没取到：用户明确发来了东西，必须给个交代，
                 # 但不值得为它占用一次模型调用。文案按消息带了什么来选：有图片载荷时
                 # 仍走原来那句（与改动前逐字节一致）。
+                #
+                # 被引用消息的缩略图**不算**在这一条里：它问的是「这条消息自己带了什么」，
+                # 而路由器本来就不会把一条空正文、无图无博客的消息放进来。缩略图取不到
+                # 有它自己的记号（前缀里的 `[图片未提供]`），不必把整轮降级成本地提示。
                 await self._send_media_unavailable(
                     request,
                     texts.IMAGE_UNAVAILABLE_TEXT
@@ -644,12 +652,20 @@ class BotApp:
                     "kb" in request.enabled_features or blog_block is not None
                 ),
             )
-            self._apply_reply_prefix(messages, request, reply_body=reply_text)
+            self._apply_reply_prefix(
+                messages,
+                request,
+                reply_body=reply_text,
+                reply_image_state=reply_image_state,
+            )
             # 必须排在 _apply_reply_prefix 之后：那一步按字符串拼接 content。
             if image_part is not None:
                 attach_image(messages, image_part)
-            # 引用换出来的图排在消息自带的图之后：一张图一块，顺序只影响模型的阅读次序。
+            # 被引用的那张缩略图紧随消息自己的图，然后是各处引用换出来的图：
+            # 一张图一块，顺序只影响模型的阅读次序。
             # 博客正文换出来的图也在其中——它同样只属当前轮，取回来了就该交出去。
+            if reply_image_part is not None:
+                attach_image(messages, reply_image_part)
             for part in ref_parts:
                 attach_image(messages, part)
             for part in blog.image_parts:
@@ -751,6 +767,21 @@ class BotApp:
         if not self._vision_enabled:
             return None, "none"
         return await self._image_loader.load(request.message)
+
+    async def _load_reply_image(self, request: Request) -> tuple[dict[str, Any] | None, str]:
+        """取回**被引用消息**的缩略图并编码；关闭图片输入时完全不碰图床。
+
+        契约给的只有 URL（没有 id、没有 mime，且是缩略图），因此只能按原样取：
+        同源约束与格式嗅探都由 `ImageLoader.load_url` 兜住，取不到就降级成
+        `[图片未提供]`（见 `_reply_image_marker`）。
+        已删除的引用不取——那条消息的图不再属于任何人（D-48 的判定顺序）。
+        """
+        if not self._vision_enabled:
+            return None, "none"
+        reply = request.message.reply
+        if reply is None or reply.is_deleted or not reply.image_url:
+            return None, "none"
+        return await self._image_loader.load_url(reply.image_url)
 
     async def _load_blog(self, request: Request) -> BlogLoad:
         """取回本轮引用的博客（正文里的内容引用已展开）；没有引用时完全不碰网络。"""
@@ -999,6 +1030,7 @@ class BotApp:
         request: Request,
         *,
         reply_body: str | None = None,
+        reply_image_state: str = "none",
     ) -> None:
         """把当前轮的**直接引用**拼到最后一条 user 消息上（D-7）。
 
@@ -1006,9 +1038,12 @@ class BotApp:
         每一轮被反复外送；它只属于引用它的那一轮（设计文档 §2.2.4「当前 reply_to 文本」）。
         即使被引用正文已在历史里也仍然保留这份前缀：有限的重复优于丢失当前指向。
 
-        `reply_body` 是展开过内容引用的引用正文（§25）；省略它就是上一次的行为。
+        `reply_body` 是展开过内容引用的引用正文（§25）；`reply_image_state` 是被引用
+        消息那张缩略图的取回结果（§20），两者省略时都是上一次的行为。
         """
-        prefix = self._reply_prefix(request, reply_body=reply_body)
+        prefix = self._reply_prefix(
+            request, reply_body=reply_body, reply_image_state=reply_image_state
+        )
         if not prefix:
             return
         for index in range(len(messages) - 1, -1, -1):
@@ -1021,7 +1056,25 @@ class BotApp:
                 return
 
     @staticmethod
-    def _reply_prefix(request: Request, *, reply_body: str | None = None) -> str | None:
+    def _reply_image_marker(image_state: str) -> str:
+        """被引用消息的图片标记：取到了 `[图片]`，本来有图但没取到 `[图片未提供]`。
+
+        视觉关闭时状态是 `"none"`（我们连试都没试），此时仍是原来的 `[图片]`：
+        那个标记本来就只说明「被引用的是图片消息」，改动前的形状逐字保留。
+        """
+        return (
+            _REPLY_IMAGE_MARKER
+            if image_state in {"none", "ok"}
+            else _REPLY_IMAGE_NOT_PROVIDED
+        )
+
+    @staticmethod
+    def _reply_prefix(
+        request: Request,
+        *,
+        reply_body: str | None = None,
+        reply_image_state: str = "none",
+    ) -> str | None:
         """构造本轮的直接引用前缀；没有引用块时返回 None。
 
         大区与私聊用不同的标签（D-25）：只有大区是「直接引用」——
@@ -1031,17 +1084,21 @@ class BotApp:
         被引用消息已删除、被引用消息没有正文（例如一条拍一拍）。
         `is_deleted` 的判定**先于** `content`：契约没承诺 reply 块里的正文一定被
         替换过，所以自己给标记，不把可能残留的原文转述给模型。
+
+        图片标记与被引用消息的正文并列：整条引用就是一张图时标记本身就是正文，
+        正文之外还带图时标记补在正文**后面**（D-48 的三种边角加上这一条组合）。
         """
         reply = request.message.reply
         if reply is None:
             return None
         context = request.reply_context if reply_body is None else reply_body
+        marker = BotApp._reply_image_marker(reply_image_state)
         if reply.is_deleted:
             body = _REPLY_DELETED_MARKER
         elif context:
-            body = context
+            body = f"{context} {marker}" if reply.image_url else context
         elif reply.image_url:
-            body = _REPLY_IMAGE_MARKER
+            body = marker
         else:
             body = _REPLY_EMPTY_MARKER
         author = reply.author_name

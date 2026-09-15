@@ -111,6 +111,7 @@ python -m pytest tests -q
 ### 图片理解
 
 `model.vision_enabled: true` 且模型自身支持视觉时，用户当前这一轮发的图会随这一轮交给模型；
+**回复（引用）一条带图的消息时，那张缩略图同样交给模型**（站点只给缩略图，没有原图 id）。
 博客区同理，但另外受 `comments.max_images_per_reply`（默认 3）约束——一轮评论回复里，
 评论附件、评论正文的 `[@10位]`、文章正文的 `[@10位]` 共用这一个名额池，按这个顺序花。
 图片不落库、不进历史；关闭时只处理文本，并明确告诉用户图没读到。
@@ -185,7 +186,8 @@ Cookie、密码与 API Key 在任何级别都不会落进日志或数据库。
   都要用户自己去对应页面看。
 - **图片与博客正文的边界**：图片默认关闭；聊天里**用户主动引用**的博客会读标题与正文
   （上限 `behavior.quoted_blog_max_chars`，默认 1000 字，超限只给标题），没被引用的不读；
-  博客评论区只读文章标题和不超过 1000 字的正文，图则另受一轮 3 张（可配）的名额约束。
+  聊天里**被回复消息的图**只取站点给的缩略图，不追原图；博客评论区只读文章标题和不
+  超过 1000 字的正文，图则另受一轮 3 张（可配）的名额约束。
 - **正文里的引用语法会被展开**：消息、评论与文章正文里的 `[@<内容ID>]` 都会去取真内容
   ——8 位读云剪贴板正文、9 位读投票的选项与票数、10 位是图床图片（配了视觉才看图）。
   剪贴板与投票接口要求 Core 以上，私有内容对非作者是 403，那时留下「加载失败」占位；
@@ -255,8 +257,6 @@ raricy_bot/
 | 模块之间锁定的接口与判定顺序 | [`docs/design/INTERFACES.md`](docs/design/INTERFACES.md) |
 | 某处行为为什么是这样 | [`docs/design/DESIGN_DECISIONS.md`](docs/design/DESIGN_DECISIONS.md) |
 | 上游站点 API 的原始契约 | [`docs/materials/chat-bot.md`](docs/materials/chat-bot.md) |
-| 联网搜索的设计与验收口径 | [`docs/design/MCP_CHAT_SEARCH_DESIGN.md`](docs/design/MCP_CHAT_SEARCH_DESIGN.md) |
-| 密钥池与知识库的设计及实施状态 | [`docs/design/EXA_ACCOUNT_POOL_AND_KB_DESIGN_PLAN.md`](docs/design/EXA_ACCOUNT_POOL_AND_KB_DESIGN_PLAN.md) |
 | 推荐的系统提示词 | [`docs/design/SYSTEM_PROMPTS.md`](docs/design/SYSTEM_PROMPTS.md) |
 
 改代码前请先读 `INTERFACES.md`：它是本仓库唯一锁定的内部合同，改签名要同时检查所有消费者。

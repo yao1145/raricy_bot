@@ -1318,6 +1318,22 @@ class BotApp:
   大区的顺序是「直接引用 → 发言者包装 → 图片标记 → 引用博客 → 正文」，即标记在
   `speaker_wrapper` **内部**：图与引用都属于发言人这条消息。
   `attach_image` 必须排在 `_apply_reply_prefix` **之后**，因为后者按字符串拼接 content。
+
+  **直接引用前缀（D-7 / D-48 / D-54）**：被引用消息的三种边角各留一行标记，
+  图片的标记与被引用正文并列——整条引用就是一张图时标记本身就是正文，
+  正文之外还带图时标记补在正文**后面**：
+
+  | `reply` 的样子 | 前缀正文 |
+  |----------------|----------|
+  | `is_deleted` | `[该消息已删除]`（判定**先于**正文，契约没承诺正文被替换过） |
+  | 正文非空 | `<正文>`；带图时再补 ` [图片]`（取不到则 ` [图片未提供]`） |
+  | 正文为空、有 `image_url` | `[图片]`（取不到则 `[图片未提供]`） |
+  | 正文为空、无图（例如拍一拍） | `[无正文]` |
+
+  `reply_image_state == "ok"` 时那张**缩略图**会作为内容块挂在最后一条 user 消息上；
+  视觉关闭时一个字节都不取，标记仍是 `[图片]`——那个标记本来就只说明「被引用的是
+  图片消息」。`is_deleted` 的引用从不取图。契约只给 URL（无 id、无 mime、是缩略图），
+  因此只能按原样取回，同源与格式都由 `fetch_image` 与字节嗅探兜住。
 - worker 的 handler（**两处代次检查不能省**）：
   0. `vision_enabled` 为假时**完全不碰** `ImageLoader`（`_load_image` 直接返回
      `(None, "none")`），因此关闭图片输入的进程里没有任何新增的图床请求。
@@ -1325,8 +1341,10 @@ class BotApp:
      → 该请求已被 `/reset` 或线程过期作废：**不调模型、不发消息**，
      `mark_handled(..., "done")` 后返回。
   1.5 取图（`ImageLoader.load`，在模型门**之外**，超时由站点请求超时兜住）→
-     `(image_part, image_state)`；紧跟其后取引用的博客（`BlogLoader.load`，同样在模型门
-     之外）→ `(blog_block, blog_state)`。整条消息只有引用、且一样都没取到时：
+     `(image_part, image_state)`；紧跟其后取**被引用消息的缩略图**
+     （`_load_reply_image`，同一条路、同样在模型门之外）→
+     `(reply_image_part, reply_image_state)`；然后取引用的博客（`BlogLoader.load`，
+     同样在模型门之外）→ `(blog_block, blog_state)`。整条消息只有引用、且一样都没取到时：
      - `image_part is None` 且 `not blog_readable(blog_state)` 且 `user_text` 为空
        且（`image_state != "none"` 或 `blog_state != "none"`）
        → 发一次本地文案（kind=`"notice_local"`，见 D-30），**不调模型**，
@@ -1338,7 +1356,8 @@ class BotApp:
      request.session_key, cfg_system_prompt, pending_user=pending,
      system_addendum=LOBBY_SHARED_SYSTEM_ADDENDUM if channel_kind == "lobby" else None,
      feature_context=("kb" in request.enabled_features or blog_block is not None))`
-     → `_apply_reply_prefix`（仍是字符串拼接）→ `attach_image`（`image_part` 非空时）
+     → `_apply_reply_prefix`（仍是字符串拼接，带上 `reply_image_state`）
+     → `attach_image`（顺序：消息自己的图 → 被引用消息的缩略图 → 各处引用换出来的图）
      → 模型（含一次重试）→ **再次**比对代次：
      - 代次已变 → **不提交历史**、**不**发送这条过期回复，只记一条日志
        （`app.stale_generation`，白名单字段），最后同样 `mark_handled(..., "done")`。
@@ -1614,7 +1633,8 @@ MCP Provider/Node/Exa/API Key 故障只将对应 feature 标为不可用；不�
 
 一个逻辑 Provider 包住多个已获授权的 stdio 子进程；对 Registry 仍然只是一个 `exa`，
 模型侧工具名、feature 绑定和 `SearchLimiter` 全局串行都不变。设计依据见
-`docs/design/EXA_ACCOUNT_POOL_AND_KB_DESIGN_PLAN.md` §5，裁决见 D-36 / D-37 / D-40。
+`docs/archive/EXA_ACCOUNT_POOL_AND_KB_DESIGN_PLAN.md` §5（已归档，不在版本控制里），
+裁决见 D-36 / D-37 / D-40。
 
 ### 22.1 配置
 
@@ -1768,7 +1788,8 @@ Registry 捕获 `McpCallCancelled` → `generation_cancelled`（DEBUG 级，不�
 ## 23. Markdown 知识库（`kb/`）
 
 本地、只读、可重建的产品能力，**不属于 MCP**，不触发任何 Exa 代码路径。
-设计依据见 `EXA_ACCOUNT_POOL_AND_KB_DESIGN_PLAN.md` §7，裁决见 D-38 … D-44。
+设计依据见 `docs/archive/EXA_ACCOUNT_POOL_AND_KB_DESIGN_PLAN.md` §7（已归档，
+不在版本控制里），裁决见 D-38 … D-44。
 
 ### 23.1 配置
 

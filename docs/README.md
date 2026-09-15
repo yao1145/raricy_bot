@@ -5,9 +5,12 @@
 > 注意：`archive/` 被仓库根的 `.gitignore` 忽略，**归档文件不在版本控制里**，
 > 重命名或删除都没有 git 兜底。`materials/`、`usage/`、`design/` 与本文正常入库。
 >
-> 其中两份例外：`CHAT_IMAGE_INPUT_DESIGN.md` 与 `CHAT_IMAGE_INPUT_PLAN.md` 是 2026-09-15
-> 从 `design/` 移进来的，它们**进过版本控制**（最后修改于 `eecaaa9`），需要时可用
-> `git show eecaaa9:docs/design/<文件名>` 取回全文。归档目录里其余五份从未提交过。
+> 其中六份例外：`CHAT_IMAGE_INPUT_DESIGN.md` 与 `CHAT_IMAGE_INPUT_PLAN.md`（最后提交
+> `e834035`）、`MCP_CHAT_SEARCH_DESIGN.md` 与 `EXA_ACCOUNT_POOL_AND_KB_DESIGN_PLAN.md`
+> （`f47ce1d`）、`CHAT_BLOG_QUOTE_DESIGN.md` 与 `CHAT_BLOG_QUOTE_PLAN.md`（`d3c9599`）
+> 都是 2026-09-15 从 `design/` 移进来的，它们**进过版本控制**，需要时用
+> `git show <上面的提交号>:docs/design/<文件名>` 取回全文。归档目录里其余五份从未提交过。
+> 移动之后它们不再被 git 跟踪——归档就是「退出仓库」，本目录里剩下的永远是最新一份。
 
 ## 现行口径在哪里
 
@@ -43,13 +46,9 @@
 | 文件 | 是什么 | 权威性 |
 |------|--------|--------|
 | `design/INTERFACES.md` | 本项目内部契约：锁定的签名、字段名、默认值、判定谓词 | 改签名前先查全部消费者 |
-| `design/DESIGN_DECISIONS.md` | 设计未明确处的裁决记录（D-1 … D-52） | 觉得某处行为怪，先读对应条目——不少「看起来像 bug」的选择是刻意的 |
+| `design/DESIGN_DECISIONS.md` | 设计未明确处的裁决记录（D-1 … D-54） | 觉得某处行为怪，先读对应条目——不少「看起来像 bug」的选择是刻意的 |
 | `design/SYSTEM_PROMPTS.md` | 系统提示词的正式来源 + 站点速查表 | 提示词正文的权威副本，**但它不参与运行**：改完必须手动同步到 `config.yaml` |
-| `design/MCP_CHAT_SEARCH_DESIGN.md` | 聊天区 Exa MCP 搜索的总述、架构、接口与实现任务 | MCP 搜索的现行设计与验收口径 |
-| `design/EXA_ACCOUNT_POOL_AND_KB_DESIGN_PLAN.md` | Exa 授权密钥池与 `/kb` Markdown 知识库的架构、问题日志与实施状态 | 已实施；P0 的处置见文首「实施状态」，正式合同见 `INTERFACES.md` §22/§23 |
 | `design/SITE_DOCS_KB_DESIGN.md` | `knowledge/` 知识库**内容侧**的取材范围、删减规则、问答写法、留痕与验收口径 | 已实施（2026-09-15，15 篇 / 220 条）。只约束内容，运行行为见 `usage/EXA_POOL_AND_KB.md` |
-| `design/CHAT_BLOG_QUOTE_DESIGN.md` | 聊天区引用内容的实现前设计稿：被引用博客的正文进模型、三种引用边角的标记 | 设计口径；裁决见 D-47 / D-48，正式合同见 `INTERFACES.md` §24 |
-| `design/CHAT_BLOG_QUOTE_PLAN.md` | 上一条的实现计划与任务清单 | 实施步骤；行为以 `design/` 与代码为准 |
 
 ## archive/ —— 归档（历史，不是现行口径）
 
@@ -64,6 +63,10 @@
 | `archive/IMPLEMENTATION_REPORT.md` | 首个可用版本的实现完成报告（含修复过程与验证方式） |
 | `archive/CHAT_IMAGE_INPUT_DESIGN.md` | 聊天图片输入（识图）的实现前设计稿。功能已上线：合同见 `design/INTERFACES.md` §20，裁决见 D-28 … D-30，测试见 `tests/test_vision.py` |
 | `archive/CHAT_IMAGE_INPUT_PLAN.md` | 上一条的实现计划与任务清单（同上，已上线；行为以 `design/` 与代码为准） |
+| `archive/MCP_CHAT_SEARCH_DESIGN.md` | 聊天区 Exa MCP 搜索的设计与实现规划。已实现并通过验收：合同见 `design/INTERFACES.md` §21，配置与排障见 `usage/EXA_POOL_AND_KB.md`（2026-09-15 从 `design/` 归档） |
+| `archive/EXA_ACCOUNT_POOL_AND_KB_DESIGN_PLAN.md` | Exa 授权密钥池与 `/kb` 本地知识库的设计及实施计划（含 P0 处置记录）。已实施：合同见 `design/INTERFACES.md` §22/§23，裁决见 D-36 … D-46（2026-09-15 从 `design/` 归档） |
+| `archive/CHAT_BLOG_QUOTE_DESIGN.md` | 聊天区引用内容的实现前设计稿：被引用博客的正文进模型、引用边角的标记。已上线：裁决见 D-47 / D-48 / D-54，合同见 `design/INTERFACES.md` §24（2026-09-15 从 `design/` 归档） |
+| `archive/CHAT_BLOG_QUOTE_PLAN.md` | 上一条的实现计划与任务清单（同上，已上线；行为以 `design/` 与代码为准） |
 
 ## 仓库根（不在本目录）
 
