@@ -13,6 +13,11 @@
 一次属性赋值，读者看到的永远是替换前或替换后的一份完整文档。写路径由单个 `asyncio.Lock` 串行
 （§30.3）。`enabled=False` 时所有方法都不碰文件系统：不建目录、不读文件、不启任务（§26.3、D-60）。
 
+共同记忆的四个管理 mutation（`add_common_candidate` / `approve_candidate` / `reject_candidate` /
+`delete_common`）各自独立复查 `access.is_admin(actor_id)`（§32.3、裁决 R14）。这是**纵深防御**，
+不是 Controller 那次检查的副本：Controller 的 bug 或未来的旁路不能自行授权一次对共享记忆的写入。
+检查在任何 I/O、任何幂等查询与任何写入之前完成，失败是稳定状态 `forbidden`，不是异常（D-60）。
+
 契约留白在本文件里定的读法（逐条记在任务报告里）：同 key 的 `add` 按「替换原条目」处理（§29.3）；
 只有 `ok` 会写文件，其余状态一律不落盘、因此也不进 `operations`（§27.4）；`operations` 超过
 `max_operations` 时按插入顺序淘汰最旧的键；候选的目标条目用 `updated_at > created_at` 判「已被改动」；
@@ -87,8 +92,9 @@ _GROUP_LOBBY: str = "memory_lobby"
 _GROUP_USER: str = "memory_user"
 
 # `priority` 数值是实现细节（D-62）：只表达「DM 私有优先于 all_user，lobby 优先于 all_user」的
-# 组间次序；组内名次接在 base 之后，因此步长只要大于单个作用域的容量上限（默认 64）即可。
-_PRIORITY_STRIDE: int = 1000
+# 组间次序。`SupplementalItem.priority` 是一个整数（§33），组间次序只能靠**步长**表达，因此步长
+# 在构造时按容量上限现算（见 `__init__`），不能写死——§26.2 只要求上限是正整数，不保证它小于
+# 某个固定的步长。
 
 # 用户快照 LRU 的容量：只影响内存，淘汰不删文件（§30.4）。
 _USER_CACHE_SIZE: int = 64
@@ -188,6 +194,13 @@ class MemoryService:
         self._users_dir: str = os.path.join(self._root, "users")
         # 刷新周期同时是用户文件的缓存 TTL：到期后的**下一次访问**才检查摘要（§30.4）。
         self._refresh_seconds: float = float(config.refresh_seconds)
+        # priority 的组间步长：严格大于任何一组在容量上限内可能出现的最大名次，否则一个把上限
+        # 设到 1000 以上的部署会让某个作用域的尾部名次跨进另一组的区间，破坏 §30.2 的相对次序。
+        self._priority_stride: int = 1 + max(
+            1,
+            int(config.max_common_entries_per_scope),
+            int(config.max_private_entries_per_user),
+        )
         self._write_lock = asyncio.Lock()
         self._common: _Snapshot | None = None
         self._users: "OrderedDict[str, _Snapshot]" = OrderedDict()
@@ -346,7 +359,7 @@ class MemoryService:
                 group=group,
                 label=entry.memory_id,
                 content=entry.content,
-                priority=base * _PRIORITY_STRIDE + rank,
+                priority=base * self._priority_stride + rank,
             )
             for rank, entry in enumerate(ordered)
         ]
@@ -382,8 +395,14 @@ class MemoryService:
         """该用户 Markdown 的路径（用 `user_storage_key` 命名；目录不存在时**不创建**）。
 
         这是唯一的路径访问入口（裁决 E / D-65）：测试与上层都从这里拿路径，不再自己拼文件名。
+        `user_id` 含孤立代理项时也不抛出（`_storage_key` 兜底），因此**读路径**永远拿得到一条
+        路径，只是那条路径上不可能有文件（写入路径在 `_mutate_private` 入口就被拒）。
         """
-        return os.path.join(self._users_dir, f"{user_storage_key(user_id)}.md")
+        key = _storage_key(user_id)
+        if key is None:
+            # 兜底路径：同形、稳定、不含原始 ID；这条路径上不会有文件，也永远不会被写入。
+            key = _invalid_id_path_key(user_id)
+        return os.path.join(self._users_dir, f"{key}.md")
 
     async def private_entries(self, user_id: str) -> tuple[MemoryEntry, ...]:
         """该用户已生效的私有条目；不可用时返回空元组。"""
@@ -489,12 +508,32 @@ class MemoryService:
             lambda document: self._apply_private_clear(document, operation_id),
         )
 
-    # --- mutation：共同 ----------------------------------------------------
+    # --- mutation：共同（四个管理操作各自独立复查 admin，§32.3 / 裁决 R14） ------
+
+    def _admin_gate(self, access: MemoryAccessPolicy, actor_id: str) -> OperationResult | None:
+        """管理 mutation 的独立授权检查：放行返回 None，否则返回 `forbidden` 结果。
+
+        **纵深防御**（§32.3、裁决 R14），不是 Controller 那次检查的副本：Controller 的 bug 或未来的
+        旁路不能自行授权一次对共享记忆的写入。检查在任何 I/O、任何幂等查询与任何写入**之前**完成，
+        因此被拒的调用方不产生任何可观察副作用；失败是稳定状态而不是异常（§27.4、D-60）。
+        """
+        if access.is_admin(actor_id):
+            return None
+        return OperationResult(status=STATUS_FORBIDDEN, object_id=None, revision=0)
 
     async def add_common_candidate(
-        self, scope: MemoryScope, proposal: MemoryProposal, *, operation_id: str
+        self,
+        scope: MemoryScope,
+        proposal: MemoryProposal,
+        *,
+        operation_id: str,
+        access: MemoryAccessPolicy,
+        actor_id: str,
     ) -> OperationResult:
         """把提案写成一条待批准候选；候选绝不进入任何普通模型请求（D-58）。"""
+        denied = self._admin_gate(access, actor_id)
+        if denied is not None:
+            return denied
         return await self._mutate_common(
             operation_id,
             lambda document: self._apply_candidate_add(document, scope, proposal, operation_id),
@@ -502,33 +541,65 @@ class MemoryService:
             screen=lambda _document: (proposal.key, proposal.content),
         )
 
-    async def approve_candidate(self, candidate_id: str, *, operation_id: str) -> OperationResult:
+    async def approve_candidate(
+        self,
+        candidate_id: str,
+        *,
+        operation_id: str,
+        access: MemoryAccessPolicy,
+        actor_id: str,
+    ) -> OperationResult:
         """把候选原子移入生效区；目标条目已被改动时返回 conflict，不覆盖（§32.3）。
 
         候选正文即将被写进 Markdown，因此这里同样过一遍密钥筛：人工写进候选里的密钥不会被
-        批准动作搬进生效区。
+        批准动作搬进生效区——包括外部版本里的那一份（见 `_write_document` 的基线复查）。
         """
+        denied = self._admin_gate(access, actor_id)
+        if denied is not None:
+            return denied
         return await self._mutate_common(
             operation_id,
             lambda document: self._apply_candidate_approve(document, candidate_id, operation_id),
             event="memory.candidate_updated",
+            id_field="memory_id",
             screen=lambda document: _candidate_texts(document, candidate_id),
         )
 
-    async def reject_candidate(self, candidate_id: str, *, operation_id: str) -> OperationResult:
+    async def reject_candidate(
+        self,
+        candidate_id: str,
+        *,
+        operation_id: str,
+        access: MemoryAccessPolicy,
+        actor_id: str,
+    ) -> OperationResult:
         """丢弃一条候选，不动任何已生效条目。"""
+        denied = self._admin_gate(access, actor_id)
+        if denied is not None:
+            return denied
         return await self._mutate_common(
             operation_id,
             lambda document: self._apply_candidate_reject(document, candidate_id, operation_id),
             event="memory.candidate_updated",
         )
 
-    async def delete_common(self, memory_id: str, *, operation_id: str) -> OperationResult:
+    async def delete_common(
+        self,
+        memory_id: str,
+        *,
+        operation_id: str,
+        access: MemoryAccessPolicy,
+        actor_id: str,
+    ) -> OperationResult:
         """删除一条已生效的共同记忆；ID 前缀决定它属于哪个区。"""
+        denied = self._admin_gate(access, actor_id)
+        if denied is not None:
+            return denied
         return await self._mutate_common(
             operation_id,
             lambda document: self._apply_common_delete(document, memory_id, operation_id),
             event="memory.updated",
+            id_field="memory_id",
         )
 
     # --- mutation 的公共骨架 ----------------------------------------------
@@ -545,8 +616,10 @@ class MemoryService:
 
         `screen` 拿到基线文档、返回将要写进 Markdown 的文本；筛选发生在 render 与写入之前。
         """
-        if not self._enabled or not user_id:
+        if not self._enabled or not user_id or _storage_key(user_id) is None:
             # 关闭时能力根本没被注入；真被调到说明调用方绕过了访问门（§28、§34.1）。
+            # user_id 为空或含孤立代理项（编码不出存储键）说明调用方给的压根不是站点 ID：
+            # 同样按 forbidden 处理，绝不为此建目录或落文件。
             return OperationResult(status=STATUS_FORBIDDEN, object_id=None, revision=0)
         async with self._write_lock:
             state = self._user_state(user_id)
@@ -561,7 +634,7 @@ class MemoryService:
                     status=STATUS_SECRET_DETECTED, object_id=None, revision=state.revision
                 )
             status, object_id, written = self._write_document(
-                self._private_view(user_id), state, apply_fn
+                self._private_view(user_id), state, apply_fn, screen=screen
             )
             if written is not state:
                 self._store_user(user_id, written)
@@ -575,9 +648,15 @@ class MemoryService:
         apply_fn: _ApplyFn,
         *,
         event: str,
+        id_field: str = "candidate_id",
         screen: _ScreenFn | None = None,
     ) -> OperationResult:
-        """共同文件的 mutation 骨架：幂等 → 密钥筛 → 原子写（§30.2）。"""
+        """共同文件的 mutation 骨架：幂等 → 密钥筛 → 原子写（§30.2）。
+
+        `id_field` 决定成功日志把对象 ID 记在哪个白名单字段上（§37）：候选类操作记
+        `candidate_id`；批准与删除留下的对象 ID 是**生效条目**（`GM-A-…` / `GM-L-…`），必须记
+        `memory_id`——否则「按 `candidate_id=MC-…` 查批准」会静默漏掉批准事件。
+        """
         if not self._enabled:
             return OperationResult(status=STATUS_FORBIDDEN, object_id=None, revision=0)
         async with self._write_lock:
@@ -591,14 +670,18 @@ class MemoryService:
                 return OperationResult(
                     status=STATUS_SECRET_DETECTED, object_id=None, revision=state.revision
                 )
-            status, object_id, written = self._write_document(self._common_view(), state, apply_fn)
+            status, object_id, written = self._write_document(
+                self._common_view(), state, apply_fn, screen=screen
+            )
             if written is not state:
                 self._common = written
             if status == STATUS_OK:
-                if event == "memory.updated":
-                    # 已生效条目按 ID 前缀报出它所在的作用域（§29.1）。
+                if id_field == "memory_id":
+                    # 已生效条目按 ID 前缀报出它所在的作用域（§29.1）——只有删除是这么来的；
+                    # 批准仍在与候选同一个文件里发生，作用域按公共文件记。
+                    scope = _scope_of(object_id) if event == "memory.updated" else "common"
                     self._log_updated(
-                        event, scope=_scope_of(object_id), revision=written.revision, memory_id=object_id
+                        event, scope=scope, revision=written.revision, memory_id=object_id
                     )
                 else:
                     # 候选类的操作统一记公共文件（候选 ID 不带作用域）。
@@ -627,13 +710,24 @@ class MemoryService:
     # --- 原子写（规划 §5.5 的七步） ----------------------------------------
 
     def _write_document(
-        self, view: _DocumentView, snapshot: _Snapshot, apply_fn: _ApplyFn
+        self,
+        view: _DocumentView,
+        snapshot: _Snapshot,
+        apply_fn: _ApplyFn,
+        *,
+        screen: _ScreenFn | None = None,
     ) -> tuple[str, str | None, _Snapshot]:
         """一次原子写入；返回（状态, 对象 ID, 新快照）。
 
         任一步失败都保留原正式文件与旧快照并清理临时文件，失败一律映射为 `unavailable`
         （§30.3 第 7 步、D-60）。同一份 `apply_fn` 会被用两次：一次以内存快照为基线，
         一次以接手的**外部版本**为基线（§5.5 第 4 步）。
+
+        `screen` 也要跑两次：一次是调用方对内存快照跑的那次（在 mutation 入口），这里再对
+        **外部版本**跑一次。§30.2 的密钥筛覆盖「任何将要写进 Markdown 的正文」，而外部版本接手后
+        写进文件的正文来自磁盘上那份文档（批准动作会把**基线里**的候选正文搬进生效区），
+        快照上的那次筛选覆盖不到它；命中同样整条拒绝、不落盘（返回 `secret_detected`）。合法外部
+        版本照常被采纳进快照（§30.4），只是本次操作不写。
 
         抓什么、为什么（按调用点区分，而不是按 reason 区分）：
         - 外部版本解析失败：由 `_external_baseline` 返回 None，映射成 `conflict`（§30.3 第 4 步）。
@@ -664,6 +758,10 @@ class MemoryService:
                 if baseline is None:
                     return STATUS_CONFLICT, None, snapshot
                 adopted = _snapshot_of(baseline, digest, self._now())
+                if screen is not None and self._contains_secret(screen(baseline)):
+                    # 基线里那份正文即将被搬进生效区：与入口处的命中同一条路——整条拒绝、
+                    # 不落盘、不记命中串（§30.2、§37）。
+                    return STATUS_SECRET_DETECTED, None, adopted
                 built, status, object_id = apply_fn(baseline)
                 if status != STATUS_OK or built is None:
                     return status, None, adopted
@@ -928,10 +1026,7 @@ class MemoryService:
             # 改 key 撞到另一条既有条目：文件格式容不下两个同 key 条目，拒绝覆盖。
             return None, STATUS_CONFLICT, None
         entry = replace(target, key=proposal.key, content=proposal.content, updated_at=stamp)
-        canonical = _canonical(target.memory_id, PREFIX_USER)
-        if canonical is not None:
-            # 人工改窄过宽度的 ID 在这里顺手规范成渲染形态，避免内存快照与文件字节漂移（§29.1）。
-            entry = replace(entry, memory_id=canonical)
+        entry = _canonical_entry(entry, PREFIX_USER)
         entries[entries.index(target)] = entry
         revision = document.revision + 1
         return (
@@ -1058,14 +1153,15 @@ class MemoryService:
             entry = replace(
                 referenced, key=candidate.key, content=candidate.content, updated_at=stamp
             )
-            canonical = _canonical(entry.memory_id, prefix)
-            if canonical is not None:
-                entry = replace(entry, memory_id=canonical)
+            entry = _canonical_entry(entry, prefix)
             entries[entries.index(referenced)] = entry
             memory_id = entry.memory_id
         elif same_key is not None:
-            # 同 key 的新增 = 替换那一条（§29.3），ID 与 created_at 保持不变。
+            # 同 key 的新增 = 替换那一条（§29.3），ID 与 created_at 保持不变。ID 同样要规范成
+            # 渲染形态：人工改窄过的那一条不规范化，快照与 `common_entries()` 会一直报窄形态，
+            # 而文件里写着 6 位——正是 ID 义务要防的漂移。
             entry = replace(same_key, key=candidate.key, content=candidate.content, updated_at=stamp)
+            entry = _canonical_entry(entry, prefix)
             entries[entries.index(same_key)] = entry
             memory_id = entry.memory_id
         else:
@@ -1290,6 +1386,42 @@ def _remove_quietly(path: str) -> None:
         os.remove(path)
     except OSError:
         pass
+
+
+def _canonical_entry(entry: MemoryEntry, prefix: str) -> MemoryEntry:
+    """把条目的 ID 规范成渲染形态；形状不对时原样返回（§29.1）。
+
+    人工改窄过宽度的文件在这里收敛：不收敛的话内存快照会一直停在 `GM-L-7`，而文件里写着
+    `GM-L-000007`，快照与字节在 ID 宽度上逐次写入地漂移。
+    """
+    canonical = _canonical(entry.memory_id, prefix)
+    if canonical is None:
+        return entry
+    return replace(entry, memory_id=canonical)
+
+
+def _storage_key(user_id: str) -> str | None:
+    """§27.3 的用户存储键；`user_id` 含孤立代理项、编码不进严格 UTF-8 时返回 None。
+
+    `models.user_storage_key` 用严格 UTF-8 编码 `"raricy-memory-v1\\0" + user_id`，孤立代理项会抛
+    `UnicodeEncodeError`；站点给的 `author.id` 不可能长这样，但读路径不能因此把异常抛给调用方
+    （D-60）。返回 None 表示「这个 ID 没有可用的存储键」：`private_path` 退回同形的兜底路径，
+    `_mutate_private` 则直接落 `forbidden`，绝不替一个不存在的 ID 建目录或落文件。
+    """
+    try:
+        return user_storage_key(user_id)
+    except UnicodeEncodeError:
+        return None
+
+
+def _invalid_id_path_key(user_id: str) -> str:
+    """编码不出来的 `user_id` 的兜底存储键：`surrogatepass` 让这次编码永远成立。
+
+    用**另一个**域前缀，因此与任何合法 ID 的存储键都不会互相覆盖（合法 ID 走 `user_storage_key`
+    那条分支）。哈希只用于生成 ASCII 文件名与「这条路径上没有文件」的判定，同样不构成加密。
+    """
+    raw = f"raricy-memory-invalid-id\0{user_id}".encode("utf-8", "surrogatepass")
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _canonical(memory_id: str | None, prefix: str) -> str | None:

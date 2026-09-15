@@ -2520,15 +2520,20 @@ class MemoryService:
         proposal: MemoryProposal,
         *,
         operation_id: str,
+        access: MemoryAccessPolicy,
+        actor_id: str,
     ) -> OperationResult: ...
     async def approve_candidate(
-        self, candidate_id: str, *, operation_id: str
+        self, candidate_id: str, *, operation_id: str,
+        access: MemoryAccessPolicy, actor_id: str,
     ) -> OperationResult: ...
     async def reject_candidate(
-        self, candidate_id: str, *, operation_id: str
+        self, candidate_id: str, *, operation_id: str,
+        access: MemoryAccessPolicy, actor_id: str,
     ) -> OperationResult: ...
     async def delete_common(
-        self, memory_id: str, *, operation_id: str
+        self, memory_id: str, *, operation_id: str,
+        access: MemoryAccessPolicy, actor_id: str,
     ) -> OperationResult: ...
 ```
 
@@ -2554,6 +2559,16 @@ class MemoryService:
 - `start()` / `stop()`：`enabled=false` 时**不做任何事**（不建目录、不读文件、不启任务）。
   启用时创建或加载 `common.md`，并启动 `refresh_seconds` 周期的刷新任务；失败只记
   `memory.load_failed` / `memory.refresh_failed` 并保留 unavailable 状态，**绝不抛出**。
+- 共同记忆的四个管理 mutation（`add_common_candidate` / `approve_candidate` / `reject_candidate` /
+  `delete_common`）额外接收 `access` 与 `actor_id`：每个方法**各自独立**先查
+  `access.is_admin(actor_id)`，失败返回 `forbidden`。检查在任何 I/O、任何幂等查询与任何写入
+  **之前**完成，因此被拒的调用方不产生任何可观察副作用；失败是稳定状态，不是异常（§27.4、D-60）。
+  这是**纵深防御**（§32.3 要求 Controller 与 Service 两层都查；裁决 R14），不是 Controller 那次
+  检查的副本——否则 Controller 的一个 bug 或未来的一条旁路就能自行授权一次对共享记忆的写入。
+  `context_for` 已按调用传 `access`，这里沿用同一模式，策略因此不进构造函数。
+- 批准（`approve_candidate`）的正文来自**当时磁盘上的候选**：外部版本接管后写进 Markdown 的仍是
+  那份候选的 key 与正文，密钥筛因此要按同一份基线复查一次（§30.2 覆盖「任何将要写进 Markdown 的
+  正文」），命中同样整条拒绝并返回 `secret_detected`。
 
 ### 30.2 作用域读取与幂等
 
