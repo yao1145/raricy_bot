@@ -1392,3 +1392,34 @@ fail-closed，代价也正落在这个默认值上：照旧合同实现、或因
 表现是 `/memory auto on` 永远被拒、自动提取永远不跑，而且**没有报错、没有日志、没有测试失败**
 ——一个静默失效的缺省值。因此修订后的 §32.3 把「装配方必须显式传真实取值」写进签名旁的规则里：
 只留一个自解释的默认值不够，这个默认值恰恰是漏传时的伪装。
+
+## 附录：运行期裁决编号索引（补充裁决 A–H、控制器裁决 R1–R16）
+
+实现期在规划产物里另立了两套编号——`.superpowers/sdd/TASKS.md` 的「补充裁决 A–H」与
+`.superpowers/sdd/TASKS/progress.md` 的「Controller rulings R1–R16」；两者都不入库，而 `src/`
+的注释与本文件的正文直接引用这些编号（例如 `memory/codec.py` 只写「裁决 G」）。下表给出
+每个**被引用**编号的实质记录处：
+
+| 运行期裁决 | 实质记录处 |
+|---|---|
+| 裁决 A | 本文件 D-61（第 1 条）；INTERFACES §27、§33 |
+| 裁决 B | 本文件 D-62；INTERFACES §30.2、§33 |
+| 裁决 C | 本文件 D-61（第 3 条）；INTERFACES §33 |
+| 裁决 D | 本文件 D-63；INTERFACES §34.4 |
+| 裁决 E | 本文件 D-65；INTERFACES §30.1 |
+| 裁决 F | 本文件 D-64；INTERFACES §36 |
+| 裁决 G | 本文件 D-61（第 2 条）；INTERFACES §27、§29、§30 |
+| R8 | 本文件 D-68；INTERFACES §27.4 |
+| R9 | 本文件 D-69 |
+| R10 | 本文件 D-70 |
+| R11 | 本文件 D-71 |
+| R12 | 本文件 D-72 |
+| R13 | 本文件 D-73 |
+| R14 | 本文件 D-74；INTERFACES §30.1、§32.3 |
+| R15 | 本文件 D-75 |
+| R16 | 本文件 D-76 |
+
+注：补充裁决 H 与 R1–R7 在 `src/` 与 `docs/design/` 里都没有引用处，故不单列（R1–R5 与表内
+的裁决 B–F 是同一条；R6 / R7 分别记录在 INTERFACES §26.2、§36；H 的 Task 1 子合同记录在
+D-67 与 INTERFACES §26–§37）。`memory/service.py` 另有一处**未编号**的「补充裁决」引用——
+`find_operation` 的加入，其合同在 INTERFACES §30.1。
