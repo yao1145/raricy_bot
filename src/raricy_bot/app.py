@@ -5,12 +5,18 @@
 - 启动顺序：`Store.open` → `SiteClient.start` + `login` → 构造 `SSEReceiver`
   → **用 `store.watermark()` 播种 `Last-Event-ID`（D-16）** → `WorkerPool.start`
   → `OpsServer.start` → `sse.run()` 作为后台 task；
+- 长期记忆的装配位置（§34.2）：在 Store 崩溃恢复与主模型构造**之后**、聊天 worker 与评论服务
+  启动**之前**——`MemoryService.start` → 构造 `MemoryWriter` / `MemoryController` → 启动记忆
+  worker → 构造 Router 时注入 access policy、memory queue 与 `private_enabled` 回调；
+  `memory.enabled=false` 时整段跳过，不建目录也不注入任何能力（D-60）；
 - 路由结果分派：`reply_now` 用 `notice_local`、`busy` 用 `notice` 并加 (频道, 触发者) 冷却；
+  `memory_queued` 什么都不做（终态由记忆 worker 负责，§34.3）；
 - 模型失败的 `failure` 通知同样用 `notice` + 触发者冷却；额度用尽补发一次 `quota` 通知；
 - 403 进入不可用状态，按 `ready_probe_seconds` 探测恢复（D-4）；
-- 优雅关闭总超时 10 秒，`stop()` 可重复调用。
+- 优雅关闭总超时 10 秒，`stop()` 可重复调用；记忆 worker 必须早于模型客户端关闭（§34.2）。
 
-日志只写白名单字段，绝不写正文、Cookie、密码或 API Key（§19 红线）。
+日志只写白名单字段，绝不写正文、Cookie、密码或 API Key（§19 红线）；
+记忆日志只允许 §37 的九个事件名与白名单字段。
 """
 
 from __future__ import annotations
@@ -32,7 +38,12 @@ from .comments.service import CommentService
 from .config import Config
 from .core.blog import BlogLoad, BlogLoader, blog_marker, blog_readable
 from .core.content_refs import ContentRefResolver
-from .core.context import ContextManager, lobby_thread_session_key, speaker_wrapper
+from .core.context import (
+    ContextManager,
+    SupplementalItem,
+    lobby_thread_session_key,
+    speaker_wrapper,
+)
 from .core.router import MessageRouter, Request, RouteResult
 from .core.sender import MessageSender, SendResult
 from .core.vision import ImageLoader, attach_image, with_image_marker
@@ -48,6 +59,11 @@ from .logging_setup import get_logger, log_event
 from .mcp.exa import ExaSearchAdapter, SearchLimiter
 from .mcp.registry import model_tool_name
 from .mcp.runtime import McpManager
+from .memory.access import MemoryAccessPolicy
+from .memory.commands import MemoryCommandRequest
+from .memory.controller import MemoryController
+from .memory.service import MemoryService
+from .memory.writer import MemoryWriter
 from .ops import OpsServer
 from .quota import QuotaGuard, notice_cooldown_key
 from .redact import Redactor
@@ -94,6 +110,9 @@ class BotApp:
         model_client: ModelClient | None = None,
         mcp_manager: McpManager | None = None,
         knowledge_service: KnowledgeService | None = None,
+        memory_service: MemoryService | None = None,
+        memory_writer: MemoryWriter | None = None,
+        memory_controller: MemoryController | None = None,
     ) -> None:
         self._config = config
         self._transport = transport
@@ -197,6 +216,23 @@ class BotApp:
             else KnowledgeService(config.knowledge_base)
         )
 
+        # 长期记忆（全局记忆 Beta，§34.2）。策略是纯内存对象，构造它不做任何 I/O；
+        # 队列与 worker 池同理，只有 `start()` 里 `enabled=true` 时才真正启动（D-60）。
+        # 三个可选注入点供测试用假件替换服务/撰写器/控制器：真实模型与磁盘 I/O 都不进来。
+        self._memory_access = MemoryAccessPolicy(config.memory)
+        self._memory_service = memory_service
+        self._memory_writer = memory_writer
+        self._memory_controller = memory_controller
+        self._memory_queue: asyncio.Queue[MemoryCommandRequest] = asyncio.Queue(
+            maxsize=config.memory.queue_size
+        )
+        # 并发固定为 1：命令路径要串行，`WorkerPool` 已按会话键加锁，这里再收一层总闸。
+        self._memory_workers = WorkerPool(
+            queue=self._memory_queue,
+            handler=self._handle_memory_command,
+            concurrency=1,
+        )
+
         self._workers = WorkerPool(
             queue=self._queue,
             handler=self._handle_request,
@@ -283,6 +319,23 @@ class BotApp:
             await self._store.close()
             raise
 
+        # 主模型必须早于记忆撰写器构造：`MemoryWriter` 绑定的是这一个客户端（§34.2 第 2 步）。
+        # 位置相对旧版上移了一格（原先在 Router 之后），构造失败时的行为不变：异常照常
+        # 传播出 `start()`，同样不会留下比旧版更多的半初始化资源。
+        if self._model is None:
+            self._model = OpenAIModelClient(
+                self._config.model,
+                self._config.secrets.llm_api_key,
+                redactor=self._redactor,
+                transport=self._transport,
+            )
+        # 记忆装配（§34.2 第 1-3 步）：必须在聊天 worker 与评论服务启动之前，
+        # 且整段只在 `memory.enabled=true` 时执行（D-60）。
+        await self._start_memory()
+
+        # 记忆路径的三种参数要么都给，要么都不给：全都为 None 时 Router 的行为与
+        # 升级前逐字节一致（§34.1），`memory.enabled=false` 走的就是这条。
+        memory_on = self._config.memory.enabled
         self._router = MessageRouter(
             self_user_id=user.id,
             bot_username=self._config.secrets.username,
@@ -293,14 +346,10 @@ class BotApp:
             storage=self._config.storage,
             vision_enabled=self._vision_enabled,
             kb_enabled=self._config.knowledge_base.enabled,
+            memory_access=self._memory_access if memory_on else None,
+            memory_queue=self._memory_queue if memory_on else None,
+            private_enabled=self._memory_private_enabled if memory_on else None,
         )
-        if self._model is None:
-            self._model = OpenAIModelClient(
-                self._config.model,
-                self._config.secrets.llm_api_key,
-                redactor=self._redactor,
-                transport=self._transport,
-            )
         # MCP 是可选扩展：任何连接、发现或子进程错误只让对应 feature 不可用，
         # 不得阻止普通聊天、评论或健康端点启动。
         try:
@@ -444,6 +493,137 @@ class BotApp:
                 return False
         return True
 
+    # --- 长期记忆（§34.2 / §34.3 / §30.1） -----------------------------------
+
+    async def _start_memory(self) -> None:
+        """记忆装配的第一段（§34.2 第 1-3 步）；`enabled=false` 时整体跳过（D-60）。
+
+        关闭时连策略也不构造注入：Router 的三个记忆参数都为 `None`，`/remember` 仍是普通聊天，
+        `/search /remember x` 仍是普通搜索请求，`/help` 仍走四个旧常量——升级前的行为逐字节不变。
+        """
+        if not self._config.memory.enabled:
+            return
+        service = self._memory_service
+        if service is None:
+            service = MemoryService(
+                self._config.memory,
+                # §30.1 / §37：生产装配**必须**传入 BotApp 自有的这个 Redactor —— 它在构造时
+                # 登记了密码与 LLM_API_KEY，登录成功后 `SiteClient` 又把会话 Cookie 追加到
+                # **同一个实例**上（注册到日志单例的是另一次调用、另一个实例）。
+                # 漏掉它就等于密钥筛完全失效：不报错、不打日志、悄悄放过任何含密钥的正文。
+                redactor=self._redactor,
+            )
+            self._memory_service = service
+        try:
+            # 服务自己承诺绝不抛出（§30.1），这一层兜的是注入的替身与将来的回归：
+            # 记忆起不来只记账，绝不阻止聊天、评论与健康端点启动（D-60）。
+            await service.start()
+        except Exception as exc:
+            log_event(
+                _logger,
+                logging.WARNING,
+                "memory.load_failed",
+                scope="common",
+                error=type(exc).__name__,
+            )
+        writer = self._memory_writer
+        if writer is None and self._model is not None:
+            # 撰写器绑定的是上面那一个主模型客户端，与普通聊天共用同一道并发门。
+            writer = MemoryWriter(
+                self._model,
+                model_gate=self._model_gate,
+                timeout_seconds=self._config.memory.writer_timeout_seconds,
+                max_context_tokens=self._config.memory.writer_context_tokens,
+                max_entry_chars=self._config.memory.max_entry_chars,
+            )
+            self._memory_writer = writer
+        if self._memory_controller is None and writer is not None:
+            self._memory_controller = MemoryController(
+                service=service,
+                writer=writer,
+                access=self._memory_access,
+                # §32.3 与 §34.4：`/memory auto on` 与自动提取都只在部署开放时成立。
+                # 漏掉这个参数则开关永远打不开，同样静默、同样没有日志。
+                auto_capture_available=self._config.memory.auto_capture_available,
+            )
+        await self._memory_workers.start()
+
+    def _memory_private_enabled(self, user_id: str | None) -> bool:
+        """`/help` 的 `private_enabled` 回调（§34.1 第 3 条，D-67）。
+
+        **同步、无 I/O**：只读 `MemoryService` 的内存快照。这里必须做形状适配 ——
+        `private_settings_cached` 返回的是 `PrivateSettings | None`，直接把方法接给 Router
+        会让 `bool(对象)` 恒为真，于是 `/help` 对每个取不到快照的人都宣称私有记忆已开启。
+
+        快照还没加载（用户从未触发过一次读取）或用户未知时返回 `False`，按「未开启」处理。
+        """
+        service = self._memory_service
+        if service is None or not user_id:
+            return False
+        settings = service.private_settings_cached(user_id)
+        return bool(settings is not None and settings.private_enabled)
+
+    async def _memory_context_items(self, request: Request) -> tuple[SupplementalItem, ...]:
+        """取本轮的记忆候选条目（§34.3）；任何失败都返回空元组并继续（软故障，D-60）。
+
+        只按作用域取候选：按 token 预算的取舍与插入位置由 `ContextManager.build_messages`
+        决定（D-62）。这里不做任何会改变聊天结果的判断。
+        """
+        service = self._memory_service
+        if service is None:
+            return ()
+        # 传给 `context_for` 的就是 Router 用的那一个策略实例：`access` 按调用传入（§30.2），
+        # 这里不能另造一个 —— 两份策略会在门禁口径上悄悄漂移。
+        access = self._memory_access
+        try:
+            context = await service.context_for(
+                user_id=request.message.author.id,
+                channel_kind=request.channel_kind,
+                access=access,
+            )
+        except Exception as exc:
+            # 正常情况下 `context_for` 自己就把一切失败吞成空结果（D-60）；这一层只兜
+            # 注入的替身与将来的回归：记忆取不到绝不能把这一轮聊天一起拖掉。
+            log_event(
+                _logger,
+                logging.WARNING,
+                "memory.context_omitted",
+                scope="memory",
+                reason="internal",
+                error=type(exc).__name__,
+            )
+            return ()
+        return tuple(context.items)
+
+    async def _handle_memory_command(self, request: MemoryCommandRequest) -> None:
+        """记忆 worker 的处理：执行命令 → 回一条本地文案 → 无论成败都标记终态（§34.3）。
+
+        - 文案一律 `notice_local`：它是应答明确用户动作的本地回复，**不占**主动通知名额（D-1），
+          否则大区里的一条记忆命令会按 (频道, 触发者) 冷却掉整站 24 小时的主动通知；
+        - `thread_root_id=None`：记忆命令只在私聊（§34.1），私聊没有大区共享链；
+        - `mark_handled` 在 `finally` 里：命令失败或控制器抛异常都不许把水位卡住
+          （`WorkerPool` 会兜住异常，但兜不住一个没有终态的事件）。
+        """
+        try:
+            controller = self._memory_controller
+            if controller is None:
+                return
+            result = await controller.execute_command(request)
+            if self._unavailable or not result.text:
+                # D-4：不可用期间不发消息（与 `_send_local` 同一口径）；
+                # 命令本身已经执行完，终态照常在 finally 里落。
+                return
+            outcome = await self._sender.send(
+                request.channel_id,
+                result.text,
+                request.message_id,
+                kind="notice_local",
+                thread_root_id=None,
+            )
+            self._note_forbidden(outcome)
+        finally:
+            await self._store.mark_handled(request.message_id, "done")
+
     # --- SSE 事件分派 -------------------------------------------------------
 
     async def _on_event(self, event) -> None:
@@ -455,13 +635,19 @@ class BotApp:
         await self._dispatch(result)
 
     async def _dispatch(self, result: RouteResult) -> None:
-        """按 §16 分派路由结果；`ignored` / `queued` 无需在此做事。"""
+        """按 §16 分派路由结果；`ignored` / `queued` / `memory_queued` 无需在此做事。"""
         if result.action == "reply_now":
             await self._send_local(result)
         elif result.action == "busy":
             await self._send_busy(result)
         elif result.action == "resync":
             self._schedule_resync()
+        elif result.action == "memory_queued":
+            # 记忆命令已经躺在记忆队列里（§34.1）：这一帧没有 `Request`，也**不是** `queued`。
+            # 唯一做事的角色是记忆 worker（`mark_handled` 也在它那边，§34.3），这里连
+            # `mark_handled` 都不能调 —— 抢先把事件标成终态会让 worker 之外再没有终态写入点，
+            # 命令失败时就永远卡住了。这个分支存在的意义只是「明确地什么都不做」。
+            return
 
     async def _send_local(self, result: RouteResult) -> None:
         """应答明确用户动作的本地回复：kind=notice_local（D-1，不落通知冷却）。"""
@@ -642,6 +828,11 @@ class BotApp:
             elif "kb" in request.enabled_features:
                 # 与搜索说明互斥：一条消息里最多一种能力（D-39）。
                 system_addenda.append(texts.KB_SYSTEM_ADDENDUM)
+            # 记忆候选只在本轮作者可用时取（§34.3）；取失败传空元组继续，绝不打断聊天（D-60）。
+            # 位置在 `/kb` 的本地收口之后：那些分支本来就不调模型，也就没有必要读记忆。
+            supplemental: tuple[SupplementalItem, ...] = ()
+            if request.memory_allowed:
+                supplemental = await self._memory_context_items(request)
             messages = self._ctx.build_messages(
                 request.session_key,
                 self._config.system_prompt,
@@ -651,6 +842,9 @@ class BotApp:
                 feature_context=(
                     "kb" in request.enabled_features or blog_block is not None
                 ),
+                # 记忆正文只走这一条口子：`build_messages` 把它放进 role="user" 的当前轮，
+                # 既不进 system，也不进历史（§33、D-56）。本方法之外不再碰 memory 文本。
+                supplemental_items=supplemental,
             )
             self._apply_reply_prefix(
                 messages,
@@ -1279,7 +1473,13 @@ class BotApp:
     # --- 关闭实现 -----------------------------------------------------------
 
     async def _shutdown(self) -> None:
-        """按顺序停各组件；每一步都容忍组件尚未构造。"""
+        """按 §34.2 的顺序停各组件；每一步都容忍组件尚未构造。
+
+        顺序是权威版本（§34.2 覆盖 §16 / §16.1 里那些更细的既有动作）：
+        评论服务与 SSE → 主聊天 worker 与记忆 worker → 记忆刷新任务 → OpsServer / MCP / KB /
+        模型客户端 / SiteClient / Store。
+        **记忆 worker 必须早于模型客户端关闭**：在途的 AI 撰写会访问那个已关闭的客户端。
+        """
         # 评论 poller 先停，禁止在聊天组件关闭期间再产生新的候选任务。
         comment_service, self._comment_service = self._comment_service, None
         if comment_service is not None:
@@ -1294,6 +1494,16 @@ class BotApp:
         await self._cancel_task("_cleanup_task")
 
         await self._workers.stop()
+        # 记忆 worker 与主聊天 worker 同一阶段停下；此时没有新的记忆命令会被领取。
+        await self._memory_workers.stop()
+        # 记忆刷新 task 在 worker 之后停（§34.2 第 3 步）：刷新的只是内存快照，
+        # 但它要早于模型客户端与 Store，否则末次刷新会撞上已经关掉的东西。
+        # 与启动同一条口径：关闭时连 stop() 都不必调（那时服务根本没被启动过，D-60）。
+        if self._config.memory.enabled:
+            service = self._memory_service
+            if service is not None:
+                await service.stop()
+
         await self._ops.stop()
         await self._mcp_manager.stop()
         await self._kb.stop()
