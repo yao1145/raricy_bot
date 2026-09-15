@@ -36,6 +36,7 @@ from .models import (
     ProposalAction,
     user_storage_key,
 )
+from .writer import MemoryModel, MemoryWriter
 
 __all__ = [
     "STATUS_CONFLICT",
@@ -53,10 +54,12 @@ __all__ = [
     "MemoryCaptureResult",
     "MemoryContext",
     "MemoryEntry",
+    "MemoryModel",
     "MemoryProposal",
     "MemoryProposalResult",
     "MemoryScope",
     "MemoryTarget",
+    "MemoryWriter",
     "OperationResult",
     "ProposalAction",
     "user_storage_key",
