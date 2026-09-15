@@ -84,6 +84,11 @@ _BLOCK_SEPARATOR: str = "\n\n"
 _BODY_SEPARATOR: str = "\n\n---\n"
 
 
+def _history_tokens(turns: Sequence[Turn]) -> int:
+    """一组轮次正文的 token 估算之和（整对丢弃与整对回补共用同一口径）。"""
+    return sum(estimate_tokens(turn.content) for turn in turns)
+
+
 def _render_supplemental_block(items: Sequence[SupplementalItem]) -> str:
     """把选中的条目按作用域分组渲染成注入用的文本块（规划 §6.2 末段的版面）。
 
@@ -209,7 +214,13 @@ class ContextManager:
         block = ""
         if supplemental_items:
             history, block = self._plan_supplemental(
-                history, base_tokens, feature_context, supplemental_items
+                history,
+                base_tokens,
+                feature_context,
+                supplemental_items,
+                # 有本轮正文时资料块会与它拼成 `block + _BODY_SEPARATOR + pending_user`，
+                # 分隔符也占预算；没有正文时资料自成一条 user 消息，不存在分隔符。
+                has_pending_body=pending_user is not None,
             )
         elif feature_context:
             # 硬上限：历史整对丢到一条不剩也要让本轮内容装进去（D-38）。
@@ -242,6 +253,8 @@ class ContextManager:
         base_tokens: int,
         feature_context: bool,
         items: tuple[SupplementalItem, ...],
+        *,
+        has_pending_body: bool,
     ) -> tuple[list[Turn], str]:
         """按规划 §6.2 的次序决定「留哪些历史、选哪些资料」，返回 (保留的历史, 资料块)。
 
@@ -255,6 +268,10 @@ class ContextManager:
            （D-38 的硬上限不变）。
         3. 资料按 `priority` 从小到大逐条尝试，装不下就跳过该条并继续试后面的（规则 4）。
         4. 剩下的预算从新到旧补更早的完整历史对（规则 6）。
+
+        `has_pending_body` 表示资料块会拼在本轮正文之前：组装体是
+        `block + _BODY_SEPARATOR + pending_user`，分隔符同样是外送内容，选中资料后必须一并
+        计入已用预算，否则后面的历史对会把它顶穿（D-38 的硬上限）。
         """
         used = base_tokens
         keep_start = len(history)
@@ -262,7 +279,7 @@ class ContextManager:
             # 规则 3：普通聊天「至少保留最近一组完整历史」—— 先把它计入已用预算，
             # 资料只能争剩下的。历史因此永远是一段连续的后缀。
             keep_start = max(0, len(history) - 2)
-            used += sum(estimate_tokens(turn.content) for turn in history[keep_start:])
+            used += _history_tokens(history[keep_start:])
 
         # priority 越小越优先；同优先级保持入参次序（sorted 是稳定排序）。
         selected: list[SupplementalItem] = []
@@ -279,12 +296,16 @@ class ContextManager:
         if selected:
             block = _render_supplemental_block(selected)
             used += estimate_tokens(block) + addendum_tokens
+            if has_pending_body:
+                # 组装体是 `block + _BODY_SEPARATOR + pending_user`：分隔符同样是外送内容。
+                # 零条选中时不加这一笔，那一路要回退到改动前的输出（逐字节一致，R2）。
+                used += estimate_tokens(_BODY_SEPARATOR)
 
         # 规则 6：剩余预算从新到旧补更早的完整历史对。整对不可拆、也不跳着补，
         # 因此只要有一对装不下就停 —— 保留的历史始终是连续的一段后缀，与旧行为一致。
         while keep_start >= 2:
             pair = history[keep_start - 2 : keep_start]
-            cost = sum(estimate_tokens(turn.content) for turn in pair)
+            cost = _history_tokens(pair)
             if used + cost > self._max_input_tokens:
                 break
             used += cost

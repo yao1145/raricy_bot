@@ -145,6 +145,11 @@ class MemoryTarget:
 
     def __post_init__(self) -> None:
         # 作用域与 owner_key 不匹配是编程错误，不是用户可预期失败，因此抛异常而不是返回状态。
+        if not isinstance(self.scope, MemoryScope):
+            # 先验作用域本身：下游一律用 `== MemoryScope.X` 判定作用域，一个拼错的字符串
+            # 会让「私有」落进共同作用域分支，把本该私有的内容按共享处理。
+            # 只认枚举成员：值字符串虽然比较相等，但不是这里的合同类型。
+            raise ValueError("MemoryTarget 的 scope 必须是 MemoryScope 成员")
         if self.scope == MemoryScope.USER:
             if not isinstance(self.owner_key, str) or not self.owner_key:
                 raise ValueError("user 作用域的 MemoryTarget 必须带非空 owner_key")
