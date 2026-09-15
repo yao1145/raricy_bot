@@ -276,6 +276,12 @@ class MemoryWriter:
             # 合法性先于策略：本判定在 noop/置信度分支之前，低置信度也先在此被拒。
             # `noop` 不受此限，其形状由规则 11 单独钉死。
             return _invalid()
+        if action is not ProposalAction.NOOP and not _is_utf8_encodable(content):
+            # 正文必须是合法的 UTF-8 文本：JSON 里的 `\\ud800` 一类转义能通过 json.loads，
+            # 却不是可编码的字符 —— codec 落盘与 §34.4 的回执渲染都会抛 UnicodeEncodeError。
+            # 与空正文同一条放置：合法性先于策略，低置信度也先在此被拒（§27.4 归稳定状态）。
+            # `noop` 不受此限：它的正文由规则 11 统一规范成空串。
+            return _invalid()
 
         confidence_value = data["confidence"]
         if isinstance(confidence_value, bool) or not isinstance(
@@ -367,3 +373,18 @@ def _is_edge_filler(char: str) -> bool:
     """空白或控制字符：`str.isspace()` 之外还要覆盖 C0、DEL 与 C1。"""
     code = ord(char)
     return char.isspace() or code < 0x20 or 0x7F <= code <= 0x9F
+
+
+def _is_utf8_encodable(text: str) -> bool:
+    """判断正文能否编码成 UTF-8：不能编码的字符串一律不构成合法记忆（§27.4）。
+
+    `json.loads` 会把 `"\\ud800"` 这样的转义解析成**孤立代理项**（lone surrogate），
+    它不是合法字符：`content.encode("utf-8")` 立刻抛 `UnicodeEncodeError`。
+    这个字符串会一路流到 codec 的 Markdown 落盘与 §34.4 的出站回执（JSON 编码），
+    因此在这一层就把它归入 `invalid_proposal`，而不是留给下游抛异常。
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
