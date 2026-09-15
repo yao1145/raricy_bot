@@ -11,6 +11,9 @@
 - **确定性**：同一份 document 重复渲染逐字节相同——front matter 字段顺序固定、`operations` 按键
   排序、ID 规范成 6 位零填充、三个区顺序固定、用户文件条目按 ID 升序。这是服务做幂等与外部编辑
   检测的基础（§29.3、D-59）。
+- **往返只差两处有意的规范化**：ID 序号按 6 位零填充输出（`UM-7` 读回是 `UM-000007`），正文**行尾**
+  的 `\r`（CRLF 的行尾写法）在读回时被吸收。两者一轮就收敛：先 render 再 parse、第二次 render 与
+  第一次逐字节相同，所以幂等与外部编辑检测不受影响。
 
 解析是严格的：字段集合、字段顺序、ID 前缀、时间、正文结构与列表边界不合法一律落成稳定 reason，
 绝不静默修复、绝不部分应用（§29.2）。用户文件一律按敏感数据处理（§27.3）。
@@ -321,8 +324,9 @@ def _load_yaml(text: str) -> object:
     """用严格 loader 解析一段 YAML；任何解析失败都归入 `malformed`。"""
     try:
         return yaml.load(text, Loader=_StrictLoader)
-    except (yaml.YAMLError, RecursionError):
-        # 极深嵌套会让 PyYAML 的递归解析器撞上栈上限；那也是「映射深度无界」的输入。
+    except (yaml.YAMLError, RecursionError, ValueError):
+        # 极深嵌套会让 PyYAML 的递归解析器撞上栈上限；超长数字字面量会让它的整数构造撞上
+        # CPython 的整数与字符串转换上限——两者都是「输入让解析器失灵」，不是崩溃。
         raise CodecError("malformed") from None
 
 
@@ -552,8 +556,13 @@ def _check_schema_version(value: object) -> None:
 
 
 def _check_plain_int(value: object) -> None:
+    """只认能渲染成十进制文本的整数：数千位的整数连 `str()` 都转不出来（CPython 默认上限 4300 位）。"""
     if isinstance(value, bool) or not isinstance(value, int):
         raise CodecError("malformed")
+    try:
+        str(value)
+    except ValueError:
+        raise CodecError("malformed") from None
 
 
 def _check_bool(value: object) -> None:
@@ -602,14 +611,37 @@ def _check_id(value: object, prefix: str) -> str:
     return digits
 
 
+def _id_key(digits: str) -> str:
+    """ID 数字部分的规范形式：`7`、`07`、`000007` 是同一个 ID。
+
+    只去前导零（不做 `int` 转换，任意宽度都安全），判重与排序共用它——两者若各用一套规范化，
+    宽度超过 6 位的 ID 就会出现「排序认为相等、判重认为不同」的裂缝。
+    """
+    return digits.lstrip("0") or "0"
+
+
+def _check_content(value: object) -> None:
+    """正文必须是能写进 UTF-8 文件的字符串。
+
+    孤立代理项（如 `"\\ud800"`，JSON 转义可以产生，§31.2 的字符黑名单挡不住）在 Python 里是合法
+    `str`，却编码不出任何字节；在这里拒绝，渲染才保证「要么成功、要么给出稳定理由」。只查正文：
+    key 与 ID 由 YAML 转义成 `\\uD800` 写进行内，本来就能往返，不该被牵连。
+    """
+    if not isinstance(value, str):
+        raise CodecError("malformed")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise CodecError("malformed") from None
+
+
 def _check_entry(item: MemoryEntry, prefix: str) -> None:
     _check_id(item.memory_id, prefix)
     _check_key(item.key)
     _check_bool(item.pinned)
     _check_timestamp(item.created_at)
     _check_timestamp(item.updated_at)
-    if not isinstance(item.content, str):
-        raise CodecError("malformed")
+    _check_content(item.content)
 
 
 def _check_candidate(candidate: MemoryCandidate) -> None:
@@ -632,8 +664,7 @@ def _check_candidate(candidate: MemoryCandidate) -> None:
         _check_id(candidate.target_id, prefix)
     _check_key(candidate.key)
     _check_timestamp(candidate.created_at)
-    if not isinstance(candidate.content, str):
-        raise CodecError("malformed")
+    _check_content(candidate.content)
 
 
 def _check_operations(operations: object, cfg: MemoryConfig | None) -> None:
@@ -657,7 +688,7 @@ def _check_capacity(count: int, limit: int | None) -> None:
         raise CodecError("malformed")
 
 
-def _check_unique(values: Sequence[str], reason: str) -> None:
+def _check_unique(values: Sequence[str], reason: CodecReason) -> None:
     seen: set[str] = set()
     for value in values:
         if value in seen:
@@ -691,11 +722,12 @@ def _check_common(document: CommonDocument, cfg: MemoryConfig | None) -> None:
     for candidate in candidates:
         _check_candidate(candidate)
     # ID 唯一按**归一化后**的形式比：`GM-A-7` 与 `GM-A-000007` 渲染出来是同一个 ID。
+    # 归一化与 `_sorted_entries` 的排序键共用 `_id_key`，宽度超过 6 位时两者也不会各说各话。
     _check_unique(
-        [PREFIX_ALL_USER + _check_id(i.memory_id, PREFIX_ALL_USER).zfill(ID_DIGITS) for i in all_user]
-        + [PREFIX_LOBBY + _check_id(i.memory_id, PREFIX_LOBBY).zfill(ID_DIGITS) for i in lobby]
+        [PREFIX_ALL_USER + _id_key(_check_id(i.memory_id, PREFIX_ALL_USER)) for i in all_user]
+        + [PREFIX_LOBBY + _id_key(_check_id(i.memory_id, PREFIX_LOBBY)) for i in lobby]
         + [
-            PREFIX_CANDIDATE + _check_id(c.candidate_id, PREFIX_CANDIDATE).zfill(ID_DIGITS)
+            PREFIX_CANDIDATE + _id_key(_check_id(c.candidate_id, PREFIX_CANDIDATE))
             for c in candidates
         ],
         "duplicate_id",
@@ -722,7 +754,7 @@ def _check_private(document: PrivateDocument, cfg: MemoryConfig | None) -> None:
     for item in entries:
         _check_entry(item, PREFIX_USER)
     _check_unique(
-        [PREFIX_USER + _check_id(i.memory_id, PREFIX_USER).zfill(ID_DIGITS) for i in entries],
+        [PREFIX_USER + _id_key(_check_id(i.memory_id, PREFIX_USER)) for i in entries],
         "duplicate_id",
     )
     _check_unique([item.key for item in entries], "duplicate_key")
@@ -825,14 +857,21 @@ def _render_candidate(candidate: MemoryCandidate) -> list[str]:
 
 
 def _sorted_entries(entries: Sequence[MemoryEntry]) -> tuple[MemoryEntry, ...]:
-    """按 ID 升序排序：序号按数值比较，因此 `UM-9` 排在 `UM-10` 之前（§29.3）。"""
+    """按 ID 升序排序：序号按数值比较，因此 `UM-9` 排在 `UM-10` 之前（§29.3）。
+
+    排序键是 `_id_key` 的结果（先比长度再比字典序），与判重共用同一套规范化，任意宽度都成立。
+    """
 
     def sort_key(item: MemoryEntry) -> tuple[int, str]:
-        digits = _check_id(item.memory_id, PREFIX_USER).lstrip("0")
-        return (len(digits), digits)
+        canonical = _id_key(_check_id(item.memory_id, PREFIX_USER))
+        return (len(canonical), canonical)
 
     return tuple(sorted(entries, key=sort_key))
 
 
 def _encode(lines: Sequence[str]) -> bytes:
-    return ("\n".join(lines) + "\n").encode("utf-8")
+    """整份文档拼成 UTF-8 字节；编码失败是兜底，正常路径由 `_check_content` 在校验边界挡下。"""
+    try:
+        return ("\n".join(lines) + "\n").encode("utf-8")
+    except UnicodeEncodeError:
+        raise CodecError("malformed") from None
