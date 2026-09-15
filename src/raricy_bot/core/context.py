@@ -273,7 +273,7 @@ class ContextManager:
                 del history[:2]
 
         if block:
-            # 只有确实选入至少一条资料时才追加（R2）：零条选中时 system 与改动前逐字节一致。
+            # 只有确实选入至少一条资料时才追加：零条选中时 system 与改动前逐字节一致。
             # 追加方式与 system_addendum 相同，且与它一样单独计入预算（在 _plan_supplemental 里）。
             system = f"{system}\n\n{MEMORY_SYSTEM_ADDENDUM}"
 
@@ -346,7 +346,7 @@ class ContextManager:
             used += estimate_tokens(block) + addendum_tokens
             if has_pending_body:
                 # 组装体是 `block + _BODY_SEPARATOR + pending_user`：分隔符同样是外送内容。
-                # 零条选中时不加这一笔，那一路要回退到改动前的输出（逐字节一致，R2）。
+                # 零条选中时不加这一笔，那一路要回退到改动前的输出（逐字节一致）。
                 used += estimate_tokens(_BODY_SEPARATOR)
 
         # 规则 6：剩余预算从新到旧补更早的完整历史对。整对不可拆、也不跳着补，
