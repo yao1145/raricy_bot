@@ -7,7 +7,8 @@
   → `OpsServer.start` → `sse.run()` 作为后台 task；
 - 长期记忆的装配位置（§34.2）：在 Store 崩溃恢复与主模型构造**之后**、聊天 worker 与评论服务
   启动**之前**——`MemoryService.start` → 构造 `MemoryWriter` / `MemoryController` → 启动记忆
-  worker → 构造 Router 时注入 access policy、memory queue 与 `private_enabled` 回调；
+  worker → 构造 Router 时注入 access policy、memory queue 与 `private_enabled` 回调 →
+  构造 CommentRouter / CommentService 时注入 access policy 与只读 context provider（第 5 步）；
   `memory.enabled=false` 时整段跳过，不建目录也不注入任何能力（D-60）；
 - 路由结果分派：`reply_now` 用 `notice_local`、`busy` 用 `notice` 并加 (频道, 触发者) 冷却；
   `memory_queued` 什么都不做（终态由记忆 worker 负责，§34.3）；
@@ -97,6 +98,27 @@ class SearchUnavailable(Exception):
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(reason)
+
+
+class _CommentMemoryAccess:
+    """评论侧共同记忆的门禁载体：只承载 Router 已经判过的那一个布尔（§35、D-56）。
+
+    `CommentRouter` 在还持有 `CommentNode.author.id` 时用真实策略算完 `permits_common`，
+    而请求对象**刻意不带作者 ID**，因此作者身份过不了路由器 —— 下游只剩
+    `memory_allowed`。若在取用时拿 `None` 当作者去向 allowlist 策略复问一遍，结果恒为假，
+    等于把一条已经批准过的读取再错判一次（§28 对空作者 ID 的规定说的是这种情况）。
+
+    所以这里只回答「共同记忆可读」，并且：
+    - 只有 `CommentService` 在 `memory_allowed` 为真时才调用它（唯一调用点）；
+    - 私有一律 False（纵深防御：`context_for` 本来也只在 DM 才问私有）；
+    - 频道由 provider 钉死为 `comment`，作用域因此永远只有 `all_user`（§30.2 的表）。
+    """
+
+    def permits_common(self, user_id: str | None) -> bool:
+        return True
+
+    def permits_private(self, user_id: str | None, channel_kind: str) -> bool:
+        return False
 
 
 class BotApp:
@@ -219,7 +241,13 @@ class BotApp:
         # 长期记忆（全局记忆 Beta，§34.2）。策略是纯内存对象，构造它不做任何 I/O；
         # 队列与 worker 池同理，只有 `start()` 里 `enabled=true` 时才真正启动（D-60）。
         # 三个可选注入点供测试用假件替换服务/撰写器/控制器：真实模型与磁盘 I/O 都不进来。
+        #
+        # 这一个布尔是整个记忆装配的总闸：构造 Router／构造评论侧／`_start_memory`／关闭
+        # 四处都从它取值，`Config` 冻结让它们今天不会漂，但只有一处来源才能让它们将来也不漂。
+        self._memory_enabled = config.memory.enabled
         self._memory_access = MemoryAccessPolicy(config.memory)
+        # 评论侧的门禁载体（§35）：纯内存对象，与策略同一位置构造，不持有任何记忆服务。
+        self._comment_memory_access = _CommentMemoryAccess()
         self._memory_service = memory_service
         self._memory_writer = memory_writer
         self._memory_controller = memory_controller
@@ -335,7 +363,7 @@ class BotApp:
 
         # 记忆路径的三种参数要么都给，要么都不给：全都为 None 时 Router 的行为与
         # 升级前逐字节一致（§34.1），`memory.enabled=false` 走的就是这条。
-        memory_on = self._config.memory.enabled
+        memory_on = self._memory_enabled
         self._router = MessageRouter(
             self_user_id=user.id,
             bot_username=self._config.secrets.username,
@@ -413,6 +441,9 @@ class BotApp:
                     cfg=self._config.comments,
                     now=time.time,
                     vision_enabled=self._comment_vision,
+                    # §34.2 第 5 步：与聊天侧同一个总闸，关闭时**不注入**任何记忆能力，
+                    # 评论路径因此一次都不碰记忆（D-60）。
+                    memory_access=self._memory_access if memory_on else None,
                 )
                 self._comment_service = CommentService(
                     self._client,
@@ -430,6 +461,11 @@ class BotApp:
                     content_refs=self._comment_ref_resolver,
                     image_loader=(
                         self._image_loader if self._comment_vision else None
+                    ),
+                    # §34.2 第 5 步的只读 context provider：无参数、只读、只可能返回
+                    # `all_user`；关闭时同样不注入，评论侧连一个方法都拿不到。
+                    memory_context=(
+                        self._comment_memory_items if memory_on else None
                     ),
                 )
                 await self._comment_service.start()
@@ -501,7 +537,7 @@ class BotApp:
         关闭时连策略也不构造注入：Router 的三个记忆参数都为 `None`，`/remember` 仍是普通聊天，
         `/search /remember x` 仍是普通搜索请求，`/help` 仍走四个旧常量——升级前的行为逐字节不变。
         """
-        if not self._config.memory.enabled:
+        if not self._memory_enabled:
             return
         service = self._memory_service
         if service is None:
@@ -526,27 +562,39 @@ class BotApp:
                 scope="common",
                 error=type(exc).__name__,
             )
-        writer = self._memory_writer
-        if writer is None and self._model is not None:
-            # 撰写器绑定的是上面那一个主模型客户端，与普通聊天共用同一道并发门。
-            writer = MemoryWriter(
-                self._model,
-                model_gate=self._model_gate,
-                timeout_seconds=self._config.memory.writer_timeout_seconds,
-                max_context_tokens=self._config.memory.writer_context_tokens,
-                max_entry_chars=self._config.memory.max_entry_chars,
+        try:
+            # 第 2-3 步（§34.2）与 MCP/KB 的邻居同款地包在软故障里：两个构造函数今天
+            # 只是纯赋值，但将来的任何参数校验都会把一次记忆问题升级成启动失败 —— 那与
+            # D-60 相反。记忆起不来只记账，聊天、评论与健康端点照常。
+            writer = self._memory_writer
+            if writer is None and self._model is not None:
+                # 撰写器绑定的是上面那一个主模型客户端，与普通聊天共用同一道并发门。
+                writer = MemoryWriter(
+                    self._model,
+                    model_gate=self._model_gate,
+                    timeout_seconds=self._config.memory.writer_timeout_seconds,
+                    max_context_tokens=self._config.memory.writer_context_tokens,
+                    max_entry_chars=self._config.memory.max_entry_chars,
+                )
+                self._memory_writer = writer
+            if self._memory_controller is None and writer is not None:
+                self._memory_controller = MemoryController(
+                    service=service,
+                    writer=writer,
+                    access=self._memory_access,
+                    # §32.3 与 §34.4：`/memory auto on` 与自动提取都只在部署开放时成立。
+                    # 漏掉这个参数则开关永远打不开，同样静默、同样没有日志。
+                    auto_capture_available=self._config.memory.auto_capture_available,
+                )
+            await self._memory_workers.start()
+        except Exception as exc:
+            log_event(
+                _logger,
+                logging.WARNING,
+                "memory.load_failed",
+                scope="memory",
+                error=type(exc).__name__,
             )
-            self._memory_writer = writer
-        if self._memory_controller is None and writer is not None:
-            self._memory_controller = MemoryController(
-                service=service,
-                writer=writer,
-                access=self._memory_access,
-                # §32.3 与 §34.4：`/memory auto on` 与自动提取都只在部署开放时成立。
-                # 漏掉这个参数则开关永远打不开，同样静默、同样没有日志。
-                auto_capture_available=self._config.memory.auto_capture_available,
-            )
-        await self._memory_workers.start()
 
     def _memory_private_enabled(self, user_id: str | None) -> bool:
         """`/help` 的 `private_enabled` 回调（§34.1 第 3 条，D-67）。
@@ -595,6 +643,40 @@ class BotApp:
             return ()
         return tuple(context.items)
 
+    async def _comment_memory_items(self) -> tuple[SupplementalItem, ...]:
+        """评论区的只读 context provider（§34.2 第 5 步、§35）；失败返回空元组（D-60）。
+
+        与聊天侧 `_memory_context_items` 的关键差别是**没有参数**：评论请求刻意不带作者 ID，
+        模型侧只剩 `memory_allowed` 这个布尔，因此这里不接受任何调用方输入 —— 它拿不到
+        「谁」，也就无法按作者改写作用域。频道在这里钉死为 `comment`，于是 `context_for`
+        按 §30.2 的表只会读 `all_user`：`lobby` 与任何用户私有文件都不打开。
+
+        门禁由 `CommentRouter` 用真实作者 ID 判过，`_CommentMemoryAccess` 只把那个结论
+        带过作者 ID 不可得的那一段（§35、D-56）。
+        """
+        service = self._memory_service
+        if service is None:
+            return ()
+        try:
+            context = await service.context_for(
+                user_id=None,
+                channel_kind="comment",
+                access=self._comment_memory_access,
+            )
+        except Exception as exc:
+            # `context_for` 自己就把失败吞成空结果（D-60）；这一层只兜注入的替身与将来的回归：
+            # 共同记忆取不到绝不能把这一轮评论一起拖掉，`alive` 与 `/livez` 也不受影响。
+            log_event(
+                _logger,
+                logging.WARNING,
+                "memory.context_omitted",
+                scope="comment",
+                reason="internal",
+                error=type(exc).__name__,
+            )
+            return ()
+        return tuple(context.items)
+
     async def _handle_memory_command(self, request: MemoryCommandRequest) -> None:
         """记忆 worker 的处理：执行命令 → 回一条本地文案 → 无论成败都标记终态（§34.3）。
 
@@ -607,6 +689,15 @@ class BotApp:
         try:
             controller = self._memory_controller
             if controller is None:
+                # 软故障也要**可见**（D-60）：这条命令只能被就地放弃，终态照留在 finally 里，
+                # 但绝不能一声不吭 —— 否则水位推进、用户什么都收不到，事后无从分辨。
+                # 只记稳定事件与白名单字段，绝不记命令参数（§37）。
+                log_event(
+                    _logger,
+                    logging.WARNING,
+                    "memory.command",
+                    reason="controller_unavailable",
+                )
                 return
             result = await controller.execute_command(request)
             if self._unavailable or not result.text:
@@ -1499,7 +1590,7 @@ class BotApp:
         # 记忆刷新 task 在 worker 之后停（§34.2 第 3 步）：刷新的只是内存快照，
         # 但它要早于模型客户端与 Store，否则末次刷新会撞上已经关掉的东西。
         # 与启动同一条口径：关闭时连 stop() 都不必调（那时服务根本没被启动过，D-60）。
-        if self._config.memory.enabled:
+        if self._memory_enabled:
             service = self._memory_service
             if service is not None:
                 await service.stop()

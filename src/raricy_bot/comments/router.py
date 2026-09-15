@@ -18,6 +18,7 @@ from .. import texts
 from ..config import CommentConfig
 from ..core.context import ContextManager
 from ..logging_setup import get_logger, log_event
+from ..memory.access import MemoryAccessPolicy
 from ..site.comment_models import CommentNode
 from ..store import CommentClaim
 from ..text_utils import (
@@ -42,7 +43,9 @@ class CommentRequest:
     """等待评论 worker 处理的一轮请求。
 
     这里只保留当前轮需要的最小资料。尤其不含作者原始 id；身份判定在路由和
-    领取前完成，模型只接收 username 标签。
+    领取前完成，模型只接收 username 标签。记忆门禁同理：判定必须在**仍持有**
+    `CommentNode.author.id` 时完成，请求里只留下 `memory_allowed` 这一个布尔
+    （§35、D-56）—— 因此**不得**给它补一个 author id 字段。
     """
 
     comment_id: str
@@ -58,6 +61,9 @@ class CommentRequest:
     has_quoted_blog: bool
     # 图片附件的地址（同源约束由 `fetch_image` 兜住）；图没了或本来就没带图时为 None。
     image_url: str | None = None
+    # 当前评论作者能否使用共同记忆（§35）。未注入策略或门禁关闭时恒 False；
+    # 为真也只意味着可以读 `all_user`，lobby 与用户私有文件在评论路径上永不读取。
+    memory_allowed: bool = False
 
 
 @dataclass(frozen=True)
@@ -178,6 +184,7 @@ class CommentRouter:
         logger_instance: logging.Logger | None = None,
         logger: logging.Logger | None = None,
         vision_enabled: bool = False,
+        memory_access: MemoryAccessPolicy | None = None,
     ) -> None:
         self._self_user_id = self_user_id
         self._bot_username = bot_username
@@ -189,6 +196,10 @@ class CommentRouter:
         # 图片输入是否对评论区开启（`model.vision_enabled` 且名额大于 0）。
         # 路由器不做 I/O，因此这里只回答「该不该交给模型」，取图与降级在 service。
         self._vision_enabled = vision_enabled
+        # 共同记忆的接入策略（§35）：这是路由器需要的**最小依赖**——只用来算一次
+        # `permits_common`，不持有服务、不持有队列，因此它也读不到任何记忆正文。
+        # `None` 表示未注入（记忆关闭或旧装配）：`memory_allowed` 恒 False（D-60）。
+        self._memory_access = memory_access
         self._parent_lookup = parent_lookup
         self._logger = (
             logger_instance
@@ -312,6 +323,9 @@ class CommentRouter:
             has_image=self._has_image(comment),
             has_quoted_blog=self._has_quoted_blog(comment),
             image_url=self._readable_image_url(comment),
+            # 门禁判定必须在这里完成：`comment.author.id` 一旦离开路由器就不可得，
+            # 模型侧只剩这个布尔（§35、D-56）。
+            memory_allowed=self._memory_allowed(comment.author.id),
         )
 
         # 本地回复不调用模型。/reset 的新会话由 force_new claim 建立，旧会话完全不动。
@@ -525,6 +539,18 @@ class CommentRouter:
             if not attempted:
                 return _ParentLookupResult(None)
         return _ParentLookupResult(self._coerce_parent(value, blog_id, supplied_text))
+
+    def _memory_allowed(self, author_id: str | None) -> bool:
+        """当前评论作者能否读取共同记忆（§35）；未注入策略时恒 False。
+
+        判据与聊天区同款（`access.permits_common`）：`allowlist` 模式要求非空作者 ID
+        在名单内，`all` 模式对所有作者（含拿不到 ID 的评论）为真 —— 但真也只意味着
+        可读 `all_user`，评论路径永远不会读 `lobby` 或任何用户私有文件（§28、§30.2）。
+        """
+        access = self._memory_access
+        if access is None:
+            return False
+        return access.permits_common(author_id)
 
     @staticmethod
     def _coerce_claim(value: Any, comment_id: str) -> CommentClaim:

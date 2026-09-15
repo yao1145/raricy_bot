@@ -11,13 +11,13 @@ import asyncio
 import inspect
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .. import texts
 from ..core.content_refs import ContentRefResolver, ResolvedRefs
-from ..core.context import ContextManager
+from ..core.context import ContextManager, SupplementalItem
 from ..core.vision import ImageLoader, attach_image, with_image_marker
 from ..logging_setup import get_logger, log_event
 from ..site.comment_models import CommentNode, CommentTreeTooLarge as SiteCommentTreeTooLarge
@@ -114,7 +114,12 @@ def _clean_label(value: object) -> str:
 
 
 class CommentService:
-    """独立评论服务：两个 poller、等待调度器与单并发 worker。"""
+    """独立评论服务：两个 poller、等待调度器与单并发 worker。
+
+    评论侧与长期记忆的唯一接触面是注入的只读 provider（§35）：`memory_allowed` 为真时
+    问它要一次共同记忆（只可能是 `all_user`）。这里**没有** `/remember`、`/memory`
+    命令，也没有任何自动提取——那些条目只属于私聊。
+    """
 
     def __init__(
         self,
@@ -134,6 +139,7 @@ class CommentService:
         system_prompt: str = "",
         content_refs: ContentRefResolver | None = None,
         image_loader: ImageLoader | None = None,
+        memory_context: Callable[[], Awaitable[Iterable[SupplementalItem]]] | None = None,
         now: Callable[[], float] = time.time,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         logger: logging.Logger | None = None,
@@ -161,6 +167,10 @@ class CommentService:
         self.content_refs = content_refs
         # 图片输入（§20）；None 表示视觉关闭（或评论侧名额为 0），一个字节都不取。
         self.image_loader = image_loader
+        # 只读的 context provider（§34.2 第 5 步、§35）：**无参数**，作用域由装配层
+        # 钉死在评论上，因此这条路径结构上要不到 `lobby`，也要不到任何用户私有文件。
+        # None 表示记忆关闭或未注入：一次都不调用，评论与升级前逐字节一致（D-60）。
+        self.memory_context = memory_context
         self.handler = handler
         self.model_client = (
             GatedModelClient(model_client, model_gate)
@@ -1098,11 +1108,19 @@ class CommentService:
         context = self.context_manager
         if context is not None and hasattr(context, "build_messages"):
             session_key = getattr(request, "session_key", "")
+            # 共同记忆只在门禁允许的这一轮取（§35）：请求里只剩 `memory_allowed`
+            # 这一个布尔，作者身份早已留在路由器里。取到的条目只进当前轮的
+            # `pending_user`（资料块由 `build_messages` 摆在正文之前，与文章块、
+            # 父评论块同一段），既不进 system，也绝不进历史。
+            supplemental: tuple[SupplementalItem, ...] = ()
+            if getattr(request, "memory_allowed", False):
+                supplemental = await self._shared_memory_items()
             messages = context.build_messages(
                 session_key,
                 self.system_prompt or "",
                 pending_user=prompt,
                 system_addendum=addendum,
+                supplemental_items=supplemental,
             )
         else:
             messages = [
@@ -1121,6 +1139,32 @@ class CommentService:
                 username, with_image_marker(raw_text, image_state)
             ),
         )
+
+    async def _shared_memory_items(self) -> tuple[SupplementalItem, ...]:
+        """取这一轮可用的共同记忆；任何失败都返回空元组并继续（软故障，D-60）。
+
+        provider 由装配层注入且**不接受参数**：频道在那里被钉死为评论，因此这条路径
+        要不到 `lobby`，也拿不到任何用户私有文件（§35、§30.2 的表）。失败只降级成
+        「这一轮没有共同记忆」——评论照常生成、照常发送，`alive` 与健康端点都不受影响。
+        """
+        provider = self.memory_context
+        if provider is None:
+            return ()
+        try:
+            items = provider()
+            if inspect.isawaitable(items):
+                items = await items
+            return tuple(items)
+        except Exception as exc:
+            log_event(
+                self.logger,
+                logging.WARNING,
+                "memory.context_omitted",
+                scope="comment",
+                reason="internal",
+                error=type(exc).__name__,
+            )
+            return ()
 
     async def _update_after_send(
         self,
