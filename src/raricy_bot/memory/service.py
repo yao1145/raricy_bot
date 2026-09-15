@@ -106,6 +106,9 @@ _TEMP_SUFFIX: str = ".tmp"
 # 幂等键与 ID 的 ASCII 十进制序号（与 codec 同一口径，`digit()` 会放过非 ASCII 数字）。
 _ASCII_DIGITS = re.compile(r"[0-9]+")
 
+# 四个 ID 前缀：`_canonical_object_id` 靠它把「前缀自带」的对象 ID 收敛成渲染形态（§29.1）。
+_ID_PREFIXES: tuple[str, ...] = (PREFIX_ALL_USER, PREFIX_LOBBY, PREFIX_USER, PREFIX_CANDIDATE)
+
 # 稳定失败原因里表示「文件系统错误」的那个（codec 的六个 reason 之外唯一允许进日志的值）。
 _REASON_IO: str = "io"
 
@@ -729,6 +732,13 @@ class MemoryService:
         快照上的那次筛选覆盖不到它；命中同样整条拒绝、不落盘（返回 `secret_detected`）。合法外部
         版本照常被采纳进快照（§30.4），只是本次操作不写。
 
+        **ID 收敛也在这里收口**（§29.1 的 ID 义务）：render 只给条目与候选的**标题行**补零，
+        候选的 `target_id` 与 `operations.object_id` 是逐字渲染的，而 applier 会把磁盘上人工改窄
+        的 ID（`GM-L-7`）原样抄进新文档——只让窄 ID「幸存」的写入因此会让快照停在窄形态、文件却
+        是 6 位补零。在 render 之前把整份文档的 ID 收敛成渲染形态，并存下**收敛后**的那一份，
+        快照与文件字节就不会再在 ID 宽度上漂移；`_write_document` 是唯一 render 与落盘的地方，
+        所以这条覆盖由构造保证，不靠每个 applier 各自记得规范化。已经是渲染形态的 ID 逐字不变。
+
         抓什么、为什么（按调用点区分，而不是按 reason 区分）：
         - 外部版本解析失败：由 `_external_baseline` 返回 None，映射成 `conflict`（§30.3 第 4 步）。
         - 渲染**本模块自己的**文档失败：`CodecError`（render 的校验）与 `UnicodeEncodeError`
@@ -748,6 +758,8 @@ class MemoryService:
             if status != STATUS_OK or built is None:
                 # full / not_found / conflict / noop / invalid_proposal：一个字节都不写（§27.4）。
                 return status, None, snapshot
+            built = _canonical_document(built)
+            object_id = _canonical_object_id(object_id)
             data = self._render(built)
             temp_path = _write_temp_file(os.path.dirname(view.path), data)
             disk = _read_bytes(view.path, self._config.max_file_bytes + 1)
@@ -765,6 +777,8 @@ class MemoryService:
                 built, status, object_id = apply_fn(baseline)
                 if status != STATUS_OK or built is None:
                     return status, None, adopted
+                built = _canonical_document(built)
+                object_id = _canonical_object_id(object_id)
                 data = self._render(built)
                 _overwrite_temp_file(temp_path, data)
             self._replace(temp_path, view.path)
@@ -1398,6 +1412,70 @@ def _canonical_entry(entry: MemoryEntry, prefix: str) -> MemoryEntry:
     if canonical is None:
         return entry
     return replace(entry, memory_id=canonical)
+
+
+def _canonical_document(document: _MemoryDocument) -> _MemoryDocument:
+    """把整份文档的 ID 收敛成渲染形态；写路径的公共收口（§29.1 的 ID 义务）。
+
+    render 只给条目与候选的标题行补零，候选的 `target_id` 与 `operations.object_id` 是逐字渲染
+    的，而 applier 会把磁盘上人工改窄的 ID（`GM-L-7`）原样抄进新文档——「只让窄 ID 幸存」的删除
+    也会这样。只在这里收敛一次，所有写入路径就都被覆盖：`_write_document` 是唯一 render 与落盘的
+    地方，快照存的也是这一份收敛后的文档，快照与文件字节不再在 ID 宽度上漂移。形状不认得的 ID
+    原样保留（与 `_canonical_entry` 同口径），真正的拒绝由 codec 的校验负责。
+    """
+    if isinstance(document, PrivateDocument):
+        return replace(
+            document,
+            entries=tuple(_canonical_entry(item, PREFIX_USER) for item in document.entries),
+            operations=_canonical_operations(document.operations),
+        )
+    return replace(
+        document,
+        all_user=tuple(_canonical_entry(item, PREFIX_ALL_USER) for item in document.all_user),
+        lobby=tuple(_canonical_entry(item, PREFIX_LOBBY) for item in document.lobby),
+        candidates=tuple(_canonical_candidate(item) for item in document.candidates),
+        operations=_canonical_operations(document.operations),
+    )
+
+
+def _canonical_candidate(candidate: MemoryCandidate) -> MemoryCandidate:
+    """候选的编号与目标引用都收敛成渲染形态；形状不认得时原样保留（§29.1）。
+
+    候选的作用域只能是 `all_user` / `lobby`（codec 的校验保证），因此目标引用按作用域前缀收敛。
+    """
+    prefix = _scope_prefix(candidate.scope)
+    candidate_id = _canonical(candidate.candidate_id, PREFIX_CANDIDATE)
+    target_id = _canonical(candidate.target_id, prefix)
+    return replace(
+        candidate,
+        candidate_id=candidate_id if candidate_id is not None else candidate.candidate_id,
+        target_id=target_id if target_id is not None else candidate.target_id,
+    )
+
+
+def _canonical_object_id(object_id: str | None) -> str | None:
+    """操作结果里的对象 ID 收敛成渲染形态；不是 ID（或形状不认得）时原样返回（§29.1）。
+
+    对象 ID 可以是生效条目、候选或私有条目，前缀由 ID 自己带，这里只能逐个试。它会被逐字渲染进
+    `operations`，也会经 `find_operation` 回到调用方，所以同样属于「写前必须收敛」的范围。
+    """
+    if not isinstance(object_id, str):
+        return object_id
+    for prefix in _ID_PREFIXES:
+        canonical = _canonical(object_id, prefix)
+        if canonical is not None:
+            return canonical
+    return object_id
+
+
+def _canonical_operations(
+    operations: Mapping[str, OperationResult],
+) -> Mapping[str, OperationResult]:
+    """把 `operations` 记录的对象 ID 一并收敛；键的插入顺序原样保留（`_record` 按它淘汰最旧的键）。"""
+    return {
+        operation_id: replace(result, object_id=_canonical_object_id(result.object_id))
+        for operation_id, result in operations.items()
+    }
 
 
 def _storage_key(user_id: str) -> str | None:
