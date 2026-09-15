@@ -16,6 +16,8 @@ from typing import Any
 
 import yaml
 
+from . import texts
+
 # 默认配置文件路径；可被环境变量 BOT_CONFIG_PATH 覆盖。
 DEFAULT_CONFIG_PATH: str = "./config.yaml"
 
@@ -25,6 +27,10 @@ MAX_CONFIG_BYTES: int = 1024 * 1024
 # 站点图床的单图硬上限（10 MiB）。来源：raricy.com src/lib/image-upload.ts 的
 # MAX_IMAGE_SIZE。配得比它更大的话站点根本不会给出那么大的图，只会掩盖意图。
 MAX_IMAGE_BYTES: int = 10 * 1024 * 1024
+
+# 自动提取披露里条目 ID 的保守宽度（`UM-` 加九位十进制）。codec 的规范是六位，
+# 多算三位只是把配置校验卡得更早；计数器真的涨过九位时由 `app.py` 那一侧的兜底接住。
+WORST_CASE_MEMORY_ID: str = "UM-999999999"
 
 # 密钥环境变量名。
 USERNAME_ENV: str = "RARICY_USERNAME"
@@ -1021,6 +1027,26 @@ def _memory(
             raise ConfigError(
                 f"配置 {where}.max_entry_chars 不能大于 behavior.max_input_chars"
             )
+        if auto_capture_available:
+            # 自动提取的披露要跟回答挤同一份输出空间（§34.4 / D-63）：装配层按
+            # `limit = max_output_chars - len(披露) - len(TRUNCATION_SUFFIX)` 预留，披露本身
+            # 是固定开销加上一条最长正文。上限装不下时 limit 会落到零以下，用户的回答就整条
+            # 变成一句截断提示 —— D-60 明令禁止的结局，因此这里必须留出至少一个回答字符。
+            # 只在部署真的开着自动提取时才查：用户那一侧的开关是运行时状态（启动时判不了），
+            # 而它只有在部署允许时才可能被打开。
+            disclosure_overhead = len(
+                texts.memory_auto_capture_text(
+                    memory_id=WORST_CASE_MEMORY_ID, content="", created=True
+                )
+            )
+            if (
+                disclosure_overhead + max_entry_chars + len(texts.TRUNCATION_SUFFIX)
+                >= behavior.max_output_chars
+            ):
+                raise ConfigError(
+                    f"配置 {where}.max_entry_chars 不能占满 behavior.max_output_chars："
+                    "自动提取的写入披露与截断后缀还要留在同一条消息里"
+                )
         _check_memory_root_dir(root_dir, knowledge_base.root_dir, storage.db_path)
 
     return MemoryConfig(

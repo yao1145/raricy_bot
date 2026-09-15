@@ -92,6 +92,30 @@ _REPLY_EMPTY_MARKER: str = "[无正文]"
 _SHUTDOWN_TIMEOUT_SECONDS: float = 10.0
 
 
+def _reply_image_url(request: Request) -> str | None:
+    """本轮直接引用里那张可以取的缩略图 URL；没有、已删除或没带图时为 None（D-48）。
+
+    这是「这一轮要不要去取被引用的图」的**唯一**定义：`_load_reply_image` 按它取图，
+    自动提取的「不依赖资料」判定按它跳过（§34.4）。两处必须同时移动 —— 否则提取会开始
+    对一轮真的取了图的回合动手。
+    """
+    reply = request.message.reply
+    if reply is None or reply.is_deleted or not reply.image_url:
+        return None
+    return reply.image_url
+
+
+def _ref_source_texts(request: Request) -> tuple[str, str | None]:
+    """本轮会做 `[@<ID>]` 内容引用展开的两块正文（§25）：消息正文与直接引用的正文。
+
+    展开器（`_resolve_refs`）与自动提取的「不依赖资料」判定共用这一处定义：哪两块文本算
+    「本轮依赖的资料」只写一次，将来多展开一块时两边一起动。
+    """
+    if request.reply_context:
+        return request.user_text, request.reply_context
+    return request.user_text, None
+
+
 class SearchUnavailable(Exception):
     """搜索授权前的本地能力门判否，并携带可判别的稳定原因码。
 
@@ -662,6 +686,11 @@ class BotApp:
         资料走到这里的只有下面三种，都要排除——用户的问题是冲着那些资料去的，只拿他写下的
         十几个字去提炼「记忆」只会得到噪音。
 
+        判「依赖资料」看的是**用户把手指到哪儿**，不是这一轮真的取回了多少字节：图片输入关闭
+        （`_vision_enabled` 为假，图床一个请求都不发）或引用的博客没加载成功时一样跳过提取。
+        这两个回合的问题同样是冲着那份资料去的，按「取到几个字节」分叉既难解释，也与
+        `has_media` 的既有口径（`image_missing` / `blog_missing` 同样算数）对不上。
+
         代次也放在这里：自动提取是**当前这一轮**的副作用，被 `/reset` 或过期作废的那一轮
         不该再往记忆里写任何东西。调用点已经紧跟在代次检查之后，这里仍是独立的一道 ——
         派生的条件不该依赖调用顺序来成立。
@@ -683,13 +712,10 @@ class BotApp:
         if has_media(message):
             # 自己的图（含 `image_missing`）与引用的博客：正文之外还有资料。
             return False
-        reply = message.reply
-        if reply is not None and not reply.is_deleted and reply.image_url:
+        if _reply_image_url(request) is not None:
             # 被引用消息的缩略图（§20）：已删除的引用不取图，那种引用不算依赖图片。
             return False
-        if find_refs(request.user_text) or (
-            request.reply_context and find_refs(request.reply_context)
-        ):
+        if any(find_refs(text) for text in _ref_source_texts(request) if text):
             # `[@<ID>]` 内容引用（§25）：被引用正文里的引用同样会随当前轮展开。
             return False
         return True
@@ -707,8 +733,17 @@ class BotApp:
         `X = max_output_chars - len(disclosure)`，`limit = X - len(TRUNCATION_SUFFIX)`
         （`truncate_at_paragraph` 最多返回 `limit + len(TRUNCATION_SUFFIX)`），再拼
         `body + disclosure` —— 于是 Sender 的第二次截断（按 `max_output_chars`）不会切掉披露。
+        预留还要再扣掉**脱敏可能带来的增长**：Sender 先脱敏、后截断，模型回显一个比
+        `"[redacted]"` 短的密钥会让正文变长，那就轮到披露的尾巴被切。
+
+        配置凑到几乎没有回答余地时（披露 + 内容上限顶满 `max_output_chars`）宁可**放弃披露**，
+        也不让 `limit` 落到零以下、把用户的回答整条换成一句截断提示：D-60 的底线是回答优先。
+        配置层已按 `memory.max_entry_chars` 交叉校验，这一道只兜住它算不到的运行时长度。
 
         失败、超时、`noop`、写入失败与幂等重放一律原样返回 `answer`（不追加任何说明）。
+        控制器返回的**形状不对**（读不出 `status` 等字段）同样只算软故障：那时模型早就把回答
+        生成好了，一个 `AttributeError` 不允许把这条回答一起带走。下面从调用到拼披露整段都在
+        同一个 `try` 里，正是为了这一点（D-60）。
 
         **记忆提交与站内回复不是一个分布式事务**：这一步之后再发生的发送失败不会回滚记忆，
         用户仍然能在 `/memory list` 里看到那条条目（规划 §8.3 接受这个取舍）。理由是不能为了
@@ -735,10 +770,45 @@ class BotApp:
                 message_id=request.message.id,
                 source_text=request.user_text,
             )
+            if result.status != STATUS_OK or result.memory_id is None:
+                # 只有**确实写入**才带披露（§27.2）：撰写失败、低置信度 noop、写入失败与
+                # 幂等重放都落在这里，原回答照常发送。
+                return answer
+            disclosure = texts.memory_auto_capture_text(
+                memory_id=result.memory_id,
+                content=result.content,
+                created=result.action is ProposalAction.ADD,
+            )
+            # 预留按**脱敏后**的长度算：Sender 先脱敏、后截断（core/sender.py 第 1 步），
+            # 而模型回显一个比 "[redacted]" 短的密钥会让正文变长 —— 拼好的文本就会顶出上限，
+            # 披露的尾巴被 Sender 的第二次截断切掉（D-63 要防的正是这个）。脱敏不会把文本变
+            # 短到需要补回，所以这里只减正增长；外送的仍是模型原文，脱敏依旧由 Sender 统一做。
+            growth = max(len(self._redactor.redact(answer)) - len(answer), 0)
+            limit = (
+                self._config.behavior.max_output_chars
+                - len(disclosure)
+                - len(texts.TRUNCATION_SUFFIX)
+                - growth
+            )
+            if limit < 1:
+                # 退化配置：披露（加上脱敏的增长）把输出空间吃光，再截下去用户的回答就会整条
+                # 变成一句截断提示。D-60 的底线是回答优先，因此这一轮放弃披露 —— 记忆已经写入，
+                # 用户仍能在 /memory list 里看到它，软故障照例留一条稳定日志。
+                log_event(
+                    _logger,
+                    logging.WARNING,
+                    "memory.auto_capture",
+                    scope="user",
+                    reason="disclosure_no_room",
+                )
+                return answer
+            body, _ = truncate_at_paragraph(answer, limit)
+            return body + disclosure
         except asyncio.CancelledError:
             raise
         except Exception:
-            # 软故障（D-60）：记忆链路上的意外不允许把这一轮回答一起拖掉。
+            # 软故障（D-60）：记忆链路上的意外不允许把这一轮回答一起拖掉 —— 控制器的返回值
+            # 形状不对（读不出 `status` 等字段）也走这里，否则已经生成好的回答根本发不出去。
             # 只记稳定事件与白名单字段，绝不记正文、key 或用户 ID（§37）。
             log_event(
                 _logger,
@@ -748,22 +818,6 @@ class BotApp:
                 reason="internal",
             )
             return answer
-        if result.status != STATUS_OK or result.memory_id is None:
-            # 只有**确实写入**才带披露（§27.2）：撰写失败、低置信度 noop、写入失败与
-            # 幂等重放都落在这里，原回答照常发送。
-            return answer
-        disclosure = texts.memory_auto_capture_text(
-            memory_id=result.memory_id,
-            content=result.content,
-            created=result.action is ProposalAction.ADD,
-        )
-        limit = (
-            self._config.behavior.max_output_chars
-            - len(disclosure)
-            - len(texts.TRUNCATION_SUFFIX)
-        )
-        body, _ = truncate_at_paragraph(answer, limit)
-        return body + disclosure
 
     async def _comment_memory_items(self) -> tuple[SupplementalItem, ...]:
         """评论区的只读 context provider（§34.2 第 5 步、§35）；失败返回空元组（D-60）。
@@ -1193,10 +1247,10 @@ class BotApp:
         """
         if not self._vision_enabled:
             return None, "none"
-        reply = request.message.reply
-        if reply is None or reply.is_deleted or not reply.image_url:
+        url = _reply_image_url(request)
+        if url is None:
             return None, "none"
-        return await self._image_loader.load_url(reply.image_url)
+        return await self._image_loader.load_url(url)
 
     async def _load_blog(self, request: Request) -> BlogLoad:
         """取回本轮引用的博客（正文里的内容引用已展开）；没有引用时完全不碰网络。"""
@@ -1214,10 +1268,10 @@ class BotApp:
           留在历史里会在该会话后续每一轮被反复外送。
         """
         budget = self._ref_resolver.max_ref_chars
-        resolved = await self._ref_resolver.resolve(request.user_text, budget=budget)
+        user_text, reply_text = _ref_source_texts(request)
+        resolved = await self._ref_resolver.resolve(user_text, budget=budget)
         parts = list(resolved.image_parts)
-        reply_text = request.reply_context
-        if reply_text:
+        if reply_text is not None:
             reply = await self._ref_resolver.resolve(reply_text, budget=budget)
             reply_text = reply.text
             parts.extend(reply.image_parts)
