@@ -341,7 +341,7 @@ class CommentRouter:
         # 纯图请求（`user_text` 为空）直落下面的入队：命令判定都要求非空正文，
         # 三个都必然为假，因此不需要为它单开一条分支。
         if is_help_command(user_text):
-            return self._local(request, texts.COMMENT_HELP_TEXT, "help")
+            return self._local(request, self._comment_help_text(), "help")
         if force_new:
             return self._local(request, texts.RESET_DONE_TEXT, "reset")
         if is_secret_probe(user_text):
@@ -551,6 +551,17 @@ class CommentRouter:
         if access is None:
             return False
         return access.permits_common(author_id)
+
+    def _comment_help_text(self) -> str:
+        """评论区 `/help` 的文案（§35、§36）：只按记忆**有没有被注入**二选一。
+
+        未注入（默认部署，或 `memory.enabled=false`）时用的是升级前那份常量、逐字节相同：
+        那时评论区一次都不会用到共同记忆，文案就不能声称它会随本轮请求发送（§26.3）。
+        注入后才改用披露版（评论侧最多只用 `all_user`，绝不使用私有记忆）。
+        判据不放宽到「当前作者能否读取」：披露句讲的是评论区的上限（「最多只会用到」），
+        同一段评论线程里的两个人不该因为各自在不在名单里而看到两种措辞。
+        """
+        return texts.comment_help_text(memory_injected=self._memory_access is not None)
 
     @staticmethod
     def _coerce_claim(value: Any, comment_id: str) -> CommentClaim:

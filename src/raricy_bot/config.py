@@ -261,6 +261,9 @@ class MemoryConfig:
     max_entry_chars: int = 500
     max_file_bytes: int = 262144
     max_operations: int = 512
+    # 记忆自己的 token 上限（§33 的分组上限，两个都是「先给记忆封顶」的意思）：
+    # 共同记忆（all_user 与 lobby）**合计**一份，私有记忆各一份；超上限的条目整条跳过，
+    # 不会截断，也不会改变整轮预算（behavior/comments 的 context_input_tokens）的账目。
     common_context_tokens: int = 800
     private_context_tokens: int = 800
     writer_context_tokens: int = 2000

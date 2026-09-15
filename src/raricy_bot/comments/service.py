@@ -17,7 +17,7 @@ from typing import Any, Protocol
 
 from .. import texts
 from ..core.content_refs import ContentRefResolver, ResolvedRefs
-from ..core.context import ContextManager, SupplementalItem
+from ..core.context import ContextManager, SupplementalCap, SupplementalItem
 from ..core.vision import ImageLoader, attach_image, with_image_marker
 from ..logging_setup import get_logger, log_event
 from ..site.comment_models import CommentNode, CommentTreeTooLarge as SiteCommentTreeTooLarge
@@ -140,6 +140,7 @@ class CommentService:
         content_refs: ContentRefResolver | None = None,
         image_loader: ImageLoader | None = None,
         memory_context: Callable[[], Awaitable[Iterable[SupplementalItem]]] | None = None,
+        memory_common_tokens: int | None = None,
         now: Callable[[], float] = time.time,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         logger: logging.Logger | None = None,
@@ -171,6 +172,10 @@ class CommentService:
         # 钉死在评论上，因此这条路径结构上要不到 `lobby`，也要不到任何用户私有文件。
         # None 表示记忆关闭或未注入：一次都不调用，评论与升级前逐字节一致（D-60）。
         self.memory_context = memory_context
+        # 评论侧 `all_user` 共同记忆的 token 上限（§26.1 的 `common_context_tokens`、§33）：
+        # None 表示不设分组上限，只受评论自己的整轮预算约束（`comments.context_input_tokens`）。
+        # 与 provider 一起注入，因为两者描述的是同一件事：这一轮能不能、能拿多少共同记忆。
+        self.memory_common_tokens = memory_common_tokens
         self.handler = handler
         self.model_client = (
             GatedModelClient(model_client, model_gate)
@@ -1115,12 +1120,21 @@ class CommentService:
             supplemental: tuple[SupplementalItem, ...] = ()
             if getattr(request, "memory_allowed", False):
                 supplemental = await self._shared_memory_items()
+            # 共同记忆的分组上限（§26.1、§33）：评论侧只可能拿到 `all_user`，因此池里只有它；
+            # 没注入上限时传空元组，选择行为与没有分组上限时完全一致（§26.2 第 8 条只在
+            # `memory.enabled=true` 时施加，关闭的部署连上限都不该存在）。
+            caps: tuple[SupplementalCap, ...] = (
+                (SupplementalCap(("memory_all_user",), self.memory_common_tokens),)
+                if self.memory_common_tokens is not None
+                else ()
+            )
             messages = context.build_messages(
                 session_key,
                 self.system_prompt or "",
                 pending_user=prompt,
                 system_addendum=addendum,
                 supplemental_items=supplemental,
+                supplemental_caps=caps,
             )
         else:
             messages = [

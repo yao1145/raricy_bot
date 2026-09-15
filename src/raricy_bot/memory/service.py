@@ -303,7 +303,14 @@ class MemoryService:
         channel_kind: str,
         access: MemoryAccessPolicy,
     ) -> MemoryContext:
-        """按作用域取候选条目（§30.2）；任何失败都返回空 items，绝不抛出（D-60）。"""
+        """按作用域取候选条目（§30.2）；任何失败都返回空 items，绝不抛出（D-60）。
+
+        DM 行的判据有两个：门禁（`access.permits_private`）**与**用户自己的
+        `private_enabled`（§30.2 的 DM 行、D-78）。后者是 `/memory off` 承诺的那件事——
+        「之后的私聊里我不会再参考你的条目」——用户关掉读取后，即便文件就在旁边也一条不注入。
+        判定放在这里而不是装配层，是因为开关与条目写在**同一份**用户文件里：读这份文件与
+        「要不要把它交出去」是同一个决定，分开会多出一次读取，也会让将来的调用方漏掉这一道。
+        """
         if not self._enabled:
             # 关闭时不读任何文件，也不记 context_omitted：这是正常路径，路径依赖里没有记忆。
             return MemoryContext(common_revision=0, private_revision=None, items=())
@@ -322,10 +329,16 @@ class MemoryService:
                 # 私有记忆只在 DM 且门禁通过时读取；其它频道连文件都不读（§30.2 的表）。
                 state = self._user_state(user_id)
                 if state.available and isinstance(state.document, PrivateDocument):
+                    # 快照照常载入并报修订号（开关就存在这份文件里，必须先读才知道），
+                    # 但开关关闭时**一条都不选**：既不是 unavailable，也不是读取失败，
+                    # 因此不记 context_omitted —— 与 enabled=false 同属正常路径。
                     private_revision = state.document.revision
-                    items.extend(
-                        self._items(state.document.entries, _GROUP_USER, base=0, prefix=PREFIX_USER)
-                    )
+                    if state.document.private_enabled:
+                        items.extend(
+                            self._items(
+                                state.document.entries, _GROUP_USER, base=0, prefix=PREFIX_USER
+                            )
+                        )
                 else:
                     self._log_omitted("user", state.reason)
         except Exception as exc:  # 兜底：记忆是可选增强，读取失败不能外溢（D-60）。

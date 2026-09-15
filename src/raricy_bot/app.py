@@ -10,6 +10,8 @@
   worker → 构造 Router 时注入 access policy、memory queue 与 `private_enabled` 回调 →
   构造 CommentRouter / CommentService 时注入 access policy 与只读 context provider（第 5 步）；
   `memory.enabled=false` 时整段跳过，不建目录也不注入任何能力（D-60）；
+  **注入的判据是记忆 worker 真的起来了（`_memory_armed`）**，不是配置里的 `enabled`：
+  一个没有消费者的队列会把记忆命令卡在水位之外（§34.3、D-15）；
 - 路由结果分派：`reply_now` 用 `notice_local`、`busy` 用 `notice` 并加 (频道, 触发者) 冷却；
   `memory_queued` 什么都不做（终态由记忆 worker 负责，§34.3）；
 - 自动提取（§34.4）只在主模型给出回答之后、回答发出之前尝试一次：全部前置条件同时成立
@@ -44,6 +46,7 @@ from .core.blog import BlogLoad, BlogLoader, blog_marker, blog_readable
 from .core.content_refs import ContentRefResolver, find_refs
 from .core.context import (
     ContextManager,
+    SupplementalCap,
     SupplementalItem,
     lobby_thread_session_key,
     speaker_wrapper,
@@ -274,6 +277,13 @@ class BotApp:
         # 这一个布尔是整个记忆装配的总闸：构造 Router／构造评论侧／`_start_memory`／关闭
         # 四处都从它取值，`Config` 冻结让它们今天不会漂，但只有一处来源才能让它们将来也不漂。
         self._memory_enabled = config.memory.enabled
+        # 「记忆能力**已经装好**」的唯一事实来源，由 `_start_memory` 在 worker 池真正跑起来
+        # 之后置真。它必须与 `_memory_enabled`（部署要不要记忆）分开：装配里的软故障兜底
+        # 会把 worker 启动失败吞成一条日志，而 Router 的注入决定是一次独立的配置读取 ——
+        # 两者一旦分叉，记忆命令就会被排进一个**没有消费者**的队列：没有回复，`finally` 里的
+        # `mark_handled` 也永远不跑，事件不是终态、水位被钉住（D-15 / §34.3）。
+        # 未装好时一律不注入：Router 的三个记忆参数都为 None，回到 D-60 的回退路径。
+        self._memory_armed = False
         self._memory_access = MemoryAccessPolicy(config.memory)
         # 评论侧的门禁载体（§35）：纯内存对象，与策略同一位置构造，不持有任何记忆服务。
         self._comment_memory_access = _CommentMemoryAccess()
@@ -387,12 +397,14 @@ class BotApp:
                 transport=self._transport,
             )
         # 记忆装配（§34.2 第 1-3 步）：必须在聊天 worker 与评论服务启动之前，
-        # 且整段只在 `memory.enabled=true` 时执行（D-60）。
+        # 且整段只在 `memory.enabled=true` 时执行（D-60）。整段成功跑完才会置 `_memory_armed`。
         await self._start_memory()
 
         # 记忆路径的三种参数要么都给，要么都不给：全都为 None 时 Router 的行为与
-        # 升级前逐字节一致（§34.1），`memory.enabled=false` 走的就是这条。
-        memory_on = self._memory_enabled
+        # 升级前逐字节一致（§34.1）。判据是 `_memory_armed` 而不是配置里的 `enabled`：
+        # 只有记忆 worker 真的在跑，记忆命令才有消费者（§34.3 的 `memory_queued` 终态由它落笔）。
+        # 装配失败时这一段与 `memory.enabled=false` 完全同形，`enabled=false` 走的就是这条。
+        memory_on = self._memory_armed
         self._router = MessageRouter(
             self_user_id=user.id,
             bot_username=self._config.secrets.username,
@@ -495,6 +507,12 @@ class BotApp:
                     # `all_user`；关闭时同样不注入，评论侧连一个方法都拿不到。
                     memory_context=(
                         self._comment_memory_items if memory_on else None
+                    ),
+                    # §26.1 的 `common_context_tokens` 同样管评论侧：评论的整轮预算更小
+                    # （`comments.context_input_tokens`），共同记忆不该把它吃光（§26.2 第 8 条）。
+                    # 关闭时与 provider 一起缺席：那时评论侧一次都不碰记忆。
+                    memory_common_tokens=(
+                        self._config.memory.common_context_tokens if memory_on else None
                     ),
                 )
                 await self._comment_service.start()
@@ -616,6 +634,9 @@ class BotApp:
                     auto_capture_available=self._config.memory.auto_capture_available,
                 )
             await self._memory_workers.start()
+            # 到这里队列才有了消费者：只有在这个点上置真，Router 才会拿到记忆能力。
+            # 启动失败会掉进下面的 except（标志保持 False，Router 不注入），不会半开半闭。
+            self._memory_armed = True
         except Exception as exc:
             log_event(
                 _logger,
@@ -639,6 +660,25 @@ class BotApp:
             return False
         settings = service.private_settings_cached(user_id)
         return bool(settings is not None and settings.private_enabled)
+
+    def _supplemental_caps(self) -> tuple[SupplementalCap, ...]:
+        """补充资料的分组 token 上限（§33、§26.1）：把 `memory.*_context_tokens` 接上。
+
+        共同记忆（`all_user` 与 `lobby`）**合计**一份预算、私有记忆（`memory_user`）单独一份，
+        与 `config.example.yaml` 里那句「all_user 与 lobby 合计使用这一份共同记忆预算」一致
+        —— 传两个分组名进同一个上限，而不是各给一份。
+
+        取值只来自配置（上限按分组名传，`core/context.py` 不认识任何记忆类型，D-61）；
+        上限只管**选哪些条目**，整轮预算与历史回补的账目一个字都不动。记忆关闭时这些上限
+        也没有对象可用：那一轮的 `supplemental_items` 恒为空元组，选择根本不会发生。
+        """
+        memory = self._config.memory
+        return (
+            SupplementalCap(
+                ("memory_all_user", "memory_lobby"), memory.common_context_tokens
+            ),
+            SupplementalCap(("memory_user",), memory.private_context_tokens),
+        )
 
     async def _memory_context_items(self, request: Request) -> tuple[SupplementalItem, ...]:
         """取本轮的记忆候选条目（§34.3）；任何失败都返回空元组并继续（软故障，D-60）。
@@ -1112,6 +1152,9 @@ class BotApp:
                 # 记忆正文只走这一条口子：`build_messages` 把它放进 role="user" 的当前轮，
                 # 既不进 system，也不进历史（§33、D-56）。本方法之外不再碰 memory 文本。
                 supplemental_items=supplemental,
+                # §26.1 的两个 token 旋钮在这里生效：共同记忆与私有记忆各有一份上限，
+                # 记忆因此不能把整轮预算吃光、把历史挤掉（取舍仍由 `build_messages` 做，D-62）。
+                supplemental_caps=self._supplemental_caps(),
             )
             self._apply_reply_prefix(
                 messages,

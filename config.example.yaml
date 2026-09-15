@@ -209,7 +209,8 @@ memory:
   max_file_bytes: 262144
   max_operations: 512
 
-  # all_user 与 lobby 合计使用这一份共同记忆预算。
+  # 记忆自己的 token 上限：共同记忆（all_user 与 lobby）合计使用这一份，私有记忆各一份。
+  # 超过上限的条目整条跳过（不截断），记忆因此不会把整轮预算吃光、把历史挤掉。
   common_context_tokens: 800
   private_context_tokens: 800
   writer_context_tokens: 2000

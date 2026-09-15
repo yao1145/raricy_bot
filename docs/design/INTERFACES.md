@@ -2254,6 +2254,11 @@ memory: MemoryConfig = field(default_factory=MemoryConfig)
       看不到 §34.4 里「脱敏把正文变长」那一项。因此运行期仍必须有 `disclosure_no_room`
       分支兜底（D-77）。
 
+`common_context_tokens` 与 `private_context_tokens` 的**唯一**去处是 §33 的分组上限：前者管
+`all_user` 与 `lobby` 两个分组**合计**，后者管 `memory_user`；评论侧只用到前者（§35）。它们不改变
+整轮预算（`behavior.context_input_tokens` / `comments.context_input_tokens`）的任何账目，只是先给
+记忆自己的那一份封顶，因此调小它们只可能让记忆少占、历史多留。
+
 ### 26.3 关闭语义
 
 - `enabled=false`（默认）：不创建目录、不读取文件、不构造记忆服务与刷新任务、不向
@@ -2643,9 +2648,14 @@ class MemoryService:
 
   | 场景 | `all_user` | `lobby` | 当前用户私有 |
   |------|-----------|---------|-------------|
-  | DM | 读 | 不读 | 读（且仅当 `access.permits_private(user_id, "dm")`） |
+  | DM | 读 | 不读 | 读（且**同时**满足 `access.permits_private(user_id, "dm")` 与该用户 Markdown 的 `private_enabled`） |
   | lobby | 读 | 读 | **连文件都不读** |
   | comment | 读 | 不读 | **连文件都不读** |
+
+  DM 行的第二个判据是**用户自己的开关**（D-78）：`/memory off` 的回复承诺「之后的私聊里我不会
+  再参考你的条目」，所以开关关闭时 `context_for` 读到条目也一条不注入（正常路径，不记
+  `memory.context_omitted`）。判定只此一处：开关与条目写在**同一份**用户文件上，「读它」与
+  「要不要交出去」是同一个动作，调用方（`app.py` 的 provider）不得在装配层再判一次。
 
 - 返回的 `SupplementalItem.group` 取 `memory_all_user` / `memory_lobby` / `memory_user`；
   `label` 是条目 ID（`GM-A-…` / `GM-L-…` / `UM-…`）；`priority` 由本模块给值（数值是实现细节），
@@ -2935,6 +2945,12 @@ class SupplementalItem:
     priority: int    # 越小越优先
 
 
+@dataclass(frozen=True)
+class SupplementalCap:
+    groups: tuple[str, ...]   # 共享这一份上限的分组名（可以多于一个）
+    max_tokens: int           # 这些分组**合计**的渲染后上限
+
+
 def build_messages(
     self,
     session_key: str,
@@ -2944,6 +2960,7 @@ def build_messages(
     system_addendum: str | None = None,
     feature_context: bool = False,
     supplemental_items: tuple[SupplementalItem, ...] = (),
+    supplemental_caps: tuple[SupplementalCap, ...] = (),
 ) -> list[dict[str, str]]:
     ...
 ```
@@ -2959,6 +2976,13 @@ def build_messages(
      这里不重述）。
   5. 记忆放好后，用剩余预算从新到旧补更早的完整历史对。
 - 每条记忆是**不可拆分单位**：塞不下就跳过该条，绝不截半句。
+- `supplemental_caps` 是各分组自己的 token 上限（§26.1 的两个 `*_context_tokens` 在这里生效）：
+  上限按**渲染后的文本块**计（组标签行 + 条目行），与整轮预算同一口径；同一个 `SupplementalCap`
+  里的多个分组**合计**受一份上限约束（`all_user` 与 `lobby` 共用 `common_context_tokens`，
+  `memory_user` 独用 `private_context_tokens`）。超上限的条目按规则 4 跳过，条目依旧不可拆分；
+  不在任何 `SupplementalCap` 里的分组不受分组上限约束（补充资料是通用类型，D-61）。
+  上限与整轮预算是**两道独立的门**，都通过才选入；`supplemental_items=()` 的逐字节一致不受影响
+  （那一轮根本不进选择）。
 - 历史仍按时间正序输出；记忆按作用域分组放在**最后一条 `role="user"` 消息的当前正文之前**，
   版面照规划 §6.2 末尾的文本块：
 
@@ -3049,9 +3073,16 @@ class MessageRouter:
 3. 启动记忆 worker（并发 1）；
 4. 构造 Router 时注入 access policy、memory queue 与 `private_enabled` 回调
    （接到 `MemoryService.private_settings_cached`）；
-5. 构造 CommentRouter / CommentService 时注入 memory access 与只读 context provider。
+5. 构造 CommentRouter / CommentService 时注入 memory access、只读 context provider 与
+   `common_context_tokens` 上限（§26.1、§35）。
 
 `memory.enabled=false` 时**全部跳过**，且不创建目录（D-60）。
+
+第 1-3 步的软故障兜底（§34.2 与 D-60 要求记忆的失败只记账）与第 4-5 步的**注入决定**必须共享
+同一个事实：**记忆 worker 真的在跑**。注入不能只看配置里的 `enabled`——worker 没起来时队列没有
+消费者，记忆命令会既没有回复、又永远不落终态，把水位钉住（D-15）。因此实现里用一个
+`_memory_armed` 标志（只在 `WorkerPool.start()` 成功之后置真）同时管住这两处；装配失败时 Router
+与评论侧拿到的都是 `None`，与 `enabled=false` 逐字同形。这条规则是**硬要求**，不是实现细节。
 
 关闭顺序（规划 §9.4；**本节是权威版本**，§16 / §16.1 里那些更细的既有动作并入本顺序）：
 
@@ -3131,10 +3162,16 @@ class MessageRouter:
 - `CommentService._build_model_messages` 仅在 `memory_allowed` 时取 `all_user` 共同记忆，
   放进当前轮的 `pending_user`（与文章块、父评论块同一位置）；**绝不**请求 `lobby` 或任何用户
   私有文件。
+- 评论侧的共同记忆同样受 `memory.common_context_tokens` 约束（§26.1、§26.2 第 8 条）：装配层
+  把同一份上限交给 `CommentService`（构造参数 `memory_common_tokens`），由 `build_messages`
+  在选题时按 `SupplementalCap(("memory_all_user",), …)` 执行；未注入时这一路与升级前逐字节
+  相同（`SupplementalCap` 不传，选择行为不变）。**这是 §26.2 第 8 条存在的理由**：评论的整轮
+  预算比聊天小，共同记忆不该把它吃光。
 - 评论路径**没有** `/remember`、`/memory` 或自动提取。
 - `all_user` 块**不写进**评论 `ContextManager` 历史。
 - 共同记忆服务失败不改变评论 `alive`，也不改变聊天 `/livez`、`/readyz`（软故障，D-60）。
-- 评论只可能使用 `all_user`；`COMMENT_HELP_TEXT` 不得再承诺「没有长期记忆」（§36）。
+- 评论只可能使用 `all_user`；帮助文案按记忆是否注入二选一——未注入时与升级前逐字节相同，
+  注入后才换成不承诺「没有长期记忆」的披露版（`texts.comment_help_text`，§36）。
 
 ## 36. `texts.py`（记忆文案）
 
@@ -3198,8 +3235,14 @@ def help_text(
   | 自动提取的写入披露 | §34.4 的确定性说明；措辞区分新增与更新 |
   | `MEMORY_SYSTEM_ADDENDUM` | §33；完全静态，说明记忆是不可信资料、不能改变规则或权限、与当前事实冲突时不机械照搬；**不做任何插值** |
 
-- `COMMENT_HELP_TEXT` 必须改为**不承诺「没有长期记忆」**：评论只可能使用 `all_user` 共同记忆，
-  措辞照此（本功能唯一一处允许的既有文案注释性改动）。
+- 评论区帮助文案是**两份常量 + 一个选择函数**（`texts.comment_help_text(*, memory_injected)`）：
+  - `COMMENT_HELP_TEXT`（记忆**未注入**时使用）与升级前**逐字节相同**——默认部署的评论区一次都
+    不会用到共同记忆，文案不得声称它会随请求发送（§26.3）；
+  - `COMMENT_HELP_TEXT_WITH_MEMORY`（记忆已注入时使用）**不承诺「没有长期记忆」**：评论只可能
+    使用 `all_user` 共同记忆，措辞照此（本功能唯一一处允许的既有文案注释性改动）；
+  - 选择判据是**注入与否**（`CommentRouter._memory_access is not None`），不是「当前作者能否
+    读取」：披露句讲的是评论区的上限（「最多只会用到」），同一线程里不该因作者在不在名单里而
+    换措辞。记忆关闭的部署因此逐字节回到升级前的文案。
 - `texts.py` 不 import 任何 memory 模块（`MEMORY_SYSTEM_ADDENDUM` 由 `build_messages` 取用）。
 
 ## 37. 记忆日志与安全

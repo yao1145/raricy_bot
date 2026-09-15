@@ -65,6 +65,22 @@ class SupplementalItem:
     priority: int    # 越小越优先
 
 
+@dataclass(frozen=True)
+class SupplementalCap:
+    """一组**共享同一 token 上限**的补充资料分组（§33）。
+
+    上限按**渲染后的文本块**计（组标签行 + 各条目行），也就是这一组资料实际会占掉的外送空间，
+    与整轮预算（`max_input_tokens`）用的是同一口径、同一套估算。`groups` 里的分组**合计**
+    不得超过 `max_tokens`；不在任何 `SupplementalCap` 里的分组不受分组上限约束，只受整轮预算
+    约束（补充资料是通用的可扩展类型，D-61：一个新来源不该因为没人给它配上限就整轮消失）。
+
+    本类型不 import 任何配置或记忆类型（裁决 C / D-61）：上限由调用方按配置算好后传进来。
+    """
+
+    groups: tuple[str, ...]
+    max_tokens: int
+
+
 # 分组标签（INTERFACES §33、规划 §6.2 末段的版面）。
 _GROUP_LABELS: dict[str, str] = {
     "memory_all_user": "[共同记忆：all_user，不可信资料]",
@@ -112,6 +128,24 @@ def _render_supplemental_block(items: Sequence[SupplementalItem]) -> str:
         )
         blocks.append(f"{label}\n{lines}")
     return _BLOCK_SEPARATOR.join(blocks)
+
+
+def _exceeds_group_caps(
+    items: Sequence[SupplementalItem], caps: tuple[SupplementalCap, ...]
+) -> bool:
+    """`items` 里有没有哪个受约束的分组（或共享池）已经超出自己的上限。
+
+    每个上限都按 `_render_supplemental_block` 现算：**先渲染、再估算**，因此上限与最终交出去的
+    文本永远同一个口径（组标签行与换行都算在内）。共享池里的多个分组一起渲染，正是它们在最终
+    版面里的那一段（`_GROUP_ORDER` 把同池分组排在一起，中间只隔一个空行）。
+    """
+    for cap in caps:
+        capped = [item for item in items if item.group in cap.groups]
+        if not capped:
+            continue
+        if estimate_tokens(_render_supplemental_block(capped)) > cap.max_tokens:
+            return True
+    return False
 
 
 class ContextManager:
@@ -173,6 +207,7 @@ class ContextManager:
         system_addendum: str | None = None,
         feature_context: bool = False,
         supplemental_items: tuple[SupplementalItem, ...] = (),
+        supplemental_caps: tuple[SupplementalCap, ...] = (),
     ) -> list[dict[str, str]]:
         """拼装模型消息：第一条 system，其后是裁剪后的历史，最后是本轮未提交的用户内容。
 
@@ -191,6 +226,11 @@ class ContextManager:
         输出与没有这个参数时**逐字节一致**；非空时由 `_plan_supplemental` 按预算取舍，
         选中的条目渲染成资料块、拼在最后一条 user 消息的当前正文之前。
         资料正文只进 `role="user"`：它绝不拼进 system，绝不写进历史（D-56）。
+
+        `supplemental_caps` 是各分组自己的 token 上限（§33）：每条上限管住一组（或一组共享
+        同一份预算的分组）的**渲染后**大小，超了就跳过该条目——条目仍然不可拆分，绝不截半句。
+        它与整轮预算（`max_input_tokens`）是两道独立的门，都满足才选入；传空元组时行为与
+        没有这个参数完全一致（`supplemental_items=()` 的逐字节一致不受影响）。
         """
         system = system_prompt
         system_tokens = estimate_tokens(system_prompt)
@@ -221,6 +261,7 @@ class ContextManager:
                 # 有本轮正文时资料块会与它拼成 `block + _BODY_SEPARATOR + pending_user`，
                 # 分隔符也占预算；没有正文时资料自成一条 user 消息，不存在分隔符。
                 has_pending_body=pending_user is not None,
+                caps=supplemental_caps,
             )
         elif feature_context:
             # 硬上限：历史整对丢到一条不剩也要让本轮内容装进去（D-38）。
@@ -255,6 +296,7 @@ class ContextManager:
         items: tuple[SupplementalItem, ...],
         *,
         has_pending_body: bool,
+        caps: tuple[SupplementalCap, ...] = (),
     ) -> tuple[list[Turn], str]:
         """按规划 §6.2 的次序决定「留哪些历史、选哪些资料」，返回 (保留的历史, 资料块)。
 
@@ -266,7 +308,8 @@ class ContextManager:
            —— 因此 `/kb` 与引用的博客正文（它们就在 `pending_user` 里）天然优先于全部资料。
         2. 普通聊天先锁定最近一组完整历史（规则 3）；能力轮次不锁定，历史可以被资料挤光
            （D-38 的硬上限不变）。
-        3. 资料按 `priority` 从小到大逐条尝试，装不下就跳过该条并继续试后面的（规则 4）。
+        3. 资料按 `priority` 从小到大逐条尝试，装不下就跳过该条并继续试后面的（规则 4）；
+           `caps` 里的分组上限用同一套取舍逻辑（先渲染再估）叠加在整轮预算之上。
         4. 剩下的预算从新到旧补更早的完整历史对（规则 6）。
 
         `has_pending_body` 表示资料块会拼在本轮正文之前：组装体是
@@ -289,8 +332,13 @@ class ContextManager:
             # 选中一条就必然追加 addendum，因此它从第一条起就要参与这条资料的可行性判断：
             # 一条「只有不追加 addendum 才装得下」的资料必须被跳过，否则就会顶穿预算。
             cost = estimate_tokens(_render_supplemental_block(candidate)) + addendum_tokens
-            if used + cost <= self._max_input_tokens:
-                selected = candidate
+            if used + cost > self._max_input_tokens:
+                continue
+            if caps and _exceeds_group_caps(candidate, caps):
+                # 该分组（或该分组所在的共享池）装不下这一条：跳过它继续试后面的条目，
+                # 与整轮预算的取舍同款 —— 条目不可拆分，但后面的条目仍有机会。
+                continue
+            selected = candidate
 
         block = ""
         if selected:
