@@ -3,6 +3,9 @@ docs/archive/
 CLAUDE.md
 AGENTS.md
 
+# 知识库（按要求不入库）
+knowledge/
+
 # 测试（按要求不入库）
 tests/
 

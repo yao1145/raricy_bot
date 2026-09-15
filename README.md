@@ -104,6 +104,10 @@ python -m pytest tests -q
 默认只对**私聊 + 白名单用户**开放；要在大厅公开必须显式配置（大厅仍需精确 @）。检索是
 标准库实现的词法匹配，不是语义检索；目录改动最长要等 `refresh_seconds` 才能被检索到。
 
+仓库自带的 `knowledge/` 收录站方对外文档（`docs/guide/`）的问答化改写：功能怎么用、
+有哪些限额、联机棋类怎么判胜负。它只含用户能看到的事实，源码实现与运维内容一概不收；
+取材范围、锁定提交与复核步骤见 [`docs/materials/SITE_DOCS_SOURCE.md`](docs/materials/SITE_DOCS_SOURCE.md)。
+
 ### 图片理解
 
 `model.vision_enabled: true` 且模型自身支持视觉时，用户当前这一轮发的图会随这一轮交给模型。

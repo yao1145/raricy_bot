@@ -4,6 +4,10 @@
 
 > 注意：`archive/` 被仓库根的 `.gitignore` 忽略，**归档文件不在版本控制里**，
 > 重命名或删除都没有 git 兜底。`materials/`、`usage/`、`design/` 与本文正常入库。
+>
+> 其中两份例外：`CHAT_IMAGE_INPUT_DESIGN.md` 与 `CHAT_IMAGE_INPUT_PLAN.md` 是 2026-09-15
+> 从 `design/` 移进来的，它们**进过版本控制**（最后修改于 `eecaaa9`），需要时可用
+> `git show eecaaa9:docs/design/<文件名>` 取回全文。归档目录里其余五份从未提交过。
 
 ## 现行口径在哪里
 
@@ -19,6 +23,7 @@
 | `materials/chat-bot.md` | 上游站点的聊天 API 契约，站方所写 | **不可变**。与其他任何文档冲突时以它为准，本项目只准用它 |
 | `materials/comment-bot.md` | 上游站点的博客评论 API 契约，站方所写 | **不可变**。评论读写、通知与限频冲突时以它为准 |
 | `materials/推文-Logos-发布稿.md` | 机器人形象的对外发布文案 | 与代码无关，仍在用 |
+| `materials/SITE_DOCS_SOURCE.md` | `knowledge/` 知识库的来源留痕：上游仓库与许可、锁定的提交 SHA、逐篇对照表、上游更新时的人工复核步骤 | **知识库内容的溯源口径**。全量重写无法自动跟随上游，改 `knowledge/` 前先读它 |
 
 ## usage/ —— 使用
 
@@ -41,6 +46,7 @@
 | `design/SYSTEM_PROMPTS.md` | 系统提示词的正式来源 + 站点速查表 | 提示词正文的权威副本，**但它不参与运行**：改完必须手动同步到 `config.yaml` |
 | `design/MCP_CHAT_SEARCH_DESIGN.md` | 聊天区 Exa MCP 搜索的总述、架构、接口与实现任务 | MCP 搜索的现行设计与验收口径 |
 | `design/EXA_ACCOUNT_POOL_AND_KB_DESIGN_PLAN.md` | Exa 授权密钥池与 `/kb` Markdown 知识库的架构、问题日志与实施状态 | 已实施；P0 的处置见文首「实施状态」，正式合同见 `INTERFACES.md` §22/§23 |
+| `design/SITE_DOCS_KB_DESIGN.md` | `knowledge/` 知识库**内容侧**的取材范围、删减规则、问答写法、留痕与验收口径 | 已实施（2026-09-15，15 篇 / 220 条）。只约束内容，运行行为见 `usage/EXA_POOL_AND_KB.md` |
 
 ## archive/ —— 归档（历史，不是现行口径）
 
@@ -53,6 +59,8 @@
 | `archive/BACKGROUND.md` | 项目最初的《设计文档（评审稿）》 |
 | `archive/CODE_REVIEW_2026-09-11.md` | 外部代码审查提出的四个问题（两 P1、两 P2），均已在提交 `0fd7026` 修复 |
 | `archive/IMPLEMENTATION_REPORT.md` | 首个可用版本的实现完成报告（含修复过程与验证方式） |
+| `archive/CHAT_IMAGE_INPUT_DESIGN.md` | 聊天图片输入（识图）的实现前设计稿。功能已上线：合同见 `design/INTERFACES.md` §20，裁决见 D-28 … D-30，测试见 `tests/test_vision.py` |
+| `archive/CHAT_IMAGE_INPUT_PLAN.md` | 上一条的实现计划与任务清单（同上，已上线；行为以 `design/` 与代码为准） |
 
 ## 仓库根（不在本目录）
 
