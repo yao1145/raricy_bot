@@ -13,6 +13,17 @@
 from __future__ import annotations
 
 from .access import MemoryAccessPolicy
+from .codec import (
+    CODEC_REASONS,
+    CodecError,
+    CodecReason,
+    CommonDocument,
+    PrivateDocument,
+    parse_common,
+    parse_private,
+    render_common,
+    render_private,
+)
 from .models import (
     STATUS_CONFLICT,
     STATUS_DUPLICATE,
@@ -36,9 +47,11 @@ from .models import (
     ProposalAction,
     user_storage_key,
 )
+from .service import MemoryService, PrivateSettings
 from .writer import MemoryModel, MemoryWriter
 
 __all__ = [
+    "CODEC_REASONS",
     "STATUS_CONFLICT",
     "STATUS_DUPLICATE",
     "STATUS_FORBIDDEN",
@@ -49,6 +62,9 @@ __all__ = [
     "STATUS_OK",
     "STATUS_SECRET_DETECTED",
     "STATUS_UNAVAILABLE",
+    "CodecError",
+    "CodecReason",
+    "CommonDocument",
     "MemoryAccessPolicy",
     "MemoryCandidate",
     "MemoryCaptureResult",
@@ -58,9 +74,16 @@ __all__ = [
     "MemoryProposal",
     "MemoryProposalResult",
     "MemoryScope",
+    "MemoryService",
     "MemoryTarget",
     "MemoryWriter",
     "OperationResult",
+    "PrivateDocument",
+    "PrivateSettings",
     "ProposalAction",
+    "parse_common",
+    "parse_private",
+    "render_common",
+    "render_private",
     "user_storage_key",
 ]
