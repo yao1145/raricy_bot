@@ -47,11 +47,20 @@ from .models import (
     ProposalAction,
     user_storage_key,
 )
+from .commands import (
+    USAGE_COMMAND,
+    MemoryCommand,
+    MemoryCommandRequest,
+    MemoryCommandResult,
+    parse_memory_command,
+)
+from .controller import MemoryController
 from .service import MemoryService, PrivateSettings
 from .writer import MemoryModel, MemoryWriter
 
 __all__ = [
     "CODEC_REASONS",
+    "USAGE_COMMAND",
     "STATUS_CONFLICT",
     "STATUS_DUPLICATE",
     "STATUS_FORBIDDEN",
@@ -68,7 +77,11 @@ __all__ = [
     "MemoryAccessPolicy",
     "MemoryCandidate",
     "MemoryCaptureResult",
+    "MemoryCommand",
+    "MemoryCommandRequest",
+    "MemoryCommandResult",
     "MemoryContext",
+    "MemoryController",
     "MemoryEntry",
     "MemoryModel",
     "MemoryProposal",
@@ -82,6 +95,7 @@ __all__ = [
     "PrivateSettings",
     "ProposalAction",
     "parse_common",
+    "parse_memory_command",
     "parse_private",
     "render_common",
     "render_private",
