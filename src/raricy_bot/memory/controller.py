@@ -48,6 +48,7 @@ from .models import (
     MemoryCaptureResult,
     MemoryEntry,
     MemoryScope,
+    OperationResult,
     ProposalAction,
 )
 from .service import MemoryService
@@ -70,9 +71,9 @@ _AUTO_CAPTURE_SOURCE: str = "chat"
 # 开自动），两个键必须不同，否则第二次调用会被第一次的 `operations` 命中而静默跳过。
 _SECOND_STEP_SUFFIX: str = ":second"
 
-# 失败状态 → 固定文案（§36）。表里没有的状态（`ok` / `noop`）走成功分支；`duplicate` 在 Beta
-# 不产生（§27.4），因此既不在表里，也不会被本模块制造出来。`forbidden` 也是例外：它的文案
-# 取决于命令是管理命令还是普通命令，见 `_service_forbidden_text`。
+# 失败状态 → 固定文案（§36）。成功只有 `ok` 与 `noop` 两种，其余任何状态（含 Beta 不产生的
+# `duplicate`）都不会落进成功分支，见 `_from_outcome` 的防御分支。`forbidden` 是表外的例外：
+# 它的文案取决于命令是管理命令还是普通命令，见 `_service_forbidden_text`。
 _FAILURE_TEXTS: dict[str, str] = {
     STATUS_UNAVAILABLE: texts.MEMORY_UNAVAILABLE_TEXT,
     STATUS_CONFLICT: texts.MEMORY_CONFLICT_TEXT,
@@ -101,10 +102,11 @@ class MemoryController:
 
     `service` / `writer` / `access` 三个依赖由装配方注入（D-67）。`auto_capture_available`
     是部署级开关 `MemoryConfig.auto_capture_available`：`/memory auto on` 只在它为真时成功
-    （§32.3「只在部署允许时成功」）。D-67 钉的签名里没有这个参数，而注入的三个依赖都读不到它
+    （§32.3「只在部署允许时成功」），自动提取也只在它为真时运行（§34.4 把它列为必须条件）。
+    D-67 钉的签名里没有这个参数，而注入的三个依赖都读不到它
     （`MemoryAccessPolicy` 只看门禁，`MemoryService` 不暴露 config），因此本模块把它作为第四个
     keyword-only 参数补上，默认 `False`（= 部署未开放，与配置默认值一致）并写进报告：
-    Task 11 装配时必须传入真实取值，否则 `/memory auto on` 会永远回 `forbidden`。
+    Task 11 装配时必须传入真实取值，否则 `/memory auto on` 与自动提取都会被永远拒绝。
 
     三个依赖按公开属性保存（`controller.writer` 等）：装配方与规划 §13.7 的代表性用例
     都从实例上直接读它们，而这个仓库里本来就有同样的写法（如 `comments/discovery.py`）。
@@ -222,13 +224,15 @@ class MemoryController:
         first = await self.service.set_private_enabled(
             request.user_id, False, operation_id=self._operation_id(request)
         )
-        if first.status not in (STATUS_OK, STATUS_NOOP):
-            return await self._from_outcome(request, first.status, first.object_id)
+        failure = await self._step_failure(request, first)
+        if failure is not None:
+            return failure
         second = await self.service.set_auto_capture(
             request.user_id, False, operation_id=self._second_operation_id(request)
         )
-        if second.status not in (STATUS_OK, STATUS_NOOP):
-            return await self._from_outcome(request, second.status, second.object_id)
+        failure = await self._step_failure(request, second)
+        if failure is not None:
+            return failure
         # 两步都到位才报成功；`ok` 与 `noop`（值本来就对）对用户是同一件事。
         return await self._from_outcome(request, STATUS_OK, None)
 
@@ -240,14 +244,28 @@ class MemoryController:
         first = await self.service.set_private_enabled(
             request.user_id, True, operation_id=self._operation_id(request)
         )
-        if first.status not in (STATUS_OK, STATUS_NOOP):
-            return await self._from_outcome(request, first.status, first.object_id)
+        failure = await self._step_failure(request, first)
+        if failure is not None:
+            return failure
         second = await self.service.set_auto_capture(
             request.user_id, True, operation_id=self._second_operation_id(request)
         )
-        if second.status not in (STATUS_OK, STATUS_NOOP):
-            return await self._from_outcome(request, second.status, second.object_id)
+        failure = await self._step_failure(request, second)
+        if failure is not None:
+            return failure
         return await self._from_outcome(request, STATUS_OK, None)
+
+    async def _step_failure(
+        self, request: MemoryCommandRequest, outcome: OperationResult
+    ) -> MemoryCommandResult | None:
+        """两步命令（`off` / `auto on`）的中间判定：这一步没到位就渲染成失败回复，否则 None。
+
+        `ok` 与 `noop`（值本来就对）都表示这一步已经到位，对用户是同一件事；两条路径共用同一个
+        判定，避免各自漂移。这里不碰撰写器，因此 §4.5 的顺序不受影响。
+        """
+        if outcome.status in (STATUS_OK, STATUS_NOOP):
+            return None
+        return await self._from_outcome(request, outcome.status, outcome.object_id)
 
     async def _auto_off(self, request: MemoryCommandRequest) -> MemoryCommandResult:
         """`/memory auto off`：只关自动提取，读取保持原样（不隐含关闭读取）。"""
@@ -270,11 +288,11 @@ class MemoryController:
             texts.memory_entry_line(memory_id=entry.memory_id, content=entry.content)
             for entry in entries
         )
-        # 空列表仍是 `not_found`（可见目标一个都没有），但文案必须自己说清是空的：
-        # 通用的「没有找到这条记忆」会让一个刚执行完 /memory list 的用户去看 /memory list。
-        status = STATUS_OK if entries else STATUS_NOT_FOUND
+        # 空列举是**成功**：用户没有点名任何目标，问题（当前有哪些条目）也已经回答，空态由
+        # 文案自己说清（§36）。回 `not_found` 会让 `_log_command` 把一次日常查看记成失败，
+        # 污染日志派生的健康信号 —— §27.4 的 `not_found` 只指「目标条目或候选不存在」。
         return self._result(
-            status,
+            STATUS_OK,
             texts.memory_entry_list_text(
                 scope=None if scope is None else scope.value, lines=lines
             ),
@@ -316,9 +334,9 @@ class MemoryController:
             )
             for item in candidates
         )
-        # 没有候选时说清「当前没有待批准的候选」，同样不用通用的「没有找到这条记忆」。
-        status = STATUS_OK if candidates else STATUS_NOT_FOUND
-        return self._result(status, texts.memory_candidate_list_text(lines=lines))
+        # 没有候选同样是成功：空态由文案自己说清（§36），不借 `not_found` —— 那个状态只指
+        # 「目标条目或候选不存在」（§27.4），而这里用户没有点名任何目标。
+        return self._result(STATUS_OK, texts.memory_candidate_list_text(lines=lines))
 
     async def _remember(self, request: MemoryCommandRequest) -> MemoryCommandResult:
         """`/remember <内容>`：显式私有记忆（规划 §8.1）；`operation_id` 是稳定合同。"""
@@ -428,8 +446,14 @@ class MemoryController:
     async def _auto_capture(
         self, *, user_id: str, message_id: int, source_text: str
     ) -> MemoryCaptureResult:
-        """一次自动提取：门禁 → 幂等 → 快照 → 撰写 → 宿主校验 → 原子写入。"""
+        """一次自动提取：门禁 → 部署开关 → 幂等 → 快照 → 撰写 → 宿主校验 → 原子写入。"""
         if not self.access.permits_private(user_id, _DM_KIND):
+            return self._capture(STATUS_FORBIDDEN)
+        if not self._auto_capture_available:
+            # §34.4 把部署开关与接入门并列为**必须**条件，这一步不能省：用户文件里的
+            # `auto_capture` 可能是旧值或被人手改过，只信它就等于运维关不掉自动写入。
+            # 状态取 `forbidden`（§27.4「访问门……拒绝」）：这是部署策略的拒绝，不是出错，
+            # 也不是 `noop`（那读起来像「没什么要做的」，会把拒绝藏起来）；未写入，无披露。
             return self._capture(STATUS_FORBIDDEN)
         settings = await self.service.private_settings(user_id)
         if not settings.auto_capture:
@@ -481,10 +505,14 @@ class MemoryController:
         if text is None and status == STATUS_FORBIDDEN:
             # 本模块自己的门禁之外，Service 也会回 `forbidden`（admin 复查或能力未启用）。
             text = _service_forbidden_text(request)
-        if text is None:
-            text = await self._success_text(
-                request, memory_id, opened=opened, removed=removed
-            )
+        if text is not None:
+            return self._result(status, text, memory_id)
+        if status not in (STATUS_OK, STATUS_NOOP):
+            # 防御分支：成功只有 `ok` 与 `noop` 两种。`duplicate` 在 Beta 不产生（§27.4），
+            # 但将来多出一个未知状态时也不许落进成功文案 —— 那会让用户看到「成功」形状的确认，
+            # 却配上对不上的对象 ID。按不可用处理：状态与文案成对，且不假装认识这个状态。
+            return self._result(STATUS_UNAVAILABLE, texts.MEMORY_UNAVAILABLE_TEXT)
+        text = await self._success_text(request, memory_id, opened=opened, removed=removed)
         return self._result(status, text, memory_id)
 
     async def _success_text(
