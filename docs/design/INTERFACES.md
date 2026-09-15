@@ -2305,10 +2305,12 @@ class MemoryCaptureResult:
     status: str              # 稳定状态；只有确实写入成功才是 "ok"
     memory_id: str | None    # 成功写入的条目 ID；其余情况 None
     content: str             # 成功写入的正文原文；其余情况空串
+    action: ProposalAction   # 本次是新增还是更新；未写入时取 ProposalAction.NOOP
 ```
 
-`MemoryCaptureResult` 是 §32.3 的 `auto_capture` 返回值：规划 §4.5 只给了类型名，
-字段在这里钉死，供 §34.4 的写入披露使用（见 D-63）。
+`MemoryCaptureResult` 是 §32.3 的 `auto_capture` 返回值：规划 §4.5 只给了类型名，字段在这里
+钉死（D-67）。`action` 不是装饰——设计 §6.3 要求披露必须让用户看清「是新增还是更新」，只看
+`status` 与 `memory_id` 表达不了（D-63）。
 
 ### 27.3 `MemoryTarget` 与 `user_storage_key()`
 
@@ -2345,7 +2347,7 @@ invalid_proposal | conflict | full | secret_detected
 |------|------|
 | `ok` | 操作已生效 |
 | `noop` | 无需变更（含自动提取的低置信度降级） |
-| `duplicate` | 重复：目标已存在（等价条目或候选）；规划未钉死具体使用点，实现按语义使用即可，但不得改写字符串 |
+| `duplicate` | **Beta 不产生**该状态：幂等重放返回的是第一次的稳定结果，不是 `duplicate`（D-67）。字符串仍留在稳定集合里，值不得改写或删除 |
 | `not_found` | 目标条目或候选不存在 |
 | `forbidden` | 访问门或 admin 判定拒绝 |
 | `unavailable` | 文件不可用（载入失败、原子写失败） |
@@ -2425,8 +2427,9 @@ def render_private(document: PrivateDocument) -> bytes: ...
 - 候选与已生效共同记忆放在**同一个** `common.md`，使批准可以在一次原子文件替换里同时完成
   「移出候选」和「加入生效区」（D-58）。
 - ID 形状：前缀 `GM-A-`（all_user）、`GM-L-`（lobby）、`MC-`（候选）、`UM-`（用户私有），后接
-  `next_*` / `next_id` 分配的十进制序号（示例为 6 位零填充，如 `GM-A-000007`）。前缀必须与所在区
-  一致。
+  `next_*` / `next_id` 分配的十进制序号；前缀必须与所在区一致。
+  **渲染规则（钉死）**：序号按 **6 位零填充**输出（`GM-A-000007`、`GM-L-000004`、`UM-000006`、
+  `MC-000010`）；**解析接受任意 ≥1 位宽度**的十进制序号，因此人工改窄或改宽过的文件仍能读回。
 - 用户文件不写原始 user ID、username、消息正文、模型回答或来源频道；`operations` 只存最近的
   幂等键、结果 ID 与 revision，不存命令正文。
 - `operations` 的键是宿主的 `operation_id`，形状 `<来源>:<message_id>`（示例 `"chat:348921"`；
@@ -2476,6 +2479,7 @@ class MemoryService:
         *,
         now: Callable[[], float] = time.time,
         replace: Callable[[str, str], None] = os.replace,
+        redactor: Redactor | None = None,
     ) -> None: ...
 
     async def start(self) -> None: ...
@@ -2490,6 +2494,7 @@ class MemoryService:
     ) -> MemoryContext: ...
 
     async def private_settings(self, user_id: str) -> "PrivateSettings": ...
+    def private_settings_cached(self, user_id: str) -> PrivateSettings | None: ...
     def private_path(self, user_id: str) -> str: ...
 
     async def set_private_enabled(
@@ -2537,6 +2542,15 @@ class MemoryService:
 
 - `private_path(user_id)` 是**同步**的只读方法，返回该用户 Markdown 的路径（用
   `user_storage_key` 命名；目录不存在时**不创建**）。它是唯一的路径访问入口（裁决 E / D-65）。
+- `private_settings_cached(user_id)` 同样是**同步**的只读方法：**只读内存快照、不做任何 I/O**，
+  该用户的快照还没加载或用户未知时返回 `None`（调用方按「未开启」处理）。它是 §34.1 的
+  `private_enabled` 回调的唯一数据源（D-67）。
+- **目录布局**（规划 §5.1）：`<root_dir>/common.md` 与 `<root_dir>/users/<64位用户存储键>.md`。
+  用户文件名是 §27.3 的 `user_storage_key`，原始 user ID 不出现在文件名里。
+- `redactor`：**生产装配必须传入**。传 `BotApp` 自有的那个实例即同时覆盖三类机密——它在构造时
+  登记密码与 `LLM_API_KEY`，登录成功后又被 `SiteClient` 追加会话 Cookie
+  （`site/client.py` 的 `add_secret(cookie)`；注册到日志单例的是另一次调用、另一个实例）。
+  它只用于 §30.2 的密钥筛。`None` 表示**不筛**，只允许出现在只读场景与测试里。
 - `start()` / `stop()`：`enabled=false` 时**不做任何事**（不建目录、不读文件、不启任务）。
   启用时创建或加载 `common.md`，并启动 `refresh_seconds` 周期的刷新任务；失败只记
   `memory.load_failed` / `memory.refresh_failed` 并保留 unavailable 状态，**绝不抛出**。
@@ -2566,12 +2580,15 @@ class MemoryService:
 `reject_candidate`、`delete_common`）的公共规则：
 
 - 入口**再次**校验 target 与 ID 前缀，不依赖 Router 或 Controller 已经授权。
-- 先查 `operations[operation_id]`：命中就返回第一次的稳定结果，**不再改动文件**。
+- 先查 `operations[operation_id]`：命中就返回第一次的稳定结果，**不再改动文件**。返回的是那次
+  操作原本的状态（通常是 `ok`），**不是** `duplicate`（D-67）。
 - 单进程内用一个 `asyncio.Lock` 串行所有写入（§30.3 的单写者约束）。
 - 容量上限（`max_common_entries_per_scope`、`max_private_entries_per_user`、`max_candidates`）
   命中时返回 `full`，**绝不静默删除**已有条目。
-- 写入前用现有 `Redactor` 对照已注册的密码、API Key 与 Cookie；脱敏前后不一致时**整条拒绝**
-  并返回 `secret_detected`，不保存 `[redacted]` 版本（§37）。
+- **密钥筛在 Service 的每个 mutation 入口做**（render 与写入之前；不放在 Controller，也不放在
+  renderer 里）：拿构造注入的 `redactor` 与任何将要写进 Markdown 的正文对照，脱敏前后不一致时
+  **整条拒绝**并返回 `secret_detected`，不保存 `[redacted]` 版本、不落盘、不把命中的字符串写进
+  日志（§30.1 的装配要求、§37）。
 - `/memory clear` 删除全部私有条目，但保留必要的幂等元数据，因此清空后重放旧命令不会再次执行
   （§32.3、D-59）。
 
@@ -2760,6 +2777,9 @@ def parse_memory_command(text: str) -> MemoryCommand | None: ...
 | `/memory approve <MC-ID>` / `/memory reject <MC-ID>` | `"approve"` / `"reject"` | ID 原样 | `None` |
 | `/memory delete <GM-A- 或 GM-L- ID>` | `"delete"` | ID 原样 | `None` |
 
+`/memory list` 的两种形式语义不同（无参数是查看自己的私有条目，带 scope 是列已生效共同记忆），
+见 §32.3。
+
 解析规则（`parse_memory_command`，纯函数）：
 
 - 只在**消息开头**生效，大小写不敏感；`/memoryx`、`/memoryfoo`、正文中间的 `/memory`、
@@ -2802,7 +2822,13 @@ class MemoryController:
   目标作用域由命令解析固定，AI 只撰写候选（D-58）。
 - `/memory approve` **不再调用 AI**：直接把候选原子移入生效区；候选的目标条目已被改动时返回
   `conflict`，要求重新生成候选，不覆盖新内容。
-- `/memory list all_user|lobby` 只展示**已生效**共同记忆；候选只对管理员显示。
+- `/memory list`（`scope is None`）列出**调用者自己的私有条目**——这就是设计 §6.4 要求的查看入口；
+  `/memory list all_user|lobby` 列出**已生效**共同记忆，任何通过 Beta 接入门的用户都能看。
+  两种形式都只展示已生效内容；候选只对管理员显示（`/memory candidates`）。
+- **首次开启的说明**（设计 §11、D-66）：`/memory on` 与 `/memory auto on` 的**成功回复**，以及
+  一次「隐式打开读取」的 `/remember` 成功回复，都必须带上那段简明说明——保存（或将要保存）了
+  什么、记忆可能随请求发送给第三方模型、私有记忆只在本私聊使用、如何查看与删除。
+  **不加任何持久标记**（不记录「已经说过」）：说明就挂在开启动作的那条回复上。
 - `auto_capture` 采用高精度策略：`automatic=True`，只有**成功变更**才返回 `ok`；它不接收模型
   回答、搜索结果、知识库片段、引用正文或图片描述（**签名里就没有这些参数**）。
   `MemoryCaptureResult.content` 是写入后的正文原文，供 §34.4 拼写入披露。
@@ -2849,9 +2875,9 @@ def build_messages(
   1. system、静态 addendum 与本轮 `pending_user` **永远保留**。
   2. 已位于 `pending_user` 的本轮显式资料（`/kb`、博客）优先于全部记忆。
   3. 普通聊天至少保留最近一组完整历史；`feature_context=True` 时这组历史也可丢（D-38 不变）。
-  4. 选择次序：DM 私有 > `all_user`；大区 `lobby` > `all_user`；评论只有 `all_user`。
-  5. 同一组内 `pinned` 优先，再按更新时间新到旧。
-  6. 记忆放好后，用剩余预算从新到旧补更早的完整历史对。
+  4. 记忆之间按 `context_for` 返回的 `priority` 次序取（作用域规则与组内次序的定义在 §30.2，
+     这里不重述）。
+  5. 记忆放好后，用剩余预算从新到旧补更早的完整历史对。
 - 每条记忆是**不可拆分单位**：塞不下就跳过该条，绝不截半句。
 - 历史仍按时间正序输出；记忆按作用域分组放在**最后一条 `role="user"` 消息的当前正文之前**，
   版面照规划 §6.2 末尾的文本块：
@@ -2894,10 +2920,12 @@ class MessageRouter:
                  storage: StorageConfig, now: Callable[[], float] = time.time,
                  vision_enabled: bool = False, kb_enabled: bool = False,
                  memory_access: MemoryAccessPolicy | None = None,
-                 memory_queue: asyncio.Queue[MemoryCommandRequest] | None = None) -> None
+                 memory_queue: asyncio.Queue[MemoryCommandRequest] | None = None,
+                 private_enabled: Callable[[str | None], bool] | None = None) -> None
 ```
 
-- 两者都为 `None` 时行为与今天**逐字节一致**（未注入兼容）。
+- 记忆相关的三个参数（`memory_access` / `memory_queue` / `private_enabled`）都为 `None` 时行为与
+  今天**逐字节一致**（未注入兼容）：`memory_allowed` 恒 `False`，`private_enabled` 恒 `False`。
 - `Request` 增加 `memory_allowed: bool = False`，由 Router 用当前 `message.author.id` 计算；
   门禁关闭或未注入时恒为 `False`。
 - `RouteResult.action` 增加 `"memory_queued"`，**不是** `"queued"`：app 不会把它当聊天请求
@@ -2920,8 +2948,9 @@ class MessageRouter:
      终态由记忆 worker 负责（`mark_handled`，见 34.3）。
 2. 普通聊天：`memory_allowed = memory_access.permits_common(message.author.id)`。
 3. `/help` 的文案改为调用 `help_text(...)`（§36），参数取 `vision_enabled`、`kb_enabled`、
-   `memory_allowed`（当前作者是否可用记忆）与 `private_enabled`（当前作者的私有记忆开关；
-   拿不到时按 `False`）。
+   `memory_allowed`（当前作者是否可用记忆）与 `private_enabled`（注入的回调，用当前消息的
+   `author.id` 求值；回调**必须是同步、无 I/O 的**，未注入或取不到时按 `False`）。
+   `BotApp` 把这个回调接到 `MemoryService.private_settings_cached`（§30.1、D-67）。
 4. `/reset` 行为完全不变（规划 §9.2）。
 
 ### 34.2 App 装配与生命周期
@@ -2938,17 +2967,18 @@ class MessageRouter:
 1. `MemoryService.start()` 创建或加载共同记忆；失败只记稳定错误并保留 unavailable 状态；
 2. 构造 `MemoryWriter` 与 `MemoryController`；
 3. 启动记忆 worker（并发 1）；
-4. 构造 Router 时注入 access policy 与 memory queue；
+4. 构造 Router 时注入 access policy、memory queue 与 `private_enabled` 回调
+   （接到 `MemoryService.private_settings_cached`）；
 5. 构造 CommentRouter / CommentService 时注入 memory access 与只读 context provider。
 
 `memory.enabled=false` 时**全部跳过**，且不创建目录（D-60）。
 
-关闭顺序（规划 §9.4）：
+关闭顺序（规划 §9.4；**本节是权威版本**，§16 / §16.1 里那些更细的既有动作并入本顺序）：
 
 1. 停评论服务与 SSE，停止产生新请求；
 2. 停主聊天 worker **和记忆 worker**；
 3. 停 `MemoryService` 的刷新任务；
-4. 再关 MCP、KB、模型客户端、SiteClient 与 Store。
+4. 再依次关闭 OpsServer、MCP、KB、模型客户端、SiteClient 与 Store。
 
 **记忆 worker 必须早于模型客户端关闭**，否则在途 AI 撰写会访问已关闭的客户端。
 
@@ -2984,14 +3014,19 @@ class MessageRouter:
   （已更新私有记忆 UM-000006：在 Python 相关回答中优先使用 Python 3.12。）
   ```
 
-- 发送前为说明**预留输出空间**（裁决 D / D-63）：先
-  `truncate_at_paragraph(answer, max_output_chars - len(disclosure) - len(TRUNCATION_SUFFIX))`，
-  再拼接披露文本；保证 Sender 的第二次截断不会切掉披露。
-  （`text_utils.truncate_at_paragraph(text, limit) -> tuple[str, bool]`，结果**已含**
-  `TRUNCATION_SUFFIX`，取第一个返回值；预算因此正好是 `max_output_chars - len(disclosure)`。）
+- 发送前为说明**预留输出空间**（裁决 D / D-63）：回答部分最多可占
+  `X = behavior.max_output_chars - len(disclosure)`。`truncate_at_paragraph` 会在结果末尾追加
+  `TRUNCATION_SUFFIX`（返回值最长可达 `limit + len(TRUNCATION_SUFFIX)`），所以加给它的上限必须
+  **再减去** `len(TRUNCATION_SUFFIX)`：
+  `limit = X - len(TRUNCATION_SUFFIX)`，`body, _ = truncate_at_paragraph(answer, limit)`，
+  再拼 `body + disclosure`
+  （`text_utils.truncate_at_paragraph(text, limit) -> tuple[str, bool]`，取第一个返回值）。
+  这样 Sender 的第二次截断（按 `max_output_chars`）不会切掉披露。
 - 撰写失败、超时、`noop` 或写入失败：原回答照常发送，**不追加**成功说明。
 - 记忆提交与站内回复不是一个分布式事务：记忆提交后发送失败时记忆仍然存在（规划 §8.3）；
   该取舍要写进代码注释。
+- 披露的措辞必须区分**新增**与**更新**（`MemoryCaptureResult.action`，设计 §6.3 要求用户看清
+  「是新增还是更新」），例如 `（已新增私有记忆 UM-000006：…）` / `（已更新私有记忆 UM-000006：…）`。
 - 日志只用 `memory.auto_capture` 事件与白名单字段（`memory_id`、`scope`、`reason`）。
 
 ## 35. 评论集成（`comments/router.py`、`comments/service.py`）
@@ -3028,11 +3063,13 @@ def help_text(
 
 行为：
 
-- **记忆未启用**（或用户未通过 Beta 门）时，`help_text` 的四个既有组合必须与今天的
-  `HELP_TEXT` / `HELP_TEXT_WITH_VISION` / `HELP_TEXT_WITH_KB` / `HELP_TEXT_WITH_VISION_AND_KB`
-  **逐字节相同**；既有测试不得改动（裁决 F / D-64）。四个常量可以保留为函数结果或兼容常量。
-- `channel_kind == "lobby"` 时使用含大区共享链说明的那段（今天 `_HELP_TAIL` 的一部分），
-  因此 `_HELP_TAIL` 需要拆成可组合的两段。
+- `memory_allowed=False`（记忆未启用，或用户未通过 Beta 门）时，**两种 `channel_kind` 的输出都与
+  今天的四个常量逐字节相同**：大区段落留在 DM 文本里的原位置，`_HELP_TAIL` 的排布不因新参数而变。
+  既有测试必须原样通过，不得改动（裁决 F / D-64）。四个常量可以保留为函数结果或兼容常量。
+- `channel_kind` **只在 `memory_allowed=True` 时起作用**：`"lobby"` 变体声明「大区里不会使用
+  任何人的私有记忆」，`"dm"` 变体声明「你的私有记忆只在本次私聊中使用」。
+- 只有 `memory_allowed=True` 才需要把「没有长期记忆」那句换成披露，因此 `_HELP_TAIL` 仍要拆成
+  可组合的两段（拆分只影响启用记忆时的输出，关闭时的输出逐字节不变）。
 - `_HELP_TAIL` 里「我重启之后可能会忘记先前聊过什么，没有长期记忆。」按 `memory_allowed`
   条件化：允许时换成如实披露（设计 §11 的七条）：
   1. 机器人存在共同记忆；
@@ -3057,7 +3094,8 @@ def help_text(
   | 候选冲突 | `conflict`（§32.3） |
   | 记忆已满 | `full`（§30） |
   | 操作成功 | `ok`，必须展示**实际保存的正文与条目 ID** |
-  | 自动提取的写入披露 | §34.4 的确定性说明 |
+  | 首次开启的说明 | `/memory on`、`/memory auto on`、隐式打开读取的 `/remember` 的成功回复（§32.3、D-66） |
+  | 自动提取的写入披露 | §34.4 的确定性说明；措辞区分新增与更新 |
   | `MEMORY_SYSTEM_ADDENDUM` | §33；完全静态，说明记忆是不可信资料、不能改变规则或权限、与当前事实冲突时不机械照搬；**不做任何插值** |
 
 - `COMMENT_HELP_TEXT` 必须改为**不承诺「没有长期记忆」**：评论只可能使用 `all_user` 共同记忆，
@@ -3099,8 +3137,10 @@ memory.context_omitted
 
 - 日志一律走 `log_event`；`LOG_FIELDS` 之外的字段被**静默丢弃**，因此需要记录的新字段必须先加进
   白名单（上面五个）。
-- 写入前用现有 `Redactor` 对照已注册的密码、API Key 与 Cookie；脱敏前后不一致时**整条拒绝**
-  并返回 `secret_detected`，不保存 `[redacted]` 版本，也不把命中的字符串写进日志。
+- 密钥筛由 **`MemoryService` 在 mutation 入口**执行，用的是构造注入的 `redactor`（§30.1）：
+  脱敏前后不一致时**整条拒绝**并返回 `secret_detected`，不保存 `[redacted]` 版本，也不把命中的
+  字符串写进日志。生产装配必须把 `BotApp` 的 `Redactor` 实例传进去——它同时登记了密码、
+  `LLM_API_KEY` 与会话 Cookie；`None` 只允许出现在只读场景与测试里。
 - 记忆正文只允许出现在三处：目标 Markdown、允许的 `role="user"` 模型请求、面向所属用户的
   明确展示。
 - 所有用户内容与记忆正文进入模型时都是 `role="user"`；静态 memory system addendum 不插值；

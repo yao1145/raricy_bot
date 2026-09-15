@@ -1000,8 +1000,11 @@ SQLite 本身就违反日志与存储红线（D-15 同款）。
 - `help_text(*, channel_kind, vision_enabled, kb_enabled, memory_allowed, private_enabled)` 在
   `memory_allowed=False` 时必须与今天的四个常量（`HELP_TEXT`、`HELP_TEXT_WITH_VISION`、
   `HELP_TEXT_WITH_KB`、`HELP_TEXT_WITH_VISION_AND_KB`）**逐字节相同**；既有测试不得改动。
-- `channel_kind == "lobby"` 使用含大区共享链说明的那段（今天 `_HELP_TAIL` 的一部分），因此
-  `_HELP_TAIL` 需要拆成可组合的两段。
+- `channel_kind` **只在 `memory_allowed=True` 时起作用**：`"lobby"` 变体声明「大区里不会使用任何
+  人的私有记忆」，`"dm"` 变体声明「你的私有记忆只在本次私聊中使用」。
+  `memory_allowed=False` 时两种 `channel_kind` 的输出都与今天的四个常量逐字节相同：大区段落留在
+  DM 文本里的原位置，`_HELP_TAIL` 的排布不因新参数而变（只有 `memory_allowed=True` 才需要把
+  「没有长期记忆」那句换掉，因此 tail 仍要拆成可组合的两段）。
 - `memory_allowed=True` 时把「没有长期记忆」那句换成如实披露（设计 §11 的七条，§36）。
 
 理由：帮助文案是用户唯一能看到的公布口径（D-13 同款）。测试与文档都拿它当现状基线；为新功能
@@ -1019,3 +1022,49 @@ Markdown 的路径（用 §27.3 的 `user_storage_key` 命名；目录不存在�
 理由：测试要读回真实文件来断言原子替换语义（规划 §13.3），没有合法入口就只能去猜文件名规则，
 而文件名规则（存储键）本身是不该被复制的知识。把入口收成一个只读方法，既让测试可写，又不必把
 目录布局变成公开合同。
+
+## D-66 首次开启私有记忆的说明挂在开启动作的回复上，不加持久标记
+
+原文（设计 §11）：
+
+> 用户首次开启私有记忆或自动记忆时，应看到一次简明、明确的说明。不能只在长篇隐私文档深处披露，
+> 也不能把开启其他功能解释为同意长期保存。
+
+裁决：
+
+- 规划 §11 只要求帮助文案如实披露，漏掉了这一条；Beta 按设计实现：`/memory on` 与
+  `/memory auto on` 的**成功回复**，以及一次「隐式打开读取」的 `/remember` 成功回复，都带上
+  那段简明说明。
+- 说明必须覆盖：保存（或将要保存）了什么；记忆可能随相关请求发送给第三方模型；私有记忆只在该
+  用户私聊中使用；如何查看与删除。
+- **不加持久状态**：不记录「已经说过」，不新增 front matter 键，也不依赖 `operations`。说明就挂在
+  **开启动作的那条回复**上；同一次开启被重放时按幂等返回第一次的回复，因此仍是同一份说明。
+- 措辞与其余固定文案一起放在 `texts.py`（§36）。
+
+理由：把「说过一次」持久化，等于为一个纯披露动作新开一份跨重启状态，而它要防的风险（用户不知道
+自己在被记住）在**每一次开启**时都同等存在。挂在动作回复上既满足设计 §11 的「开启时看到」，
+也不需要任何记账；幂等键已经保证重放不会多出第二条回复。
+
+## D-67 Task 1 自造（规划未定义）的合同项一次记全
+
+原文（规划 §4.3、§4.4、§4.5、§7.2）：
+
+> 规划给出了 `MemoryService` 的方法表、`MemoryWriter` 的构造与两个撰写方法、三个命令 dataclass
+> 以及 `execute_command` / `auto_capture`，但没有给 `PrivateSettings`、`MemoryCaptureResult`、
+> `MemoryController.__init__`、`MemoryCommand.name` 的取值，也没有说明 `duplicate` 何时产生。
+
+裁决：下面六项由本合同（Task 1）钉死，后续任务不得各自发明：
+
+| 项 | 合同 | 为什么 |
+|----|------|--------|
+| `MemoryCaptureResult` | `{status, memory_id, content, action: ProposalAction}`；未写入时 `action = NOOP` | Task 13 的写入披露要展示「保存了什么」与「是新增还是更新」（设计 §6.3），状态加 ID 表达不了 |
+| `PrivateSettings` | 冻结 dataclass `{private_enabled: bool, auto_capture: bool}`，随 `memory/service.py` 定义 | `private_settings()` 的返回类型在规划里只有名字；这两个字段就是它唯一要回答的问题 |
+| `MemoryController.__init__` | keyword-only：`(*, service, writer, access)` 三个依赖，类型分别是 `MemoryService` / `MemoryWriter` / `MemoryAccessPolicy` | Task 7 要实现它、Task 11 要装配它；没有签名两边只能各猜一个 |
+| `MemoryCommand.name` 取值 | `status / on / off / auto_on / auto_off / list / forget / clear / remember / suggest / candidates / approve / reject / delete`；空参数与非法 ID 落成 `argument is None` | 规划只给了「三个 dataclass」，没给 `name` 的字面量，而 Controller 的分派与测试都依赖它 |
+| `duplicate` | Beta **不产生**该状态：幂等重放返回第一次的稳定结果 | 幂等命中是「复用上次的结果」；改写成 `duplicate` 会让重放与首次不可区分，还会把一次成功的保存显示成失败 |
+| `MemoryService.private_settings_cached` | 同步只读方法，返回 `PrivateSettings` 或 `None`；只读内存快照、不做 I/O | `/help` 的 `private_enabled` 措辞需要它，而 `/help` 是本地命令，不能为了一个措辞去读文件 |
+| `MemoryService.__init__` 的 `redactor` | 新增 keyword-only 参数，类型为 `Redactor` 或 `None`，默认 `None`（不筛）；每个 mutation 入口用它筛密钥 | 规划没给脱敏通道，而「命中密钥就整条拒绝、不保存脱敏版本」必须先有一个装好密钥的 `Redactor`；生产装配传 `BotApp` 的实例（密码 + API Key + 会话 Cookie） |
+
+理由：合同的作用就是让后面 13 个任务的实现者不必各自解释同一件事。这些项在规划里只有名字或干脆
+没有，但每一项都被至少两个任务共享（Task 7 与 13、Task 7 与 11、Task 10 与 11），不钉死就会在
+接口处对不上。
