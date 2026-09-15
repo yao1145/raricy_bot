@@ -15,17 +15,17 @@
 
 ```
 config.yaml: system_prompt
-  -> src/raricy_bot/config.py:167        读为必填项，同时算出 system_prompt_sha256
-  -> src/raricy_bot/app.py:380           随每个请求传入
-  -> src/raricy_bot/core/context.py:132  作为 messages 里唯一一条 role="system"
+  -> src/raricy_bot/config.py:372,382    读为必填项，同时算出 system_prompt_sha256
+  -> src/raricy_bot/app.py:1145          随每个请求传入
+  -> src/raricy_bot/core/context.py:280  作为 messages 里唯一一条 role="system"
 ```
 
-用户正文与引用原文始终进 `role="user"`（`app.py:450` 的 `_apply_reply_prefix` 只把
+用户正文与引用原文始终进 `role="user"`（`app.py:1539` 的 `_apply_reply_prefix` 只把
 `[引用 @作者]` ／大区的 `[直接引用 @作者]` 前缀拼到当前轮，D-25），**不会拼进 system**；
 大区还会额外拼一段静态附加说明（见 1.6）。所以本文件写的是模型的固定人格与
 规则，不是可变的对话模板：写在这里的每一句都跟用户说了什么无关。
 
-改动会改变 `system_prompt_sha256`（正文的 SHA-256 前 12 位十六进制，`config.py:177`）。
+改动会改变 `system_prompt_sha256`（正文的 SHA-256 前 12 位十六进制，`config.py:382`）。
 日志只记这个指纹、不记正文，可用来核对线上跑的是哪一版。
 
 ### 1.2 上下文预算

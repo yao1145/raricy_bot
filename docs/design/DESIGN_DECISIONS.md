@@ -1059,7 +1059,7 @@ Markdown 的路径（用 §27.3 的 `user_storage_key` 命名；目录不存在�
 |----|------|--------|
 | `MemoryCaptureResult` | `{status, memory_id, content, action: ProposalAction}`；未写入时 `action = NOOP` | Task 13 的写入披露要展示「保存了什么」与「是新增还是更新」（设计 §6.3），状态加 ID 表达不了 |
 | `PrivateSettings` | 冻结 dataclass `{private_enabled: bool, auto_capture: bool}`，随 `memory/service.py` 定义 | `private_settings()` 的返回类型在规划里只有名字；这两个字段就是它唯一要回答的问题 |
-| `MemoryController.__init__` | keyword-only：`(*, service, writer, access)` 三个依赖，类型分别是 `MemoryService` / `MemoryWriter` / `MemoryAccessPolicy` | Task 7 要实现它、Task 11 要装配它；没有签名两边只能各猜一个 |
+| `MemoryController.__init__` | keyword-only：`(*, service, writer, access)` 三个依赖，类型分别是 `MemoryService` / `MemoryWriter` / `MemoryAccessPolicy` | Task 7 要实现它、Task 11 要装配它；没有签名两边只能各猜一个。**D-80 修订**：实现期补上第四个 keyword-only 参数 `auto_capture_available: bool = False`，装配方必须显式传值 |
 | `MemoryCommand.name` 取值 | `status / on / off / auto_on / auto_off / list / forget / clear / remember / suggest / candidates / approve / reject / delete`；空参数与非法 ID 落成 `argument is None` | 规划只给了「三个 dataclass」，没给 `name` 的字面量，而 Controller 的分派与测试都依赖它 |
 | `duplicate` | Beta **不产生**该状态：幂等重放返回第一次的稳定结果 | 幂等命中是「复用上次的结果」；改写成 `duplicate` 会让重放与首次不可区分，还会把一次成功的保存显示成失败 |
 | `MemoryService.private_settings_cached` | 同步只读方法，返回 `PrivateSettings` 或 `None`；只读内存快照、不做 I/O | `/help` 的 `private_enabled` 措辞需要它，而 `/help` 是本地命令，不能为了一个措辞去读文件 |
@@ -1237,7 +1237,7 @@ service 内部与测试一并改，并且**阻塞 Task 7**（它调用这四个�
 裁决：**实施者的读法正确，采纳**。请求刻意不带作者 ID，因此下游只剩一个已经算好的布尔；若在
 取用处拿 `None` 当作者去向 allowlist 策略**再问一遍**，`permits_common(None)` 恒为假——结果是
 **默认的 Beta 模式（allowlist）下评论一条共同记忆都读不到**：功能看着接好了，永远为空，且没有任何
-报错。所以 `CommentService` 收到的不是策略而是**决策载体**（`app.py:103-126` 的
+报错。所以 `CommentService` 收到的不是策略而是**决策载体**（`app.py:135-153` 的
 `_CommentMemoryAccess`）：它转达 Router 已经做出的那个决定，私有一律 `False`，并且 provider 把
 `channel_kind` 钉死为 `"comment"`，可解析的作用域因此只剩 `all_user`（§28 / §30.2 的表）。
 §28 的空作者规则仍然成立，因为载体在 Router 那一步根本没被咨询：
@@ -1272,7 +1272,7 @@ provider 拿不到参数，用一个可变的共享标志去传 Router 的布尔
 
 - **启动期**（§26.2 第 13 条）：`enabled` 且 `auto_capture_available` 时校验上面的式子，
   装不下就 `ConfigError`，让错误的配置根本起不来；
-- **运行期**（`app.py:786-804`）：`limit = max_output_chars - len(披露) - len(TRUNCATION_SUFFIX)
+- **运行期**（`app.py:826-844`）：`limit = max_output_chars - len(披露) - len(TRUNCATION_SUFFIX)
   - 脱敏增长`，只要 `limit < 1` 就**放弃披露、原回答整条照发**，并记一条
   `memory.auto_capture reason=disclosure_no_room` 的 WARNING。
 
@@ -1350,5 +1350,45 @@ Task 5 逐字实现了那一行；开关的存储与用户可见文案属于 Tas
   快照（读取开关必须先读文件），任何 `/memory` 命令（含 `/memory status`）同样会加载它。
 - `/help` 只是措辞；权威的开关状态在 `/memory status`，它走异步读文件，重启后第一句就是准确的。
 
+**考虑过并放弃的第三种修法**：改 `_HELP_MEMORY_DISCLOSURE_DM_OFF`（`texts.py:100-102`）的措辞，
+让它不陈述当前状态（例如「如果还没开启，可以发送 /memory on…；当前状态用 /memory status 查看」）。
+这段文案是新加的、只在记忆已注入时出现（因此不触碰 §36 的「关闭时逐字节不变」），改成条件句后
+既不陈述不可核验的事实，也不多花一次 I/O、不动任何合同，唯一代价是真正关闭私有记忆的用户失去
+那句平整的断言——判定这个代价不值得：`/help` 这一句的职责是陈述现状，引导已由 D-66 的首次开启
+说明承担，而一句「如果还没开启」会让本来没开的人自己去猜到底开没开。
+
 将来若要闭合，正确方向是给 `/help` 一条**异步**的措辞预取（例如 Router 在处理任何 DM 消息时先
 `await` 一次 `private_settings`），而不是让同步回调偷偷做 I/O，也不是在启动期扫描用户目录。
+
+## D-80 `MemoryController.__init__` 的第四个参数：部署级开关必须显式注入（§32.3 / D-67 修订）
+
+原文（INTERFACES §32.3）：
+
+> def __init__(self, *, service: MemoryService, writer: MemoryWriter,
+>              access: MemoryAccessPolicy) -> None: ...
+
+原文（本文件 D-67 的表格行）：
+
+> | `MemoryController.__init__` | keyword-only：`(*, service, writer, access)` 三个依赖，
+> 类型分别是 `MemoryService` / `MemoryWriter` / `MemoryAccessPolicy` | Task 7 要实现它、
+> Task 11 要装配它；没有签名两边只能各猜一个 |
+
+背景（合同复核）：Task 7 的实现给构造函数补了第四个 keyword-only 参数
+`auto_capture_available: bool = False`（`memory/controller.py:121`），Task 11 在装配处传入配置值
+（`app.py:628-635`）。两份合同正文都停在三个依赖上，没有一处回头改，于是「照合同实现」与
+「照代码读合同」会得到两个不同的控制器。
+
+裁决：**采纳实现，修订 §32.3 与 D-67 的签名**为
+`(*, service, writer, access, auto_capture_available: bool = False)`，取值来自部署级
+`MemoryConfig.auto_capture_available`。它在两处生效，都是「部署没开放就不该发生」：
+`/memory auto on` 直接返回 `forbidden`（§36 的专用文案，与「你不是管理员」分开，即 §32.3
+「只在部署允许时成功」），以及 `auto_capture` 在 Beta 访问门**之后**的第二道复查（§34.4 把它与
+接入门并列为**必须**条件；`memory/controller.py:241` 与 `:452`）。
+
+理由：三个注入依赖都读不到这个配置——`MemoryAccessPolicy` 只回答门禁，`MemoryService` 不暴露
+config，`MemoryWriter` 只带撰写侧的旋钮（`max_context_tokens` / `max_entry_chars` 等），而
+§34.4 的条件列表要求控制器自己知道部署开关。默认 `False` 是刻意与配置默认值对齐的
+fail-closed，代价也正落在这个默认值上：照旧合同实现、或因故漏传的装配方拿到的是 `False`，
+表现是 `/memory auto on` 永远被拒、自动提取永远不跑，而且**没有报错、没有日志、没有测试失败**
+——一个静默失效的缺省值。因此修订后的 §32.3 把「装配方必须显式传真实取值」写进签名旁的规则里：
+只留一个自解释的默认值不够，这个默认值恰恰是漏传时的伪装。

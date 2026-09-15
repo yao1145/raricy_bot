@@ -2243,11 +2243,12 @@ memory: MemoryConfig = field(default_factory=MemoryConfig)
     最长 ID 取「`UM-` 加九位十进制」（本实现是 `UM-999999999`），比 §29 的六位规范多算三位，
     只是把校验卡得更早；真的涨过九位时由 §34.4 的运行期分支接住。
 
-    - **门控与第 11 条同源**（`config.py:1009-1011` 的 R6 原则）：没打开自动提取的部署不该
-      因为这个组合启动失败——用户侧的 `auto_capture` 是运行时状态，部署没允许时它根本打不开。
+    - **门控与第 11 条同源**（`config.py:1012` 的 `if enabled:` 与它下面两句注释）：没打开自动
+      提取的部署不该因为这个组合启动失败——用户侧的 `auto_capture` 是运行时状态，部署没允许时
+      它根本打不开。
     - 这条校验的算术依赖两个今天成立、但站在**文案**那一侧的前提：`memory_auto_capture_text`
-      的长度只随 `content` 线性增长（`texts.py:421-427`，拼接只有 `+`，没有截断或转义），
-      以及「已新增」与「已更新」两种措辞**等长**（`texts.py:390-391`）。将来改这两处文案的人
+      的长度只随 `content` 线性增长（`texts.py:443-449`，拼接只有 `+`，没有截断或转义），
+      以及「已新增」与「已更新」两种措辞**等长**（`texts.py:412-413`）。将来改这两处文案的人
       必须回头看本条：更长的动作词或任何对正文的加工都会让这里预留的空间变小，而失效的表现是
       **启动报错**，不是悄悄降级。
     - 它只保证「脱敏增长为零」时的余量：`max_entry_chars` 是 codec 对正文字符数的上限，
@@ -2885,7 +2886,8 @@ def parse_memory_command(text: str) -> MemoryCommand | None: ...
 ```python
 class MemoryController:
     def __init__(self, *, service: MemoryService, writer: MemoryWriter,
-                 access: MemoryAccessPolicy) -> None: ...
+                 access: MemoryAccessPolicy,
+                 auto_capture_available: bool = False) -> None: ...
 
     async def execute_command(
         self, request: "MemoryCommandRequest"
@@ -2905,6 +2907,11 @@ class MemoryController:
 
 规则：
 
+- **构造参数 `auto_capture_available`**（keyword-only，默认 `False`，取值来自部署级
+  `MemoryConfig.auto_capture_available`，D-80）：`/memory auto on` 只在它为真时成功
+  （`forbidden` + §36 的专用文案），自动提取也只在它为真时运行（§34.4 把它与 Beta 接入门
+  并列为**必须**条件）。三个注入依赖都读不到这个配置，装配方（`app.py` 的 `_start_memory`）
+  必须传真实取值；漏传时默认 `False` 的表现是**静默**地永远拒绝——没有报错、没有日志。
 - 显式 `/remember` 的 `operation_id` 是 `"remember:<message_id>"`（稳定合同）。重复 SSE、
   resync 或崩溃重放先查 Markdown 的 `operations`；命中时**不再调用 AI**，直接返回第一次的
   稳定结果。

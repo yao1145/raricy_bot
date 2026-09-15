@@ -429,9 +429,10 @@ memory:
 
 记忆自己的日志只有 `memory.*` 这几个事件（`ready` / `load_failed` / `refresh_failed` /
 `command` / `write_failed` / `updated` / `candidate_updated` / `auto_capture` / `context_omitted`），
-字段只有 `scope`、`revision`、`entry_count`、`memory_id`、`candidate_id`：**正文、key、用户 id、
-存储键、路径与文件摘要都不会进日志**。所以「某条记忆为什么没生效」只能靠用户自己用
-`/memory list` 看，不要指望日志。
+字段取自 §37 为记忆**新增**的那五个（`scope`、`revision`、`entry_count`、`memory_id`、
+`candidate_id`）加上白名单里原有的通用字段（`status`、`reason`、`error`、`message_id` 等）：
+**正文、key、用户 id、存储键、路径与文件摘要都不会进日志**（白名单外的字段一律被丢弃）。
+所以「某条记忆为什么没生效」只能靠用户自己用 `/memory list` 看，不要指望日志。
 
 一条值得记住的告警：`memory.auto_capture` 带 `reason=disclosure_no_room`（WARNING）表示
 `behavior.max_output_chars` 相对 `memory.max_entry_chars` 太紧——这一轮的记忆**已经写进去了**，
