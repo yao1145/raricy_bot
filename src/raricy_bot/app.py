@@ -12,6 +12,9 @@
   `memory.enabled=false` 时整段跳过，不建目录也不注入任何能力（D-60）；
 - 路由结果分派：`reply_now` 用 `notice_local`、`busy` 用 `notice` 并加 (频道, 触发者) 冷却；
   `memory_queued` 什么都不做（终态由记忆 worker 负责，§34.3）；
+- 自动提取（§34.4）只在主模型给出回答之后、回答发出之前尝试一次：全部前置条件同时成立
+  才交给 `MemoryController.auto_capture`，成功写入时把确定性披露拼在回答末尾（并为它预留
+  输出空间，D-63），失败一律原样发出；披露绝不进历史；
 - 模型失败的 `failure` 通知同样用 `notice` + 触发者冷却；额度用尽补发一次 `quota` 通知；
 - 403 进入不可用状态，按 `ready_probe_seconds` 探测恢复（D-4）；
 - 优雅关闭总超时 10 秒，`stop()` 可重复调用；记忆 worker 必须早于模型客户端关闭（§34.2）。
@@ -38,7 +41,7 @@ from .comments.sender import CommentSender
 from .comments.service import CommentService
 from .config import Config
 from .core.blog import BlogLoad, BlogLoader, blog_marker, blog_readable
-from .core.content_refs import ContentRefResolver
+from .core.content_refs import ContentRefResolver, find_refs
 from .core.context import (
     ContextManager,
     SupplementalItem,
@@ -63,6 +66,7 @@ from .mcp.runtime import McpManager
 from .memory.access import MemoryAccessPolicy
 from .memory.commands import MemoryCommandRequest
 from .memory.controller import MemoryController
+from .memory.models import STATUS_OK, ProposalAction
 from .memory.service import MemoryService
 from .memory.writer import MemoryWriter
 from .ops import OpsServer
@@ -72,6 +76,7 @@ from .site.client import SiteClient, SiteError
 from .site.models import LOBBY, ChatMessage
 from .site.sse import SSEReceiver
 from .store import Store
+from .text_utils import has_media, truncate_at_paragraph
 
 _logger = get_logger("app")
 
@@ -643,6 +648,123 @@ class BotApp:
             return ()
         return tuple(context.items)
 
+    def _auto_capture_eligible(self, request: Request) -> bool:
+        """§34.4 的自动提取前置条件；**全部**同时成立才为真。
+
+        这里只判装配层**本地、无 I/O** 就能判的那些：总开关、DM、Beta 接入门（Router 用它
+        算出的 `memory_allowed`）、本轮是不是单轮能力命令、本轮有没有依赖外部资料、代次是否
+        还有效。部署级 `auto_capture_available` 与用户自己的 `auto_capture` 设置**不在这里
+        复查** —— `MemoryController.auto_capture` 的两个门就是它们（§32.3），在这一层再判一遍
+        只会多出一份会漂的副本，还会用它去否决控制器本该接受的写入。
+
+        本地命令（`/help`、`/reset`、用法提示、超长与探测词拒绝）在 Router 里就已经本地应答，
+        根本不会进 worker，因此这里没有它们的形状可判：它们不可能到达调用点。真正可能带着
+        资料走到这里的只有下面三种，都要排除——用户的问题是冲着那些资料去的，只拿他写下的
+        十几个字去提炼「记忆」只会得到噪音。
+
+        代次也放在这里：自动提取是**当前这一轮**的副作用，被 `/reset` 或过期作废的那一轮
+        不该再往记忆里写任何东西。调用点已经紧跟在代次检查之后，这里仍是独立的一道 ——
+        派生的条件不该依赖调用顺序来成立。
+        """
+        if not self._memory_enabled:
+            return False
+        if request.channel_kind != "dm":
+            return False
+        # `memory_allowed` 由 Router 用当前作者算出：记忆未启用或没通过 Beta 门时恒为假。
+        # 作者 ID 为空同样不提取：控制器需要一个稳定身份来定位私有文件（§28）。
+        if not request.memory_allowed or not request.message.author.id:
+            return False
+        if request.enabled_features:
+            # `/search` 与 `/kb`：搜索结果与知识库片段只属当前轮，不进记忆（设计 §3.2）。
+            return False
+        if self._ctx.generation(request.session_key) != request.generation:
+            return False
+        message = request.message
+        if has_media(message):
+            # 自己的图（含 `image_missing`）与引用的博客：正文之外还有资料。
+            return False
+        reply = message.reply
+        if reply is not None and not reply.is_deleted and reply.image_url:
+            # 被引用消息的缩略图（§20）：已删除的引用不取图，那种引用不算依赖图片。
+            return False
+        if find_refs(request.user_text) or (
+            request.reply_context and find_refs(request.reply_context)
+        ):
+            # `[@<ID>]` 内容引用（§25）：被引用正文里的引用同样会随当前轮展开。
+            return False
+        return True
+
+    async def _auto_capture_answer(self, request: Request, answer: str) -> str:
+        """在回答发出前做一次自动提取；返回**即将发送**的文本（§34.4）。
+
+        只把用户自己写的**原始正文**（`request.user_text`，不含 @机器人、不含展开过的引用、
+        不含博客块与知识库块）交给撰写器：模型回答、搜索结果、知识库片段、引用正文与图片描述
+        在 `MemoryController.auto_capture` 的签名里**没有参数可传**（§32.3、§34.4），本层也
+        绝不另找路子把它们送进去。
+
+        成功变更时先原子提交私有记忆（在控制器里完成），再拼确定性披露：新增与更新的措辞不同
+        （`MemoryCaptureResult.action`）。披露要占输出空间，因此先按 D-63 的口径截断回答主体：
+        `X = max_output_chars - len(disclosure)`，`limit = X - len(TRUNCATION_SUFFIX)`
+        （`truncate_at_paragraph` 最多返回 `limit + len(TRUNCATION_SUFFIX)`），再拼
+        `body + disclosure` —— 于是 Sender 的第二次截断（按 `max_output_chars`）不会切掉披露。
+
+        失败、超时、`noop`、写入失败与幂等重放一律原样返回 `answer`（不追加任何说明）。
+
+        **记忆提交与站内回复不是一个分布式事务**：这一步之后再发生的发送失败不会回滚记忆，
+        用户仍然能在 `/memory list` 里看到那条条目（规划 §8.3 接受这个取舍）。理由是不能为了
+        跨系统原子性，把原始消息或待提交正文写进 SQLite —— 那会立刻违反「正文只落 Markdown」
+        的红线（§37），而用户已经显式开启了自动记忆，写入依据也只是他自己的原文。
+        """
+        if not self._auto_capture_eligible(request):
+            return answer
+        controller = self._memory_controller
+        if controller is None:
+            # 软故障也要**可见**（D-60）：没有控制器时自动提取只能就地放弃，
+            # 但绝不能一声不吭 —— 否则「什么都没发生」与「功能坏了」在事后无法分辨。
+            log_event(
+                _logger,
+                logging.WARNING,
+                "memory.auto_capture",
+                scope="user",
+                reason="controller_unavailable",
+            )
+            return answer
+        try:
+            result = await controller.auto_capture(
+                user_id=request.message.author.id,
+                message_id=request.message.id,
+                source_text=request.user_text,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # 软故障（D-60）：记忆链路上的意外不允许把这一轮回答一起拖掉。
+            # 只记稳定事件与白名单字段，绝不记正文、key 或用户 ID（§37）。
+            log_event(
+                _logger,
+                logging.WARNING,
+                "memory.auto_capture",
+                scope="user",
+                reason="internal",
+            )
+            return answer
+        if result.status != STATUS_OK or result.memory_id is None:
+            # 只有**确实写入**才带披露（§27.2）：撰写失败、低置信度 noop、写入失败与
+            # 幂等重放都落在这里，原回答照常发送。
+            return answer
+        disclosure = texts.memory_auto_capture_text(
+            memory_id=result.memory_id,
+            content=result.content,
+            created=result.action is ProposalAction.ADD,
+        )
+        limit = (
+            self._config.behavior.max_output_chars
+            - len(disclosure)
+            - len(texts.TRUNCATION_SUFFIX)
+        )
+        body, _ = truncate_at_paragraph(answer, limit)
+        return body + disclosure
+
     async def _comment_memory_items(self) -> tuple[SupplementalItem, ...]:
         """评论区的只读 context provider（§34.2 第 5 步、§35）；失败返回空元组（D-60）。
 
@@ -1018,13 +1140,21 @@ class BotApp:
                 )
                 return
 
+            # 自动提取（§34.4）就在这一格：主模型已经给出回答、这条回答还没有发出。
+            # 位置在代次检查之二**之后**：被 /reset 作废的那一轮连提取都不做（本方法自己
+            # 还会再复查一次代次）。它换出来的是**要发出的文本**，历史提交仍用模型原文 `text` ——
+            # 披露里就是记忆正文，绝不进历史（§33 的红线）。
+            send_text = await self._auto_capture_answer(request, text)
+
             # 发送器也是异步边界；/reset 在此期间到达时，旧请求不得再发送。
+            # 自动提取本身也是一段异步边界，这个检查因此不只是形式：记忆已经落盘而回复不发的
+            # 情况是允许的（见 `_auto_capture_answer` 的取舍说明）。
             if self._ctx.generation(request.session_key) != request.generation:
                 return
 
             outcome = await self._sender.send(
                 request.channel_id,
-                text,
+                send_text,
                 request.message.id,
                 kind="reply",
                 thread_root_id=request.thread_root_id,
