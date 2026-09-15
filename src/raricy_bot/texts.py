@@ -329,20 +329,81 @@ MEMORY_FIRST_ENABLE_TEXT: str = (
     "用 /memory forget <UM-ID> 删除自己的私有记忆，也可以用 /memory off 暂停在回复中使用它。"
 )
 
+# ---- 命令回复（INTERFACES §32.2 的命令表）----
+# 交换点集中在 Controller 的 `_success_text` 与两处门禁分支（§32.3）。这里没有的文案，
+# Controller 不许自己用中文补，也不许把稳定状态 token 或 `字段=取值` 直接回给用户。
+
+# 非管理员的权限拒绝。与 MEMORY_BETA_DENIED_TEXT 是两回事：那条管接入门，这条管管理权
+# （§32.2 的第二组命令只对 admin_user_list 开放）。
+MEMORY_ADMIN_REQUIRED_TEXT: str = (
+    "这条命令只对记忆管理员开放，你的账号没有相应的管理权限，这次操作没有执行。"
+    "你自己的私有记忆不受影响，仍然可以用 /memory on 与 /memory list 管理。"
+)
+
+# 部署未开放自动提取时的固定拒绝（§32.3：「/memory auto on」只在部署允许时成功）。
+MEMORY_AUTO_UNAVAILABLE_TEXT: str = (
+    "当前部署没有开放自动记忆，这次没有做任何改动。"
+    "你仍然可以用 /memory on 开启私有记忆；需要保存的内容也可以用 /remember 手动提交。"
+)
+
+# 开启确认：首次开启的说明（D-66）就挂在这两条回复上，不另写一份、也不加任何持久标记。
+# 顺序固定为「确认在前、说明在后」，说明本身逐字复用 MEMORY_FIRST_ENABLE_TEXT。
+MEMORY_ON_DONE_TEXT: str = (
+    "已开启私有记忆：之后的私聊里我会参考属于你的条目。\n" + MEMORY_FIRST_ENABLE_TEXT
+)
+MEMORY_AUTO_ON_DONE_TEXT: str = (
+    "已开启自动记忆：之后的私聊内容可能被自动整理成属于你的条目。\n"
+    + MEMORY_FIRST_ENABLE_TEXT
+)
+
+# `/memory off` 的确认：读取与自动提取一并关闭，已有条目保留（规划 §7.1）。
+MEMORY_OFF_DONE_TEXT: str = (
+    "已暂停私有记忆，自动记忆也一并关闭：之后的私聊里我不会再参考你的条目，"
+    "也不会自动保存新内容。已有条目都还在，可以用 /memory on 重新开启。"
+)
+
+# `/memory auto off` 的确认：只关自动提取，私有记忆读取保持原样。
+MEMORY_AUTO_OFF_DONE_TEXT: str = (
+    "已关闭自动记忆：之后的私聊内容不会再被自动整理成条目。"
+    "已有的条目与私有记忆读取都保持不变。"
+)
+
+# 目标已不可见：幂等重放或防御分支里对象已经不在快照中。绝不回裸状态 token，也不编造正文。
+MEMORY_TARGET_GONE_TEXT: str = (
+    "这次操作此前已经记录过，但对应的条目或候选现在不在记忆里（可能已经被删除、批准或拒绝）。"
+    "可以用 /memory list 或 /memory candidates 查看当前状态。"
+)
+
+# 空态：列举类命令没有内容时也要给一句完整的话，空串会被当成命令坏了。
+MEMORY_LIST_EMPTY_TEXT: str = "你的私有记忆里还没有任何条目。可以用 /remember 让我整理并保存一条。"
+MEMORY_LIST_COMMON_EMPTY_TEXT: str = "当前还没有任何已生效的共同记忆。"
+MEMORY_CANDIDATES_EMPTY_TEXT: str = "当前没有待批准的候选。"
+
+# 状态与列举里的固定词，只此一处来源。
+_MEMORY_SWITCH_ON: str = "已开启"
+_MEMORY_SWITCH_OFF: str = "未开启"
+_MEMORY_SCOPE_LABELS: dict[str, str] = {"all_user": "所有用户", "lobby": "大区"}
+_MEMORY_ACTION_LABELS: dict[str, str] = {"add": "新增", "update": "更新"}
+
 
 # 成功类文案的动作词（新增 / 更新两态）。两个组合函数共用，措辞只有这一处来源。
 _MEMORY_ACTION_CREATED: str = "已新增"
 _MEMORY_ACTION_UPDATED: str = "已更新"
 
 
-def memory_saved_text(*, memory_id: str, content: str, created: bool) -> str:
+def memory_saved_text(
+    *, memory_id: str, content: str, created: bool, opened: bool = False
+) -> str:
     """显式 /remember 成功后的回复：展示实际保存的正文与条目 ID（设计 §6.3、规划 §8.1）。
 
     created 为真表示新增，否则表示更新——用布尔参数而不是 memory 模块的动作枚举，
     保持本模块不依赖任何 memory 模块。content 是 AI 整理后实际落盘的正文。
+
+    opened 为真表示这次保存顺带打开了私有记忆读取（§32.3），回复要带上首次开启的说明
+    （D-66）：拼接留在本模块，调用方只传事实，说明本身逐字不动。
     """
     action = _MEMORY_ACTION_CREATED if created else _MEMORY_ACTION_UPDATED
-    return (
+    text = (
         action
         + "私有记忆 "
         + memory_id
@@ -352,6 +413,9 @@ def memory_saved_text(*, memory_id: str, content: str, created: bool) -> str:
         + memory_id
         + " 可以删除这一条；再发一次 /remember 可以纠正它的内容。"
     )
+    if opened:
+        return text + "\n" + MEMORY_FIRST_ENABLE_TEXT
+    return text
 
 
 def memory_auto_capture_text(*, memory_id: str, content: str, created: bool) -> str:
@@ -361,6 +425,170 @@ def memory_auto_capture_text(*, memory_id: str, content: str, created: bool) -> 
     """
     action = _MEMORY_ACTION_CREATED if created else _MEMORY_ACTION_UPDATED
     return "（" + action + "私有记忆 " + memory_id + "：" + content + "）"
+
+
+def _memory_scope_label(scope: str) -> str:
+    """作用域取值 → 中文标签；不认识的值原样回显（那是数据，不是文案）。"""
+    return _MEMORY_SCOPE_LABELS.get(scope, scope)
+
+
+def _memory_action_label(action: str) -> str:
+    """提案动作取值 → 中文标签；不认识的值原样回显。"""
+    return _MEMORY_ACTION_LABELS.get(action, action)
+
+
+def memory_status_text(*, private_enabled: bool, auto_capture: bool, entry_count: int) -> str:
+    """`/memory status` 的回复：私有记忆与自动记忆的开关状态、私有条目数（§32.2）。
+
+    三个参数都是普通值（bool / int），因此本模块仍然不 import 任何 memory 模块。
+    `str()` 只把计数转成十进制填入句子，不是格式化：本模块一律不做字符串插值，
+    唯一允许的拼接方式是 `+`（见 `tests/test_texts.py` 的源码级防线）。
+    """
+    private = _MEMORY_SWITCH_ON if private_enabled else _MEMORY_SWITCH_OFF
+    auto = _MEMORY_SWITCH_ON if auto_capture else _MEMORY_SWITCH_OFF
+    return (
+        "私有记忆："
+        + private
+        + "\n自动记忆："
+        + auto
+        + "\n私有条目："
+        + str(entry_count)
+        + " 条\n"
+        + "开启或暂停私有记忆用 /memory on 与 /memory off；自动记忆用 /memory auto on 与 "
+        "/memory auto off；查看条目用 /memory list。"
+    )
+
+
+def memory_entry_line(*, memory_id: str, content: str) -> str:
+    """记忆列表里的一行：`<条目 ID>：<正文>`。
+
+    正文是条目所有者自己的内容，展示给本人属于 §37 允许的三处之一。
+    """
+    return memory_id + "：" + content
+
+
+def memory_entry_list_text(*, scope: str | None, lines: tuple[str, ...]) -> str:
+    """`/memory list` 的回复：表头 + 每行一条 + 收尾提示；没有条目时回显式空态。
+
+    scope 为 None 表示调用者自己的私有条目，否则是 `MemoryScope` 的字符串取值（已生效共同记忆）。
+    lines 是 memory_entry_line() 的结果；表头里的条数由它数出来，调用方不必另传计数。
+    """
+    if not lines:
+        return MEMORY_LIST_EMPTY_TEXT if scope is None else MEMORY_LIST_COMMON_EMPTY_TEXT
+    if scope is None:
+        head = "你的私有记忆，共 " + str(len(lines)) + " 条："
+        foot = "用 /memory forget <UM-ID> 可以删除其中一条；再发一次 /remember 可以纠正它的内容。"
+    else:
+        head = (
+            "已生效的共同记忆（范围："
+            + _memory_scope_label(scope)
+            + "），共 "
+            + str(len(lines))
+            + " 条："
+        )
+        foot = "这些条目对所有使用者生效；管理员可以用 /memory delete <GM-ID> 删除其中一条。"
+    return head + "\n" + "\n".join(lines) + "\n" + foot
+
+
+def memory_candidate_line(
+    *,
+    candidate_id: str,
+    scope: str,
+    action: str,
+    target_id: str | None,
+    content: str,
+) -> str:
+    """候选列表里的一行：`<候选 ID>（范围：…；动作：…[；目标：…]）：<正文>`（供管理员审阅）。
+
+    五个参数都是普通值：作用域与动作传字符串取值，文本模块不 import memory 模块。
+    """
+    descriptor = (
+        candidate_id
+        + "（范围："
+        + _memory_scope_label(scope)
+        + "；动作："
+        + _memory_action_label(action)
+    )
+    if target_id is not None:
+        descriptor = descriptor + "；目标：" + target_id
+    return descriptor + "）：" + content
+
+
+def memory_candidate_list_text(*, lines: tuple[str, ...]) -> str:
+    """`/memory candidates` 的回复：表头 + 每行一条候选 + 审阅入口；没有候选时回显式空态。"""
+    if not lines:
+        return MEMORY_CANDIDATES_EMPTY_TEXT
+    return (
+        "待批准的共同记忆候选，共 "
+        + str(len(lines))
+        + " 条（它们都还没有生效）：\n"
+        + "\n".join(lines)
+        + "\n用 /memory approve <MC-ID> 批准，或用 /memory reject <MC-ID> 拒绝。"
+    )
+
+
+def memory_candidate_created_text(
+    *,
+    candidate_id: str,
+    scope: str,
+    action: str,
+    target_id: str | None,
+    content: str,
+) -> str:
+    """`/memory suggest` 的成功回复：命名候选 ID，并说清它还没有生效（D-58）。"""
+    descriptor = (
+        "（范围："
+        + _memory_scope_label(scope)
+        + "；动作："
+        + _memory_action_label(action)
+    )
+    if target_id is not None:
+        descriptor = descriptor + "；目标：" + target_id
+    return (
+        "已创建候选 "
+        + candidate_id
+        + descriptor
+        + "），它还没有生效："
+        + content
+        + "\n用 /memory approve "
+        + candidate_id
+        + " 批准，或用 /memory reject "
+        + candidate_id
+        + " 拒绝。"
+    )
+
+
+def memory_approved_text(*, memory_id: str, content: str) -> str:
+    """`/memory approve` 的成功回复：说清它从此刻起对所有使用者生效（§32.2）。"""
+    return "已批准 " + memory_id + "，它从现在起对所有使用者生效：" + content
+
+
+def memory_candidate_rejected_text(*, candidate_id: str) -> str:
+    """`/memory reject` 的成功回复：候选已丢弃，已生效的共同记忆没有被改动。"""
+    return "已拒绝并丢弃候选 " + candidate_id + "，已生效的共同记忆没有被改动。"
+
+
+def memory_deleted_text(*, memory_id: str) -> str:
+    """`/memory delete` 的成功回复：指名被删掉的共同记忆。"""
+    return "已删除共同记忆 " + memory_id + "，这次删除对所有使用者立即生效。"
+
+
+def memory_forgotten_text(*, memory_id: str) -> str:
+    """`/memory forget` 的成功回复：命名被删掉的私有条目。"""
+    return "已删除私有记忆 " + memory_id + "。"
+
+
+def memory_cleared_text(*, removed: int) -> str:
+    """`/memory clear` 的成功回复：报出本次删掉的条数。
+
+    removed 由调用方在清理之前数出来：幂等命中不会重放删除动作，因此重放那一次确实一条都没删，
+    如实报 0 而不是复述第一次的条数（`operations` 里没有地方存这个计数）。
+    """
+    return (
+        "已清空你的私有记忆，本次删除了 "
+        + str(removed)
+        + " 条条目；设置保持不变，需要的内容可以用 /remember 重新保存。"
+    )
 
 
 # 大区共享会话的静态 system 附加说明（D-24）。

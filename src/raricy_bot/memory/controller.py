@@ -13,9 +13,11 @@
 - **Writer**只撰写 `key` 与 `content`，作用域、owner 与路径都由本模块固定（D-57）。
 
 正文与 key 绝不进日志（§37）：只记稳定状态与对象 ID。用户可见文案一律取自
-`texts.py`（§36）；`texts.py` 未覆盖的输出（`status` / `list` / `candidates` 的状态与列举，
-以及若干确认回复）只渲染**数据行**：条目 ID、正文、`字段=取值` 与稳定状态 token，
-本模块不新造中文文案 —— 合同缺口记在任务报告里。
+`texts.py`（§36）：本模块不新造任何中文，也不把稳定状态 token 或 `字段=取值` 当回复发出去。
+`texts.py` 的组合函数负责把数据拼进句子（`memory_status_text`、`memory_entry_list_text`、
+`memory_candidate_line` 等），本模块只把快照里的普通值交给它们；没有对象可展示时退回
+`MEMORY_TARGET_GONE_TEXT`。这条不变量由 `tests/test_memory_controller.py` 的源码级测试守住
+（非 docstring 的字符串字面量里不许出现中文）。
 
 失败一律映射成 §27.4 的稳定状态，不抛异常；只有 `asyncio.CancelledError` 原样传播
 （软故障 D-60：这里抛出去，用户就既看不到回复、也看不到错误）。
@@ -48,7 +50,7 @@ from .models import (
     MemoryScope,
     ProposalAction,
 )
-from .service import MemoryService, PrivateSettings
+from .service import MemoryService
 from .writer import MemoryWriter
 
 __all__ = ["MemoryController"]
@@ -68,12 +70,9 @@ _AUTO_CAPTURE_SOURCE: str = "chat"
 # 开自动），两个键必须不同，否则第二次调用会被第一次的 `operations` 命中而静默跳过。
 _SECOND_STEP_SUFFIX: str = ":second"
 
-# `/memory auto on` 在部署未开放自动提取时的稳定状态用词（§32.3「只在部署允许时成功」）。
-# 这里直接用稳定状态字符串本身：`forbidden` 的合同含义就是「访问门或 admin 判定拒绝」。
-_FORBIDDEN_TOKEN: str = STATUS_FORBIDDEN
-
 # 失败状态 → 固定文案（§36）。表里没有的状态（`ok` / `noop`）走成功分支；`duplicate` 在 Beta
-# 不产生（§27.4），因此既不在表里，也不会被本模块制造出来。
+# 不产生（§27.4），因此既不在表里，也不会被本模块制造出来。`forbidden` 也是例外：它的文案
+# 取决于命令是管理命令还是普通命令，见 `_service_forbidden_text`。
 _FAILURE_TEXTS: dict[str, str] = {
     STATUS_UNAVAILABLE: texts.MEMORY_UNAVAILABLE_TEXT,
     STATUS_CONFLICT: texts.MEMORY_CONFLICT_TEXT,
@@ -187,7 +186,8 @@ class MemoryController:
             return self._result(STATUS_NOOP, texts.MEMORY_USAGE_TEXT)
         if name in _ADMIN_COMMANDS and not self.access.is_admin(request.user_id):
             # 第一层 admin 判定（§32.3）；Service 的四个管理 mutation 各自还会独立复查（R14）。
-            return self._result(STATUS_FORBIDDEN, _FORBIDDEN_TOKEN)
+            # 文案是**权限**拒绝，与接入门的拒绝（MEMORY_BETA_DENIED_TEXT）不是同一件事。
+            return self._result(STATUS_FORBIDDEN, texts.MEMORY_ADMIN_REQUIRED_TEXT)
         if request.command.argument is None and name not in _NO_ARGUMENT_COMMANDS:
             # 具名命令缺参数（含 `/memory forget <非法 ID>`）：固定用法，不进 AI（§32.2）。
             return self._result(STATUS_NOOP, _usage_text(name))
@@ -198,10 +198,17 @@ class MemoryController:
         return await _HANDLERS[name](self, request)
 
     async def _status(self, request: MemoryCommandRequest) -> MemoryCommandResult:
-        """`/memory status`：当前私有设置与条目数（数据行，见模块 docstring 的文案说明）。"""
+        """`/memory status`：私有记忆与自动记忆的开关、私有条目数（§32.2）。"""
         settings = await self.service.private_settings(request.user_id)
         entries = await self.service.private_entries(request.user_id)
-        return self._result(STATUS_OK, _settings_lines(settings, len(entries)))
+        return self._result(
+            STATUS_OK,
+            texts.memory_status_text(
+                private_enabled=settings.private_enabled,
+                auto_capture=settings.auto_capture,
+                entry_count=len(entries),
+            ),
+        )
 
     async def _on(self, request: MemoryCommandRequest) -> MemoryCommandResult:
         """`/memory on`：启用私有记忆读取；成功回复带首次开启的说明（D-66）。"""
@@ -228,7 +235,8 @@ class MemoryController:
     async def _auto_on(self, request: MemoryCommandRequest) -> MemoryCommandResult:
         """`/memory auto on`：只在部署开放时成功，并隐含启用私有记忆读取（§32.3）。"""
         if not self._auto_capture_available:
-            return self._result(STATUS_FORBIDDEN, _FORBIDDEN_TOKEN)
+            # 部署级开关拒绝：与「你不是管理员」是两回事，因此文案也不同（§36）。
+            return self._result(STATUS_FORBIDDEN, texts.MEMORY_AUTO_UNAVAILABLE_TEXT)
         first = await self.service.set_private_enabled(
             request.user_id, True, operation_id=self._operation_id(request)
         )
@@ -258,10 +266,19 @@ class MemoryController:
             entries = await self.service.private_entries(request.user_id)
         else:
             entries = await self.service.common_entries(scope)
-        if not entries:
-            # 没有任何可见条目：`not_found` 的合同含义就是「目标不存在」，文案也已有一条现成的。
-            return self._result(STATUS_NOT_FOUND, texts.MEMORY_NOT_FOUND_TEXT)
-        return self._result(STATUS_OK, "\n".join(_entry_line(entry) for entry in entries))
+        lines = tuple(
+            texts.memory_entry_line(memory_id=entry.memory_id, content=entry.content)
+            for entry in entries
+        )
+        # 空列表仍是 `not_found`（可见目标一个都没有），但文案必须自己说清是空的：
+        # 通用的「没有找到这条记忆」会让一个刚执行完 /memory list 的用户去看 /memory list。
+        status = STATUS_OK if entries else STATUS_NOT_FOUND
+        return self._result(
+            status,
+            texts.memory_entry_list_text(
+                scope=None if scope is None else scope.value, lines=lines
+            ),
+        )
 
     async def _forget(self, request: MemoryCommandRequest) -> MemoryCommandResult:
         """`/memory forget <UM-ID>`：删除一条私有条目，保留其余条目与设置。"""
@@ -273,18 +290,35 @@ class MemoryController:
         return await self._from_outcome(request, outcome.status, outcome.object_id)
 
     async def _clear(self, request: MemoryCommandRequest) -> MemoryCommandResult:
-        """`/memory clear`：删全部私有条目，保留幂等元数据，因此旧命令重放不会再次执行（D-59）。"""
+        """`/memory clear`：删全部私有条目，保留幂等元数据，因此旧命令重放不会再次执行（D-59）。
+
+        删掉的条数在清理**之前**数出来并交给文案：`clear_private` 只回状态与修订号，
+        而重放时条目早就不在了（重放那一次确实一条都没删，文案如实报 0）。
+        """
+        removed = len(await self.service.private_entries(request.user_id))
         outcome = await self.service.clear_private(
             request.user_id, operation_id=self._operation_id(request)
         )
-        return await self._from_outcome(request, outcome.status, outcome.object_id)
+        return await self._from_outcome(
+            request, outcome.status, outcome.object_id, removed=removed
+        )
 
     async def _candidates(self, request: MemoryCommandRequest) -> MemoryCommandResult:
         """`/memory candidates`：只对管理员显示待批准候选（§32.3）；候选绝不进任何普通模型请求。"""
         candidates = await self.service.candidates()
-        if not candidates:
-            return self._result(STATUS_NOT_FOUND, texts.MEMORY_NOT_FOUND_TEXT)
-        return self._result(STATUS_OK, "\n".join(_candidate_line(item) for item in candidates))
+        lines = tuple(
+            texts.memory_candidate_line(
+                candidate_id=item.candidate_id,
+                scope=item.scope.value,
+                action=item.action.value,
+                target_id=item.target_id,
+                content=item.content,
+            )
+            for item in candidates
+        )
+        # 没有候选时说清「当前没有待批准的候选」，同样不用通用的「没有找到这条记忆」。
+        status = STATUS_OK if candidates else STATUS_NOT_FOUND
+        return self._result(status, texts.memory_candidate_list_text(lines=lines))
 
     async def _remember(self, request: MemoryCommandRequest) -> MemoryCommandResult:
         """`/remember <内容>`：显式私有记忆（规划 §8.1）；`operation_id` 是稳定合同。"""
@@ -437,51 +471,86 @@ class MemoryController:
         memory_id: str | None,
         *,
         opened: bool = False,
+        removed: int | None = None,
     ) -> MemoryCommandResult:
-        """把稳定状态与对象 ID 渲染成一次结果；重放走同一条路径，因此回复与首次逐字相同。"""
+        """把稳定状态与对象 ID 渲染成一次结果；重放走同一条路径，因此回复取自同一批文案。
+
+        `removed` 只给 `/memory clear` 用（清理前的条数），其余命令不传。
+        """
         text = _FAILURE_TEXTS.get(status)
         if text is None and status == STATUS_FORBIDDEN:
-            # 本模块自己的门禁之外，Service 也会回 `forbidden`；两者对用户是同一件事。
-            text = _FORBIDDEN_TOKEN
+            # 本模块自己的门禁之外，Service 也会回 `forbidden`（admin 复查或能力未启用）。
+            text = _service_forbidden_text(request)
         if text is None:
-            text = await self._success_text(request, status, memory_id, opened=opened)
+            text = await self._success_text(
+                request, memory_id, opened=opened, removed=removed
+            )
         return self._result(status, text, memory_id)
 
     async def _success_text(
         self,
         request: MemoryCommandRequest,
-        status: str,
         memory_id: str | None,
         *,
         opened: bool = False,
+        removed: int | None = None,
     ) -> str:
-        """成功（`ok` / `noop`）时的回复：`texts.py` 的组合文案，或只有数据与稳定 token 的行。"""
+        """成功（`ok` / `noop`）时的回复：一律由 `texts.py` 的组合文案拼成（§36）。
+
+        本模块只把快照里的普通值交给 `texts`，不在任何分支里自己写中文；文案不区分 `ok` 与
+        `noop`（值本来就对时用户看到的也是同一句确认）。
+        """
         name = request.command.name
         if name == "remember":
-            return await self._remember_text(request, status, memory_id, opened=opened)
-        if name in ("on", "auto_on"):
-            # D-66：开启动作的成功回复必须带上那段简明说明（不加任何持久标记）。
-            return texts.MEMORY_FIRST_ENABLE_TEXT
+            return await self._remember_text(request, memory_id, opened=opened)
+        if name == "on":
+            # D-66：说明已经随常量拼在开启确认之后，不在这里内联，也不加任何持久标记。
+            return texts.MEMORY_ON_DONE_TEXT
+        if name == "auto_on":
+            return texts.MEMORY_AUTO_ON_DONE_TEXT
         if name == "off":
-            return "private_enabled=off\nauto_capture=off"
+            return texts.MEMORY_OFF_DONE_TEXT
         if name == "auto_off":
-            return "auto_capture=off"
+            return texts.MEMORY_AUTO_OFF_DONE_TEXT
+        if name == "forget":
+            if memory_id is None:
+                return texts.MEMORY_TARGET_GONE_TEXT
+            return texts.memory_forgotten_text(memory_id=memory_id)
+        if name == "clear":
+            # `removed` 是清理前数出来的条数；防御分支（调用方没传）按 0 处理。
+            return texts.memory_cleared_text(removed=removed if removed is not None else 0)
         if name == "suggest":
             candidate = await self._candidate(memory_id)
-            return _candidate_line(candidate) if candidate is not None else status
+            if candidate is None:
+                # 重放时候选可能已经被批准或拒绝：只报事实，不编造正文。
+                return texts.MEMORY_TARGET_GONE_TEXT
+            return texts.memory_candidate_created_text(
+                candidate_id=candidate.candidate_id,
+                scope=candidate.scope.value,
+                action=candidate.action.value,
+                target_id=candidate.target_id,
+                content=candidate.content,
+            )
         if name == "approve":
             entry = await self._common_entry(memory_id)
-            return _entry_line(entry) if entry is not None else status
-        if name in ("forget", "reject") and memory_id is not None:
-            # 目标已经不在了（删除 / 丢弃）：只报「对谁做了什么」，不编造正文。
-            return f"{memory_id} {status}"
-        # `clear` 与其它没有对象可展示的成功：只回稳定状态 token。
-        return status
+            if entry is None:
+                return texts.MEMORY_TARGET_GONE_TEXT
+            return texts.memory_approved_text(memory_id=entry.memory_id, content=entry.content)
+        if name == "reject":
+            if memory_id is None:
+                return texts.MEMORY_TARGET_GONE_TEXT
+            return texts.memory_candidate_rejected_text(candidate_id=memory_id)
+        if name == "delete":
+            if memory_id is None:
+                return texts.MEMORY_TARGET_GONE_TEXT
+            return texts.memory_deleted_text(memory_id=memory_id)
+        # `status` / `list` / `candidates` 自己渲染结果，不走这里；真正会落到这一行的只有
+        # 「成功但没有对象可展示」的防御分支，按目标已不可见处理，绝不回裸状态 token。
+        return texts.MEMORY_TARGET_GONE_TEXT
 
     async def _remember_text(
         self,
         request: MemoryCommandRequest,
-        status: str,
         memory_id: str | None,
         *,
         opened: bool,
@@ -491,19 +560,18 @@ class MemoryController:
         重放时 `operations` 只存了 `{status, object_id, revision}`，没有正文也没有动作，
         因此正文从当前快照里取（条目还在时，那正是用户此刻能看到的正文），
         「新增还是更新」用 `created_at == updated_at` 推断 —— 更新会改写 `updated_at`，
-        相等即这条记忆创建之后没有再被改动过；不相等或条目已不在时按更保守的一侧处理。
+        相等即这条记忆创建之后没有再被改动过；条目已经不在时按「目标已不可见」处理。
+        首次开启的说明由 `memory_saved_text(opened=...)` 拼接（D-66），不在这里手工拼串。
         """
         entry = await self._private_entry(request.user_id, memory_id)
         if entry is None:
-            return status
-        text = texts.memory_saved_text(
+            return texts.MEMORY_TARGET_GONE_TEXT
+        return texts.memory_saved_text(
             memory_id=entry.memory_id,
             content=entry.content,
             created=entry.created_at == entry.updated_at,
+            opened=opened,
         )
-        if opened:
-            text = text + "\n" + texts.MEMORY_FIRST_ENABLE_TEXT
-        return text
 
     async def _private_entry(self, user_id: str, memory_id: str | None) -> MemoryEntry | None:
         if memory_id is None:
@@ -575,25 +643,15 @@ def _usage_text(name: str) -> str:
     return texts.REMEMBER_USAGE_TEXT if name == "remember" else texts.MEMORY_USAGE_TEXT
 
 
-def _settings_lines(settings: PrivateSettings, entry_count: int) -> str:
-    """`/memory status` 的数据行：字段名与 `PrivateSettings` 一致，只有数据、没有文案。"""
-    return (
-        f"private_enabled={'on' if settings.private_enabled else 'off'}\n"
-        f"auto_capture={'on' if settings.auto_capture else 'off'}\n"
-        f"private_entries={entry_count}"
-    )
+def _service_forbidden_text(request: MemoryCommandRequest) -> str:
+    """Service 层回 `forbidden` 时的用户文案（§36）。
 
-
-def _entry_line(entry: MemoryEntry) -> str:
-    """条目行：`[<ID>] <正文>`，与撰写器渲染既有记忆的形状一致（§31.1）。"""
-    return f"[{entry.memory_id}] {entry.content}"
-
-
-def _candidate_line(candidate: MemoryCandidate) -> str:
-    """候选行：`[<候选 ID>] <作用域> <动作> <目标|-> <正文>`（供管理员审阅）。"""
-    target = candidate.target_id if candidate.target_id is not None else "-"
-    scope = candidate.scope
-    return f"[{candidate.candidate_id}] {scope} {candidate.action} {target} {candidate.content}"
+    两种来源的回绝不是同一件事：管理命令走 admin 复查（权限拒绝），其余命令走能力/接入门
+    （`_mutate_private` 在部署关闭或调用方给的 user_id 不可用时回 `forbidden`），因此文案也不同。
+    """
+    if request.command.name in _ADMIN_COMMANDS:
+        return texts.MEMORY_ADMIN_REQUIRED_TEXT
+    return texts.MEMORY_BETA_DENIED_TEXT
 
 
 # 命令名 → 处理方法。放在类之后定义，`_run` 运行期读它，因此顺序无关。

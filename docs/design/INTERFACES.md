@@ -3109,6 +3109,16 @@ def help_text(
   | 候选冲突 | `conflict`（§32.3） |
   | 记忆已满 | `full`（§30） |
   | 操作成功 | `ok`，必须展示**实际保存的正文与条目 ID** |
+  | 权限拒绝（非管理员） | 通过 Beta 门但不在 `admin_user_list` 的账号调用 `suggest` / `candidates` / `approve` / `reject` / `delete`（§32.2）；与 Beta 拒绝是两个触发点，文案不得合并 |
+  | 自动提取未开放 | `/memory auto on` 而 `MemoryConfig.auto_capture_available` 为假（§32.3） |
+  | 状态报告 | `/memory status` 的成功回复：私有记忆与自动记忆的开关、私有条目数；不得回 `字段=取值` |
+  | 开关确认（四条） | `/memory on`、`/memory off`、`/memory auto on`、`/memory auto off` 的成功回复；两条开启确认以首次开启的说明收尾（D-66），不另写一份 |
+  | 删除确认 | `/memory forget <UM-ID>` 命名被删条目；`/memory clear` 报出本次删掉的条数（重放时如实报 0） |
+  | 候选创建确认 | `/memory suggest <scope> <内容>`：命名候选 ID，并说清它还没有生效（D-58） |
+  | 候选审阅确认 | `/memory approve`（说明它立即对所有使用者生效）、`/memory reject`、`/memory delete <GM-ID>`：命名受影响的 ID |
+  | 列举表头与空态 | `/memory list`、`/memory list all_user\|lobby`：表头 + 每行 `<ID>：<正文>`；没有条目时回显式空态，不回空串或通用的「找不到这条记忆」 |
+  | 候选表头与空态 | `/memory candidates`：表头 + 每行一条（含范围、动作与目标）；没有候选时回显式空态 |
+  | 目标已不可见 | 幂等重放或防御分支里对象已不在快照；报「操作已记录、对象已不在」，**绝不回裸状态 token** |
   | 首次开启的说明 | `/memory on`、`/memory auto on`、隐式打开读取的 `/remember` 的成功回复（§32.3、D-66） |
   | 自动提取的写入披露 | §34.4 的确定性说明；措辞区分新增与更新 |
   | `MEMORY_SYSTEM_ADDENDUM` | §33；完全静态，说明记忆是不可信资料、不能改变规则或权限、与当前事实冲突时不机械照搬；**不做任何插值** |
