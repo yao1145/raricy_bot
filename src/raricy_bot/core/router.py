@@ -6,6 +6,11 @@
 - `record_event` 只在通过候选过滤（第 1-5 步）之后调用（D-15），因此
   第 1-5 步的 `ignored` 不落库、不需要 `mark_handled`；第 6 步之后的
   `reply_now` / `busy` 由 app 标记，`queued` 由 worker 标记，路由器一律不标记。
+
+记忆命令（INTERFACES.md §34.1）在这一层只做三件事：算授权、构造请求、入队 ——
+不碰 Markdown、不调 AI、不让任何记忆正文流进 `Request` 或模型消息。三个记忆参数
+（`memory_access` / `memory_queue` / `private_enabled`）都不注入时整条记忆路径不存在，
+行为与升级前逐字节一致（D-60 的回退路径），此时 `Request.memory_allowed` 恒为 `False`。
 """
 
 from __future__ import annotations
@@ -19,6 +24,12 @@ from dataclasses import dataclass
 from .. import texts
 from ..config import BehaviorConfig, StorageConfig
 from ..logging_setup import get_logger, log_event
+from ..memory.access import MemoryAccessPolicy
+from ..memory.commands import (
+    MemoryCommand,
+    MemoryCommandRequest,
+    parse_memory_command,
+)
 from ..site.models import LOBBY, ChatMessage, StreamEvent
 from ..store import Store
 from ..text_utils import (
@@ -59,6 +70,12 @@ _ACTIONABLE_REASONS: frozenset[str] = frozenset(
         "secret_probe",
         "kb_usage",
         "capability_conflict",
+        # 记忆命令的四个结果（§34.1）：都会入队或回一条本地文案，同样值得运维看见。
+        # 它们只承载稳定短标识，不含命令名、命令参数或用户 ID（§37 的日志红线）。
+        "memory_queued",
+        "memory_dm_only",
+        "memory_beta_denied",
+        "memory_queue_full",
     }
 )
 
@@ -77,13 +94,18 @@ class Request:
     reply_context: str | None  # message.reply 非删除时的正文，否则 None
     thread_root_id: int | None = None  # 大区共享链的根；**私聊恒为 None**（D-20）
     enabled_features: frozenset[str] = frozenset()
+    # 当前作者是否可用共同记忆（§34.1 第 2 条）：由 Router 用 `message.author.id` 算出。
+    # 记忆未注入或门禁关闭时恒为 `False`，worker 据此决定要不要取记忆上下文（§34.3）。
+    memory_allowed: bool = False
 
 
 @dataclass(frozen=True)
 class RouteResult:
     """一次判定的结果；`reason` 是稳定短标识，仅用于日志。"""
 
-    action: str  # "queued" | "reply_now" | "ignored" | "busy" | "resync"
+    # "queued" | "reply_now" | "ignored" | "busy" | "resync" | "memory_queued"。
+    # `memory_queued` **不是** `queued`：app 不把它当聊天请求处理，终态由记忆 worker 负责（§34.1、§34.3）。
+    action: str
     channel_id: str | None
     message_id: int | None
     reply_to: int | None
@@ -110,6 +132,9 @@ class MessageRouter:
         now: Callable[[], float] = time.time,
         vision_enabled: bool = False,
         kb_enabled: bool = False,
+        memory_access: MemoryAccessPolicy | None = None,
+        memory_queue: asyncio.Queue[MemoryCommandRequest] | None = None,
+        private_enabled: Callable[[str | None], bool] | None = None,
     ) -> None:
         self._self_user_id = self_user_id
         self._bot_username = bot_username
@@ -122,6 +147,13 @@ class MessageRouter:
         self._vision_enabled = vision_enabled
         # 只影响 /help 说不说实话：知识库没开时不得宣传 /kb。判定本身不依赖它。
         self._kb_enabled = kb_enabled
+        # 记忆是可选能力：注入与否就是总开关（policy 不暴露 enabled，§28）。
+        # 两者都不注入时记忆命令不存在，`/remember` 只是普通正文，行为与升级前一致（D-60）。
+        self._memory_access = memory_access
+        self._memory_queue = memory_queue
+        # 只影响 /help 的措辞：由 app 接到 `MemoryService.private_settings_cached`（D-67），
+        # 必须同步、无 I/O；未注入或取不到时按未开启处理。
+        self._private_enabled = private_enabled
         self._logger = _logger
 
     # --- 事件分派 -----------------------------------------------------------
@@ -293,6 +325,23 @@ class MessageRouter:
                 )
             session_key = lobby_thread_session_key(thread_root_id)
 
+        # 9.0 记忆命令（§34.1、规划 §7.3）：**先于能力命令解析**识别，否则
+        # `/search /remember x` 会在剥掉 `/search` 之后被当成记忆命令执行，绕过
+        # 「一条消息最多一个能力」（D-39）。记忆未注入时整段不存在：那时 `/remember`
+        # 不是命令，只是普通正文，行为必须与升级前逐字节一致（D-60）。
+        if self._memory_path_active():
+            memory_command = parse_memory_command(user_text)
+            if memory_command is not None:
+                return self._route_memory_command(
+                    memory_command,
+                    message=message,
+                    channel_id=channel_id,
+                    channel_kind=channel_kind,
+                    session_key=session_key,
+                    thread_root_id=thread_root_id,
+                    event_id=event_id,
+                )
+
         # 9.1 解析单轮能力命令（D-39）。命令本身不是聊天正文，不进入模型；一条消息里
         # **最多剥离一个**前缀，剥离后若正文又以能力命令开头就本地拒绝 —— 用户只理解
         # 一套披露时，`/search /kb ...` 会同时把查询发给 Exa、把本地资料发给模型。
@@ -323,7 +372,10 @@ class MessageRouter:
                     thread_root_id=thread_root_id,
                     event_id=event_id,
                 )
-            if leading_capability_command(user_text) is not None:
+            if (
+                leading_capability_command(user_text) is not None
+                or self._leads_with_memory_command(user_text)
+            ):
                 return self._emit(
                     "reply_now",
                     "capability_conflict",
@@ -396,9 +448,9 @@ class MessageRouter:
                 channel_id=channel_id,
                 message_id=message.id,
                 reply_to=message.id,
-                # 能不能看图、有没有知识库都是配置决定的；帮助文案必须说实话
-                # （两者的默认值都是关闭）。
-                text=self._help_text(),
+                # 能不能看图、有没有知识库都是配置决定的；记忆状态则取决于**当前作者**。
+                # 帮助文案必须说实话（三个开关的默认值都是关闭）。
+                text=self._help_text(channel_kind, message.author.id),
                 channel_kind=channel_kind,
                 thread_root_id=thread_root_id,
                 event_id=event_id,
@@ -465,6 +517,7 @@ class MessageRouter:
             reply_context=reply_context,
             thread_root_id=thread_root_id,
             enabled_features=enabled_features,
+            memory_allowed=self._memory_allowed(message.author.id),
         )
         try:
             self._queue.put_nowait(request)
@@ -507,15 +560,155 @@ class MessageRouter:
                 return inner
         return user_text
 
-    def _help_text(self) -> str:
-        """按 vision / kb 两个开关四选一，文案不夸大当前真正具备的能力。"""
-        if self._vision_enabled and self._kb_enabled:
-            return texts.HELP_TEXT_WITH_VISION_AND_KB
-        if self._kb_enabled:
-            return texts.HELP_TEXT_WITH_KB
-        if self._vision_enabled:
-            return texts.HELP_TEXT_WITH_VISION
-        return texts.HELP_TEXT
+    def _help_text(self, channel_kind: str, user_id: str | None) -> str:
+        """帮助文案（§34.1 第 3 条）：能力开关 × 当前作者的记忆状态，不夸大能力。
+
+        vision / kb 是部署开关，记忆状态则按**当前消息的作者**求值。记忆未启用或作者
+        未通过 Beta 门时 `help_text` 的输出与重构前的四个常量逐字节相同（D-64）。
+        """
+        memory_allowed = self._memory_allowed(user_id)
+        # `private_enabled` 只在 memory_allowed 为真时影响措辞，但回调本身同步无 I/O
+        # （D-67 的 `private_settings_cached` 只读内存快照），照常求值即可。
+        return texts.help_text(
+            channel_kind=channel_kind,
+            vision_enabled=self._vision_enabled,
+            kb_enabled=self._kb_enabled,
+            memory_allowed=memory_allowed,
+            private_enabled=self._private_enabled_for(user_id),
+        )
+
+    # --- 记忆命令（§34.1） ---------------------------------------------------
+
+    def _memory_path_active(self) -> bool:
+        """记忆命令路径是否可用：策略与队列**都**注入才算。
+
+        policy 不暴露 `enabled`（§28），因此注入与否就是路由层唯一的总开关；
+        `memory.enabled=false` 时 app 根本不注入（D-60 的回退路径）。
+        """
+        return self._memory_access is not None and self._memory_queue is not None
+
+    def _memory_allowed(self, user_id: str | None) -> bool:
+        """当前作者能否读取共同记忆（§34.1 第 2 条）；未注入或门禁关闭时恒 False。"""
+        access = self._memory_access
+        if access is None:
+            return False
+        return access.permits_common(user_id)
+
+    def _private_enabled_for(self, user_id: str | None) -> bool:
+        """当前作者的私有记忆开关（§34.1 第 3 条）；未注入或取不到时按 False。
+
+        回调只影响一句措辞，所以这里连异常都吞掉：`/help` 是本地命令，
+        不得因为一次探针失败而整条回复失败（D-60 的软故障口径）。
+        """
+        callback = self._private_enabled
+        if callback is None:
+            return False
+        try:
+            return bool(callback(user_id))
+        except Exception:
+            return False
+
+    def _leads_with_memory_command(self, text: str) -> bool:
+        """剥离一个能力前缀之后，剩余正文是否又以记忆命令开头（§34.1）。
+
+        记忆命令也是一种能力，`/search /remember x` 里两条命令并存：既不能按记忆命令执行
+        （那样搜索被静默丢弃），也不该把 `/remember x` 原文当成搜索词发出去，因此与
+        `/search /kb` 同样本地拒绝（D-39）。未注入记忆时恒为 False：那时 `/remember`
+        不是命令，升级前怎么处理就怎么处理（D-60）。
+        """
+        return self._memory_path_active() and parse_memory_command(text) is not None
+
+    def _route_memory_command(
+        self,
+        command: MemoryCommand,
+        *,
+        message: ChatMessage,
+        channel_id: str,
+        channel_kind: str,
+        session_key: str,
+        thread_root_id: int | None,
+        event_id: int | None,
+    ) -> RouteResult:
+        """记忆命令的授权与入队（§34.1）；不调模型、不读命令以外的任何状态。
+
+        顺序固定为「只在 DM → Beta 接入门 → 入队」，与 §34.1 逐条对应。
+        """
+        # 大区是公开对话：同一文本只回固定提示，不进入 `MemoryAccessPolicy`（§28 末条），
+        # 也不入队 —— 连管理员也不能在大区里执行记忆命令。
+        if channel_kind != "dm":
+            return self._emit(
+                "reply_now",
+                "memory_dm_only",
+                channel_id=channel_id,
+                message_id=message.id,
+                reply_to=message.id,
+                text=texts.MEMORY_DM_ONLY_TEXT,
+                channel_kind=channel_kind,
+                thread_root_id=thread_root_id,
+                event_id=event_id,
+            )
+        access = self._memory_access
+        queue = self._memory_queue
+        user_id = message.author.id
+        # `access` 与 `queue` 已由调用方保证注入，这里的判空只为类型收窄。
+        # 拿不到稳定身份（`author.id` 为空）与未通过 Beta 接入门是同一处置：固定拒绝文案。
+        # `permits_commands` 对空 `user_id` 本来就为假（§28），这里显式判一次是为了不构造
+        # 一个 `user_id` 为空的请求，也让「无稳定身份」这件事在代码里可见。
+        if (
+            not user_id
+            or access is None
+            or queue is None
+            or not access.permits_commands(user_id, channel_kind)
+        ):
+            return self._emit(
+                "reply_now",
+                "memory_beta_denied",
+                channel_id=channel_id,
+                message_id=message.id,
+                reply_to=message.id,
+                text=texts.MEMORY_BETA_DENIED_TEXT,
+                channel_kind=channel_kind,
+                thread_root_id=thread_root_id,
+                event_id=event_id,
+            )
+        request = MemoryCommandRequest(
+            event_id=event_id,
+            message_id=message.id,
+            channel_id=channel_id,
+            # 用该 DM 的 session key（规划 §7.3）：记忆 worker 与主 worker 共用同一类队列，
+            # 会话键不能省，也不能借用大区链路键。
+            session_key=session_key,
+            user_id=user_id,
+            command=command,
+        )
+        try:
+            queue.put_nowait(request)
+        except asyncio.QueueFull:
+            # 与主队列满同一套 busy 语义：文案与冷却由 app 决定（D-3、D-18）。
+            return self._emit(
+                "busy",
+                "memory_queue_full",
+                channel_id=channel_id,
+                message_id=message.id,
+                reply_to=message.id,
+                text=texts.BUSY_NOTICE_TEXT,
+                actor_id=user_id,
+                channel_kind=channel_kind,
+                thread_root_id=thread_root_id,
+                event_id=event_id,
+            )
+        # 事件此刻已完成去重登记，**终态由记忆 worker 负责**（`mark_handled`，§34.3）：
+        # 这里不标记完成，也不构造聊天 Request —— app 不把 `memory_queued` 当聊天请求。
+        return self._emit(
+            "memory_queued",
+            "memory_queued",
+            channel_id=channel_id,
+            message_id=message.id,
+            reply_to=message.id,
+            channel_kind=channel_kind,
+            thread_root_id=thread_root_id,
+            event_id=event_id,
+        )
 
     # --- 大区共享链 ---------------------------------------------------------
 
