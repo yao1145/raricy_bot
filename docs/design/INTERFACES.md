@@ -143,7 +143,7 @@ class Secrets:
     llm_api_key: str
 
 # McpConfig、McpServerConfig、McpFeatureConfig 和 McpBindingConfig 的完整定义见 §21；
-# McpAccountPoolConfig 见 §22.1，KnowledgeBaseConfig 见 §23.1。
+# McpAccountPoolConfig 见 §22.1，KnowledgeBaseConfig 见 §23.1，MemoryConfig 见 §26.1。
 
 @dataclass(frozen=True)
 class Config:
@@ -159,6 +159,7 @@ class Config:
     secrets: Secrets
     mcp: McpConfig = field(default_factory=McpConfig)
     knowledge_base: KnowledgeBaseConfig = field(default_factory=KnowledgeBaseConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)   # 长期记忆 Beta，见 §26
 
     @property
     def db_path(self) -> str           # 兼容别名，保留一个版本；新代码用 config.storage.db_path
@@ -346,6 +347,9 @@ KB_NO_RESULTS_TEXT: str             # 检索无相关结果
 CAPABILITY_CONFLICT_TEXT: str       # 一条消息里出现两个能力命令
 KB_SYSTEM_ADDENDUM: str             # 本地资料不可信边界的静态 system 附加说明（见 5.2）
 ```
+
+记忆相关的 `help_text()` 重构、新增固定文案与 `MEMORY_SYSTEM_ADDENDUM` 见 §36
+（记忆关闭时四个既有帮助常量的内容逐字节不变）。
 
 `HELP_TEXT` 与 `HELP_TEXT_WITH_VISION` **共用同一份首尾文字**，只有中间那句能力描述
 二选一（实现上是三段模块级常量拼接）。因此两份文案的事实披露必须逐字一致：身份、
@@ -902,6 +906,8 @@ class ContextManager:
   用来作废在途请求；区别只是 `reset` 返回原会话是否存在。
   线程过期走 `invalidate`，DM `/reset` 走 `reset`。
 - 同一 `session_key` 的并发访问由调用方保证串行（worker 已保证）。
+- 记忆补充资料（`SupplementalItem` 与 `build_messages` 的新参数 `supplemental_items`）的拼装与
+  预算规则见 §33；`supplemental_items` 为空时输出必须与改动前逐字节一致。
 
 **代次（generation）—— 用来隔离 `/reset` 与在途模型请求的竞态。**
 每个 `session_key` 维护一个从 0 开始的整数代次，`reset()` **即使会话原本不存在也要递增**。
@@ -949,6 +955,9 @@ class MessageRouter:
     async def handle_message(self, channel_id: str, message: ChatMessage,
                              event_id: int | None) -> RouteResult
 ```
+
+Beta 记忆接入（`Request.memory_allowed`、`MessageRouter` 的 `memory_access` / `memory_queue`
+参数与新增动作 `"memory_queued"`）见 §34；两者都不注入时行为与今天逐字节一致。
 
 `handle_stream` 判定顺序（严格照此，`reason` 用括号内标识）：
 
@@ -1385,6 +1394,8 @@ class BotApp:
 - 401 由 `SiteClient` 内部处理；SSE 重连由 `SSEReceiver` 内部处理。
 - 优雅关闭：`stop()` 依次停 周期清理 task → SSE → WorkerPool → OpsServer → client → store，
   总超时 10 秒。清理 task 必须先于 Store 关闭被取消并等待结束。
+- 全局记忆 Beta 的装配、启动顺序、关闭顺序与 `memory_queued` 分派见 §34；
+  `memory.enabled=false` 时全部跳过，且不创建目录。
 
 ### 16.0 `/kb` 的数据流（D-38 … D-44）
 
@@ -1465,6 +1476,9 @@ notification poller 和 worker。它与聊天共享模型客户端及 semaphore 
 启动时先恢复旧评论事件再启动评论任务，关闭时先等待四个评论 task，再关闭聊天 SSE、
 worker、ops、模型、client、Store；每个取消动作必须 await。
 
+评论侧的记忆集成（`CommentRequest.memory_allowed`、只读 `all_user`、绝不请求 `lobby` 或用户
+私有文件）见 §35。
+
 ### 16.1.1 评论区的图片输入（§20）
 
 评论区识图要两个开关同时成立：`model.vision_enabled` 与
@@ -1530,8 +1544,10 @@ worker、ops、模型、client、Store；每个取消动作必须 await。
 2. 用户内容只放在 `role="user"` 的消息里，绝不拼进 system prompt。
 3. HTTP 客户端不设 `Origin` / `Referer`。
 4. 成功判据只看 `code == 200`。
-5. 不实现博客理解、通用自动联网、长期记忆或站内工具调用。聊天区显式的 `/search <问题>`
-   是唯一的单轮联网入口：仅在私聊和精确 @ 机器人的大厅消息中生效，由模型决定是否调用
+5. 不实现博客理解、通用自动联网、长期记忆或站内工具调用。**唯一例外是 §26…§37 的全局记忆
+   Beta**：默认关闭、只保存少量稳定条目、正文只落 Markdown，边界由 D-55…D-65 钉住。
+   聊天区显式的 `/search <问题>` 是唯一的单轮联网入口：仅在私聊和精确 @ 机器人的大厅消息中生效，
+   由模型决定是否调用
    已绑定的 Exa `web_search_exa`，每轮最多一次；评论区永不获得该入口。**图片理解仅在
    `model.vision_enabled` 为真时提供**，且只把当前轮那一张图取回内存转交模型：不落
    SQLite、不写日志、不写文件、不进 `ContextManager` 历史。默认关闭。不转发 SVG。
@@ -2134,3 +2150,959 @@ class ContentRefResolver:
 - 展开在**模型门之外**执行，与取图、取博客并列；展开后的正文随 `_pending_turn`
   与 `_apply_reply_prefix` 一起进当前轮。同一 ID 出现在文章正文与评论正文里会各请求一次
   ——两次 `resolve` 调用各有各的缓存，这是已知且有界的行为。
+
+## 26. `config.py`（长期记忆 `MemoryConfig`）
+
+全局记忆 Beta 的配置合同。**默认关闭**，关闭时行为与升级前逐字节一致（§26.3、D-60）。
+产品语义见 `docs/design/GLOBAL_MEMORY_DESIGN.md`（下称「设计」），技术规划见
+`docs/design/GLOBAL_MEMORY_IMPLEMENTATION_PLAN.md`（下称「规划」）§3。
+
+### 26.1 字段与默认值
+
+```python
+@dataclass(frozen=True)
+class MemoryConfig:
+    enabled: bool = False
+    access_mode: str = "allowlist"       # "allowlist" | "all"
+    allow_user_list: tuple[str, ...] = ()
+    admin_user_list: tuple[str, ...] = ()
+    root_dir: str = "./data/memory"
+    refresh_seconds: int = 10
+    queue_size: int = 20
+    max_common_entries_per_scope: int = 64
+    max_private_entries_per_user: int = 32
+    max_candidates: int = 128
+    max_entry_chars: int = 500
+    max_file_bytes: int = 262144
+    max_operations: int = 512
+    common_context_tokens: int = 800
+    private_context_tokens: int = 800
+    writer_context_tokens: int = 2000
+    writer_timeout_seconds: float = 15.0
+    auto_capture_available: bool = False
+```
+
+`Config` 增加（与 `comments` / `mcp` / `knowledge_base` 同一区域、同一写法）：
+
+```python
+memory: MemoryConfig = field(default_factory=MemoryConfig)
+```
+
+- 上面每个字段都可由 YAML 覆盖：本节**没有「代码常量」**。本子系统里不可由 YAML 改的量只有
+  三处，各在自己小节标注：存储键域前缀（§27.3）、`key` 的长度界与自动提取的置信度门槛（§31.2）。
+- `config.example.yaml` 的 `memory:` 段**逐字**照抄规划 §3.1 的 YAML 示例（含其中文注释）。
+- 访问判据一律是站点稳定的 `author.id`，不用 username（规划 §1.5）。
+
+### 26.2 校验规则
+
+逐条实现规划 §3.2：
+
+1. `enabled` 与 `auto_capture_available` 必须是 YAML 布尔值；字符串 `"true"` 非法
+   （复用现成的 `_bool_flag`）。
+2. `access_mode` 只能是 `"allowlist"` 或 `"all"`。
+3. 两个用户列表是字符串列表：空串、重复值与非字符串非法（复用现成的 `_text_tuple`）。
+4. **仅 `enabled=true` 时**：`access_mode == "allowlist"` 时 `admin_user_list` 必须是
+   `allow_user_list` 的子集，否则 `ConfigError`。管理员不能一边被 Beta 门禁拒绝，
+   一边又掌握管理入口。
+5. `access_mode == "all"` 时保留 `allow_user_list` 的值但**不使用**，便于随时切回灰度模式。
+6. 所有计数、容量与 token 字段是正整数（布尔不算整数）；`writer_timeout_seconds` 是正数。
+7. **仅 `enabled=true` 时**：`common_context_tokens + private_context_tokens
+   <= behavior.context_input_tokens`。
+8. **仅 `enabled=true` 时**：`common_context_tokens <= comments.context_input_tokens`。
+9. **仅 `enabled=true` 时**：`max_entry_chars <= behavior.max_input_chars`。
+10. **仅 `enabled=true` 时**，`root_dir` 的三条路径约束：不得等于 `storage.db_path`；
+    不得位于 `knowledge_base.root_dir` 内；也不得包含 `knowledge_base.root_dir`
+    ——否则记忆会被 `/kb` 再次扫描并外送。判定用 `os.path.abspath` + `os.path.commonpath`
+    做**路径包含**，不用字符串前缀。违反任一 → `ConfigError`。
+11. 关闭时只做类型校验与单字段范围校验；第 4、7–10 条的交叉约束只在 `enabled=true` 时施加
+    （把 `behavior.context_input_tokens` 调小，不得影响一个关闭了记忆的部署）。
+12. 未知键继续被忽略（沿用 `_section` 的现有行为，**不要**额外加未知键检查）。
+
+### 26.3 关闭语义
+
+- `enabled=false`（默认）：不创建目录、不读取文件、不构造记忆服务与刷新任务、不向
+  `MessageRouter` 注入任何记忆能力；模型请求与帮助文案与升级前逐字节一致（D-60）。
+- 记忆不引入任何新的环境变量；本子系统的密钥红线仍是 §3 注册的那三个。
+
+## 27. `memory/models.py`（记忆数据模型）
+
+`memory/` 包的纯类型底座：无 I/O、无网络、不 import `app.py`（裁决 G）。
+`MemoryContext.items` 用 `core/context.py` 的 `SupplementalItem`，因此本模块可以
+`from ..core.context import SupplementalItem` —— `core/context.py` 不依赖 memory，无循环（§33、D-61）。
+字段与语义逐字对照规划 §4.1 / §4.2。
+
+### 27.1 作用域与提案动作
+
+```python
+class MemoryScope(StrEnum):
+    ALL_USER = "all_user"
+    LOBBY = "lobby"
+    USER = "user"
+
+
+class ProposalAction(StrEnum):
+    ADD = "add"
+    UPDATE = "update"
+    NOOP = "noop"
+```
+
+### 27.2 条目、候选与结果
+
+```python
+@dataclass(frozen=True)
+class MemoryEntry:
+    memory_id: str
+    key: str
+    content: str
+    pinned: bool
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class MemoryCandidate:
+    candidate_id: str
+    scope: MemoryScope             # 只能是 all_user / lobby
+    action: ProposalAction         # add / update
+    target_id: str | None
+    key: str
+    content: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class MemoryProposal:
+    action: ProposalAction
+    target_id: str | None
+    key: str
+    content: str
+    confidence: float
+
+
+@dataclass(frozen=True)
+class MemoryProposalResult:
+    status: str
+    proposal: MemoryProposal | None
+
+
+@dataclass(frozen=True)
+class OperationResult:
+    status: str
+    object_id: str | None
+    revision: int
+
+
+@dataclass(frozen=True)
+class MemoryContext:
+    common_revision: int
+    private_revision: int | None     # 本次没读私有快照时为 None
+    items: tuple["SupplementalItem", ...]
+```
+
+```python
+@dataclass(frozen=True)
+class MemoryCaptureResult:
+    status: str              # 稳定状态；只有确实写入成功才是 "ok"
+    memory_id: str | None    # 成功写入的条目 ID；其余情况 None
+    content: str             # 成功写入的正文原文；其余情况空串
+```
+
+`MemoryCaptureResult` 是 §32.3 的 `auto_capture` 返回值：规划 §4.5 只给了类型名，
+字段在这里钉死，供 §34.4 的写入披露使用（见 D-63）。
+
+### 27.3 `MemoryTarget` 与 `user_storage_key()`
+
+```python
+@dataclass(frozen=True)
+class MemoryTarget:
+    scope: MemoryScope
+    owner_key: str | None = None
+
+
+def user_storage_key(user_id: str) -> str:
+    raw = f"raricy-memory-v1\0{user_id}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+```
+
+规则：
+
+- `all_user` / `lobby` 的 `owner_key` 必须为 `None`；`user` 的必须存在。违反时抛 `ValueError`
+  ——这是编程错误，不是用户可预期失败（后者一律映射成状态，见 27.4）。
+- `owner_key` 由宿主根据当前 `author.id` 计算；AI 输出与用户命令都不能提供（D-56 / D-57）。
+- `"raricy-memory-v1\0"` 是**代码常量**：固定域分隔前缀，不得由配置改。
+- 该哈希只避免原始 ID 出现在文件名里，**不构成加密**。用户 Markdown 一律按敏感数据保护。
+
+### 27.4 稳定状态字符串
+
+下面十个字符串是**稳定合同**（值逐字固定，不得新增、改写或按用途重命名）：
+
+```text
+ok | noop | duplicate | not_found | forbidden | unavailable |
+invalid_proposal | conflict | full | secret_detected
+```
+
+| 状态 | 含义 |
+|------|------|
+| `ok` | 操作已生效 |
+| `noop` | 无需变更（含自动提取的低置信度降级） |
+| `duplicate` | 重复：目标已存在（等价条目或候选）；规划未钉死具体使用点，实现按语义使用即可，但不得改写字符串 |
+| `not_found` | 目标条目或候选不存在 |
+| `forbidden` | 访问门或 admin 判定拒绝 |
+| `unavailable` | 文件不可用（载入失败、原子写失败） |
+| `invalid_proposal` | AI 输出不合法（`MemoryProposalResult.status`） |
+| `conflict` | 外部编辑或候选目标已被改动，拒绝覆盖 |
+| `full` | 触发容量上限，**绝不静默删除**既有条目 |
+| `secret_detected` | 脱敏前后不一致（命中已注册密钥），整条拒绝、不保存脱敏版本 |
+
+- 用户可预期的失败一律映射成状态返回，不用异常传递；异常只用于编程错误与被取消。
+- 幂等命中返回**第一次**的稳定结果，不改写成 `duplicate`（§30.2）。
+- 变更类操作里只有 `ok` 表示确实写了文件；`noop` 与其余状态都不产生写入。
+
+## 28. `memory/access.py`（Beta 接入策略）
+
+```python
+class MemoryAccessPolicy:
+    def __init__(self, config: MemoryConfig) -> None: ...
+
+    def permits_common(self, user_id: str | None) -> bool: ...
+    def permits_private(self, user_id: str | None, channel_kind: str) -> bool: ...
+    def permits_commands(self, user_id: str | None, channel_kind: str) -> bool: ...
+    def is_admin(self, user_id: str | None) -> bool: ...
+```
+
+`enabled` × `access_mode` 的真值表（逐条实现规划 §3.3）：
+
+| 方法 | `enabled=false` | `allowlist` | `all` |
+|------|-----------------|-------------|-------|
+| `permits_common(user_id)` | `False` | 非空 `user_id` ∈ `allow_user_list` | 恒 `True`（`user_id` 为 `None` 也为真） |
+| `permits_private(user_id, kind)` | `False` | 接入门通过 且 `kind == "dm"` | 非空 `user_id` 且 `kind == "dm"` |
+| `permits_commands(user_id, kind)` | `False` | 同 `permits_private` | 同 `permits_private` |
+| `is_admin(user_id)` | `False` | 接入门通过 且 ∈ `admin_user_list` | 非空 `user_id` 且 ∈ `admin_user_list` |
+
+规则：
+
+- `allowlist` 限制**全部**记忆能力：共同记忆读取、私有记忆读写、记忆命令与自动提取（D-55）。
+- `all` 模式对共同记忆允许所有消息作者，但私有记忆仍要求非空稳定 `user_id` **且**频道为 DM。
+- `is_admin` 必须**同时**满足接入门与 `admin_user_list`；**绝不**看站点 DTO 的 `is_admin` 字段。
+- 评论作者 ID 为空时：`allowlist` 不读任何记忆、`all` 可读 `all_user` 但永不读私有。这条由调用方
+  按 `user_id is None` 走 `permits_common` 实现；本模块只需保证 `all` 对 `None` 返回 True、
+  对私有一律 False。
+- 记忆管理命令只在 DM 执行；大区里的同一文本由 Router 回固定提示，不进入本模块（§34.1）。
+- 纯内存、无 I/O；`enabled=false` 时四个方法全 `False`，调用方据此走原有无记忆路径。
+
+## 29. `memory/codec.py`（Markdown 编解码）
+
+`common.md` 与用户文件的严格解析与确定性渲染。**纯同步、无文件 I/O**、不 import `app.py`
+（裁决 G）。合同化规划 §5.2 … §5.4。
+
+```python
+def parse_common(data: bytes, cfg: MemoryConfig) -> CommonDocument: ...
+def render_common(document: CommonDocument) -> bytes: ...
+def parse_private(data: bytes, cfg: MemoryConfig) -> PrivateDocument: ...
+def render_private(document: PrivateDocument) -> bytes: ...
+```
+
+`CommonDocument` / `PrivateDocument` 是新的冻结 dataclass，字段照规划 §5.2 / §5.3 的 front matter
+与正文结构。解析失败只给出稳定 reason（建议 `CodecError(reason)`）；
+异常字符串与日志**绝不**带原始内容。
+
+### 29.1 front matter 与正文结构
+
+| 文件 | 键 | 说明 |
+|------|----|------|
+| `common.md` | `schema_version` | 当前只认 `1` |
+| | `revision` | 每次成功写入 +1 |
+| | `next_all_user_id` / `next_lobby_id` / `next_candidate_id` | 各区 ID 计数器 |
+| | `operations` | 幂等键 → `{status, object_id, revision}` |
+| 用户文件 | `schema_version` / `revision` / `next_id` | 同上 |
+| | `private_enabled` / `auto_capture` | 用户私有设置 |
+| | `operations` | 同上 |
+
+- 正文结构：`# 共同记忆` 下的 `## all_user` / `## lobby` / `## candidates` 三个区；用户文件是
+  `# 用户私有记忆` 下的条目。条目体是 `- key:` / `- pinned:` / `- created_at:` / `- updated_at:`
+  （候选为 `- scope:` / `- action:` / `- target_id:` / `- key:` / `- created_at:`），正文是连续的
+  Markdown 引用行。完整示例见规划 §5.2 / §5.3。
+- 候选与已生效共同记忆放在**同一个** `common.md`，使批准可以在一次原子文件替换里同时完成
+  「移出候选」和「加入生效区」（D-58）。
+- ID 形状：前缀 `GM-A-`（all_user）、`GM-L-`（lobby）、`MC-`（候选）、`UM-`（用户私有），后接
+  `next_*` / `next_id` 分配的十进制序号（示例为 6 位零填充，如 `GM-A-000007`）。前缀必须与所在区
+  一致。
+- 用户文件不写原始 user ID、username、消息正文、模型回答或来源频道；`operations` 只存最近的
+  幂等键、结果 ID 与 revision，不存命令正文。
+- `operations` 的键是宿主的 `operation_id`，形状 `<来源>:<message_id>`（示例 `"chat:348921"`；
+  显式 `/remember` 用 `"remember:<message_id>"`，见 §32.3）；值是 `{status, object_id, revision}`。
+
+### 29.2 解析
+
+1. 先判 `len(data) > cfg.max_file_bytes` → `too_large`；再做严格 UTF-8 解码 → `not_utf8`。
+2. front matter 用 `yaml.safe_load`；`schema_version` 不是 `1` → `bad_schema`，不猜测兼容。
+3. 结构、字段类型、ID 前缀与列表边界不合法 → `malformed`；时间必须是 UTC RFC 3339。
+4. ID 重复 → `duplicate_id`；key 重复 → `duplicate_key`。
+5. 列表长度、映射深度与 `operations` 条数都有界（用 `cfg` 的容量字段与 `cfg.max_operations`）。
+6. 正文只接受**连续的 Markdown 引用行**（`> `）；`> ## 标题`、`> ---` 之类仍是正文，
+   **不得**被解析成新条目（防伪造，规划 §13.3）。
+7. 失败只返回六个稳定 reason：`not_utf8`、`too_large`、`bad_schema`、`malformed`、
+   `duplicate_id`、`duplicate_key`。
+8. 时间只用于排序与审阅，**不参与授权**。
+
+读取规则（调用方，即 §30 的 `MemoryService`）：每次最多读 `max_file_bytes + 1` 字节，
+先判上限，再交给本模块解码。
+
+### 29.3 渲染
+
+- 顺序固定：`all_user` → `lobby` → `candidates`；用户文件内的条目按 ID 升序。
+- 同一 document 重复渲染必须**逐字节相同**。
+- 同 key 更新时**替换**原条目，不得追加出并存条目。
+- `operations` 按稳定顺序输出。
+
+## 30. `memory/service.py`（存储服务）
+
+规划 §4.3 的存储语义：快照、原子写、幂等、刷新。签名逐字合同化，另加裁决 E 的
+`private_path`。本模块**不**做 AI 撰写、不做命令解析、不 import `app.py`（裁决 G）。
+
+### 30.1 接口
+
+```python
+@dataclass(frozen=True)
+class PrivateSettings:
+    private_enabled: bool
+    auto_capture: bool
+
+
+class MemoryService:
+    def __init__(
+        self,
+        config: MemoryConfig,
+        *,
+        now: Callable[[], float] = time.time,
+        replace: Callable[[str, str], None] = os.replace,
+    ) -> None: ...
+
+    async def start(self) -> None: ...
+    async def stop(self) -> None: ...
+
+    async def context_for(
+        self,
+        *,
+        user_id: str | None,
+        channel_kind: str,
+        access: MemoryAccessPolicy,
+    ) -> MemoryContext: ...
+
+    async def private_settings(self, user_id: str) -> "PrivateSettings": ...
+    def private_path(self, user_id: str) -> str: ...
+
+    async def set_private_enabled(
+        self, user_id: str, enabled: bool, *, operation_id: str
+    ) -> OperationResult: ...
+    async def set_auto_capture(
+        self, user_id: str, enabled: bool, *, operation_id: str
+    ) -> OperationResult: ...
+
+    async def apply_private_proposal(
+        self, user_id: str, proposal: MemoryProposal, *, operation_id: str
+    ) -> OperationResult: ...
+    async def delete_private(
+        self, user_id: str, memory_id: str, *, operation_id: str
+    ) -> OperationResult: ...
+    async def clear_private(
+        self, user_id: str, *, operation_id: str
+    ) -> OperationResult: ...
+
+    async def add_common_candidate(
+        self,
+        scope: MemoryScope,
+        proposal: MemoryProposal,
+        *,
+        operation_id: str,
+    ) -> OperationResult: ...
+    async def approve_candidate(
+        self, candidate_id: str, *, operation_id: str
+    ) -> OperationResult: ...
+    async def reject_candidate(
+        self, candidate_id: str, *, operation_id: str
+    ) -> OperationResult: ...
+    async def delete_common(
+        self, memory_id: str, *, operation_id: str
+    ) -> OperationResult: ...
+```
+
+公开只读辅助（测试与上层都要用，命名照此）：
+
+```python
+    async def private_entries(self, user_id: str) -> tuple[MemoryEntry, ...]: ...
+    async def common_entries(self, scope: MemoryScope) -> tuple[MemoryEntry, ...]: ...
+    async def candidates(self) -> tuple[MemoryCandidate, ...]: ...
+```
+
+- `private_path(user_id)` 是**同步**的只读方法，返回该用户 Markdown 的路径（用
+  `user_storage_key` 命名；目录不存在时**不创建**）。它是唯一的路径访问入口（裁决 E / D-65）。
+- `start()` / `stop()`：`enabled=false` 时**不做任何事**（不建目录、不读文件、不启任务）。
+  启用时创建或加载 `common.md`，并启动 `refresh_seconds` 周期的刷新任务；失败只记
+  `memory.load_failed` / `memory.refresh_failed` 并保留 unavailable 状态，**绝不抛出**。
+
+### 30.2 作用域读取与幂等
+
+规则：
+
+- `context_for` 按作用域取候选条目（`channel_kind` ∈ `"dm"` / `"lobby"` / `"comment"`）：
+
+  | 场景 | `all_user` | `lobby` | 当前用户私有 |
+  |------|-----------|---------|-------------|
+  | DM | 读 | 不读 | 读（且仅当 `access.permits_private(user_id, "dm")`） |
+  | lobby | 读 | 读 | **连文件都不读** |
+  | comment | 读 | 不读 | **连文件都不读** |
+
+- 返回的 `SupplementalItem.group` 取 `memory_all_user` / `memory_lobby` / `memory_user`；
+  `label` 是条目 ID（`GM-A-…` / `GM-L-…` / `UM-…`）；`priority` 由本模块给值（数值是实现细节），
+  但必须让 `ContextManager` 能表达 group 相对次序与组内次序：DM 私有优先于 `all_user`，
+  lobby 优先于 `all_user`，同组内 pinned 在前、再按 `updated_at` 新到旧。
+- **按 token 预算取舍与插入位置不在这里**（裁决 B / D-62）：`context_for` 只按作用域筛选并按
+  `priority` 排序返回，取舍由 `ContextManager.build_messages` 决定（§33）。
+- 任何失败返回空 items 并记 `memory.context_omitted`，**不抛出**（D-60）。
+
+全部 mutation 方法（`apply_private_proposal`、`set_private_enabled`、`set_auto_capture`、
+`delete_private`、`clear_private`、`add_common_candidate`、`approve_candidate`、
+`reject_candidate`、`delete_common`）的公共规则：
+
+- 入口**再次**校验 target 与 ID 前缀，不依赖 Router 或 Controller 已经授权。
+- 先查 `operations[operation_id]`：命中就返回第一次的稳定结果，**不再改动文件**。
+- 单进程内用一个 `asyncio.Lock` 串行所有写入（§30.3 的单写者约束）。
+- 容量上限（`max_common_entries_per_scope`、`max_private_entries_per_user`、`max_candidates`）
+  命中时返回 `full`，**绝不静默删除**已有条目。
+- 写入前用现有 `Redactor` 对照已注册的密码、API Key 与 Cookie；脱敏前后不一致时**整条拒绝**
+  并返回 `secret_detected`，不保存 `[redacted]` 版本（§37）。
+- `/memory clear` 删除全部私有条目，但保留必要的幂等元数据，因此清空后重放旧命令不会再次执行
+  （§32.3、D-59）。
+
+### 30.3 原子写入
+
+一次成功写入是规划 §5.5 的七步：
+
+1. 在目标文件**同目录**创建唯一临时文件。
+2. 以独占创建方式打开，写入完整 bytes，flush 后 fsync。
+3. 写入前比较当前磁盘摘要与内存快照摘要；不一致时先尝试载入外部版本。
+4. 外部版本合法则以它为新基线**重新应用**本次操作；非法则返回 `conflict`，不覆盖。
+5. 用 `os.replace` 原子替换正式文件。
+6. 完成后**一次引用替换**内存快照。
+7. 任一步失败都保留原正式文件与旧快照，并清理临时文件（映射为 `unavailable`）。
+
+- `replace` 由构造注入（默认 `os.replace`），测试注入失败版本。
+- **单进程单写者**：一个进程内所有 Markdown 写入串行；Beta **不支持**多个进程同时写同一目录，
+  部署文档必须写明单副本约束。
+
+### 30.4 刷新、缓存与外部编辑
+
+- `common.md` 按 `refresh_seconds` 检查外部编辑，完整解析成功后替换快照。
+- 用户文件**惰性加载** + 有界 LRU 快照缓存；缓存淘汰只释放内存，**不删文件**。
+- 用户文件在缓存 TTL 到期后的**下一次访问**检查摘要，不为所有用户起轮询任务。
+- 外部文件非法时保留该进程最后一份有效快照；冷启动无有效快照时对应范围 unavailable。
+- 日志只记 `scope`、`reason`、`revision` 与数量；**不记用户存储键、路径或正文**（§37）。
+
+## 31. `memory/writer.py`（AI 撰写器）
+
+规划 §4.4 的撰写合同：AI 只负责把来源内容整理成一条候选记忆。
+
+### 31.1 接口
+
+```python
+class MemoryModel(Protocol):
+    async def complete(self, messages: list[dict[str, str]]) -> str: ...
+
+
+class MemoryWriter:
+    def __init__(
+        self,
+        model: MemoryModel,
+        *,
+        model_gate: asyncio.Semaphore,
+        timeout_seconds: float,
+        max_context_tokens: int,
+        max_entry_chars: int,
+    ) -> None: ...
+
+    async def propose_private(
+        self,
+        source_text: str,
+        existing: tuple[MemoryEntry, ...],
+        *,
+        automatic: bool,
+    ) -> MemoryProposalResult: ...
+
+    async def propose_common(
+        self,
+        source_text: str,
+        existing: tuple[MemoryEntry, ...],
+    ) -> MemoryProposalResult: ...
+```
+
+规则：
+
+- `propose_private` 与 `propose_common` 使用**两份不同的静态 system prompt**（中文、无任何插值），
+  放在 `memory/prompts.py` 或本模块的模块级常量里。
+- **动态来源与已有记忆一律放进 `role="user"`**；`MemoryWriter` **不接受** scope、owner 或路径
+  参数——它无法替模型决定权限（D-57）。
+- 已有记忆以 `[<ID>] <content>` 形式渲染进 user 消息，受 `max_context_tokens` 约束：
+  塞不下的条目**整条丢弃**，不截半句。
+- `automatic=True` 只允许 `add` / `update` / `noop`，且只有 `confidence >= 0.85` 才接受；
+  低于门槛时返回 `status == "ok"` + `action == "noop"` 的提案（不是错误）。
+  显式 `/remember` 不以置信度替代安全校验，但 AI 仍可对一次性内容或凭证返回 `noop`。
+- `timeout_seconds` 用 `asyncio.timeout`；`model_gate` 包住模型调用；
+  `asyncio.CancelledError` **必须原样传播**（不得吞成 `invalid_proposal`）。
+- 超时、非法 JSON、拒答与模型异常统一返回 `invalid_proposal`；**不写正文进日志**。
+
+### 31.2 严格 JSON 合同
+
+AI 只返回一项 JSON，形状逐字如下：
+
+```json
+{
+  "action": "add",
+  "target_id": null,
+  "key": "preference.python_version",
+  "content": "在 Python 相关回答中，用户偏好使用 Python 3.12 的示例。",
+  "confidence": 0.97
+}
+```
+
+解析规则（逐条实现规划 §4.4）：
+
+1. 可剥离最外层**一个** Markdown JSON 代码围栏；围栏之外还出现其他正文 → 拒绝。
+2. 用标准库 `json.loads`，不新增依赖。
+3. 必须**恰好**包含 `action`、`target_id`、`key`、`content`、`confidence` 五个字段；
+   **未知字段整份拒绝**（`scope`、`owner` 等一律拒绝，不做「忽略未知字段」的宽容解析）。
+4. `action ∈ {add, update, noop}`；`automatic=True` 与共同候选都**不允许** `delete`。
+5. `target_id` 只能引用**传给模型的那批既有条目**（用 `existing` 的 ID 集合校验）；
+   `action == "add"` 时必须是 `null`。
+6. `key`：小写 ASCII 字母、数字、`.`、`_`、`-`，长度 **1..64**（**代码常量**，不可由 YAML 改）。
+7. `content`：去首尾空白与控制字符、剥掉 Markdown 标题伪装（如开头的 `#`）后，长度不超过
+   `max_entry_chars`。
+8. `confidence` 是 0..1 的有限数字；**bool 不算数字**，`NaN` / 无穷一律拒绝。
+9. `automatic=True` 且 `confidence < 0.85` → `ok` + `noop` 提案。**0.85 是代码常量**，
+   不可由 YAML 改。
+10. 超时、非法 JSON、拒答、模型异常 → `invalid_proposal`。
+11. `noop` 提案的规范化（本节钉死）：`proposal.content` 一律为空串 `""`——不保留原文，
+    免得未经保存的正文流进下游展示路径；`status` 仍是 `"ok"`；`key`、`target_id`、`confidence`
+    保留模型输出的原值。
+
+## 32. `memory/commands.py` 与 `memory/controller.py`（命令与编排）
+
+### 32.1 命令类型
+
+```python
+@dataclass(frozen=True)
+class MemoryCommand:
+    name: str
+    argument: str | None = None
+    scope: MemoryScope | None = None
+
+
+@dataclass(frozen=True)
+class MemoryCommandRequest:
+    event_id: int | None
+    message_id: int
+    channel_id: str
+    session_key: str
+    user_id: str
+    command: MemoryCommand
+
+
+@dataclass(frozen=True)
+class MemoryCommandResult:
+    status: str
+    text: str
+    memory_id: str | None = None
+
+
+def parse_memory_command(text: str) -> MemoryCommand | None: ...
+```
+
+### 32.2 命令表与解析
+
+全部命令只在 DM 执行：
+
+```text
+/memory status
+/memory on
+/memory off
+/memory auto on
+/memory auto off
+/memory list
+/memory list all_user
+/memory list lobby
+/memory forget <UM-ID>
+/memory clear
+/remember <内容>
+
+# 仅 admin_user_list
+/memory suggest all_user <内容>
+/memory suggest lobby <内容>
+/memory candidates
+/memory approve <MC-ID>
+/memory reject <MC-ID>
+/memory delete <GM-A-ID | GM-L-ID>
+```
+
+`MemoryCommand` 的字段取值是稳定合同：
+
+| 输入 | `name` | `argument` | `scope` |
+|------|--------|-----------|---------|
+| `/memory status` | `"status"` | `None` | `None` |
+| `/memory on` / `/memory off` | `"on"` / `"off"` | `None` | `None` |
+| `/memory auto on` / `/memory auto off` | `"auto_on"` / `"auto_off"` | `None` | `None` |
+| `/memory list` | `"list"` | `None` | `None` |
+| `/memory list all_user` / `lobby` | `"list"` | `None` | `MemoryScope.ALL_USER` / `LOBBY` |
+| `/memory forget <UM-ID>` | `"forget"` | ID 原样 | `None` |
+| `/memory clear` | `"clear"` | `None` | `None` |
+| `/remember <内容>` | `"remember"` | 内容原文 | `None` |
+| `/memory suggest all_user <内容>` | `"suggest"` | 内容原文 | `MemoryScope.ALL_USER` / `LOBBY` |
+| `/memory candidates` | `"candidates"` | `None` | `None` |
+| `/memory approve <MC-ID>` / `/memory reject <MC-ID>` | `"approve"` / `"reject"` | ID 原样 | `None` |
+| `/memory delete <GM-A- 或 GM-L- ID>` | `"delete"` | ID 原样 | `None` |
+
+解析规则（`parse_memory_command`，纯函数）：
+
+- 只在**消息开头**生效，大小写不敏感；`/memoryx`、`/memoryfoo`、正文中间的 `/memory`、
+  未知子命令都不命中（返回 `None`，交给后续普通路径）。
+- 命令名与参数之间必须有空白。
+- `/memory forget` 缺参数时返回一个**解析成功但 `argument is None`** 的命令（由上层回固定用法），
+  **不要**返回 `None`（那会让它变成普通聊天）。
+- ID 参数做前缀校验（`UM-` / `MC-` / `GM-A-` / `GM-L-`）：非法 ID 在解析阶段即按用法错误处理
+  （`argument is None`），不进入 AI。空参数与非法 ID 都只回固定用法。
+
+### 32.3 `MemoryController`
+
+```python
+class MemoryController:
+    def __init__(self, *, service: MemoryService, writer: MemoryWriter,
+                 access: MemoryAccessPolicy) -> None: ...
+
+    async def execute_command(
+        self, request: "MemoryCommandRequest"
+    ) -> "MemoryCommandResult": ...
+
+    async def auto_capture(
+        self,
+        *,
+        user_id: str,
+        message_id: int,
+        source_text: str,
+    ) -> "MemoryCaptureResult": ...
+```
+
+执行顺序（**固定**，规划 §4.5）：访问门 → 幂等命中 → 读取目标快照 → AI 撰写 → 宿主校验 →
+原子写入 → 生成固定用户文案。
+
+规则：
+
+- 显式 `/remember` 的 `operation_id` 是 `"remember:<message_id>"`（稳定合同）。重复 SSE、
+  resync 或崩溃重放先查 Markdown 的 `operations`；命中时**不再调用 AI**，直接返回第一次的
+  稳定结果。
+- `/memory suggest <scope> <内容>` 只允许 admin：Controller **与** Service 两层都查 `is_admin`；
+  目标作用域由命令解析固定，AI 只撰写候选（D-58）。
+- `/memory approve` **不再调用 AI**：直接把候选原子移入生效区；候选的目标条目已被改动时返回
+  `conflict`，要求重新生成候选，不覆盖新内容。
+- `/memory list all_user|lobby` 只展示**已生效**共同记忆；候选只对管理员显示。
+- `auto_capture` 采用高精度策略：`automatic=True`，只有**成功变更**才返回 `ok`；它不接收模型
+  回答、搜索结果、知识库片段、引用正文或图片描述（**签名里就没有这些参数**）。
+  `MemoryCaptureResult.content` 是写入后的正文原文，供 §34.4 拼写入披露。
+- 命令的分组语义（规划 §7.1）：`/memory on` 启用私有记忆读取（显式 `/remember` 保存成功时也
+  自动打开）；`/memory off` 暂停读取并关闭自动提取，但保留已有条目；`/memory clear` 删除全部
+  私有条目且保留幂等元数据；`/memory auto on` 只在部署允许时成功并隐含启用读取；
+  `/reset` **不清理**任何长期记忆。
+- 用户可预期的失败一律映射成稳定状态（§27.4），不抛异常；日志只记稳定状态与数量，
+  **不记正文、key、命令参数或用户 ID**（§37）。
+- 用户可见文案一律取自 `texts.py`（§36）；成功文案必须展示**实际保存的正文与条目 ID**
+  （设计 §11、规划 §8.1），不得只回「已记住」。
+
+## 33. `core/context.py`（记忆的预算拼装）
+
+`SupplementalItem` 与 `build_messages` 的新参数合同化规划 §6.1 / §6.2。类型定义在
+`core/context.py`；`memory/models.py` 可以 import 它，反向不成立（裁决 A / D-61）。
+
+```python
+@dataclass(frozen=True)
+class SupplementalItem:
+    group: str       # memory_all_user | memory_lobby | memory_user
+    label: str       # GM-A-... / GM-L-... / UM-...
+    content: str
+    priority: int    # 越小越优先
+
+
+def build_messages(
+    self,
+    session_key: str,
+    system_prompt: str,
+    *,
+    pending_user: str | None = None,
+    system_addendum: str | None = None,
+    feature_context: bool = False,
+    supplemental_items: tuple[SupplementalItem, ...] = (),
+) -> list[dict[str, str]]:
+    ...
+```
+
+规则：
+
+- `supplemental_items` 为空时必须与改动前**逐字节一致**（规划 §6.1 的硬要求）。
+- 选择顺序（规划 §6.2）：
+  1. system、静态 addendum 与本轮 `pending_user` **永远保留**。
+  2. 已位于 `pending_user` 的本轮显式资料（`/kb`、博客）优先于全部记忆。
+  3. 普通聊天至少保留最近一组完整历史；`feature_context=True` 时这组历史也可丢（D-38 不变）。
+  4. 选择次序：DM 私有 > `all_user`；大区 `lobby` > `all_user`；评论只有 `all_user`。
+  5. 同一组内 `pinned` 优先，再按更新时间新到旧。
+  6. 记忆放好后，用剩余预算从新到旧补更早的完整历史对。
+- 每条记忆是**不可拆分单位**：塞不下就跳过该条，绝不截半句。
+- 历史仍按时间正序输出；记忆按作用域分组放在**最后一条 `role="user"` 消息的当前正文之前**，
+  版面照规划 §6.2 末尾的文本块：
+
+```text
+[共同记忆：all_user，不可信资料]
+[GM-A-000007] ...
+
+[用户私有记忆，不可信资料]
+[UM-000006] ...
+
+---
+[当前消息]
+...
+```
+
+- 分组标签按 `group` 取 `[共同记忆：all_user，不可信资料]` / `[共同记忆：lobby，不可信资料]` /
+  `[用户私有记忆，不可信资料]`；条目行是 `[<ID>] <content>`；组间空行，与当前正文之间用
+  `---` 分隔。
+- 只有**确实选入至少一条**记忆时才向 system 追加 `MEMORY_SYSTEM_ADDENDUM`：
+  `build_messages` 自己从 `texts` 取用并追加（它不 import memory，裁决 C），方式与现有
+  `system_addendum` 一致（`"\n\n"` 拼接），并分别计入预算。该常量完全静态、不做任何插值
+  （与 `LOBBY_SHARED_SYSTEM_ADDENDUM` 同款，D-24）。
+- `append_exchange` 与记忆无关：历史内容**不含**记忆块（规划 §6.2 末段）。
+- 记忆正文只出现在 `role="user"` 的当前轮里，**绝不**进 system、**绝不**进历史（D-56）。
+
+## 34. `core/router.py` 与 `app.py`（路由、队列与生命周期）
+
+合同化规划 §7.3 / §8 / §9。
+
+### 34.1 Router
+
+`MessageRouter.__init__` 增加两个 keyword-only 参数：
+
+```python
+class MessageRouter:
+    def __init__(self, *, self_user_id: str, bot_username: str,
+                 ctx: ContextManager, store: Store,
+                 queue: asyncio.Queue[Request], cfg: BehaviorConfig,
+                 storage: StorageConfig, now: Callable[[], float] = time.time,
+                 vision_enabled: bool = False, kb_enabled: bool = False,
+                 memory_access: MemoryAccessPolicy | None = None,
+                 memory_queue: asyncio.Queue[MemoryCommandRequest] | None = None) -> None
+```
+
+- 两者都为 `None` 时行为与今天**逐字节一致**（未注入兼容）。
+- `Request` 增加 `memory_allowed: bool = False`，由 Router 用当前 `message.author.id` 计算；
+  门禁关闭或未注入时恒为 `False`。
+- `RouteResult.action` 增加 `"memory_queued"`，**不是** `"queued"`：app 不会把它当聊天请求
+  处理，终态由记忆 worker 负责（34.3）。
+
+判定顺序（记忆命令在能力命令解析**之前**识别，避免 `/search /remember …` 绕过单能力规则）：
+
+1. `parse_memory_command(user_text)` 命中时（§32.2）：
+   - 只在 **DM** 执行；大区里的同一文本返回「请在私聊中管理记忆」的固定本地提示
+     （`reply_now`，kind `notice_local`），不调 AI、不入记忆队列。
+   - 未通过 Beta 接入门（`access.permits_commands(user_id, channel_kind)`）→ 固定拒绝文案
+     （`reply_now`）。
+   - `user_id` 为空（拿不到稳定身份）时按未通过门禁处理。
+   - 通过 → 构造 `MemoryCommandRequest`（`event_id`、`message_id`、`channel_id`、
+     `session_key` 用该 DM 的 session key、`user_id` 用 `message.author.id`、`command`）
+     并 `put_nowait` 入 `memory_queue`。
+   - 队列满（`asyncio.QueueFull`）→ 与现有 busy 语义一致的 `RouteResult.action == "busy"`
+     （文案 `BUSY_NOTICE_TEXT`）。
+   - 成功入队 → `RouteResult.action == "memory_queued"`。事件此时已完成去重登记，
+     终态由记忆 worker 负责（`mark_handled`，见 34.3）。
+2. 普通聊天：`memory_allowed = memory_access.permits_common(message.author.id)`。
+3. `/help` 的文案改为调用 `help_text(...)`（§36），参数取 `vision_enabled`、`kb_enabled`、
+   `memory_allowed`（当前作者是否可用记忆）与 `private_enabled`（当前作者的私有记忆开关；
+   拿不到时按 `False`）。
+4. `/reset` 行为完全不变（规划 §9.2）。
+
+### 34.2 App 装配与生命周期
+
+`BotApp.__init__` 新增（规划 §9.1）：`MemoryAccessPolicy`、`MemoryService`、`MemoryWriter`
+（主模型构造完成后绑定）、`MemoryController`、独立 `asyncio.Queue[MemoryCommandRequest]`
+（容量 `memory.queue_size`）与 `WorkerPool[MemoryCommandRequest]`（**并发 1**）。
+测试注入点：`memory_service`、`memory_writer`、`memory_controller` 均可选注入（fake 优先，
+避免真实模型与磁盘 I/O）。
+
+启动顺序（规划 §9.2）：在 Store 崩溃恢复与主模型构造**之后**、聊天 worker 与评论服务启动
+**之前**：
+
+1. `MemoryService.start()` 创建或加载共同记忆；失败只记稳定错误并保留 unavailable 状态；
+2. 构造 `MemoryWriter` 与 `MemoryController`；
+3. 启动记忆 worker（并发 1）；
+4. 构造 Router 时注入 access policy 与 memory queue；
+5. 构造 CommentRouter / CommentService 时注入 memory access 与只读 context provider。
+
+`memory.enabled=false` 时**全部跳过**，且不创建目录（D-60）。
+
+关闭顺序（规划 §9.4）：
+
+1. 停评论服务与 SSE，停止产生新请求；
+2. 停主聊天 worker **和记忆 worker**；
+3. 停 `MemoryService` 的刷新任务；
+4. 再关 MCP、KB、模型客户端、SiteClient 与 Store。
+
+**记忆 worker 必须早于模型客户端关闭**，否则在途 AI 撰写会访问已关闭的客户端。
+
+### 34.3 聊天侧读取与记忆 worker
+
+- `_handle_request` 在拼装消息时，若 `request.memory_allowed` 为真，调用
+  `service.context_for(user_id=..., channel_kind=..., access=...)`，把返回的 items 传给
+  `ctx.build_messages(..., supplemental_items=...)`；取失败时传空元组继续（软故障，D-60）。
+- `_dispatch` 增加 `memory_queued` 分支：无事可做（worker 会处理），**不要**当 `queued` 或
+  `reply_now` 处理。
+- 记忆 worker 的 handler：
+  - 调 `MemoryController.execute_command(request)`；
+  - 用 `kind="notice_local"` 发送返回文案（**不占**主动通知名额，D-1）；
+  - 传 `thread_root_id=None`（记忆命令只在 DM）；
+  - 在 `finally` 里 `mark_handled(request.message_id, "done")`，避免水位卡住；
+  - handler 抛异常不得终止 worker，但 `mark_handled` 必须在 `finally`。
+- `/remember` 的数据流（规划 §8.1）：Router 记录事件并入队 → Controller 检查门与
+  `operation_id` → 读当前用户私有条目 → `propose_private(automatic=False)` → 校验 →
+  原子 add/update → `notice_local` 展示**实际保存的正文与 ID**。
+
+### 34.4 自动提取（规划 §8.3）
+
+只在**同时**满足以下条件时运行：`memory.enabled`；当前用户通过 Beta 接入门；频道是 DM；
+部署配置 `auto_capture_available`；用户私有设置 `auto_capture`；当前消息不是本地命令、
+`/search`、`/kb`，也不依赖图片、博客或内容引用资料；当前请求 generation 仍有效。
+
+- 执行位置：**主模型已经生成回答之后、发送回答之前**。
+- `MemoryWriter` 只接收用户自己写的**原始正文**与当前私有记忆；**不接收**模型回答、搜索结果、
+  知识库片段、引用正文或图片描述。
+- 成功变更后先原子提交私有记忆，再给即将发送的回答追加确定性说明：
+
+  ```text
+  （已更新私有记忆 UM-000006：在 Python 相关回答中优先使用 Python 3.12。）
+  ```
+
+- 发送前为说明**预留输出空间**（裁决 D / D-63）：先
+  `truncate_at_paragraph(answer, max_output_chars - len(disclosure) - len(TRUNCATION_SUFFIX))`，
+  再拼接披露文本；保证 Sender 的第二次截断不会切掉披露。
+  （`text_utils.truncate_at_paragraph(text, limit) -> tuple[str, bool]`，结果**已含**
+  `TRUNCATION_SUFFIX`，取第一个返回值；预算因此正好是 `max_output_chars - len(disclosure)`。）
+- 撰写失败、超时、`noop` 或写入失败：原回答照常发送，**不追加**成功说明。
+- 记忆提交与站内回复不是一个分布式事务：记忆提交后发送失败时记忆仍然存在（规划 §8.3）；
+  该取舍要写进代码注释。
+- 日志只用 `memory.auto_capture` 事件与白名单字段（`memory_id`、`scope`、`reason`）。
+
+## 35. 评论集成（`comments/router.py`、`comments/service.py`）
+
+合同化规划 §10。
+
+- `CommentRequest` 增加 `memory_allowed: bool = False`；**不得**添加 author ID 字段
+  （现状如此，合同不变）。
+- `CommentRouter` 在仍持有 `CommentNode.author.id` 时算出 `memory_allowed`
+  （`access.permits_common(comment.author.id)`），并注入它需要的最小依赖。作者 ID 为空时：
+  `allowlist` 模式为 `False`；`all` 模式可以是 `True`（只读 `all_user`）。
+- `CommentService._build_model_messages` 仅在 `memory_allowed` 时取 `all_user` 共同记忆，
+  放进当前轮的 `pending_user`（与文章块、父评论块同一位置）；**绝不**请求 `lobby` 或任何用户
+  私有文件。
+- 评论路径**没有** `/remember`、`/memory` 或自动提取。
+- `all_user` 块**不写进**评论 `ContextManager` 历史。
+- 共同记忆服务失败不改变评论 `alive`，也不改变聊天 `/livez`、`/readyz`（软故障，D-60）。
+- 评论只可能使用 `all_user`；`COMMENT_HELP_TEXT` 不得再承诺「没有长期记忆」（§36）。
+
+## 36. `texts.py`（记忆文案）
+
+为避免 vision × KB × memory 继续组合出更多常量，`/help` 重构为一个函数（规划 §11）：
+
+```python
+def help_text(
+    *,
+    channel_kind: str,
+    vision_enabled: bool,
+    kb_enabled: bool,
+    memory_allowed: bool,
+    private_enabled: bool,
+) -> str: ...
+```
+
+行为：
+
+- **记忆未启用**（或用户未通过 Beta 门）时，`help_text` 的四个既有组合必须与今天的
+  `HELP_TEXT` / `HELP_TEXT_WITH_VISION` / `HELP_TEXT_WITH_KB` / `HELP_TEXT_WITH_VISION_AND_KB`
+  **逐字节相同**；既有测试不得改动（裁决 F / D-64）。四个常量可以保留为函数结果或兼容常量。
+- `channel_kind == "lobby"` 时使用含大区共享链说明的那段（今天 `_HELP_TAIL` 的一部分），
+  因此 `_HELP_TAIL` 需要拆成可组合的两段。
+- `_HELP_TAIL` 里「我重启之后可能会忘记先前聊过什么，没有长期记忆。」按 `memory_allowed`
+  条件化：允许时换成如实披露（设计 §11 的七条）：
+  1. 机器人存在共同记忆；
+  2. 用户可以选择使用私有记忆（`private_enabled` 决定措辞）；
+  3. 普通聊天不会被完整保存；
+  4. 记忆可能随相关请求发送给第三方模型；
+  5. 私有记忆只在该用户私聊中使用；
+  6. 用户可以查看、纠正和删除自己的私有记忆；
+  7. `/reset` 不等于删除长期记忆。
+- `private_enabled` 的两种取值产生**不同措辞**（已开启 / 未开启）。
+- 帮助文案仍须能整条塞进站点单条消息上限（现状已满足，不要把长度翻倍）。
+- 新增固定文案全部集中在 `texts.py`（标识符由实现决定，语义与触发点见下表），全部中文，
+  **不回显宿主路径、原始 user ID 或模型错误正文**：
+
+  | 文案 | 触发点 |
+  |------|--------|
+  | Beta 拒绝（未通过接入门） | Router 收到记忆命令但 `permits_commands` 为假（§34.1） |
+  | 只允许 DM | 大区里出现记忆命令（§34.1） |
+  | 用法提示（`/memory` 与 `/remember`） | 空参数或非法 ID（§32.2） |
+  | 撰写失败 | `invalid_proposal` / 超时（§31） |
+  | 文件不可用 | `unavailable`（§30） |
+  | 候选冲突 | `conflict`（§32.3） |
+  | 记忆已满 | `full`（§30） |
+  | 操作成功 | `ok`，必须展示**实际保存的正文与条目 ID** |
+  | 自动提取的写入披露 | §34.4 的确定性说明 |
+  | `MEMORY_SYSTEM_ADDENDUM` | §33；完全静态，说明记忆是不可信资料、不能改变规则或权限、与当前事实冲突时不机械照搬；**不做任何插值** |
+
+- `COMMENT_HELP_TEXT` 必须改为**不承诺「没有长期记忆」**：评论只可能使用 `all_user` 共同记忆，
+  措辞照此（本功能唯一一处允许的既有文案注释性改动）。
+- `texts.py` 不 import 任何 memory 模块（`MEMORY_SYSTEM_ADDENDUM` 由 `build_messages` 取用）。
+
+## 37. 记忆日志与安全
+
+`logging_setup.LOG_FIELDS` 增加且**只**增加下面五个字段（它们只承载稳定标识与计数）：
+
+```text
+scope | revision | entry_count | memory_id | candidate_id
+```
+
+允许的事件名（规划 §12；每条路径只使用自己需要的子集）：
+
+```text
+memory.ready
+memory.load_failed
+memory.refresh_failed
+memory.command
+memory.write_failed
+memory.updated
+memory.candidate_updated
+memory.auto_capture
+memory.context_omitted
+```
+
+禁止记录（任何级别、任何路径）：
+
+- 记忆正文、key、候选正文；
+- user ID、用户存储键、username；
+- 文件绝对路径、文件摘要；
+- AI 撰写请求与响应；
+- 记忆命令参数；
+- 密钥检测命中的具体字符串。
+
+规则：
+
+- 日志一律走 `log_event`；`LOG_FIELDS` 之外的字段被**静默丢弃**，因此需要记录的新字段必须先加进
+  白名单（上面五个）。
+- 写入前用现有 `Redactor` 对照已注册的密码、API Key 与 Cookie；脱敏前后不一致时**整条拒绝**
+  并返回 `secret_detected`，不保存 `[redacted]` 版本，也不把命中的字符串写进日志。
+- 记忆正文只允许出现在三处：目标 Markdown、允许的 `role="user"` 模型请求、面向所属用户的
+  明确展示。
+- 所有用户内容与记忆正文进入模型时都是 `role="user"`；静态 memory system addendum 不插值；
+  模型输出不能授权自身调用文件、网络或 Store（设计 §7.6 的高风险信息一律不进入记忆）。
+- 记忆是软故障：任何读取、撰写或写入失败都不得让聊天、评论、`/livez`、`/readyz` 失败（D-60）。
