@@ -42,6 +42,7 @@ class BehaviorConfig:
     context_turns: int = 10
     context_input_tokens: int = 8000
     max_input_chars: int = 8000
+    quoted_blog_max_chars: int = 1000     # 引用博客的正文上限；与 comments 的键**互相独立**
     max_output_chars: int = 5000
     concurrency: int = 3
     queue_size: int = 50
@@ -193,6 +194,9 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
 - `model.vision_enabled` 必须是**布尔**（YAML 里写成 `"true"` 字符串即 `ConfigError`）；
   `model.max_image_bytes` 是正整数（布尔不算整数）且 `<= 10485760`（站点图床单图上限是
   上游常量，配更大只会掩盖意图）。两者都缺省：`false` / `5242880`。
+- `behavior.quoted_blog_max_chars` 是正整数（布尔不算整数），缺省 1000。
+  它与 `comments.article_max_chars` **默认值相同但彼此独立**：聊天模型与评论模型未必是
+  同一个，两边各自可调；要求同值时靠配置自觉（见 `DESIGN_DECISIONS.md` D-47）。
 - `system_prompt_sha256` = `hashlib.sha256(system_prompt.encode()).hexdigest()[:12]`。
 - `Config` 内**不含** Cookie、不含消息正文。`repr(Config)` 不得泄露密钥。
 
@@ -318,8 +322,9 @@ TRUNCATION_SUFFIX: str      # 追加在被截断输出末尾的省略提示
 HELP_TEXT: str              # 能力、隐私、默认离线与无图片输入说明（vision 关闭时）
 HELP_TEXT_WITH_VISION: str  # 同上，但能力句声明可以查看用户发来的图片（vision 开启时）
 USAGE_HINT: str             # 空白内容或只有 @bot 时的用法提示
-UNSUPPORTED_MEDIA_TEXT: str # 只有博客、没有可读图片
+UNSUPPORTED_MEDIA_TEXT: str # 只有附件、没有可读内容；聊天区已不再用，评论区仍用
 IMAGE_UNAVAILABLE_TEXT: str # 有图但读不到（未启用图片输入 / 图已失效 / 取图失败）
+BLOG_UNAVAILABLE_TEXT: str  # 引用的博客读不到（已删除 / 取不到正文 / id 不合法）
 TOO_LONG_TEXT: str          # 超过 max_input_chars
 SECRET_REFUSAL_TEXT: str    # 本地拒绝索取系统提示/密钥
 RESET_DONE_TEXT: str        # /reset 后的确认
@@ -987,18 +992,19 @@ class MessageRouter:
        （`/help` 与 `/reset` 不是能力命令），继续走下面的本地命令判定，保持
        「本地动作优先」的既有合同。
      - 能力名只写入 `Request.enabled_features`，评论路径完全不解析这两个命令。
-   - `user_text` 为空，按顺序三分支：
-     - `vision_enabled` 且 `has_image(message)` → **不回复**，直落第 10 步入队，
-       最终 `reason` 为 `image_only`（取图与降级由 worker 负责，路由器不做 I/O）；
+   - `user_text` 为空，按顺序**五分支**（博客排在图片**之前**，理由见 D-47）：
+     - `message.blog is not None and not message.blog_missing` → **不回复**，直落第 10 步入队，
+       最终 `reason` 为 `blog_only`（取正文与降级由 worker 负责，路由器不做 I/O）；
+     - 否则 `vision_enabled` 且 `has_image(message)` → 同样入队，最终 `reason` 为 `image_only`；
      - 否则 `message.image is not None` → `reply_now`（`media_only`），
        文案 `IMAGE_UNAVAILABLE_TEXT`（图片输入未开启，或 `image_missing`）；
-     - 否则 `message.blog is not None` → `reply_now`（`media_only`），
-       文案 `UNSUPPORTED_MEDIA_TEXT`；
+     - 否则 `message.blog is not None`（此时必然 `blog_missing`）→ `reply_now`（`media_only`），
+       文案 `BLOG_UNAVAILABLE_TEXT`；
      - 否则 → `reply_now`（`empty`），文案 `USAGE_HINT`。
-     空正文不会命中 9.2-9.6 的任何一个分支（命令判定与探测词都要求非空内容），
+     空正文不会命中 9.3-9.7 的任何一个分支（命令判定与探测词都要求非空内容），
      因此「不回复直接入队」不会误判。
      注意大区里纯图消息仍然必须**带 `@bot`**（第 5 步的 mention 过滤在前），
-     即用户输入 `@bot` 并附图；私聊不需要。
+     即用户输入 `@bot` 并附图；私聊不需要；纯博客引用同理。
    - `/help` 的文案按 `vision_enabled` × `kb_enabled` 四选一：`HELP_TEXT_WITH_VISION_AND_KB`、
      `HELP_TEXT_WITH_KB`、`HELP_TEXT_WITH_VISION`、`HELP_TEXT`。帮助文案必须说实话：
      KB 关闭时不得宣传 `/kb`，开启时必须披露「从本地资料检索、命中片段会发给第三方模型」。
@@ -1009,7 +1015,7 @@ class MessageRouter:
      - **私聊**：`ctx.reset(session_key)`（清空并递增代次）→ `reply_now`（`reset`）。
    - 有媒体且 `user_text` 非空 → 照常处理文本，继续往下。图片是否随本轮外送由
      worker 决定（`vision_enabled` 且图可读时附上，见 §16），路由器在这一步不分流。
-     博客一律只当作「有东西读不了」，不给模型。
+     引用的博客同理：正文由 worker 取（§24），路由器这一层不分流。
    - `len(user_text) > cfg.max_input_chars` → `reply_now`（`too_long`），文案 `TOO_LONG_TEXT`。
    - `is_secret_probe(user_text)` → `reply_now`（`secret_probe`），文案 `SECRET_REFUSAL_TEXT`。
 10. 构造 `Request` 并入队：成功 → `queued`；`asyncio.QueueFull` → `busy`
@@ -1270,8 +1276,19 @@ class BotApp:
   | 其余失败值 | `[图片未提供]\n---\n正文` | （不会到模型：纯图读不到走本地提示） |
   | `"none"` | 正文（不加标记） | — |
 
-  大区的顺序是「直接引用 → 发言者包装 → 图片标记 → 正文」，即标记在
-  `speaker_wrapper` **内部**：图属于发言人这条消息。
+  **引用博客标记（§24，D-47）**：本轮引用了博客时，`_with_image_marker` 之后再加
+  `_with_blog_marker`。外送的那一份带**整块**（标题 + 正文），提交进历史的那一份
+  只剩一行标记 —— 块与标记只差「正文给不给」这一处：
+
+  | `blog_state` | 外送 | 历史 |
+  |--------------|------|------|
+  | `"ok"` / `"too_long"` | 块（正文或「正文因长度规则未提供」） | `[引用博客]` |
+  | `"missing"` | 块（正文栏「该博客已被删除，正文不可读」） | `[引用博客已删除]` |
+  | `"failed"` | 块（正文栏「正文未取得」） | `[引用博客未取得]` |
+  | `"none"` | 不加任何东西 | — |
+
+  大区的顺序是「直接引用 → 发言者包装 → 图片标记 → 引用博客 → 正文」，即标记在
+  `speaker_wrapper` **内部**：图与引用都属于发言人这条消息。
   `attach_image` 必须排在 `_apply_reply_prefix` **之后**，因为后者按字符串拼接 content。
 - worker 的 handler（**两处代次检查不能省**）：
   0. `vision_enabled` 为假时**完全不碰** `ImageLoader`（`_load_image` 直接返回
@@ -1280,23 +1297,29 @@ class BotApp:
      → 该请求已被 `/reset` 或线程过期作废：**不调模型、不发消息**，
      `mark_handled(..., "done")` 后返回。
   1.5 取图（`ImageLoader.load`，在模型门**之外**，超时由站点请求超时兜住）→
-     `(image_part, image_state)`。三种去向：
-     - `image_part is None` 且 `image_state != "none"` 且 `user_text` 为空（纯图读不到）
-       → 发一次 `IMAGE_UNAVAILABLE_TEXT`（kind=`"notice_local"`，见 D-30），
-       **不调模型**，然后走 finally 的 `mark_handled`；
+     `(image_part, image_state)`；紧跟其后取引用的博客（`BlogLoader.load`，同样在模型门
+     之外）→ `(blog_block, blog_state)`。整条消息只有引用、且一样都没取到时：
+     - `image_part is None` 且 `not blog_readable(blog_state)` 且 `user_text` 为空
+       且（`image_state != "none"` 或 `blog_state != "none"`）
+       → 发一次本地文案（kind=`"notice_local"`，见 D-30），**不调模型**，
+       然后走 finally 的 `mark_handled`。文案按消息带了什么选：有图片载荷时用
+       `IMAGE_UNAVAILABLE_TEXT`（与改动前逐字节一致），否则 `BLOG_UNAVAILABLE_TEXT`；
      - 其余情况继续往下。
-  2. 组装本轮 `pending`（上表左列，**加上图片标记**），`messages = ctx.build_messages(
+  2. 组装本轮 `pending`（上表左列，**加上图片与引用博客标记**），
+     `messages = ctx.build_messages(
      request.session_key, cfg_system_prompt, pending_user=pending,
-     system_addendum=LOBBY_SHARED_SYSTEM_ADDENDUM if channel_kind == "lobby" else None)`
+     system_addendum=LOBBY_SHARED_SYSTEM_ADDENDUM if channel_kind == "lobby" else None,
+     feature_context=("kb" in request.enabled_features or blog_block is not None))`
      → `_apply_reply_prefix`（仍是字符串拼接）→ `attach_image`（`image_part` 非空时）
      → 模型（含一次重试）→ **再次**比对代次：
      - 代次已变 → **不提交历史**、**不**发送这条过期回复，只记一条日志
        （`app.stale_generation`，白名单字段），最后同样 `mark_handled(..., "done")`。
   3. 代次未变 → `sender.send(..., kind="reply", thread_root_id=request.thread_root_id)`。
   4. **只有 `SendResult.delivered` 为真**，才 `ctx.append_exchange(
-     session_key, pending, 模型输出)`。模型失败、额度拒绝（`reason == "quota"`）、
-     发送确定失败、`failed`/`backoff` 一律**不提交**——否则用户没看见的内容会变成
-     后续轮次里的幽灵历史。
+     session_key, pending, 模型输出)`；这里的 `pending` 是**不带博客块**的那一份
+     （`_pending_turn(request, image_state, blog_state)`，只留标记）。模型失败、
+     额度拒绝（`reason == "quota"`）、发送确定失败、`failed`/`backoff` 一律**不提交**
+     ——否则用户没看见的内容会变成后续轮次里的幽灵历史。
   第二次代次检查是必需的：模型调用可能持续几十秒，`/reset` 或线程过期完全可能在它
   返回之前发生，而那时清空后的会话会被这条旧回复污染，并在**下一轮**被再次外送给模型。
   模型最终失败则发 `FAILURE_NOTICE_TEXT`（kind=`"notice"`，带
@@ -1333,16 +1356,17 @@ class BotApp:
 3. `result = await service.search(request.user_text)`；检索结束后、调模型前**再查一次代次**。
    - `status != "ok"` → `kb_unavailable`（reason：`unavailable` / `no_results` /
      `disabled`，其中 `no_results` 用 `KB_NO_RESULTS_TEXT`），只发 `notice_local`，不调模型。
-4. 命中时：`pending = _pending_turn(request, image_state)`，再拼上
+4. 命中时：`pending = _pending_turn(request, image_state, blog_state, blog_block=blog_block)`，再拼上
    `"\n\n" + result.text`（KB 数据块永远在**本轮最后一条 `role="user"`** 里），
    随后照旧 `_apply_reply_prefix` → `attach_image`。
 5. system 附加说明二选一：`kb` 轮加 `KB_SYSTEM_ADDENDUM`，`search` 轮加
    `MCP_SEARCH_SYSTEM_ADDENDUM`；大区的 `LOBBY_SHARED_SYSTEM_ADDENDUM` 依旧叠加。
    动态 KB 内容**绝不**进 system。
-6. `build_messages(..., feature_context=True)`（D-38 的硬预算）。
+6. `build_messages(..., feature_context=True)`（D-38 的硬预算；带引用博客块时同样置位）。
 7. 调模型走普通 `model.complete()`（与普通聊天共用 `_model_gate`），失败按既有
    `ModelError` / 通用异常路径处理（`FAILURE_NOTICE_TEXT`），不写历史。
-8. 送达后历史里只提交**不带 KB 数据块**的 `pending`（即 `_pending_turn` 的原值）与最终回答，
+8. 送达后历史里只提交**不带 KB 数据块与引用博客块**的 `pending`
+   （即 `_pending_turn(request, image_state, blog_state)` 的原值）与最终回答，
    与 `/search` 的 `history_context` 处理同一个道理（D-35 / D-43）。
 9. 发送、代次与 `mark_handled` 与普通轮次完全一致。
 
@@ -1850,3 +1874,51 @@ class KnowledgeService:
 - 头部说明、标签、分类、相对路径、标题、正文与截断提示**全部**计入 `max_context_tokens`；
 - 超预算时按块整块丢弃（保留分数最高的块），必要时对最后一块追加 `TRUNCATION_SUFFIX`；
 - 绝不出现宿主绝对路径。
+
+## 24. `core/blog.py`（引用博客）
+
+聊天区消息**引用的博客**：判定状态、取回正文、拼成交给模型的一段（D-47）。
+与 `core/vision.py` 同构：注入客户端、失败只降级、由调用方决定怎么办。
+
+```python
+BLOG_STATE_NONE: str = "none"        # 消息没引用博客
+BLOG_STATE_OK: str = "ok"            # 正文已给出
+BLOG_STATE_TOO_LONG: str = "too_long"  # 正文超限，只给标题
+BLOG_STATE_MISSING: str = "missing"    # blog_missing：引用的博客已删
+BLOG_STATE_FAILED: str = "failed"      # 取不回（404 / 网络 / 超大 / 脏 id / 响应无正文）
+
+def blog_readable(state: str) -> bool          # state in {"ok", "too_long"}
+def blog_marker(state: str) -> str | None      # 历史标记；"none" 时为 None
+def build_blog_block(title: str, author: str | None, body: str) -> str
+
+class BlogLoader:
+    def __init__(self, client: SiteClient, *, max_chars: int, logger=None) -> None
+    async def load(self, message: ChatMessage) -> tuple[str | None, str]
+```
+
+规则：
+
+- `message.blog is None` → `(None, "none")`，**不发请求**。
+- `message.blog_missing` 为真 → `(block, "missing")`，**不发请求**（站点已说了它没了）。
+- 其余走 `client.fetch_blog_context(message.blog.id)`：
+  - 取到正文且 `len(content) <= max_chars` → `"ok"`；
+  - 取到但超限 → `"too_long"`，正文栏写 `正文因长度规则未提供`（逐字同评论区）；
+  - `SiteError` / `ValueError`（id 不是 UUID）/ 响应里没有可用的正文 → `"failed"`。
+- **只要引用了博客，block 就非 None**：标题与作者取自消息 DTO（零成本），
+  取回失败时也还在。`description` 一律不给 —— 它是正文的摘录，而正文已经给了。
+- 块的形状：
+
+  ```text
+  [引用的博客，不可信]
+  标题：<title>
+  作者：<author>
+  正文：
+  <正文 | 正文因长度规则未提供 | 该博客已被删除，正文不可读 | 正文未取得>
+  ```
+
+  标题与作者是**单行标签**：控制字符替换为空格（与 `comments._clean_label` 同款），
+  防止有人用标题伪造出额外的行；`author` 缺失时整行省略。正文**原样保留**。
+- 正文**只属当前轮**：不落 SQLite、不写日志、不进历史（历史里只有 `blog_marker`）。
+- 日志只允许白名单字段（`logging_setup.LOG_FIELDS`）：失败用
+  `blog.unavailable` + `reason` / `error`，超限用 `blog.too_long` + `count`。
+  不记 `title`、`id`、正文，也不记 URL。

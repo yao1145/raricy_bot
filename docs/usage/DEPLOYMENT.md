@@ -579,7 +579,24 @@ model:
 - 不转发 SVG（图床上传白名单里有它，但它是唯一带脚本能力的格式）。
 - 日志里只会有 `vision.image_unavailable reason=... size_bytes=...`，**不会有图片 URL**。
 
-### 9.3 改了必须同步改 Dockerfile 与 docker-compose.yml
+### 9.3 引用博客的正文上限（可选，默认 1000 字）
+
+用户在大区或私聊里**引用**一篇博客时，机器人会去读那篇博客的标题与正文，随这一轮
+交给第三方模型。正文上限由 `behavior.quoted_blog_max_chars` 控制（默认 1000，
+与 `comments.article_max_chars` 的默认值相同但是**两个键**，可各自调）：
+
+```yaml
+behavior:
+  quoted_blog_max_chars: 1000   # 超过就只给标题，并在正文位置写明原因
+```
+
+- 超限、已删除、取不到，机器人都会明确写下「正文没给」，不会让模型以为文章是空的。
+- 正文**只属于当前轮**，不进会话历史：调大这个值只会让**引用它的那一轮**变大，
+  不会让后续每一轮都被重复外送。
+- 想把聊天与评论区调成同一个值，两个键都要写：聊天看 `behavior.quoted_blog_max_chars`，
+  评论区看 `comments.article_max_chars`。
+
+### 9.4 改了必须同步改 Dockerfile 与 docker-compose.yml
 
 ```yaml
 ops:
@@ -588,12 +605,12 @@ storage:
   db_path: "./data/bot.db"     # 容器内解析为 /app/data/bot.db，正是数据卷挂载点
 ```
 
-### 9.3 两条校验会拦住你
+### 9.5 两条校验会拦住你
 
 - `daily_normal_limit` 必须**小于** `daily_absolute_limit`
 - `minute_attempt_limit` 默认 25 是照站点 30 次/分硬限留的余量，**不要往上调**
 
-### 9.4 编辑 config.yaml 之后（Rocky / SELinux）
+### 9.6 编辑 config.yaml 之后（Rocky / SELinux）
 
 若日志又出现 `配置错误：无法读取配置文件`，是编辑器重写文件时把 SELinux 标签带掉了。
 重建一次让它重新打标：
@@ -1137,7 +1154,7 @@ getenforce      # Enforcing 就必须做本节
 sed -i 's#-#- ./config.yaml:/app/config.yaml:ro$#-#- ./config.yaml:/app/config.yaml:ro,Z#' docker-compose.yml
 ```
 
-改完配置后若报 `无法读取配置文件`，是编辑器重写文件带掉了标签，按第 9.4 节重建容器。
+改完配置后若报 `无法读取配置文件`，是编辑器重写文件带掉了标签，按第 9.6 节重建容器。
 
 ### A.4 Rocky 上的补充检查项
 

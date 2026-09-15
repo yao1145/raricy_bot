@@ -30,6 +30,7 @@ from .comments.router import CommentRouter
 from .comments.sender import CommentSender
 from .comments.service import CommentService
 from .config import Config
+from .core.blog import BlogLoader, blog_marker, blog_readable
 from .core.context import ContextManager, lobby_thread_session_key, speaker_wrapper
 from .core.router import MessageRouter, Request, RouteResult
 from .core.sender import MessageSender, SendResult
@@ -55,6 +56,12 @@ from .site.sse import SSEReceiver
 from .store import Store
 
 _logger = get_logger("app")
+
+# 被引用消息的三种边角标记。它们是**模型可见**的文本，不是给用户看的文案，
+# 所以不进 texts.py（那里放的是用户可见的回复）。
+_REPLY_IMAGE_MARKER: str = "[图片]"
+_REPLY_DELETED_MARKER: str = "[该消息已删除]"
+_REPLY_EMPTY_MARKER: str = "[无正文]"
 
 # 优雅关闭总超时（秒）；超时后不再等待，交由进程退出兜底。
 _SHUTDOWN_TIMEOUT_SECONDS: float = 10.0
@@ -133,6 +140,9 @@ class BotApp:
         self._client = SiteClient(config.site.base_url, self._redactor, **client_kwargs)
         self._image_loader = ImageLoader(
             self._client, max_bytes=config.model.max_image_bytes
+        )
+        self._blog_loader = BlogLoader(
+            self._client, max_chars=config.behavior.quoted_blog_max_chars
         )
         self._queue: asyncio.Queue[Request] = asyncio.Queue(
             maxsize=config.behavior.queue_size
@@ -551,10 +561,23 @@ class BotApp:
             # 取图在模型门之外：三个 worker 各自下载互不阻塞，
             # 超时由站点请求超时兜住（设计 §3.5）。
             image_part, image_state = await self._load_image(request)
-            if image_part is None and image_state != "none" and not request.user_text:
-                # 纯图但读不到：用户明确发来一张图，必须给个交代，
-                # 但不值得为它占用一次模型调用。
-                await self._send_image_unavailable(request)
+            # 引用博客同样在模型门之外：与取图并列，两边互不阻塞。
+            blog_block, blog_state = await self._load_blog(request)
+            if (
+                not request.user_text
+                and image_part is None
+                and not blog_readable(blog_state)
+                and (image_state != "none" or blog_state != "none")
+            ):
+                # 整条消息就是引用、且一样都没取到：用户明确发来了东西，必须给个交代，
+                # 但不值得为它占用一次模型调用。文案按消息带了什么来选：有图片载荷时
+                # 仍走原来那句（与改动前逐字节一致）。
+                await self._send_media_unavailable(
+                    request,
+                    texts.IMAGE_UNAVAILABLE_TEXT
+                    if image_state != "none"
+                    else texts.BLOG_UNAVAILABLE_TEXT,
+                )
                 return
             # `/kb`：访问门 → 检索 → 数据块；任何本地拒绝都在这里收口，不进模型。
             kb_text: str | None = None
@@ -563,8 +586,11 @@ class BotApp:
                 if kb_text is None:
                     return
             # D-22：本轮内容先**临时**拼给模型，只有回复真正送达才提交进历史。
-            # KB 数据块只属于当前轮，历史里提交的是不带它的问题（D-43）。
-            pending = self._pending_turn(request, image_state)
+            # KB 数据块只属于当前轮，历史里提交的是不带它的问题（D-43）；
+            # 引用的博客正文同理，历史里只留一行标记（设计 §3.5）。
+            pending = self._pending_turn(
+                request, image_state, blog_state, blog_block=blog_block
+            )
             if kb_text is not None:
                 pending = f"{pending}\n\n{kb_text}" if pending else kb_text
             system_addenda: list[str] = []
@@ -580,8 +606,10 @@ class BotApp:
                 self._config.system_prompt,
                 pending_user=pending,
                 system_addendum="\n\n".join(system_addenda) or None,
-                # 能力数据块不可丢弃，历史可以（D-38）。
-                feature_context="kb" in request.enabled_features,
+                # 数据块不可丢弃，历史可以（D-38）：/kb 与引用的博客正文同理。
+                feature_context=(
+                    "kb" in request.enabled_features or blog_block is not None
+                ),
             )
             self._apply_reply_prefix(messages, request)
             # 必须排在 _apply_reply_prefix 之后：那一步按字符串拼接 content。
@@ -666,7 +694,8 @@ class BotApp:
                 if self._ctx.generation(request.session_key) == request.generation:
                     # 历史里只留问题本身：搜索摘要有自己的压缩形式，KB 命中原文
                     # 则完全不保留（D-35 / D-43）——下一轮本来就没有读知识库的授权。
-                    history_user = self._pending_turn(request, image_state)
+                    # 引用博客的正文同理，只留标记。
+                    history_user = self._pending_turn(request, image_state, blog_state)
                     if history_context:
                         history_user = f"{history_user}\n\n{history_context}"
                     self._ctx.append_exchange(request.session_key, history_user, text)
@@ -683,6 +712,10 @@ class BotApp:
         if not self._vision_enabled:
             return None, "none"
         return await self._image_loader.load(request.message)
+
+    async def _load_blog(self, request: Request) -> tuple[str | None, str]:
+        """取回本轮引用的博客；没有引用时完全不碰网络。"""
+        return await self._blog_loader.load(request.message)
 
     async def _complete_search(
         self,
@@ -836,18 +869,18 @@ class BotApp:
         )
         self._note_forbidden(outcome)
 
-    async def _send_image_unavailable(self, request: Request) -> None:
-        """纯图但读不到：本地提示，不调模型。
+    async def _send_media_unavailable(self, request: Request, text: str) -> None:
+        """整条消息就是引用但读不到：本地提示，不调模型。
 
-        kind 用 `notice_local` 而不是 `notice`：它与路由第 9.1 步的纯媒体提示同类，
+        kind 用 `notice_local` 而不是 `notice`：它与路由第 9.2 步的纯媒体提示同类，
         都是应答明确用户动作的本地回复（D-1）。用 notice 会占掉该用户 24 小时的
-        主动通知名额，把一次「图没读到」变成「今天别再提醒他」（D-30）。
+        主动通知名额，把一次「没读到」变成「今天别再提醒他」（D-30）。
         """
         if self._unavailable:
             return
         outcome = await self._sender.send(
             request.channel_id,
-            texts.IMAGE_UNAVAILABLE_TEXT,
+            text,
             request.message.id,
             kind="notice_local",
             thread_root_id=request.thread_root_id,
@@ -870,17 +903,46 @@ class BotApp:
         return user_text
 
     @staticmethod
-    def _pending_turn(request: Request, image_state: str) -> str:
+    def _pending_turn(
+        request: Request,
+        image_state: str,
+        blog_state: str,
+        *,
+        blog_block: str | None = None,
+    ) -> str:
         """构造本轮待提交的用户内容（不含直接引用，见 D-7）。
 
+        `blog_block` 只有**外送那一份**才给：引用博客的正文只属于当前轮，历史里只留
+        标记（设计 §3.5）。其余两种情况形状逐字相同。
+
         - 大区：带上站点发言者标签，模型才分得清谁在说话（D-20），
-          图片标记在包装**内部**（图属于发言人这条消息）；
+          图片与博客标记在包装**内部**（它们都属于发言人这条消息）；
         - 私聊：就是正文本身。
         """
         text = BotApp._with_image_marker(request.user_text, image_state)
+        text = BotApp._with_blog_marker(text, blog_state, blog_block)
         if request.channel_kind != "lobby":
             return text
         return speaker_wrapper(request.message.author.username, text)
+
+    @staticmethod
+    def _with_blog_marker(
+        user_text: str, blog_state: str, blog_block: str | None = None
+    ) -> str:
+        """给本轮正文加上引用博客的块（外送版）或标记（历史版）。
+
+        块与标记只差「正文给不给」这一处，两者都必须留痕：只把块去掉的话，历史里
+        会出现「助手在回答一篇看不见的文章」这种对不上的轮次；正文为空时更糟 ——
+        那一轮的历史会直接变成空的（D-28 的同一条理由）。
+        """
+        if blog_state == "none":
+            return user_text
+        head = blog_block if blog_block is not None else blog_marker(blog_state)
+        if not head:
+            return user_text
+        if not user_text:
+            return head
+        return f"{head}\n---\n{user_text}"
 
     def _apply_reply_prefix(
         self, messages: list[dict[str, str]], request: Request
@@ -905,19 +967,31 @@ class BotApp:
 
     @staticmethod
     def _reply_prefix(request: Request) -> str | None:
-        """构造本轮的直接引用前缀；没有引用上下文时返回 None。
+        """构造本轮的直接引用前缀；没有引用块时返回 None。
 
         大区与私聊用不同的标签（D-25）：只有大区是「直接引用」——
         它的历史里本来就有别的发言者，需要与发言者标签区分开。
+
+        三种边角也要留痕，否则模型看到的就是一句没头没尾的话：被引用的是图片、
+        被引用消息已删除、被引用消息没有正文（例如一条拍一拍）。
+        `is_deleted` 的判定**先于** `content`：契约没承诺 reply 块里的正文一定被
+        替换过，所以自己给标记，不把可能残留的原文转述给模型。
         """
-        context = request.reply_context
-        if not context:
-            return None
         reply = request.message.reply
-        author = reply.author_name if reply is not None else None
+        if reply is None:
+            return None
+        if reply.is_deleted:
+            body = _REPLY_DELETED_MARKER
+        elif request.reply_context:
+            body = request.reply_context
+        elif reply.image_url:
+            body = _REPLY_IMAGE_MARKER
+        else:
+            body = _REPLY_EMPTY_MARKER
+        author = reply.author_name
         label = "直接引用" if request.channel_kind == "lobby" else "引用"
         header = f"[{label} @{author}]" if author else f"[{label}]"
-        return f"{header} {context}"
+        return f"{header} {body}"
 
     # --- 运行期清理 ---------------------------------------------------------
 

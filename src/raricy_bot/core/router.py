@@ -54,6 +54,7 @@ _ACTIONABLE_REASONS: frozenset[str] = frozenset(
         "empty",
         "media_only",
         "image_only",
+        "blog_only",
         "too_long",
         "secret_probe",
         "kb_usage",
@@ -335,15 +336,19 @@ class MessageRouter:
                     event_id=event_id,
                 )
 
-        # 9.2 空正文：能看图就交给模型，否则给本地提示。
-        # 空正文不会命中下面 9.2-9.6 的任何一个分支（命令判定与探测词都要求非空内容），
-        # 因此 `image_only` 置位之后直落第 10 步入队是安全的。
-        image_only = False
+        # 9.2 空正文：能读的引用交给模型，读不到的给本地提示。
+        # 空正文不会命中下面 9.3-9.7 的任何一个分支（命令判定与探测词都要求非空内容），
+        # 因此 `queued_reason` 置位之后直落第 10 步入队是安全的。
+        # 博客排在图片**之前**：图片 + 博客、无正文的消息若先判图片，vision 关闭时
+        # 会回一句图片提示而博客白引（设计 §3.3）。
+        queued_reason: str | None = None
         if not user_text:
-            if self._vision_enabled and has_image(message):
+            if message.blog is not None and not message.blog_missing:
+                queued_reason = "blog_only"
+            elif self._vision_enabled and has_image(message):
                 # 纯图消息入队。取图与降级由 app 的 worker 负责（设计 §3.5）：
                 # 路由器不做 I/O，也就无从知道这张图能不能取到。
-                image_only = True
+                queued_reason = "image_only"
             elif message.image is not None:
                 # 有图但读不到：图片输入未开启，或 image_missing。
                 return self._emit(
@@ -358,13 +363,14 @@ class MessageRouter:
                     event_id=event_id,
                 )
             elif message.blog is not None:
+                # 走到这里必然 blog_missing：站方已经告诉我们它没了。
                 return self._emit(
                     "reply_now",
                     "media_only",
                     channel_id=channel_id,
                     message_id=message.id,
                     reply_to=message.id,
-                    text=texts.UNSUPPORTED_MEDIA_TEXT,
+                    text=texts.BLOG_UNAVAILABLE_TEXT,
                     channel_kind=channel_kind,
                     thread_root_id=thread_root_id,
                     event_id=event_id,
@@ -477,7 +483,7 @@ class MessageRouter:
             )
         return self._emit(
             "queued",
-            "image_only" if image_only else "queued",
+            queued_reason if queued_reason is not None else "queued",
             channel_id=channel_id,
             message_id=message.id,
             reply_to=message.id,

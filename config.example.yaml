@@ -85,6 +85,9 @@ behavior:
   context_turns: 10
   context_input_tokens: 8000
   max_input_chars: 8000
+  # 消息里引用的博客正文，交给模型的最多字符数（按 Unicode 字符数）。
+  # 超限时只给标题并写明原因，与 comments.article_max_chars 的规则一致。
+  quoted_blog_max_chars: 1000
   max_output_chars: 5000
   concurrency: 3
   queue_size: 50
