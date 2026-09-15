@@ -362,7 +362,12 @@ KB_SYSTEM_ADDENDUM: str             # 本地资料不可信边界的静态 syste
 再次发送给第三方模型、回复链内消息才能延续上下文，且 `/reset` 创建新链而非删除旧链）。
 `HELP_TEXT_WITH_VISION` 的差别只有一句：可以查看用户发来的图片，且**图片同样会转交
 第三方模型处理**。两者都调用于 `/help` 命令，**不得**触发模型调用；整条都必须能塞进
-站点单条消息上限（1000 字）。
+站点单条消息上限（**5000 字**）。
+
+> 这个数字以上游合同为准：`docs/materials/chat-bot.md` §7.1 的「长度上限」表写明纯文本消息与
+> 带附件时的 `content` **同为 5000 字**（2026-09 起两档同值，此前才是 1000 / 500），
+> 超限错误码是 `tooLong` / `captionTooLong`。本节曾误写「1000 字」，那个数字正是把
+> `tests/` 里的断言带偏的原因；两处不一致时一律以上游合同为准（见 CLAUDE.md）。
 
 ### 5.1 `LOBBY_SHARED_SYSTEM_ADDENDUM`
 
@@ -956,8 +961,9 @@ class MessageRouter:
                              event_id: int | None) -> RouteResult
 ```
 
-Beta 记忆接入（`Request.memory_allowed`、`MessageRouter` 的 `memory_access` / `memory_queue`
-参数与新增动作 `"memory_queued"`）见 §34；两者都不注入时行为与今天逐字节一致。
+Beta 记忆接入（`Request.memory_allowed`、`MessageRouter` 的 `memory_access` / `memory_queue` /
+`private_enabled` **三个**参数与新增动作 `"memory_queued"`）见 §34；三个都不注入时行为与今天
+逐字节一致。
 
 `handle_stream` 判定顺序（严格照此，`reason` 用括号内标识）：
 
@@ -1150,6 +1156,13 @@ class MessageSender:
      重发必须**完整**走第 5 步的错误分支 —— 尤其是重发吃到 429 时同样要
      `quota.backoff(retry_after or cfg.rate_limit_wait_seconds)` 再返回 `failed`，
      不能把 429 当成普通失败吞掉：那会让后续发送不被节流，直接把站点的每分钟硬限撞穿。
+
+**`max_output_chars` 还有一条上游约束**：记忆的自动提取披露（§34.4、D-63）按
+`max_output_chars - len(披露) - len(TRUNCATION_SUFFIX)` 预留空间，因此这条上限至少要能容下
+「一条最长的披露 + 一个回答字符 + `TRUNCATION_SUFFIX`」；部署打开自动提取时由 §26.2 第 13 条在
+启动期校验（`enabled=false` 或 `auto_capture_available=false` 时不施加）。本节的第 1 步是那条预留
+的**兜底**：即使文本仍超上限，也只按自然段截断；披露本身装不下时由 §34.4 放弃披露（D-77），
+不会退化成「整条回答变成一句截断提示」。
 
 **「已送出但记账失败」不是发送失败**：`record_sent`（含链映射）是尽力而为 ——
 它抛异常时只记一条无正文 error，仍按 `delivered` 返回并正常 `note_sent` 计费。
@@ -2214,9 +2227,32 @@ memory: MemoryConfig = field(default_factory=MemoryConfig)
     不得位于 `knowledge_base.root_dir` 内；也不得包含 `knowledge_base.root_dir`
     ——否则记忆会被 `/kb` 再次扫描并外送。判定用 `os.path.abspath` + `os.path.commonpath`
     做**路径包含**，不用字符串前缀。违反任一 → `ConfigError`。
-11. 关闭时只做类型校验与单字段范围校验；第 4、7–10 条的交叉约束只在 `enabled=true` 时施加
+11. 关闭时只做类型校验与单字段范围校验；第 4、7–10、13 条的交叉约束只在启用时施加
     （把 `behavior.context_input_tokens` 调小，不得影响一个关闭了记忆的部署）。
 12. 未知键继续被忽略（沿用 `_section` 的现有行为，**不要**额外加未知键检查）。
+13. **仅 `enabled=true` 且 `auto_capture_available=true` 时**（本条不在规划 §3.2 里，是 Task 13
+    的修复补入的）：自动提取的写入披露要与回答挤同一条输出消息（§34.4、D-63），因此必须先
+    证明空间够用，否则 `ConfigError`：
+
+    ```text
+    len(memory_auto_capture_text(memory_id=最长可能的 UM-ID, content="", created=True))
+    + max_entry_chars + len(TRUNCATION_SUFFIX)
+    < behavior.max_output_chars
+    ```
+
+    最长 ID 取「`UM-` 加九位十进制」（本实现是 `UM-999999999`），比 §29 的六位规范多算三位，
+    只是把校验卡得更早；真的涨过九位时由 §34.4 的运行期分支接住。
+
+    - **门控与第 11 条同源**（`config.py:1009-1011` 的 R6 原则）：没打开自动提取的部署不该
+      因为这个组合启动失败——用户侧的 `auto_capture` 是运行时状态，部署没允许时它根本打不开。
+    - 这条校验的算术依赖两个今天成立、但站在**文案**那一侧的前提：`memory_auto_capture_text`
+      的长度只随 `content` 线性增长（`texts.py:421-427`，拼接只有 `+`，没有截断或转义），
+      以及「已新增」与「已更新」两种措辞**等长**（`texts.py:390-391`）。将来改这两处文案的人
+      必须回头看本条：更长的动作词或任何对正文的加工都会让这里预留的空间变小，而失效的表现是
+      **启动报错**，不是悄悄降级。
+    - 它只保证「脱敏增长为零」时的余量：`max_entry_chars` 是 codec 对正文字符数的上限，
+      看不到 §34.4 里「脱敏把正文变长」那一项。因此运行期仍必须有 `disclosure_no_room`
+      分支兜底（D-77）。
 
 ### 26.3 关闭语义
 
@@ -2342,6 +2378,26 @@ def user_storage_key(user_id: str) -> str:
 ok | noop | duplicate | not_found | forbidden | unavailable |
 invalid_proposal | conflict | full | secret_detected
 ```
+
+它们由 `memory/models.py` 以 `STATUS_*` 常量导出，**标识符名同样逐字固定**（裁决 R8）：
+
+```python
+STATUS_OK: str = "ok"
+STATUS_NOOP: str = "noop"
+STATUS_DUPLICATE: str = "duplicate"
+STATUS_NOT_FOUND: str = "not_found"
+STATUS_FORBIDDEN: str = "forbidden"
+STATUS_UNAVAILABLE: str = "unavailable"
+STATUS_INVALID_PROPOSAL: str = "invalid_proposal"
+STATUS_CONFLICT: str = "conflict"
+STATUS_FULL: str = "full"
+STATUS_SECRET_DETECTED: str = "secret_detected"
+```
+
+- 十个常量各自标注 `: str`，与本仓库既有的状态常量写法一致（`core/blog.py:26` 的
+  `BLOG_STATE_OK: str = "ok"`）。
+- 值**和**名字都只有这一处来源：`memory/` 内外的模块与测试一律从 `memory.models` 导入这些
+  常量，不得重新内联字面量、不得另起别名、不得增删第十一个。
 
 | 状态 | 含义 |
 |------|------|
@@ -2543,6 +2599,10 @@ class MemoryService:
     async def private_entries(self, user_id: str) -> tuple[MemoryEntry, ...]: ...
     async def common_entries(self, scope: MemoryScope) -> tuple[MemoryEntry, ...]: ...
     async def candidates(self) -> tuple[MemoryCandidate, ...]: ...
+
+    async def find_operation(
+        self, operation_id: str, *, user_id: str | None = None
+    ) -> OperationResult | None: ...
 ```
 
 - `private_path(user_id)` 是**同步**的只读方法，返回该用户 Markdown 的路径（用
@@ -2550,6 +2610,11 @@ class MemoryService:
 - `private_settings_cached(user_id)` 同样是**同步**的只读方法：**只读内存快照、不做任何 I/O**，
   该用户的快照还没加载或用户未知时返回 `None`（调用方按「未开启」处理）。它是 §34.1 的
   `private_enabled` 回调的唯一数据源（D-67）。
+- `find_operation(operation_id, *, user_id=None)` 是幂等键的**公开查询入口**：命中返回那次操作
+  第一次的稳定结果（通常是 `ok`，**不是** `duplicate`，D-67），未命中、`operation_id` 为空或
+  `enabled=false` 时返回 `None`。`user_id` 非空时先查该用户的私有快照、再查共同快照；为空只查
+  共同快照。它服务于 §32.3 的**先查后撰写**：Controller 必须先调它、命中就不许再调 AI
+  （写入侧的顺序由本模块自己保证，撰写侧的顺序只能由调用方保证）。
 - **目录布局**（规划 §5.1）：`<root_dir>/common.md` 与 `<root_dir>/users/<64位用户存储键>.md`。
   用户文件名是 §27.3 的 `user_storage_key`，原始 user ID 不出现在文件名里。
 - `redactor`：**生产装配必须传入**。传 `BotApp` 自有的那个实例即同时覆盖三类机密——它在构造时
@@ -2925,7 +2990,7 @@ def build_messages(
 
 ### 34.1 Router
 
-`MessageRouter.__init__` 增加两个 keyword-only 参数：
+`MessageRouter.__init__` 增加**三个** keyword-only 参数：
 
 ```python
 class MessageRouter:
@@ -3042,7 +3107,17 @@ class MessageRouter:
   该取舍要写进代码注释。
 - 披露的措辞必须区分**新增**与**更新**（`MemoryCaptureResult.action`，设计 §6.3 要求用户看清
   「是新增还是更新」），例如 `（已新增私有记忆 UM-000006：…）` / `（已更新私有记忆 UM-000006：…）`。
-- 日志只用 `memory.auto_capture` 事件与白名单字段（`memory_id`、`scope`、`reason`）。
+- 日志只用 `memory.auto_capture` 事件与白名单字段（`memory_id`、`scope`、`status`、`reason`）。
+  该事件的 `reason` 只使用下面三个稳定短标识（新增取值必须先改本节，源码级测试会拦）：
+  `controller_unavailable`（装配里没有控制器，本轮自动提取就地放弃）、
+  `disclosure_no_room`（披露装不下，见下一条）、`internal`（兜底异常）。
+  写入成功或撰写失败的那些轮次**不带** `reason`，只带 `status`（必要时带 `memory_id`）。
+- **唯一一处「写进去了但用户没被告知」的路径：`disclosure_no_room`（D-77）。** 当
+  `limit = max_output_chars - len(披露) - len(TRUNCATION_SUFFIX) - 脱敏增长` 落到 1 以下时，这一轮
+  **放弃披露、原回答照常发送**：记忆已经提交（提交发生在这一步之前，无法回退），用户却看不到那句
+  说明。此时只留一条 `reason=disclosure_no_room` 的稳定 WARNING；条目本身仍能在 `/memory list`
+  里看到、可以删。§26.2 第 13 条的启动期校验只保证「脱敏增长为零」时的余量，所以这条运行期分支是
+  **承重的**，不是理论兜底。
 
 ## 35. 评论集成（`comments/router.py`、`comments/service.py`）
 

@@ -173,6 +173,9 @@ Cookie、密码与 API Key 在任何级别都不会落进日志或数据库。
 - [ ] **启用知识库前**：逐文件清点挂载目录，确认不含密钥、隐私、内部提示词、部署配置、
       日志、数据库或无权转交第三方模型的材料。目录名与文件名本身也会展示给提问者，
       所以命名同样要审；资料负责人要签字确认可见范围。
+- [ ] **启用长期记忆（Beta）前**：确认账号资料的第三方模型披露仍然准确（记忆条目同样属于
+      会随请求发送的内容），按 [`docs/usage/DEPLOYMENT.md`](docs/usage/DEPLOYMENT.md) §4.2.2
+      的灰度顺序推进；记忆目录按敏感数据管理，不加入 Git、镜像或任何公开制品。
 
 部署后的验证步骤（大区与私聊各自触发、回显不成环、模拟 401/403/429 与队列满载、
 重启后去重保留而上下文清空、容器日志与数据库检查）见
@@ -181,7 +184,16 @@ Cookie、密码与 API Key 在任何级别都不会落进日志或数据库。
 
 ## 已知限制
 
-- **没有长期记忆**：上下文只在内存里，重启即清空；大区的回复链归属保留 7 天。
+- **长期记忆是 Beta 功能，默认关闭**：短上下文仍然只在内存里，重启即清空（大区的回复链归属
+  保留 7 天）。开启后多一层可选的长期记忆：共同记忆（`all_user` / `lobby`，管理员审批后才生效、
+  所有使用者可见其内容）与用户私有记忆（每人一份，只在本人私聊里被参考）。它按接入名单灰度
+  （默认 `allowlist`），私有记忆由用户自己在**私聊**里用 `/memory`（`status` / `on` / `off` /
+  `auto on` / `auto off` / `list` / `forget <UM-ID>` / `clear`）与 `/remember <内容>` 查看、
+  纠正、删除；博客评论区最多只用 `all_user`
+  共同记忆，任何场景都不会使用别人的私有记忆。记忆读写失败是软故障，不影响聊天、评论与
+  `/livez`、`/readyz`；记忆正文既不进日志也不进 SQLite。用户可见的说明见
+  [`docs/usage/USAGE.md`](docs/usage/USAGE.md)，部署与灰度步骤见
+  [`docs/usage/DEPLOYMENT.md`](docs/usage/DEPLOYMENT.md) §4.2.2。
 - **不主动联网、不能运行代码、查不到站内数据**：别人的余额、鱼干流水、通知、申诉进度，
   都要用户自己去对应页面看。
 - **图片与博客正文的边界**：图片默认关闭；聊天里**用户主动引用**的博客会读标题与正文
@@ -216,6 +228,7 @@ raricy_bot/
 │   ├── mcp/                 # 通用 MCP Provider、工具注册、Exa 适配与多 Key 池
 │   ├── kb/                  # 本地 Markdown 知识库：扫描、分块、词法索引与检索
 │   ├── comments/            # 评论：发现轮询、匹配、配额、发送器、后台服务
+│   ├── memory/              # 长期记忆（Beta）：Markdown 存储、AI 撰写、命令与接入策略
 │   ├── ops.py               # /livez 与 /readyz
 │   ├── app.py               # 组件装配与生命周期
 │   └── __main__.py          # python -m raricy_bot 入口
@@ -245,6 +258,10 @@ raricy_bot/
 主库只设**软上限**（默认 128 MiB）：超过时日志里出现 `app.cleanup_oversize`，**不会**硬截断
 ——硬截断会让去重、水位或配额写入突然失败，后果比库变大严重得多。需要收缩物理文件时停机
 手工 `VACUUM`，步骤见 [`docs/usage/DEPLOYMENT.md`](docs/usage/DEPLOYMENT.md) §10.3。
+
+长期记忆（Beta，默认关闭）**不在 SQLite 里**：条目是 `memory.root_dir`（默认 `./data/memory`，
+容器里即 `/app/data/memory`）下的 Markdown 文件，按**敏感数据**管理——备份、恢复与访问控制
+见 [`docs/usage/DEPLOYMENT.md`](docs/usage/DEPLOYMENT.md) §4.2.2。
 
 ## 文档怎么读
 

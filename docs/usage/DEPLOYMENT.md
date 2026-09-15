@@ -333,6 +333,113 @@ Rocky/RHEL 启用 SELinux 时，按[附录 A](#附录-arocky-linux-9-差异)的�
 > 秒级完成）。停止时若正在重建索引，后台线程会跑完当前一轮，进程退出可能慢于 10 秒的优雅
 > 关闭预算 —— 让编排器的 `stop_grace_period` 留出余量即可。
 
+### 4.2.2 启用长期记忆（Beta，可选）
+
+> 这是**灰度功能**，默认关闭，而且建议按下面的顺序一步步开：每一步都能停下来、都能回退。
+> 用户能看到什么、能发哪些命令，见 [`USAGE.md`](USAGE.md) 第 5 与第 6 节；
+> 记忆的存储与日志口径见 `docs/design/INTERFACES.md` §29 … §37。
+
+配置全貌（`config.example.yaml` 的 `memory:` 段就是这一份，默认值即「关闭」）：
+
+```yaml
+memory:
+  enabled: false              # 第一步保持 false
+  access_mode: "allowlist"    # allowlist：只有名单内可用；all：所有用户可读共同记忆
+  allow_user_list: []         # 第二步保持空
+  admin_user_list: []         # 第三步把自己加进去
+  root_dir: "./data/memory"   # 容器里即 /app/data/memory，位于 bot-data 卷内
+  auto_capture_available: false   # 自动记忆是独立开关，见本节最后一段
+```
+
+**开启顺序（每一步都验证过再走下一步）**
+
+1. **空跑一次，确认关闭时什么都不做。** 保持 `enabled: false` 启动容器，然后确认
+   `docker compose exec bot ls /app/data` 里**没有** `memory/` 目录：关闭时不建目录、不读文件、
+   不启后台任务（D-60），因此这一步不会动任何东西。
+2. **只打开 `enabled`，名单留空。** 改成 `enabled: true` 重启；服务会创建或加载
+   `common.md` 并启动周期刷新。此时 `allow_user_list` 还是空的，任何账号在私聊里发
+   `/memory status` 都只会收到一条「还在测试阶段，你的账号还没有使用权限」的固定回复——
+   这正是接入门在工作。日志里应能看到 `event=memory.ready`。
+3. **把管理员自己加进名单。** `admin_user_list` 里的账号**也必须在** `allow_user_list` 里
+   （管理权与接入门是两个条件，同时满足才生效）。改完 `docker compose up -d` 或重启容器。
+4. **用管理员账号自测一遍**（全部在私聊里）：
+   - `/remember 回答里优先用 Python 3.12 的示例` → 应回一条**带实际保存正文与条目 ID**
+     （形如 `UM-000001`）的确认，磁盘上出现 `users/<64 位存储键>.md`；
+   - `/memory list` → 看到刚保存的条目；`/memory forget <UM-ID>` → 删掉它；
+   - `/memory suggest lobby 大区通用的说明` → `/memory candidates` → `/memory approve <MC-ID>`
+     → `/memory list lobby`，再到**大区**里 @ 机器人提问，确认共同记忆进入了回答。
+5. **小范围放行。** 把试用账号加进 `allow_user_list`，观察一段时间（条数上限、`full` 提示、
+   `/memory list` 的回复都值得看一遍）。名单是**稳定用户 id**，不是可改的用户名。
+6. **稳定之后再考虑 `access_mode: "all"`。** 这只影响「谁能读共同记忆 / 谁能用记忆命令」，
+   不会改变私有记忆的边界（私有记忆在任何模式下都只在本人私聊里读写）。
+
+**单副本约束（Beta 的硬限制）**
+
+**同一份 `root_dir` 只能由一个进程写。** 不要 `--scale bot=2`、不要 `deploy.replicas: 2`，
+也不要在两个部署之间共享同一个记忆目录：记忆是「内存快照 + 原子替换整个文件」，两个进程各自
+持有自己的快照时，后一次替换会**静默覆盖**另一边的写入。这条与第 1 节第 3 条（整台机器人本来就
+只部署一个副本）方向一致，但记忆是**独立的第二条理由**——即使两个副本用各自的数据库也不能共用
+记忆目录。多副本选主不在 Beta 范围内。
+
+**回退（两种方式，都不删数据）**
+
+- `memory.enabled: false`：整段记忆装配被跳过——不读、不写、不建目录，Markdown 原样留在磁盘上；
+- 或者保持 `enabled: true` 但把 `allow_user_list` 清空（回到 `allowlist` 模式）：谁都用不了，
+  已有文件同样保留，将来把名单加回来即可继续。
+
+两种回退都不会删除任何条目，也不会影响聊天与评论。
+
+**备份、恢复与数据保护**
+
+- 记忆文件在 `root_dir`，默认即 `bot-data` 命名卷里的 `/app/data/memory`，所以 §10.5 的卷备份
+  **已经包含**它；单独备份时按同样方式停机打包，不要在运行中直接拷（可能拿到原子替换一半的
+  中间态）。
+- **整个记忆根目录按敏感数据管理**：用户文件里是用户自己交出来的内容，含私有记忆。
+  不要把用户私有 Markdown 加进 Git、镜像层或任何公开制品；备份文件也要按敏感数据存放。
+- **恢复前先停服务**（`docker compose stop bot`），恢复完成后再启动：刷新任务与一次性写入
+  都不该和恢复并发。
+- **恢复后先用 codec 离线校验再启动**（文件可能被手工编辑过或被截断）：
+
+  ```bash
+  cd /opt/raricy_bot
+  docker compose run --rm -v "$PWD/memory-backup:/backup:ro" bot python -c "
+  from pathlib import Path
+  from raricy_bot.config import load_config
+  from raricy_bot.memory.codec import parse_common, parse_private
+  cfg = load_config('/app/config.yaml').memory
+  count = 0
+  for path in sorted(Path('/backup').rglob('*.md')):
+      data = path.read_bytes()
+      (parse_common if path.name == 'common.md' else parse_private)(data, cfg)
+      count += 1
+  print('校验通过', count, '个文件')
+  "
+  ```
+
+  解析失败会直接报错并指出文件——先修好或移走它，否则服务会带着「记忆不可用」的状态起来
+  （不影响聊天，但那份文件读不出来）。
+
+**自动提取是独立的灰度项**
+
+`auto_capture_available` 默认 `false`，它**不会**因为 `access_mode` 切到 `all` 而自动打开：
+用户还得自己在私聊里执行 `/memory auto on`，两者都满足才会自动整理。要开放时按自己的节奏单独
+改这一项。它只把用户**自己写的私聊原文**交给撰写模型，不接收模型回答、搜索结果或知识库片段。
+
+**排障时能看什么**
+
+记忆自己的日志只有 `memory.*` 这几个事件（`ready` / `load_failed` / `refresh_failed` /
+`command` / `write_failed` / `updated` / `candidate_updated` / `auto_capture` / `context_omitted`），
+字段只有 `scope`、`revision`、`entry_count`、`memory_id`、`candidate_id`：**正文、key、用户 id、
+存储键、路径与文件摘要都不会进日志**。所以「某条记忆为什么没生效」只能靠用户自己用
+`/memory list` 看，不要指望日志。
+
+一条值得记住的告警：`memory.auto_capture` 带 `reason=disclosure_no_room`（WARNING）表示
+`behavior.max_output_chars` 相对 `memory.max_entry_chars` 太紧——这一轮的记忆**已经写进去了**，
+但回答末尾没能带上那句「（已新增私有记忆 ……）」的披露（D-77：回答优先）。用户仍能在私聊里用
+`/memory list` 看到并删除它。把 `behavior.max_output_chars` 调大、或把 `memory.max_entry_chars`
+调小即可消掉；启动期的校验（`enabled` 且 `auto_capture_available` 时）只保证脱敏增长为零时够用，
+所以看到这条日志说明还有脱敏增长那一项在吃空间。
+
 ### 4.3 两个不要动的默认值
 
 改了会出问题（原因见第 7 节）：
@@ -766,6 +873,10 @@ docker compose exec bot rm /app/data/backup.db
 > 备份里**没有**对话正文——数据库本来就不存正文。但也别把备份随手放到公开的地方，
 > 里面含机器人账号的会话状态。
 
+若启用了长期记忆（§4.2.2），卷里还多一个 `/app/data/memory` 目录，上面两种方式都会把它一起
+备走。它**含有用户私有内容**，按敏感数据管理；单独备份与恢复的步骤（停服务、先用 codec 离线
+校验、不进公开制品）见 §4.2.2。
+
 ---
 
 ## 11. 升级
@@ -1062,13 +1173,17 @@ docker compose logs --tail=200 bot | grep -E 'router\.route|sender\.send|app\.'
 - [ ] 已配置日志体积上限（第 10.2 节）与 `TZ`（第 10.1 节）
 - [ ] 已做过一次备份并验证能解开（第 10.5 节）
 - [ ] 若启用评论能力：已在测试文章上验证首次 @、直接回复、旁支静默、`/help` 与 `/reset`
+- [ ] 若启用长期记忆（Beta）：按 §4.2.2 走完「空跑确认不建目录 → 名单留空验证接入门 →
+      管理员自测 `/remember` 与共同候选 → 小范围放行」，并演练过一次回退
 - [ ] Rocky 上另见[附录 A](#附录-arocky-linux-9-差异)的补充检查项
 
 ---
 
 ## 17. 已知限制（不是部署问题，是首版范围）
 
-- 不支持博客理解、通用工具调用和长期用户记忆。聊天区联网搜索是**默认关闭**的可选项，
+- 不支持博客理解与通用工具调用。**长期记忆是默认关闭的 Beta 可选项**（灰度步骤、单副本约束、
+  回退与备份见 §4.2.2）：开启后也只保存被模型整理成**条目**的内容，不是「记住整段对话」，
+  且不改变短上下文的规则（仍然只在内存、重启即空）。聊天区联网搜索是**默认关闭**的可选项，
   仅 `/search <问题>` 触发 Exa 摘要查询；评论区不联网。图片理解是**可选项**：
   `model.vision_enabled` 默认 `false`，开启后也只把当前轮那一张图取回内存交给模型
   （不落库、不写日志、不进历史），且要求模型本身支持视觉。

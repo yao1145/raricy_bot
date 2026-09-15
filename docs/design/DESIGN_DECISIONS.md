@@ -1053,7 +1053,7 @@ Markdown 的路径（用 §27.3 的 `user_storage_key` 命名；目录不存在�
 > 以及 `execute_command` / `auto_capture`，但没有给 `PrivateSettings`、`MemoryCaptureResult`、
 > `MemoryController.__init__`、`MemoryCommand.name` 的取值，也没有说明 `duplicate` 何时产生。
 
-裁决：下面六项由本合同（Task 1）钉死，后续任务不得各自发明：
+裁决：下面七项由本合同（Task 1）钉死，后续任务不得各自发明：
 
 | 项 | 合同 | 为什么 |
 |----|------|--------|
@@ -1068,3 +1068,228 @@ Markdown 的路径（用 §27.3 的 `user_storage_key` 命名；目录不存在�
 理由：合同的作用就是让后面 13 个任务的实现者不必各自解释同一件事。这些项在规划里只有名字或干脆
 没有，但每一项都被至少两个任务共享（Task 7 与 13、Task 7 与 11、Task 10 与 11），不钉死就会在
 接口处对不上。
+
+## D-68 十个稳定状态的标识符名与它们的值一样是合同（R8）
+
+原文（INTERFACES §27.4，初版）：
+
+> 下面十个字符串是**稳定合同**（值逐字固定，不得新增、改写或按用途重命名）。
+
+裁决：§27.4 只钉了**值**，没钉**名字**，而名字才是模块之间的真实接口。Task 3 把十个状态导出
+为 `STATUS_OK`、`STATUS_NOOP`、`STATUS_DUPLICATE`、`STATUS_NOT_FOUND`、`STATUS_FORBIDDEN`、
+`STATUS_UNAVAILABLE`、`STATUS_INVALID_PROPOSAL`、`STATUS_CONFLICT`、`STATUS_FULL`、
+`STATUS_SECRET_DETECTED`，各自标注 `<名称>: str = "<字面量>"`（与 `core/blog.py:26` 的
+`BLOG_STATE_OK: str = "ok"` 同款）。**这十个标识符名从此冻结**，与值同等地位：`memory/` 内外
+的模块与测试一律从 `memory.models` 导入，不得重新内联字面量、不得另起别名、不得增删第十一个。
+Task 14 已把本裁决写进 §27.4 的正文。
+
+理由：`models`、`access`、`service`、`commands`、`controller`、`writer` 以及测试都 import 这些
+常量，但合同里只有字符串。没有钉名字时，每个任务都可以合法地发明自己的拼法（`OK_STATUS`、
+`STATUS_DUPLICATE_ID`……），而**对不上只在运行期、只在某一条失败路径上暴露**——恰恰是最难被
+测试发现的位置。这与 D-67 是同一类问题：合同给出的名字必须是实现可依赖的那个名字。
+
+## D-69 `update` 的 `target_id` 不得为 `null`（R9）
+
+原文（INTERFACES §31.2 规则 5）：
+
+> `target_id` 只能引用**传给模型的那批既有条目**（用 `existing` 的 ID 集合校验）；
+> `action == "add"` 时必须是 `null`。
+
+裁决：`action == "update"` 而 `target_id` 为 `null` → **`invalid_proposal`**（不是接受、也不是
+`noop`）。规则 5 的 `null` 豁免**只**给 `add`；`update` 必须点名 `existing` 里的一条，因此
+`null` 落在「引用了不存在的条目」这一侧。`noop` 不受影响：规则 11 保留模型原样的 `target_id`，
+包括 `null`。
+
+理由：第一条实现把它读成了「接受」，被否决。一个点名不到任何对象的 `update` 没有任何可执行
+语义：接受就等于凭空造一条新条目（等于绕过 `add` 的规则），静默改成 `add` 更是替用户做了决定。
+拒绝是软失败（§27.4 的状态、一句话的固定文案），代价为零。
+
+## D-70 规范化后为空的正文明文拒绝：`invalid_proposal`（R10）
+
+原文（INTERFACES §31.2 规则 7）：
+
+> `content`：去首尾空白与控制字符、剥掉 Markdown 标题伪装（如开头的 `#`）后，长度不超过
+> `max_entry_chars`。
+
+裁决：规则 7 只给了**上限**，空串因此能通过。**规范化后为空的 `content` → `invalid_proposal`**，
+检查位置在置信度阈值**之前**、且只对非 `noop` 的动作生效：一个既低置信度又为空的提案仍然是
+`invalid_proposal`，不是静默的 `noop`；`noop` 带空正文仍按规则 11 判 `ok`。
+
+理由：三条各自独立，任一条都足以拒绝。其一，§34.4 会把 `MemoryCaptureResult.content` 拼回
+**用户可见的回复**（「已新增私有记忆 UM-000006：」后面空无一物）。其二，一条空条目照样占
+`max_private_entries_per_user` 的一个名额，用户看到的是「记忆是满的」却说不出满在哪。其三，
+§30 的 codec 必须能往返它——`key` 有非空校验，为空的正文等于让这条记录既没有内容也没有可辨识
+的标识。有效性先于策略：格式不合法的东西不该因为「置信度低」而被降级成「无需变更」。
+
+## D-71 并发闸门在外、`asyncio.timeout` 在内（R11）
+
+原文（INTERFACES §31.1）：
+
+> `timeout_seconds` 用 `asyncio.timeout`；`model_gate` 包住模型调用；
+> `asyncio.CancelledError` **必须原样传播**（不得吞成 `invalid_proposal`）。
+
+裁决：`async with model_gate:` 在外，`async with asyncio.timeout(...)` 在内。这个顺序是
+**承重的**，不是风格问题。
+
+理由：反过来的话，排队等闸门的时间会被算进这一次调用的超时，于是「前面还有两轮在写」就会
+伪装成「模型太慢」，把一个可能完全正常的提案判成 `invalid_proposal`——用户看到的是
+「这次没能整理出可以长期保存的内容」，而真正的原因是排队。队列越长、误判越多，且完全静默。
+
+## D-72 `max_context_tokens` 是整份请求的预算（R12）
+
+原文（INTERFACES §31.1，规则表里只约束了已有记忆那一部分）：
+
+> 已有记忆以 `[<ID>] <content>` 形式渲染进 user 消息，受 `max_context_tokens` 约束：
+> 塞不下的条目**整条丢弃**，不截半句。
+
+裁决：`max_context_tokens` 是**整份请求**的预算——system prompt、user 消息的静态骨架、来源正文、
+已有记忆行四者合计。装不下的既有条目**逐条跳过**（保留能装下的那些），来源正文与 system 部分
+**绝不截断**。
+
+理由：§33 对读取侧的口径是「塞不下就跳过该条，绝不截半句」，撰写侧沿用同一口径才不会出现
+两种互相矛盾的「预算」概念。若按「只算已有记忆」理解，一份超长来源会让请求实际超出上限；
+若允许截断来源，模型整理出的内容就与用户原话不再一致，而 `content` 是要写进 Markdown 并
+回显给用户的。
+
+## D-73 孤立代理项：写入路径按**调用点**分状态，不是按 reason（R13）
+
+相关原文（INTERFACES）：§31.2 规则 7 只覆盖空白与控制字符，**没有**提代理项——
+
+> `content`：去首尾空白与控制字符、剥掉 Markdown 标题伪装（如开头的 `#`）后，长度不超过
+> `max_entry_chars`。
+
+§30.3 步骤 4 把「外部编辑的版本不可解析」映射成 `conflict`；§27.4 把 `unavailable` 定义为
+「文件不可用（载入失败、原子写失败）」。合同没有说「编码失败」属于哪一边。
+
+背景：由 Task 6 的复核者在独立探测「没有异常逃出 `_parse`」时发现——JSON 的 `\ud800` 转义经
+`json.loads` 解出的孤立代理项能通过全部校验，撰写器返回 `ok`，但 `content.encode("utf-8")`
+抛 `UnicodeEncodeError`。它在**好几条路径上同时**成立，所以两端都补：
+
+- **撰写器（Task 6）**：不可 UTF-8 编码的正文按 `invalid_proposal` 拒绝，位置与其它有效性检查
+  并列（置信度阈值之前、只对非 `noop` 的动作）。
+- **Codec（Task 4）**：校验边界就要拦住它（`_check_entry` 与 `_check_candidate` **两个**校验器，
+  另加 `_encode` 兜底），失败必须是 `CodecError` 而不是裸 `UnicodeEncodeError`——否则服务侧的
+  `except CodecError` 根本接不住，「服务不抛」的承诺就只能靠运气。范围仅限 `content`：`key` /
+  `object_id` 里的代理项会被 YAML 转义成 `\uD800` 并可正常往返，严格 UTF-8 解析也不可能**产生**
+  代理项，因此这是纯内存里的洞。
+- **Service（Task 5）**：写入路径的编码失败一律映射成 **`unavailable`**（「文件不可用 / 原子写
+  失败」）。不是 `conflict`（§30.3 步骤 4 把它留给**外部编辑**的不可解析版本），也不是
+  `invalid_proposal`（§27.4 把那个状态定义为**撰写器**对模型输出的判定；一份通过全部校验、
+  随后写不进去的提案是合法的）。
+
+**Service 必须按调用点分支，不能只按 `reason` 映射**：codec 修好之后，`CodecError("malformed")`
+有两个来源、两个正确状态——解析一份被外部改坏的文件 → `conflict`；渲染服务自己内存里的文档
+→ `unavailable`。只看 `reason` 会稳定地给出错误的用户文案。
+
+理由：`MemoryCaptureResult.content` 会被 §34.4 拼进**出站回复**，所以代理项不只撞 codec 的文件
+写入，也会撞发往站点 API 的 JSON 编码——它必须在校验阶段就被拒绝，而不是留给编码器去炸。
+D-60 要求任何失败都不越过服务边界，这就要求异常类型与状态映射都是确定的。
+
+## D-74 §30.1 修订：四个共同记忆管理操作各自复查 admin（R14）
+
+原文（INTERFACES §32.3）：
+
+> `/memory suggest <scope> <内容>` 只允许 admin：Controller **与** Service 两层都查 `is_admin`；
+
+裁决：原样实现**做不到**——§30.1 冻结的 `MemoryService.__init__` 不持有访问策略，四个管理
+mutation（`add_common_candidate`、`approve_candidate`、`reject_candidate`、`delete_common`）也
+不接收调用方身份，Service 根本没有可判的对象。**修订 §30.1**：这四个方法一律追加
+`*, access: MemoryAccessPolicy, actor_id: str`，各自在**任何 I/O、任何幂等查询与任何写入之前**
+先查 `access.is_admin(actor_id)`，失败返回 `forbidden`（稳定状态，不是异常，§27.4 / D-60）。
+Task 5 的实施者把「做不了」如实上报而不是发明变通，这个判断是对的；Task 14 之前的合同正文已同步。
+
+理由：三条。(a) §32.3 白纸黑字要求两层；(b) 这四个是全功能里**影响最大**的写入——它们把内容
+发布给所有使用者，Controller 侧的一个 bug 或未来的一条旁路就会变成自我授权；(c) `context_for`
+**本来就**按调用传 `access`，这是合同自己已有的模式，不是新发明。代价也记下来：四个签名重做、
+service 内部与测试一并改，并且**阻塞 Task 7**（它调用这四个方法），只能在这条落地之后再派。
+
+## D-75 `/search /remember …`：按原文识别，但冲突门挂在「记忆已注入」上（R15）
+
+原文（INTERFACES §34.1，同一节里的两句话）：
+
+> 判定顺序（记忆命令在能力命令解析**之前**识别，避免 `/search /remember …` 绕过单能力规则）：
+
+> 记忆相关的三个参数（`memory_access` / `memory_queue` / `private_enabled`）都为 `None` 时行为
+> 与今天**逐字节一致**（未注入兼容）。
+
+裁决：两条在 `/search /remember x` 上直接冲突——今天它是一条普通的 `/search` 请求，先识别就会
+改变未注入部署的行为。**按原文识别（遵守顺序条款）**，但把由此产生的**能力冲突**门在「记忆
+已注入」上：未注入时，这个文本退回今天的普通搜索请求，逐字节不变。
+
+理由：顺序条款的目的是**不让一条记忆命令借 `/search` 的前缀绕过「一条消息只能用一种能力」**；
+记忆根本没注入时不存在这条绕行路径，也就没有要防的东西。两条条款因此同时成立，而不是二选一。
+这也是 D-60「关闭时逐字节兼容」在本节的落地方式。
+
+## D-76 评论侧的作者身份：`_CommentMemoryAccess` 是决策载体，不是策略（R16）
+
+原文（INTERFACES §35）：
+
+> `CommentRouter` 在仍持有 `CommentNode.author.id` 时算出 `memory_allowed`
+> （`access.permits_common(comment.author.id)`），并注入它需要的最小依赖。
+
+> `CommentService._build_model_messages` 仅在 `memory_allowed` 时取 `all_user` 共同记忆，
+> 放进当前轮的 `pending_user`（与文章块、父评论块同一位置）；**绝不**请求 `lobby` 或任何用户
+> 私有文件。
+
+> `CommentRequest` 增加 `memory_allowed: bool = False`；**不得**添加 author ID 字段
+> （现状如此，合同不变）。
+
+裁决：**实施者的读法正确，采纳**。请求刻意不带作者 ID，因此下游只剩一个已经算好的布尔；若在
+取用处拿 `None` 当作者去向 allowlist 策略**再问一遍**，`permits_common(None)` 恒为假——结果是
+**默认的 Beta 模式（allowlist）下评论一条共同记忆都读不到**：功能看着接好了，永远为空，且没有任何
+报错。所以 `CommentService` 收到的不是策略而是**决策载体**（`app.py:103-126` 的
+`_CommentMemoryAccess`）：它转达 Router 已经做出的那个决定，私有一律 `False`，并且 provider 把
+`channel_kind` 钉死为 `"comment"`，可解析的作用域因此只剩 `all_user`（§28 / §30.2 的表）。
+§28 的空作者规则仍然成立，因为载体在 Router 那一步根本没被咨询：
+
+- 作者 `""` + allowlist → Router `permits_common("")` 为假 → 不咨询载体 → 无记忆；
+- 作者在白名单里 + allowlist → Router 为真 → 载体 → `all_user`；
+- 任意作者 + `all` → Router 为真 → 载体 → `all_user`。
+
+**回归警示（本裁决存在的主要理由）**：`_CommentMemoryAccess` 看起来像一个「该被换成真
+`MemoryAccessPolicy` 的桩」，但它不是。把它「恢复」成真策略会**静默杀死** allowlist 模式下的
+评论共同记忆——`context_for(user_id=None, …)` 会向策略复问一个没有作者的问题并得到 `False`。
+这是全功能里最容易在将来被好心改回去的一处。
+
+已知取舍：它的 `permits_common` 返回的是无条件的 `True`，即**按构造就是 fail-open**。复核者
+判定在现状下可接受：只有 §35 的那一个调用点，且只有 `memory_allowed` 为真时才会被叫到；
+provider 拿不到参数，用一个可变的共享标志去传 Router 的布尔会在两条并发评论之间竞争。最坏的
+情况（将来出现第二个调用点）是 `all_user` 的共同记忆绕过 allowlist——仍**够不到** `lobby`，更
+够不到任何私有文件。若那天真的到来，正确做法是把它换成携带布尔的闭包
+（`memory_context: Callable[[bool], ...]`，由 Service 传入 `request.memory_allowed`），而不是
+换回真策略。
+
+## D-77 披露装不下时放弃披露、保住回答（`disclosure_no_room`）
+
+原文（设计 §6.3、§12）：
+
+> 自动记忆模式也不能静默写入。普通回答可以保持自然，但必须附带足够简洁的变更说明。
+
+> 长期记忆属于可选增强能力，不是聊天可用性的前提。
+
+背景：这两条在一种退化配置下正面冲突——`behavior.max_output_chars` 小到装不下「披露 + 一个回答
+字符 + `TRUNCATION_SUFFIX`」。Task 13 的修复按「回答优先」在两处收口：
+
+- **启动期**（§26.2 第 13 条）：`enabled` 且 `auto_capture_available` 时校验上面的式子，
+  装不下就 `ConfigError`，让错误的配置根本起不来；
+- **运行期**（`app.py:786-804`）：`limit = max_output_chars - len(披露) - len(TRUNCATION_SUFFIX)
+  - 脱敏增长`，只要 `limit < 1` 就**放弃披露、原回答整条照发**，并记一条
+  `memory.auto_capture reason=disclosure_no_room` 的 WARNING。
+
+为什么是这个收口（两个替代方案都不成立）：走到这一步时记忆**已经提交**——`auto_capture` 先写文件，
+披露是发送前的拼接——所以在那个位置上「拒绝这次写入」没有可拒绝的对象；而按上限硬截会得到一条
+只剩「（内容过长，已截断）」的回复，把回答整个毁掉，正是 D-60 禁止的结局。
+
+**这是本功能唯一一处「写进去了、用户却没被告知」的路径，而且它可达、不是理论。** 启动期那条算术
+看不到脱敏增长（`max_entry_chars` 只约束正文字符数），所以任何正增长都可能把它顶穿——配置校验
+保证的只是「增长为零」时的余量。缓解手段有三条，都写进了 §34.4：稳定的日志行、条目仍可由
+`/memory list` 看到并删除、以及 `max_output_chars` 与 `max_entry_chars` 两个旋钮都在运维手里
+（部署文档 §4.2.2 的排障一段写了怎么认这条日志、怎么消掉它）。
+
+将来若要彻底闭合，正确方向是**在提交之前**判空间（例如由调用方把本轮可用的输出预算先传给
+Controller，让它决定这次写入值不值得），而不是把披露挪到另一条消息里——那会让「刚保存了什么」
+与「哪一轮保存的」脱钩，比不说更糟。
+
+理由：披露是用户授权的前提（设计 §6.1），能保住时应尽全力保住；但「保披露」不能以「毁掉这次
+回答」为代价。把冲突写在这里，是为了让下一个读到 `disclosure_no_room` 的人知道它是**有意的取舍**，
+而不是一个可以顺手删掉的防御分支。
