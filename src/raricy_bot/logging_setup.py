@@ -48,6 +48,13 @@ LOG_FIELDS: frozenset[str] = frozenset(
         "snapshot_version",
         "chunk_count",
         "available_count",
+        # 长期记忆（INTERFACES §37）：只承载稳定标识与计数，绝不含正文、key、
+        # user id、文件路径或命令参数。
+        "scope",
+        "revision",
+        "entry_count",
+        "memory_id",
+        "candidate_id",
     }
 )
 

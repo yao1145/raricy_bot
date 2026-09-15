@@ -236,6 +236,33 @@ class KnowledgeBaseConfig:
 
 
 @dataclass(frozen=True)
+class MemoryConfig:
+    """长期记忆（全局记忆 Beta）配置（INTERFACES §26.1）；默认关闭。
+
+    所有字段都可由 YAML 覆盖：本节没有「代码常量」。
+    """
+
+    enabled: bool = False
+    access_mode: str = "allowlist"       # "allowlist" | "all"
+    allow_user_list: tuple[str, ...] = ()
+    admin_user_list: tuple[str, ...] = ()
+    root_dir: str = "./data/memory"
+    refresh_seconds: int = 10
+    queue_size: int = 20
+    max_common_entries_per_scope: int = 64
+    max_private_entries_per_user: int = 32
+    max_candidates: int = 128
+    max_entry_chars: int = 500
+    max_file_bytes: int = 262144
+    max_operations: int = 512
+    common_context_tokens: int = 800
+    private_context_tokens: int = 800
+    writer_context_tokens: int = 2000
+    writer_timeout_seconds: float = 15.0
+    auto_capture_available: bool = False
+
+
+@dataclass(frozen=True)
 class Secrets:
     """密钥集合；repr 必须脱敏。"""
 
@@ -279,6 +306,7 @@ class Config:
     comments: CommentConfig = field(default_factory=CommentConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
     knowledge_base: KnowledgeBaseConfig = field(default_factory=KnowledgeBaseConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
 
     @property
     def db_path(self) -> str:
@@ -325,6 +353,9 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
     storage = _storage(storage_raw)
     comments = _comments(_section(raw, "comments"))
     knowledge_base = _knowledge_base(_section(raw, "knowledge_base"), behavior)
+    memory = _memory(
+        _section(raw, "memory"), behavior, comments, knowledge_base, storage
+    )
     ops = OpsConfig(
         host=_ops_host(ops_raw),
         port=_ops_port(ops_raw),
@@ -348,6 +379,7 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
         comments=comments,
         mcp=mcp,
         knowledge_base=knowledge_base,
+        memory=memory,
     )
 
 
@@ -887,6 +919,129 @@ def _knowledge_base(
         chunk_overlap_chars=chunk_overlap_chars,
         top_k=top_k,
         max_context_tokens=max_context_tokens,
+    )
+
+
+def _path_contains(parent: str, child: str) -> bool:
+    """child 是否位于 parent 目录内部；按真实路径包含判定，不做字符串前缀匹配。
+
+    先各自取绝对路径再求公共前缀：`./knowledge2` 不是 `./knowledge` 的子目录，
+    而字符串前缀法会把它误判成子目录。
+    """
+    parent_abs = os.path.abspath(parent)
+    child_abs = os.path.abspath(child)
+    try:
+        common = os.path.commonpath([parent_abs, child_abs])
+    except ValueError:
+        # 不同盘符（Windows）等无法比较的路径：一定不构成包含关系。
+        return False
+    return os.path.normcase(common) == os.path.normcase(parent_abs)
+
+
+def _check_memory_root_dir(root_dir: str, kb_root_dir: str, db_path: str) -> None:
+    """记忆目录不得与数据库文件或知识库目录重叠（INTERFACES §26.2 第 10 条）。
+
+    重叠会让记忆文件被 `/kb` 再次扫描并外送，或者让知识库文件被当成记忆条目。
+    """
+    if os.path.normcase(os.path.abspath(root_dir)) == os.path.normcase(
+        os.path.abspath(db_path)
+    ):
+        raise ConfigError("配置 memory.root_dir 不能与 storage.db_path 相同")
+    if _path_contains(kb_root_dir, root_dir):
+        raise ConfigError("配置 memory.root_dir 不能位于 knowledge_base.root_dir 内")
+    if _path_contains(root_dir, kb_root_dir):
+        raise ConfigError("配置 memory.root_dir 不能包含 knowledge_base.root_dir")
+
+
+def _memory(
+    container: Mapping[str, Any],
+    behavior: BehaviorConfig,
+    comments: CommentConfig,
+    knowledge_base: KnowledgeBaseConfig,
+    storage: StorageConfig,
+) -> MemoryConfig:
+    """构造长期记忆配置；关闭时只做类型与单字段范围校验，交叉约束只在启用时施加。"""
+    where = "memory"
+    enabled = _bool_flag(container, "enabled", where, False)
+    auto_capture_available = _bool_flag(container, "auto_capture_available", where, False)
+
+    access_mode = container.get("access_mode", "allowlist")
+    if access_mode not in ("allowlist", "all"):
+        raise ConfigError(f"配置 {where}.access_mode 首版必须是 allowlist 或 all")
+
+    allow_user_list = _text_tuple(container, "allow_user_list", where, ())
+    admin_user_list = _text_tuple(container, "admin_user_list", where, ())
+    for key, values in (
+        ("allow_user_list", allow_user_list),
+        ("admin_user_list", admin_user_list),
+    ):
+        if any(not user_id for user_id in values):
+            raise ConfigError(f"配置 {where}.{key} 不能包含空字符串")
+        if len(set(values)) != len(values):
+            raise ConfigError(f"配置 {where}.{key} 不能重复")
+
+    root_dir = _text_with_default(container, "root_dir", where, "./data/memory")
+    refresh_seconds = _positive_int(container, "refresh_seconds", where, 10)
+    queue_size = _positive_int(container, "queue_size", where, 20)
+    max_common_entries_per_scope = _positive_int(
+        container, "max_common_entries_per_scope", where, 64
+    )
+    max_private_entries_per_user = _positive_int(
+        container, "max_private_entries_per_user", where, 32
+    )
+    max_candidates = _positive_int(container, "max_candidates", where, 128)
+    max_entry_chars = _positive_int(container, "max_entry_chars", where, 500)
+    max_file_bytes = _positive_int(container, "max_file_bytes", where, 262144)
+    max_operations = _positive_int(container, "max_operations", where, 512)
+    common_context_tokens = _positive_int(container, "common_context_tokens", where, 800)
+    private_context_tokens = _positive_int(container, "private_context_tokens", where, 800)
+    writer_context_tokens = _positive_int(container, "writer_context_tokens", where, 2000)
+    writer_timeout_seconds = _positive_number(
+        container, "writer_timeout_seconds", where, 15.0
+    )
+
+    if enabled:
+        # 下面几条只在启用时成立：默认关闭的部署不该因为一个与它无关的默认值组合
+        # （例如把 behavior.context_input_tokens 调得很小）而启动失败。
+        if access_mode == "allowlist" and not set(admin_user_list) <= set(allow_user_list):
+            raise ConfigError(
+                f"配置 {where}.admin_user_list 必须是 allow_user_list 的子集"
+            )
+        if common_context_tokens + private_context_tokens > behavior.context_input_tokens:
+            raise ConfigError(
+                f"配置 {where}.common_context_tokens 与 private_context_tokens 之和"
+                " 不能大于 behavior.context_input_tokens"
+            )
+        if common_context_tokens > comments.context_input_tokens:
+            raise ConfigError(
+                f"配置 {where}.common_context_tokens 不能大于"
+                " comments.context_input_tokens"
+            )
+        if max_entry_chars > behavior.max_input_chars:
+            raise ConfigError(
+                f"配置 {where}.max_entry_chars 不能大于 behavior.max_input_chars"
+            )
+        _check_memory_root_dir(root_dir, knowledge_base.root_dir, storage.db_path)
+
+    return MemoryConfig(
+        enabled=enabled,
+        access_mode=access_mode,
+        allow_user_list=allow_user_list,
+        admin_user_list=admin_user_list,
+        root_dir=root_dir,
+        refresh_seconds=refresh_seconds,
+        queue_size=queue_size,
+        max_common_entries_per_scope=max_common_entries_per_scope,
+        max_private_entries_per_user=max_private_entries_per_user,
+        max_candidates=max_candidates,
+        max_entry_chars=max_entry_chars,
+        max_file_bytes=max_file_bytes,
+        max_operations=max_operations,
+        common_context_tokens=common_context_tokens,
+        private_context_tokens=private_context_tokens,
+        writer_context_tokens=writer_context_tokens,
+        writer_timeout_seconds=writer_timeout_seconds,
+        auto_capture_available=auto_capture_available,
     )
 
 

@@ -48,6 +48,16 @@ class Turn:
     content: str
 
 
+@dataclass(frozen=True)
+class SupplementalItem:
+    """一条随当前轮注入的补充资料；由调用方决定来源与优先级。"""
+
+    group: str       # memory_all_user | memory_lobby | memory_user
+    label: str       # GM-A-... / GM-L-... / UM-...
+    content: str
+    priority: int    # 越小越优先
+
+
 class ContextManager:
     """内存会话历史；只做追加、清空、裁剪与消息拼装。"""
 

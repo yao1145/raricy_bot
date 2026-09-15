@@ -187,3 +187,33 @@ comments:
   retry_base_seconds: 5
   retry_max_seconds: 300
   server_backoff_seconds: 3600
+
+# 长期记忆目前为 Beta。默认关闭；启用后仍默认无人可用。
+memory:
+  enabled: false
+
+  # allowlist：只有 allow_user_list 中的用户能使用任何记忆能力。
+  # all：所有用户都能使用；共同记忆管理权仍只属于 admin_user_list。
+  access_mode: "allowlist"
+  allow_user_list: []
+  admin_user_list: []
+
+  root_dir: "./data/memory"
+  refresh_seconds: 10
+  queue_size: 20
+
+  max_common_entries_per_scope: 64
+  max_private_entries_per_user: 32
+  max_candidates: 128
+  max_entry_chars: 500
+  max_file_bytes: 262144
+  max_operations: 512
+
+  # all_user 与 lobby 合计使用这一份共同记忆预算。
+  common_context_tokens: 800
+  private_context_tokens: 800
+  writer_context_tokens: 2000
+  writer_timeout_seconds: 15
+
+  # 部署允许后，用户仍需在私聊中主动开启自动记忆。
+  auto_capture_available: false
