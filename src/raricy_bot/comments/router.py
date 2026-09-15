@@ -56,6 +56,8 @@ class CommentRequest:
     parent_bot_text: str | None
     has_image: bool
     has_quoted_blog: bool
+    # 图片附件的地址（同源约束由 `fetch_image` 兜住）；图没了或本来就没带图时为 None。
+    image_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -175,6 +177,7 @@ class CommentRouter:
         parent_lookup: Callable[[str, str], Awaitable[Any] | Any] | None = None,
         logger_instance: logging.Logger | None = None,
         logger: logging.Logger | None = None,
+        vision_enabled: bool = False,
     ) -> None:
         self._self_user_id = self_user_id
         self._bot_username = bot_username
@@ -183,6 +186,9 @@ class CommentRouter:
         self._queue = queue
         self._cfg = cfg
         self._now = now
+        # 图片输入是否对评论区开启（`model.vision_enabled` 且名额大于 0）。
+        # 路由器不做 I/O，因此这里只回答「该不该交给模型」，取图与降级在 service。
+        self._vision_enabled = vision_enabled
         self._parent_lookup = parent_lookup
         self._logger = (
             logger_instance
@@ -305,13 +311,21 @@ class CommentRouter:
             ),
             has_image=self._has_image(comment),
             has_quoted_blog=self._has_quoted_blog(comment),
+            image_url=self._readable_image_url(comment),
         )
 
         # 本地回复不调用模型。/reset 的新会话由 force_new claim 建立，旧会话完全不动。
+        image_only = False
         if not user_text:
-            media = self._has_media(comment)
-            text = texts.UNSUPPORTED_MEDIA_TEXT if media else texts.USAGE_HINT
-            return self._local(request, text, "media_only" if media else "empty")
+            # 纯图评论（只能是直接回复机器人评论的那种）在视觉开启时是一轮请求：
+            # 有字节可取的图才入队，取图与降级由 service 负责（路由器不做 I/O）。
+            image_only = self._vision_enabled and request.image_url is not None
+            if not image_only:
+                media = self._has_media(comment)
+                text = texts.UNSUPPORTED_MEDIA_TEXT if media else texts.USAGE_HINT
+                return self._local(request, text, "media_only" if media else "empty")
+        # 纯图请求（`user_text` 为空）直落下面的入队：命令判定都要求非空正文，
+        # 三个都必然为假，因此不需要为它单开一条分支。
         if is_help_command(user_text):
             return self._local(request, texts.COMMENT_HELP_TEXT, "help")
         if force_new:
@@ -319,13 +333,13 @@ class CommentRouter:
         if is_secret_probe(user_text):
             return self._local(request, texts.SECRET_REFUSAL_TEXT, "secret_probe")
 
-        # 附件与文字同时出现时只处理文字；附件本身不进入模型请求。
+        # 附件交给模型：视觉开启且附件可读时随本轮一起外送（§20），否则只有文字。
         if enqueue:
             try:
                 self._queue.put_nowait(request)
             except asyncio.QueueFull:
                 return self._result("busy", request, texts.BUSY_NOTICE_TEXT, "queue_full")
-        return self._result("queued", request, None, "queued")
+        return self._result("queued", request, None, "image_only" if image_only else "queued")
 
     async def handle_candidate(self, candidate: Any, claim: CommentClaim | None = None) -> CommentRouteResult:
         """消费 discovery 的 ``CommentCandidate``，复用其已经完成的原子领取。"""
@@ -404,6 +418,18 @@ class CommentRouter:
     def _has_image(comment: CommentNode) -> bool:
         """识别图片引用，包括已失效但仍代表附件的占位字段。"""
         return bool(comment.has_image or getattr(comment, "image_missing", False))
+
+    @staticmethod
+    def _readable_image_url(comment: CommentNode) -> str | None:
+        """附件里**可以取回**的那张图的地址；没带图或图已不在时为 None。
+
+        与 `_has_image` 的分工是 `image_missing`：那个字段表示「引用了图但图已不存在」，
+        没有字节可交（与 `text_utils.has_image` 同款口径）——「有没有附件」与
+        「有没有东西可看」是两个问题。
+        """
+        image = getattr(comment, "image", None)
+        url = getattr(image, "url", "")
+        return url if isinstance(url, str) and url else None
 
     @staticmethod
     def _has_quoted_blog(comment: CommentNode) -> bool:

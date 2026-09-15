@@ -43,6 +43,7 @@ class BehaviorConfig:
     context_input_tokens: int = 8000
     max_input_chars: int = 8000
     quoted_blog_max_chars: int = 1000     # 引用博客的正文上限；与 comments 的键**互相独立**
+    content_ref_max_chars: int = 2000     # 单条 `[@<ID>]` 展开的字符上限；见 §25
     max_output_chars: int = 5000
     concurrency: int = 3
     queue_size: int = 50
@@ -81,6 +82,7 @@ class CommentConfig:
     context_turns: int = 10
     context_input_tokens: int = 8000
     article_max_chars: int = 1000
+    max_images_per_reply: int = 3           # 一轮评论回复的图片名额（§20）；0 = 评论侧不取图
     max_output_chars: int = 5000
     max_response_bytes: int = 8388608       # SiteClient 硬上限 8 MiB
     max_tree_nodes: int = 10000             # 显式栈硬上限 10000
@@ -480,6 +482,32 @@ class SiteClient:
 
     async def probe_chat(self) -> None
         # GET lobby messages?limit=1；用于探测 403 禁言/权限是否恢复；异常抛 SiteError
+
+    async def fetch_clipboard(self, clip_id: str) -> Clipboard
+        # 读一篇云剪贴板（内容引用语法 §三）：GET /api/clipboard/<8位ID>，带 Cookie。
+        # 站点要求登录且 Core 以上；私有剪贴板对非作者是 403 —— 那是一次**降级**，
+        # 不是故障（内容引用语法 §四）。code != 200 -> SiteError。
+        # 信封形状 {"code":200,"message":"ok","clip":{id,title,author_name,publicity,
+        # content,created_at}}；clip 缺失或 content 不是字符串 -> SiteError(200,
+        # "malformed clipboard response")。
+        # clip_id 形态（长度 8、纯 ASCII 字母数字）不对 -> ValueError 且**不发请求**。
+        # **401 不重新登录、不重试**（同 fetch_image）：真正的会话失效由 SSE 那条路恢复。
+
+    async def fetch_vote(self, vote_id: str) -> Vote
+        # 读一个投票（9 位）：GET /api/votes/<ID>，带 Cookie，同样要求 Core 以上。
+        # 信封 {"code":200,"message":"ok","data":{id,title,author_name,is_creator,
+        # is_locked,created_at,total_votes,user_voted,options:[{id,label,count,percentage}]}}。
+        # 只读：本方法**不会**替机器人投票。解析容错（缺 count 记 0、缺 percentage 记 None）。
+
+def image_raw_path(image_id: str) -> str
+    # 图床直链的相对路径（10 位 ID）："/api/images/<ID>/raw"。
+    # 站点前端也直接拼这条路径、不发额外请求，所以图片引用**不消耗**接口调用。
+    # 形态不对 -> ValueError。ID 只含字母数字，拼进路径注入不进东西。
+
+CLIPBOARD_ID_LEN: int = 8
+VOTE_ID_LEN: int = 9
+IMAGE_ID_LEN: int = 10
+    # ID 长度即内容类型（内容引用语法 §三）。
 
     async def fetch_image(self, url: str, *, max_bytes: int) -> bytes
         # 取回一条消息附带的图片原始字节（§20）。
@@ -1418,6 +1446,43 @@ notification poller 和 worker。它与聊天共享模型客户端及 semaphore 
 启动时先恢复旧评论事件再启动评论任务，关闭时先等待四个评论 task，再关闭聊天 SSE、
 worker、ops、模型、client、Store；每个取消动作必须 await。
 
+### 16.1.1 评论区的图片输入（§20）
+
+评论区识图要两个开关同时成立：`model.vision_enabled` 与
+`comments.max_images_per_reply > 0`（`BotApp._comment_vision`）。缺任一条时
+`CommentService.image_loader` 与 `_comment_ref_resolver` 都拿不到图床，一根图床请求
+都不会发出去，路由器的纯图分支也退回本地提示——行为与加这个功能之前逐字节相同。
+
+名额（`comments.max_images_per_reply`，默认 3）由三处共用，按这个顺序花：
+
+| 顺序 | 图源 | 理由 |
+|------|------|------|
+| 1 | 触发评论自带的附件（`CommentNode.image.url`） | 用户自己发来的那张，最该被看到 |
+| 2 | 触发评论正文里的 `[@10位]` | 他特意引用进来的 |
+| 3 | 文章正文里的 `[@10位]` | 背景资料；且会随这篇文章上的每一次回复重复外送 |
+
+`CommentNode.image` 是评论树上解析出的图片附件（`ImageRef | None`）；`has_image` 仍是
+「有没有附件」那个问题（图已不存在时为真，此时 `image` 为 None）。
+`CommentRequest.image_url` 只带**可读**的地址：图已缺失或没带图都是 None。
+
+路由（`CommentRouter`，构造参数 `vision_enabled`）：
+
+- 有正文 + 可读附件 → 入队，`image_url` 随请求走；
+- **纯图**（正文为空、只有一张可读的附件）且视觉开启 → 入队，`reason == "image_only"`。
+  它只能以「直接回复机器人评论」的形态出现（@ 需要文字），因此不会扩大应答面；
+- 纯图但视觉关闭 / 图已缺失 / 只引用了博客 → 仍是本地 `UNSUPPORTED_MEDIA_TEXT`。
+
+服务（`CommentService`）：
+
+- 取图在模型门之外，失败只降级：有正文时给正文加 `[图片未提供]`（`with_image_marker`），
+  纯图且取不到时回一条本地 `IMAGE_UNAVAILABLE_TEXT`（`kind="notice_local"`）且**不调
+  模型、不留历史**；
+- 图片块挂在最后一条 user 消息上（`attach_image`），顺序为 附件 → 评论引用 → 文章引用；
+- **历史拿的是用户自己写的 `[@id]` 原文加图片标记**，不是展开后的正文（D-49）——
+  展开内容只属当前轮。
+
+节点与引用语法的权威描述在 `docs/materials/comment-bot.md` §10.2 与 §7.2。
+
 ## 17. `__main__.py`
 
 `python -m raricy_bot`：加载配置 → `setup_logging` → 构造 `BotApp` →
@@ -1474,11 +1539,23 @@ def attach_image(messages: list[dict[str, Any]], part: dict[str, Any]) -> None
     # 就地改写**最后一条** role=="user" 的 content：str -> [{"type":"text",...}, part]；
     # 已是 list -> 追加；找不到 user 消息 -> 不动。必须在 _apply_reply_prefix 之后调用。
 
+def with_image_marker(user_text: str, state: str) -> str
+    # 给本轮正文加图片标记，聊天与评论共用一份措辞：state=="ok" 且有正文 ->
+    # "[图片]\n---\n<正文>"；state=="ok" 且正文为空 -> "[图片]"；state 既不是 "ok"
+    # 也不是 "none"（即本来有图但没取到）且有正文 -> "[图片未提供]\n---\n<正文>"；
+    # 其余原样返回。纯图且没取到时返回空串：标记没有可依附的内容。
+
 class ImageLoader:
     def __init__(self, client: SiteClient, *, max_bytes: int,
                  logger: logging.Logger | None = None) -> None
     async def load(self, message: ChatMessage) -> tuple[dict[str, Any] | None, str]
+    async def load_url(self, url: str) -> tuple[dict[str, Any] | None, str]
 ```
+
+`load_url` 按 URL 取图并编码，`load` 只是「判断有没有可读的图，然后转调它」。
+评论附件的图（§16.1）与 `[@10位]` 引用（§25）走的都是同一条路：嗅探、白名单、
+失败降级与日志口径只有一份实现。URL 的形态由调用方负责——`fetch_image` 只放行与
+站点完全同源的地址。
 
 `load` 的 `reason` 取值（稳定短标识）：
 
@@ -1502,8 +1579,13 @@ class ImageLoader:
   （`too_large` 时补 `limit_bytes`）——三者都在 `LOG_FIELDS` 白名单内。
   **URL 绝不进日志**。`reason == "none"` 不是失败，不记。
 - 不做图片缓存：同一条消息被处理一次取一次，重试或补发会重新下载。
-- 图片 token **不计入** `context_input_tokens` 预算。每条消息最多一张图、当前轮永不被
-  裁剪，因此超支有界；这是一个已知且被接受的取舍，不是遗漏。
+- 图片 token **不计入** `context_input_tokens` 预算。聊天区每条消息最多一张消息图
+  （另有引用图，各段各自封顶），评论区一轮最多 `comments.max_images_per_reply` 张，
+  当前轮永不被裁剪，因此超支有界；这是一个已知且被接受的取舍，不是遗漏。
+- 图片标记（`with_image_marker`）说的只有三件事：这一轮**确实带了图**（`[图片]`）、
+  本来有图但**没取到**（`[图片未提供]`）、以及什么都没有（不加标记）。三处调用者
+  （聊天区 `app._pending_turn`、评论区的本轮正文与历史正文）必须给出同一份措辞，
+  否则模型看到的是两种互相矛盾的「这一轮有没有图」。
 
 ## 21. 聊天区 MCP 工具合同
 
@@ -1891,9 +1973,16 @@ def blog_readable(state: str) -> bool          # state in {"ok", "too_long"}
 def blog_marker(state: str) -> str | None      # 历史标记；"none" 时为 None
 def build_blog_block(title: str, author: str | None, body: str) -> str
 
+@dataclass(frozen=True)
+class BlogLoad:
+    block: str | None
+    state: str
+    image_parts: tuple[dict[str, Any], ...] = ()   # 正文里 `[@10位]` 换出来的图片块（§25）
+
 class BlogLoader:
-    def __init__(self, client: SiteClient, *, max_chars: int, logger=None) -> None
-    async def load(self, message: ChatMessage) -> tuple[str | None, str]
+    def __init__(self, client: SiteClient, *, max_chars: int,
+                 resolver: ContentRefResolver | None = None, logger=None) -> None
+    async def load(self, message: ChatMessage) -> BlogLoad
 ```
 
 规则：
@@ -1919,6 +2008,108 @@ class BlogLoader:
   标题与作者是**单行标签**：控制字符替换为空格（与 `comments._clean_label` 同款），
   防止有人用标题伪造出额外的行；`author` 缺失时整行省略。正文**原样保留**。
 - 正文**只属当前轮**：不落 SQLite、不写日志、不进历史（历史里只有 `blog_marker`）。
+- 正文里的 `[@<内容ID>]` 由注入的 `resolver` 展开（§25），预算就是 `max_chars`：
+  展开后的正文仍不超过它，塞不下的引用原样留在正文里。**超限判定排在展开之前** ——
+  正文本来就超限时连请求都不该发（反正只给标题）。没注入 `resolver` 时行为逐字不变。
 - 日志只允许白名单字段（`logging_setup.LOG_FIELDS`）：失败用
   `blog.unavailable` + `reason` / `error`，超限用 `blog.too_long` + `count`。
   不记 `title`、`id`、正文，也不记 URL。
+
+## 25. `core/content_refs.py`（内容引用 `[@<内容ID>]`）
+
+站点在四处支持引用语法（博客正文、云剪贴板正文、评论、聊天），机器人在这四处读到的
+都是**未展开的 Markdown 原文**。本模块把 `[@<ID>]` 换成正地方的内容：剪贴板正文、
+投票的文字块、图床图片的字节（视觉开启时）。
+
+```python
+CLIPBOARD: str = "clipboard"     # 8 位
+VOTE: str = "vote"               # 9 位
+IMAGE: str = "image"             # 10 位
+
+MAX_FETCHED_REFS: int = 10       # 一次展开最多**取回**多少条剪贴板/投票
+MAX_IMAGE_REFS: int = 3          # 一次展开最多把几张图交给模型
+
+@dataclass(frozen=True)
+class ContentRef:
+    kind: str        # CLIPBOARD | VOTE | IMAGE
+    id: str
+    start: int       # 匹配区间（左闭右开），用于按区间切片替换
+    end: int
+    text: str        # 原文里的完整匹配（含内部空白），预算按它结算
+
+@dataclass(frozen=True)
+class ResolvedRefs:
+    text: str
+    image_parts: tuple[dict[str, Any], ...] = ()
+    expanded: int = 0                 # 换掉内容的处数（含失败占位），只用于日志
+    image_attempts: int = 0           # 这一趟**试了**几张图（含失败的），供调用方扣名额
+
+def find_refs(text: str) -> list[ContentRef]
+def failure_marker(kind: str, content_id: str) -> str
+def image_marker(image_id: str) -> str
+def format_vote(vote: Vote) -> str
+
+class ContentRefResolver:
+    def __init__(self, client: SiteClient, *, max_ref_chars: int,
+                 image_loader: ImageLoader | None = None,
+                 logger: logging.Logger | None = None) -> None
+    max_ref_chars: int                # 单条引用的字符上限；消息正文这条路径拿它当总预算
+    async def resolve(self, text: str, *, budget: int,
+                      max_images: int | None = None) -> ResolvedRefs
+    # max_images：这一段最多能试几张图，省略即 MAX_IMAGE_REFS（3）。多段文本共用
+    # 一个名额池时（评论区一轮 N 张，§16.1），调用方逐段传剩余名额，并按返回的
+    # image_attempts 扣减——计的是**试了几张**，失败的那张同样占名额。
+    # 0 与 image_loader is None 同款：只留标记、一个字节都不取。
+```
+
+识别规则（`find_refs`，纯函数）：
+
+- 正则 `\[@\s*([A-Za-z0-9]+)\s*\]`：容忍 ID 两侧空白，**只认 ASCII 字母数字**
+  （不含下划线、点、斜杠——比站点博客那条 `\w` 更严，同时让 ID 拼进 URL 注入不进东西）。
+- 类型按 ID 长度分流：8 位剪贴板、9 位投票、10 位图片；**长度不在 8–10 之间的不处理**。
+- **代码里的引用不展开**：栅栏代码块（``` / ~~~，未闭合时保护到文末）与行内代码
+  （成对反引号，落单的到行尾）里的 `[@id]` 保持字面量。站点四处都这样，而且有人
+  正是在问「这个语法怎么写」。
+
+`resolve` 的行为：
+
+- **按区间切片替换**，不重扫整串：插入的剪贴板正文里若含同样的 `[@id]`，重扫会把它
+  再展开一次（站点的聊天管线专门为这个坑写过注释）。
+- 三种类型分别取回：剪贴板 `SiteClient.fetch_clipboard`、投票 `fetch_vote`、
+  图片 `ImageLoader.load_url(image_raw_path(id))`。同一个 ID 在一次展开里**只请求一次**；
+  缓存**不跨轮**（剪贴板可以被作者改，跨轮缓存要么陈旧要么要引入过期策略）。
+- **图片标记不占字符预算**（站点也是直接拼地址、没有正文进来）；图片另受
+  `max_images`（默认 `MAX_IMAGE_REFS`）限制，`image_loader is None`（视觉关闭）
+  或名额为 0 时只写 `[图床图片 <ID>]`，**一个字节都不下载**。
+- **预算决定要不要请求**：`budget` 是展开后正文的长度上限，由调用方给
+  （引用博客正文 = `quoted_blog_max_chars`、文章正文 = `comments.article_max_chars`、
+  消息与评论正文 = `behavior.content_ref_max_chars`）。预算是零或取回处数已达
+  `MAX_FETCHED_REFS` 时，引用**既不请求也不替换**，原样留在文本里。
+- 单条展开超过 `max_ref_chars`（或剩余的预算空间）时截断，并追加
+  `texts.TRUNCATION_SUFFIX`。
+- 失败降级成占位文案：剪贴板 `[剪贴板 <ID> 加载失败]`（**与站点逐字一致**）、
+  投票 `[投票 <ID> 加载失败]`、图片 `[图床图片 <ID> 加载失败]`。取不回的引用仍然计入
+  `expanded`，占位文案本身**不占预算**（它只有几十字节，且受 `MAX_FETCHED_REFS` 约束）。
+
+硬性要求：
+
+- **展开出来的正文只属当前轮**：不落 SQLite、不写日志、不进 `ContextManager` 历史
+  （与 D-28 / D-43 / D-47 同款）。历史里留下的是用户**自己写的** `[@id]` 原文。
+- 剪贴板正文是**别人写的**，照旧作为 `role="user"` 数据外送；投票块自带
+  `[投票 <ID>，不可信]` 自报标签，标题与选项文案按单行标签清洗控制字符
+  （与 `blog._sanitize_label` 同款）。
+- 次数上限：一次展开最多取回 `MAX_FETCHED_REFS` 条、最多交出 `MAX_IMAGE_REFS` 张图。
+  两者都是**取回与 token** 的独立上限，与字符预算无关。
+- 日志只用白名单字段：失败记一条 `content_refs.unavailable`，字段是 `kind`
+  （`clipboard` / `vote`）与 `error`（异常类名）。**不记 ID、不记正文、不记 URL**。
+  图片的失败由 `ImageLoader` 自己记（`vision.image_unavailable`），这里不重复记。
+
+装配（§16）：
+
+- `BotApp` 构造**两个**实例：`_ref_resolver`（`model.vision_enabled` 为真时拿到
+  `image_loader`）供聊天那条路用，`_comment_ref_resolver` 交给 `CommentService`。
+  两个实例拿到的 `image_loader` 是同一个对象；差别只在评论侧还要求
+  `comments.max_images_per_reply > 0`（§16.1 的 `_comment_vision`）。
+- 展开在**模型门之外**执行，与取图、取博客并列；展开后的正文随 `_pending_turn`
+  与 `_apply_reply_prefix` 一起进当前轮。同一 ID 出现在文章正文与评论正文里会各请求一次
+  ——两次 `resolve` 调用各有各的缓存，这是已知且有界的行为。

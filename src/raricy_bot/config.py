@@ -158,6 +158,12 @@ class BehaviorConfig:
     # 引用博客正文的长度上限。默认值与 comments.article_max_chars 相同，但**是两个键**：
     # 聊天模型与评论模型未必是同一个，两边各自可调。
     quoted_blog_max_chars: int = 1000
+    # 单条内容引用（`[@<ID>]`）展开出来的字符上限：剪贴板正文上限 5 万字、
+    # 投票选项同理，都属于**别人写的**内容，不给上限就等于让一条十个字的消息
+    # 变成几十万字的外送正文。它同时是**消息与评论正文**展开时的总预算
+    # （博客正文与文章正文的总预算另有其键，见上一条与 comments.article_max_chars）。
+    # 默认 2000 与站点在聊天/评论里的截断口径一致。
+    content_ref_max_chars: int = 2000
     max_output_chars: int = 5000
     concurrency: int = 3
     queue_size: int = 50
@@ -192,6 +198,9 @@ class CommentConfig:
     context_turns: int = 10
     context_input_tokens: int = 8000
     article_max_chars: int = 1000
+    # 一轮评论回复最多交给模型几张图：附件与两处正文里的 `[@10位]` 引用共用这一个
+    # 名额池。0 合法，等于评论侧不取图（`model.vision_enabled` 仍可整体关掉视觉）。
+    max_images_per_reply: int = 3
     max_output_chars: int = 5000
     max_response_bytes: int = 8388608
     max_tree_nodes: int = 10000
@@ -476,6 +485,9 @@ def _behavior(container: Mapping[str, Any]) -> BehaviorConfig:
     quoted_blog_max_chars = _positive_int(
         container, "quoted_blog_max_chars", "behavior", 1000
     )
+    content_ref_max_chars = _positive_int(
+        container, "content_ref_max_chars", "behavior", 2000
+    )
     max_output_chars = _positive_int(container, "max_output_chars", "behavior", 5000)
     concurrency = _positive_int(container, "concurrency", "behavior", 3)
     queue_size = _positive_int(container, "queue_size", "behavior", 50)
@@ -492,6 +504,7 @@ def _behavior(container: Mapping[str, Any]) -> BehaviorConfig:
         context_input_tokens=context_input_tokens,
         max_input_chars=max_input_chars,
         quoted_blog_max_chars=quoted_blog_max_chars,
+        content_ref_max_chars=content_ref_max_chars,
         max_output_chars=max_output_chars,
         concurrency=concurrency,
         queue_size=queue_size,
@@ -566,6 +579,15 @@ def _comments(container: Mapping[str, Any]) -> CommentConfig:
     def integer(key: str, default: int) -> int:
         return _positive_int(container, key, "comments", default)
 
+    def non_negative_integer(key: str, default: int) -> int:
+        """取不小于 0 的整数：0 在这里是有意义的值（评论侧不取图）。"""
+        value = container.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ConfigError(f"配置 comments.{key} 必须是整数")
+        if value < 0:
+            raise ConfigError(f"配置 comments.{key} 不能为负数")
+        return value
+
     recent_poll_seconds = integer("recent_poll_seconds", 30)
     notification_poll_seconds = integer("notification_poll_seconds", 15)
     notification_max_pages = integer("notification_max_pages", 5)
@@ -574,6 +596,7 @@ def _comments(container: Mapping[str, Any]) -> CommentConfig:
     context_turns = integer("context_turns", 10)
     context_input_tokens = integer("context_input_tokens", 8000)
     article_max_chars = integer("article_max_chars", 1000)
+    max_images_per_reply = non_negative_integer("max_images_per_reply", 3)
     max_output_chars = integer("max_output_chars", 5000)
     max_response_bytes = integer("max_response_bytes", 8 * 1024 * 1024)
     max_tree_nodes = integer("max_tree_nodes", 10000)
@@ -617,6 +640,7 @@ def _comments(container: Mapping[str, Any]) -> CommentConfig:
         context_turns=context_turns,
         context_input_tokens=context_input_tokens,
         article_max_chars=article_max_chars,
+        max_images_per_reply=max_images_per_reply,
         max_output_chars=max_output_chars,
         max_response_bytes=max_response_bytes,
         max_tree_nodes=max_tree_nodes,

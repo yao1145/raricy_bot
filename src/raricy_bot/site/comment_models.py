@@ -8,6 +8,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
+# 图片附件的 DTO 与解析器与聊天消息共用一份：两处的 `image` 信封形状相同，
+# 而 `_parse_image` 的容错口径（非映射即 None）正是这里要的。
+from .models import ImageRef, _parse_image
+
 
 def normalize_uuid(value: object) -> str | None:
     """验证并规范化站点对象 UUID；非法值返回 None。"""
@@ -114,6 +118,9 @@ class CommentNode:
     is_deleted: bool = False
     created_at: float | None = None
     updated_at: float | None = None
+    # 图片附件本身（`url` 由 `fetch_image` 的同源约束兜住）。图没了时是 None，
+    # 但 `has_image` 仍为真——「本来带了图」与「图还在」是两件事。
+    image: ImageRef | None = None
     has_image: bool = False
     has_quoted_blog: bool = False
     children: tuple["CommentNode", ...] = ()
@@ -174,6 +181,7 @@ class CommentNode:
                 is_deleted=_bool(current.get("is_deleted")),
                 created_at=parse_comment_time(current.get("created_at")),
                 updated_at=parse_comment_time(current.get("updated_at")),
+                image=_parse_image(raw_image),
                 has_image=(
                     _bool(current.get("has_image"))
                     or _bool(current.get("image_missing"))

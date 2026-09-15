@@ -2,15 +2,21 @@
 
 模型只能看到**这一轮**的博客正文：它不进历史、不落库、不写日志。
 正文取回走公开的 spider 接口（与评论机器人同一条通路，不带 Cookie）。
+
+正文里的 `[@<内容ID>]` 引用由注入的解析器展开（§25）：展开后的正文同样**只属当前轮**，
+换出来的图片块由调用方挂到本轮消息上。
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from typing import Any
 
 from ..logging_setup import get_logger, log_event
 from ..site.client import SiteClient, SiteError
 from ..site.models import ChatMessage
+from .content_refs import ContentRefResolver
 
 _logger = get_logger("blog")
 
@@ -82,6 +88,20 @@ def build_blog_block(title: str, author: str | None, body: str) -> str:
     return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class BlogLoad:
+    """一次取回的结果。
+
+    `block` 为 None 只表示**没引用博客**；只要引用了，块就一定在（标题与作者取自
+    消息 DTO，零成本）。`image_parts` 是正文里 `[@10位]` 引用换出来的图片块，
+    只有视觉开启时才可能非空，由调用方挂到本轮消息上。
+    """
+
+    block: str | None
+    state: str
+    image_parts: tuple[dict[str, Any], ...] = ()
+
+
 class BlogLoader:
     """把一条消息引用的博客取回并拼成块。
 
@@ -95,20 +115,22 @@ class BlogLoader:
         client: SiteClient,
         *,
         max_chars: int,
+        resolver: ContentRefResolver | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self._client = client
         self._max_chars = max_chars
+        self._resolver = resolver
         self._logger = logger if logger is not None else _logger
 
-    async def load(self, message: ChatMessage) -> tuple[str | None, str]:
-        """返回 `(block | None, state)`；只有「没引用博客」才返回 None。"""
+    async def load(self, message: ChatMessage) -> BlogLoad:
+        """返回 `BlogLoad`；只有「没引用博客」时 `block` 为 None。"""
         blog = message.blog
         if blog is None:
-            return None, BLOG_STATE_NONE
+            return BlogLoad(None, BLOG_STATE_NONE)
         if message.blog_missing:
             # 站点已经说了它没了，再打一次只会拿到 404。
-            return self._block(blog, _BODY_MISSING), BLOG_STATE_MISSING
+            return self._block(blog, _BODY_MISSING, BLOG_STATE_MISSING)
 
         try:
             article = await self._client.fetch_blog_context(blog.id)
@@ -123,18 +145,33 @@ class BlogLoader:
             return self._degrade(blog, "no_content")
         if len(content) > self._max_chars:
             self._log_too_long(count=len(content))
-            return self._block(blog, _BODY_TOO_LONG), BLOG_STATE_TOO_LONG
-        return build_blog_block(blog.title, blog.author, content), BLOG_STATE_OK
+            return self._block(blog, _BODY_TOO_LONG, BLOG_STATE_TOO_LONG)
+        content, parts = await self._resolve(content)
+        return BlogLoad(
+            build_blog_block(blog.title, blog.author, content), BLOG_STATE_OK, parts
+        )
 
-    def _block(self, blog: object, body: str) -> str:
+    async def _resolve(self, content: str) -> tuple[str, tuple[dict[str, Any], ...]]:
+        """展开正文里的内容引用；没注入解析器时原样返回（行为逐字不变）。
+
+        超限判定排在展开**之前**：正文本来就超限时连请求都不该发 —— 反正只给标题。
+        展开的预算就是正文自己的上限，所以展开不会把一篇原本合格的正文推成超限。
+        """
+        if self._resolver is None:
+            return content, ()
+        resolved = await self._resolver.resolve(content, budget=self._max_chars)
+        return resolved.text, resolved.image_parts
+
+    def _block(self, blog: object, body: str, state: str) -> BlogLoad:
         """按消息里的引用拼块；标题与作者可能缺失，`build_blog_block` 自己会省行。"""
-        return build_blog_block(
+        block = build_blog_block(
             getattr(blog, "title", "") or "",
             getattr(blog, "author", None),
             body,
         )
+        return BlogLoad(block, state)
 
-    def _degrade(self, blog: object, reason: str, error: str = "") -> tuple[str, str]:
+    def _degrade(self, blog: object, reason: str, error: str = "") -> BlogLoad:
         """降级：块照给（标题还在），状态是 failed。
 
         日志字段只允许 `logging_setup.LOG_FIELDS` 白名单里的名字：这里的 `reason`
@@ -144,7 +181,7 @@ class BlogLoader:
         if error:
             fields["error"] = error
         log_event(self._logger, logging.INFO, "blog.unavailable", **fields)
-        return self._block(blog, _BODY_FAILED), BLOG_STATE_FAILED
+        return self._block(blog, _BODY_FAILED, BLOG_STATE_FAILED)
 
     def _log_too_long(self, *, count: int) -> None:
         """超限不是失败，只记一条字符数（`count` 在字段白名单里）。"""

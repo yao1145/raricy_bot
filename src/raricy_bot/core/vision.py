@@ -84,6 +84,24 @@ def attach_image(messages: list[dict[str, Any]], part: dict[str, Any]) -> None:
         return
 
 
+def with_image_marker(user_text: str, state: str) -> str:
+    """给本轮正文加上图片标记。
+
+    `[图片]` 表示这一轮确实带了图；`[图片未提供]` 表示本来有图但没取到 ——
+    让模型知道自己没看到图，而不是以为用户什么都没发。纯图且没取到时给不出正文，
+    返回空串：标记没有可依附的内容，该由调用方回一条本地提示。
+
+    聊天区与评论区共用这一份措辞：两边说的是同一种「这一轮有没有图、模型看没看到」。
+    """
+    if state == "ok" and user_text:
+        return f"[图片]\n---\n{user_text}"
+    if state == "ok":
+        return "[图片]"
+    if state != "none" and user_text:
+        return f"[图片未提供]\n---\n{user_text}"
+    return user_text
+
+
 class ImageLoader:
     """把一条消息里的图片取回并编码成模型可用的内容块。
 
@@ -107,9 +125,16 @@ class ImageLoader:
         image = message.image
         if image is None or message.image_missing:
             return None, "none"
+        return await self.load_url(image.url)
 
+    async def load_url(self, url: str) -> tuple[dict[str, Any] | None, str]:
+        """按 URL 取图并编码；消息附图与 `[@10位]` 引用共用这一条路。
+
+        URL 的形态由调用方负责：`fetch_image` 只放行与站点**完全同源**的地址，
+        跨源在发请求之前就被拒。失败一律降级成 `(None, reason)`，与 `load` 同款。
+        """
         try:
-            data = await self._client.fetch_image(image.url, max_bytes=self._max_bytes)
+            data = await self._client.fetch_image(url, max_bytes=self._max_bytes)
         except ImageFetchError as exc:
             self._log_failure(exc.reason)
             return None, exc.reason

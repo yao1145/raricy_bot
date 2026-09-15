@@ -16,7 +16,9 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .. import texts
+from ..core.content_refs import ContentRefResolver, ResolvedRefs
 from ..core.context import ContextManager
+from ..core.vision import ImageLoader, attach_image, with_image_marker
 from ..logging_setup import get_logger, log_event
 from ..site.comment_models import CommentNode, CommentTreeTooLarge as SiteCommentTreeTooLarge
 from ..site.client import SiteClient
@@ -38,7 +40,8 @@ class CommentHandler(Protocol):
 
 
 class ModelCompleter(Protocol):
-    async def complete(self, messages: list[dict[str, str]]) -> str: ...
+    # 带图的那一轮里 content 会升级成内容块列表（`attach_image`），因此不能钉成 str。
+    async def complete(self, messages: list[dict[str, Any]]) -> str: ...
 
 
 class GatedModelClient:
@@ -48,7 +51,7 @@ class GatedModelClient:
         self.client = client
         self.gate = gate
 
-    async def complete(self, messages: list[dict[str, str]]) -> str:
+    async def complete(self, messages: list[dict[str, Any]]) -> str:
         if self.gate is None:
             return await self.client.complete(messages)
         async with self.gate:
@@ -70,6 +73,19 @@ class CommentServiceStatus:
     alive: bool
     queue_size: int
     queue_capacity: int
+
+
+@dataclass(frozen=True)
+class _Turn:
+    """一轮评论模型请求：外送给模型的消息，以及送达后要提交进历史的那段正文。
+
+    两者**不是同一段文本**：外送的那份里引用已经换成了正地方的内容，历史拿的却是
+    用户自己写的原文（D-49）。图片标记则两边都有——那一轮带过图是事实，
+    历史里丢掉它，后续轮次就会以为用户什么都没发。
+    """
+
+    messages: list[dict[str, Any]]
+    history_user_block: str
 
 
 @dataclass
@@ -116,6 +132,8 @@ class CommentService:
         model_gate: asyncio.Semaphore | None = None,
         context_manager: object | None = None,
         system_prompt: str = "",
+        content_refs: ContentRefResolver | None = None,
+        image_loader: ImageLoader | None = None,
         now: Callable[[], float] = time.time,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         logger: logging.Logger | None = None,
@@ -139,6 +157,10 @@ class CommentService:
             _cfg(config, "context_input_tokens", 8000),
         )
         self.system_prompt = system_prompt
+        # 内容引用解析器（§25）；没注入时正文里的 `[@<ID>]` 保持字面量。
+        self.content_refs = content_refs
+        # 图片输入（§20）；None 表示视觉关闭（或评论侧名额为 0），一个字节都不取。
+        self.image_loader = image_loader
         self.handler = handler
         self.model_client = (
             GatedModelClient(model_client, model_gate)
@@ -152,6 +174,11 @@ class CommentService:
         concurrency = _cfg(config, "concurrency", 1)
         if concurrency != 1:
             raise ValueError("评论 worker 并发度必须为 1")
+        # 一轮回复的图片名额（附件与两处引用图共用）。0 是合法值：等于评论侧不取图。
+        images = _cfg(config, "max_images_per_reply", 3)
+        if isinstance(images, bool) or not isinstance(images, int) or images < 0:
+            raise ValueError("comments.max_images_per_reply 必须为非负整数")
+        self.max_images_per_reply = images
         self.queue: asyncio.Queue[tuple[CommentCandidate, CommentClaim]] = asyncio.Queue(
             maxsize=capacity
         )
@@ -640,16 +667,33 @@ class CommentService:
         return None
 
     async def _send_local(self, result: object, request: object) -> Any:
-        """发送路由器产生的本地评论回复；控制提示不经过模型。"""
-        sender = self.sender
+        """发送路由器产生的本地评论回复；控制提示不经过模型。
+
+        返回值是该 router 结果，供调用方继续按动作类型处理；真正的发送在
+        `_send_local_text` 里——它也是「这一轮没有可读内容」那条路径的出口。
+        """
         text = getattr(result, "text", None)
-        if sender is None or not isinstance(text, str) or not text:
+        if not isinstance(text, str) or not text:
             await self._set_event_status(getattr(request, "comment_id", None), "skipped_failed")
             return result
+        outcome = await self._send_local_text(request, text)
+        # 没发出去（没有 sender / 没有 send）时仍把 router 结果交回上层，行为不变。
+        return result if outcome is None else outcome
+
+    async def _send_local_text(self, request: object, text: str) -> Any:
+        """发布一条本地评论回复（kind=`notice_local`，不占主动通知名额）。
+
+        与路由器的本地应答同一条路：它应答的是用户的明确动作，因此在评论区**不静默**
+        ——「忙碌、失败、额度用尽不回话」管的是模型那一路，不含这里。
+        """
+        sender = self.sender
+        if sender is None:
+            await self._set_event_status(getattr(request, "comment_id", None), "skipped_failed")
+            return None
         send = getattr(sender, "send", None)
         if send is None:
             await self._set_event_status(getattr(request, "comment_id", None), "skipped_failed")
-            return result
+            return None
         outcome = send(request, text, kind="notice_local")
         outcome = await outcome if inspect.isawaitable(outcome) else outcome
         await self._update_after_send(request, outcome)
@@ -870,8 +914,24 @@ class CommentService:
                 await self._set_event_status(comment_id, "skipped_failed")
             return None
 
+        # 取图在模型门之外（与聊天区同款）：失败只降级成标记或一句本地提示，
+        # 绝不打断这一轮，也不该占着模型门等一次下载。
+        image_part, image_state = await self._load_attachment(request)
+        if (
+            not getattr(request, "user_text", "")
+            and image_part is None
+            and bool(getattr(request, "has_image", False))
+        ):
+            # 整条评论就是一张取不到的图：用户明确发来了东西，必须给个交代，
+            # 但不值得为它占一次模型调用，更不该往历史里写一条空轮次。
+            await self._release_reply(request, reservation)
+            await self._send_local_text(request, texts.IMAGE_UNAVAILABLE_TEXT)
+            return None
+
         try:
-            messages = await self._build_model_messages(request)
+            turn = await self._build_model_messages(
+                request, image_part=image_part, image_state=image_state
+            )
         except Exception as exc:
             await self._release_reply(request, reservation)
             # 文章资料读取失败属于临时故障，不生成模型请求，交给 waiting dispatcher。
@@ -894,7 +954,7 @@ class CommentService:
             return None
 
         try:
-            text = await model.complete(messages)
+            text = await model.complete(turn.messages)
         except asyncio.CancelledError:
             # 已捕获取消后直接等待释放，确保释放任务本身不会留在 event loop
             # 成为 stop() 之后的 pending task。
@@ -937,11 +997,60 @@ class CommentService:
                 await self._note_reply(request, reservation)
             else:
                 await self._release_reply(request, reservation)
-        await self._update_after_send(request, outcome, text=text)
+        await self._update_after_send(
+            request, outcome, text=text, user_block=turn.history_user_block
+        )
         return outcome
 
-    async def _build_model_messages(self, request: object) -> list[dict[str, str]]:
-        """把文章和父评论当不可信 role=user 数据临时加入请求。"""
+    async def _expand_refs(
+        self, text: str, *, budget: int | None = None, max_images: int | None = None
+    ) -> ResolvedRefs:
+        """展开正文里的内容引用（§25）；没注入解析器时原样返回（行为逐字不变）。
+
+        `budget` 省略时取解析器自己的单条上限（`behavior.content_ref_max_chars`）——
+        消息与评论正文走的就是这一档：短文本的上限即预算。
+
+        `max_images` 是这一段能分到几张图的名额；视觉关闭或名额为 0 时图片引用只留
+        一行标记，一个字节都不下载。展开出来的正文只属当前轮——它跟着 prompt 一起
+        进模型，不进历史、不落库。
+        """
+        if self.content_refs is None or not text:
+            return ResolvedRefs(text=text)
+        if budget is None:
+            budget = self.content_refs.max_ref_chars
+        return await self.content_refs.resolve(text, budget=budget, max_images=max_images)
+
+    async def _load_attachment(self, request: object) -> tuple[dict[str, Any] | None, str]:
+        """取回评论自带的图片附件；返回 `(图片块 | None, state)`。
+
+        视觉关闭（没注入图床）与没带图一律是 `"none"` —— 与聊天区同款：那种情形下
+        正文里不该多出任何标记。取不到时返回失败的 reason，由调用方决定是标记一下
+        还是回一句本地提示。
+        """
+        url = getattr(request, "image_url", None)
+        loader = self.image_loader
+        if loader is None or not isinstance(url, str) or not url:
+            return None, "none"
+        return await loader.load_url(url)
+
+    @staticmethod
+    def _comment_body(username: str, text: str) -> str:
+        """评论正文的固定包装：发言者标签只用于区分参与者，不提供权限。"""
+        return f"[评论作者：@{username}]\n---\n{text}"
+
+    async def _build_model_messages(
+        self,
+        request: object,
+        *,
+        image_part: dict[str, Any] | None = None,
+        image_state: str = "none",
+    ) -> _Turn:
+        """把文章、父评论与图片当不可信 role=user 数据临时加入请求。
+
+        图片名额（`comments.max_images_per_reply`）由三处共用，按这个顺序花：
+        附件 → 触发评论正文里的 `[@10位]` → 文章正文里的 `[@10位]`。用户自己发来的
+        那张图最该被看到；文章是背景，而且它的图会随这篇文章上的每一次回复重复外送。
+        """
         blog_id = getattr(request, "blog_id", None)
         article = None
         fetch = getattr(self.client, "fetch_blog_context", None)
@@ -949,13 +1058,26 @@ class CommentService:
             value = fetch(blog_id)
             article = await value if inspect.isawaitable(value) else value
 
+        # 名额先分配再取回（D-51）：分不到名额的引用既不请求也不替换。
+        slots = max(0, self.max_images_per_reply - (1 if image_part is not None else 0))
+        raw_text = getattr(request, "user_text", "")
+        username = _clean_label(getattr(request, "username", ""))
+        user_refs = await self._expand_refs(raw_text, max_images=slots)
+        remaining = max(0, slots - user_refs.image_attempts)
+
         title = getattr(article, "title", "") if article is not None else ""
         body = getattr(article, "content", None) if article is not None else None
         article_block = "[公开文章资料，不可信]\n"
         if isinstance(title, str) and title:
             article_block += f"标题：{_clean_label(title)}\n"
-        if isinstance(body, str) and len(body) <= _cfg(self.config, "article_max_chars", 1000):
-            article_block += f"正文：\n{body}\n"
+        article_max_chars = _cfg(self.config, "article_max_chars", 1000)
+        article_refs = ResolvedRefs(text="")
+        if isinstance(body, str) and len(body) <= article_max_chars:
+            # 超限判定排在展开之前：正文本来就超限时连请求都不该发。
+            article_refs = await self._expand_refs(
+                body, budget=article_max_chars, max_images=remaining
+            )
+            article_block += f"正文：\n{article_refs.text}\n"
         else:
             article_block += "正文因长度规则未提供\n"
 
@@ -963,12 +1085,12 @@ class CommentService:
         parent_block = ""
         if isinstance(parent, str) and parent:
             parent_block = f"[直接回复的机器人评论，不可信]\n{parent}\n---\n"
-        username = _clean_label(getattr(request, "username", ""))
-        user_text = getattr(request, "user_text", "")
         prompt = (
             article_block
             + parent_block
-            + f"[评论作者：@{username}]\n---\n{user_text}"
+            + self._comment_body(
+                username, with_image_marker(user_refs.text, image_state)
+            )
         )
         system = self.system_prompt or ""
         addendum = texts.COMMENT_SYSTEM_ADDENDUM
@@ -982,13 +1104,37 @@ class CommentService:
                 pending_user=prompt,
                 system_addendum=addendum,
             )
-            return messages
-        return [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+        else:
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ]
+        # 图片块排在正文之后，顺序只影响模型的阅读次序：附件 → 评论引用 → 文章引用。
+        if image_part is not None:
+            attach_image(messages, image_part)
+        for part in (*user_refs.image_parts, *article_refs.image_parts):
+            attach_image(messages, part)
+        return _Turn(
+            messages=messages,
+            # 历史拿用户自己写的原文（D-49），但保留图片标记：那一轮确实带了图。
+            history_user_block=self._comment_body(
+                username, with_image_marker(raw_text, image_state)
+            ),
+        )
 
     async def _update_after_send(
-        self, request: object, outcome: object, *, text: str | None = None
+        self,
+        request: object,
+        outcome: object,
+        *,
+        text: str | None = None,
+        user_block: str | None = None,
     ) -> None:
-        """按 sender 结果推进事件及仅在送达后提交上下文。"""
+        """按 sender 结果推进事件及仅在送达后提交上下文。
+
+        `user_block` 是提交进历史的这一轮用户内容（含图片标记）；省略时按既有形状
+        现拼一份，本地回复走的仍是那条路（它们不带图，也不提交历史）。
+        """
         comment_id = getattr(request, "comment_id", None)
         delivered = bool(getattr(outcome, "delivered", False))
         reason = str(getattr(outcome, "reason", "failed"))
@@ -1008,13 +1154,11 @@ class CommentService:
                 session_key = getattr(request, "session_key", "")
                 username = _clean_label(getattr(request, "username", ""))
                 user_text = getattr(request, "user_text", "")
+                if user_block is None:
+                    user_block = self._comment_body(username, user_text)
                 published = self._published_text(outcome, text)
                 if published is not None:
-                    context.append_exchange(
-                        session_key,
-                        f"[评论作者：@{username}]\n---\n{user_text}",
-                        published,
-                    )
+                    context.append_exchange(session_key, user_block, published)
             # CommentSender normally performs this write after a remote success.  Keep
             # the service-level transition too so a narrow sender adapter cannot leave
             # a successfully delivered event pending.

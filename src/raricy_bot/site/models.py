@@ -109,6 +109,16 @@ def _parse_pat(value: object) -> "PatRef | None":
     )
 
 
+def _parse_number(value: object) -> float | None:
+    """尽量转 float；布尔、None 与非数字字符串一律为 None。
+
+    投票的百分比是站点算好的展示值，缺失只影响那一行的显示，不影响判定。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 def _parse_reply(value: object) -> "ReplyRef | None":
     """解析引用块；id 解析失败时整块降级为 None（比丢掉整条消息好）。"""
     if not isinstance(value, Mapping):
@@ -173,6 +183,93 @@ class ReplyRef:
     author_name: str | None
     is_deleted: bool
     image_url: str | None
+
+
+@dataclass(frozen=True)
+class Clipboard:
+    """一篇云剪贴板（`[@8位ID]` 引用的目标）。
+
+    正文是**另一名用户**写的 Markdown，属于不可信数据；它只用于当轮外送，
+    不进历史、不落库、不写日志。
+    """
+
+    id: str
+    title: str
+    author: str | None
+    content: str
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "Clipboard | None":
+        """从 `GET /api/clipboard/<id>` 的信封里解析；没有可用正文返回 None。"""
+        clip = payload.get("clip")
+        if not isinstance(clip, Mapping):
+            return None
+        content = clip.get("content")
+        if not isinstance(content, str):
+            return None
+        return cls(
+            id=_as_str(clip.get("id")),
+            title=_as_str(clip.get("title")),
+            author=_as_optional_str(clip.get("author_name")),
+            content=content,
+        )
+
+
+@dataclass(frozen=True)
+class VoteOption:
+    """投票的一个选项；`percentage` 缺失时为 None。"""
+
+    label: str
+    count: int
+    percentage: float | None = None
+
+
+@dataclass(frozen=True)
+class Vote:
+    """一个投票（`[@9位ID]` 引用的目标）。标题与选项文案同样不可信。"""
+
+    id: str
+    title: str
+    author: str | None
+    total_votes: int
+    is_locked: bool
+    options: tuple[VoteOption, ...]
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "Vote | None":
+        """从 `GET /api/votes/<id>` 的信封里解析；载荷不可用时返回 None。"""
+        data = payload.get("data")
+        if not isinstance(data, Mapping):
+            return None
+        raw_options = data.get("options")
+        options: list[VoteOption] = []
+        if isinstance(raw_options, list):
+            for item in raw_options:
+                if not isinstance(item, Mapping):
+                    continue
+                try:
+                    count = _coerce_int(item.get("count"))
+                except ValueError:
+                    count = 0
+                options.append(
+                    VoteOption(
+                        label=_as_str(item.get("label")),
+                        count=count,
+                        percentage=_parse_number(item.get("percentage")),
+                    )
+                )
+        try:
+            total = _coerce_int(data.get("total_votes"))
+        except ValueError:
+            total = 0
+        return cls(
+            id=_as_str(data.get("id")),
+            title=_as_str(data.get("title")),
+            author=_as_optional_str(data.get("author_name")),
+            total_votes=total,
+            is_locked=_as_bool(data.get("is_locked")),
+            options=tuple(options),
+        )
 
 
 @dataclass(frozen=True)

@@ -21,7 +21,8 @@ model:
   timeout_seconds: 45
   max_output_tokens: 600
   # 图片输入默认关闭。仅当本模型确实支持视觉时才打开：否则每一条带图的消息
-  # 都会以 400 失败并回一条失败提示。
+  # 都会以 400 失败并回一条失败提示。开启后聊天区与博客区都获得识图能力，
+  # 评论侧另有自己的名额（comments.max_images_per_reply）。
   vision_enabled: false
   # 单张图的下载期硬上限（字节），不得超过站点图床的 10 MiB 上限。
   max_image_bytes: 5242880
@@ -88,6 +89,12 @@ behavior:
   # 消息里引用的博客正文，交给模型的最多字符数（按 Unicode 字符数）。
   # 超限时只给标题并写明原因，与 comments.article_max_chars 的规则一致。
   quoted_blog_max_chars: 1000
+  # 正文里的内容引用 `[@<内容ID>]`（8 位剪贴板 / 9 位投票 / 10 位图床）展开出来的
+  # 单条字符上限；它同时是消息正文与评论正文展开时的总预算。
+  # 引用博客正文与文章正文另有总预算（见上一条与 comments.article_max_chars）。
+  # 默认 2000 与站点在聊天/评论里的截断口径一致；调大它意味着更多别人写的内容
+  # 会被送进模型，按自己的模型上下文与成本决定。
+  content_ref_max_chars: 2000
   max_output_chars: 5000
   concurrency: 3
   queue_size: 50
@@ -162,6 +169,11 @@ comments:
   context_turns: 10
   context_input_tokens: 8000
   article_max_chars: 1000
+  # 一轮评论回复最多交给模型几张图，附件与两处正文里的 `[@10位]` 引用共用这一个
+  # 名额：评论附件 → 评论正文的引用 → 文章正文的引用，按这个顺序花。
+  # 0 表示评论侧不取图（聊天区不受影响）；整体关闭用 model.vision_enabled。
+  # 图片不计入上面的 context_input_tokens（那是文字预算），名额本身就是它们的成本上限。
+  max_images_per_reply: 3
   max_output_chars: 5000
   max_response_bytes: 8388608
   max_tree_nodes: 10000

@@ -30,11 +30,12 @@ from .comments.router import CommentRouter
 from .comments.sender import CommentSender
 from .comments.service import CommentService
 from .config import Config
-from .core.blog import BlogLoader, blog_marker, blog_readable
+from .core.blog import BlogLoad, BlogLoader, blog_marker, blog_readable
+from .core.content_refs import ContentRefResolver
 from .core.context import ContextManager, lobby_thread_session_key, speaker_wrapper
 from .core.router import MessageRouter, Request, RouteResult
 from .core.sender import MessageSender, SendResult
-from .core.vision import ImageLoader, attach_image
+from .core.vision import ImageLoader, attach_image, with_image_marker
 from .core.worker import (
     ModelClient,
     ModelError,
@@ -141,8 +142,28 @@ class BotApp:
         self._image_loader = ImageLoader(
             self._client, max_bytes=config.model.max_image_bytes
         )
+        # 内容引用解析器：三种引用各一处取回，聊天与评论共用同一份策略。
+        # 视觉关闭时不给它 image_loader —— 那等于连图字节都不该下载（与 _load_image 同款）。
+        self._ref_resolver = ContentRefResolver(
+            self._client,
+            max_ref_chars=config.behavior.content_ref_max_chars,
+            image_loader=self._image_loader if config.model.vision_enabled else None,
+        )
         self._blog_loader = BlogLoader(
-            self._client, max_chars=config.behavior.quoted_blog_max_chars
+            self._client,
+            max_chars=config.behavior.quoted_blog_max_chars,
+            resolver=self._ref_resolver,
+        )
+        # 评论区识图要两个开关同时成立：模型支持视觉，且这一轮还留着名额
+        # （`comments.max_images_per_reply` 为 0 即评论侧不取图，聊天区不受影响）。
+        self._comment_vision = (
+            config.model.vision_enabled and config.comments.max_images_per_reply > 0
+        )
+        # 同一个客户端、同一份上限，只有「取不取字节」这一处不同。
+        self._comment_ref_resolver = ContentRefResolver(
+            self._client,
+            max_ref_chars=config.behavior.content_ref_max_chars,
+            image_loader=self._image_loader if self._comment_vision else None,
         )
         self._queue: asyncio.Queue[Request] = asyncio.Queue(
             maxsize=config.behavior.queue_size
@@ -340,6 +361,7 @@ class BotApp:
                     queue=self._comment_router_queue,
                     cfg=self._config.comments,
                     now=time.time,
+                    vision_enabled=self._comment_vision,
                 )
                 self._comment_service = CommentService(
                     self._client,
@@ -354,6 +376,10 @@ class BotApp:
                     quota=self._comment_quota,
                     context_manager=self._comment_ctx,
                     system_prompt=self._config.system_prompt,
+                    content_refs=self._comment_ref_resolver,
+                    image_loader=(
+                        self._image_loader if self._comment_vision else None
+                    ),
                 )
                 await self._comment_service.start()
             except BaseException:
@@ -562,7 +588,10 @@ class BotApp:
             # 超时由站点请求超时兜住（设计 §3.5）。
             image_part, image_state = await self._load_image(request)
             # 引用博客同样在模型门之外：与取图并列，两边互不阻塞。
-            blog_block, blog_state = await self._load_blog(request)
+            blog = await self._load_blog(request)
+            blog_block, blog_state = blog.block, blog.state
+            # 内容引用（`[@<ID>]`）也在这里展开：三种引用各一次请求，与取图/取博客并列。
+            user_text, reply_text, ref_parts = await self._resolve_refs(request)
             if (
                 not request.user_text
                 and image_part is None
@@ -589,7 +618,11 @@ class BotApp:
             # KB 数据块只属于当前轮，历史里提交的是不带它的问题（D-43）；
             # 引用的博客正文同理，历史里只留一行标记（设计 §3.5）。
             pending = self._pending_turn(
-                request, image_state, blog_state, blog_block=blog_block
+                request,
+                image_state,
+                blog_state,
+                blog_block=blog_block,
+                user_text=user_text,
             )
             if kb_text is not None:
                 pending = f"{pending}\n\n{kb_text}" if pending else kb_text
@@ -611,10 +644,16 @@ class BotApp:
                     "kb" in request.enabled_features or blog_block is not None
                 ),
             )
-            self._apply_reply_prefix(messages, request)
+            self._apply_reply_prefix(messages, request, reply_body=reply_text)
             # 必须排在 _apply_reply_prefix 之后：那一步按字符串拼接 content。
             if image_part is not None:
                 attach_image(messages, image_part)
+            # 引用换出来的图排在消息自带的图之后：一张图一块，顺序只影响模型的阅读次序。
+            # 博客正文换出来的图也在其中——它同样只属当前轮，取回来了就该交出去。
+            for part in ref_parts:
+                attach_image(messages, part)
+            for part in blog.image_parts:
+                attach_image(messages, part)
             model = self._model
             if model is None:
                 if "search" in request.enabled_features:
@@ -713,9 +752,30 @@ class BotApp:
             return None, "none"
         return await self._image_loader.load(request.message)
 
-    async def _load_blog(self, request: Request) -> tuple[str | None, str]:
-        """取回本轮引用的博客；没有引用时完全不碰网络。"""
+    async def _load_blog(self, request: Request) -> BlogLoad:
+        """取回本轮引用的博客（正文里的内容引用已展开）；没有引用时完全不碰网络。"""
         return await self._blog_loader.load(request.message)
+
+    async def _resolve_refs(
+        self, request: Request
+    ) -> tuple[str, str | None, tuple[dict[str, Any], ...]]:
+        """展开本轮消息正文与**直接引用**正文里的内容引用（§25）。
+
+        - 两块正文各自套用同一个预算（`behavior.content_ref_max_chars`）：它们是
+          同一条消息外送时相邻的两段，各自都不超过上限。
+        - **历史拿到的仍是用户自己写的原文**（调用方不传这两份展开结果），
+          与「引用的博客正文只属当前轮」同一条理由：换回来的是别人写的内容，
+          留在历史里会在该会话后续每一轮被反复外送。
+        """
+        budget = self._ref_resolver.max_ref_chars
+        resolved = await self._ref_resolver.resolve(request.user_text, budget=budget)
+        parts = list(resolved.image_parts)
+        reply_text = request.reply_context
+        if reply_text:
+            reply = await self._ref_resolver.resolve(reply_text, budget=budget)
+            reply_text = reply.text
+            parts.extend(reply.image_parts)
+        return resolved.text, reply_text, tuple(parts)
 
     async def _complete_search(
         self,
@@ -888,38 +948,27 @@ class BotApp:
         self._note_forbidden(outcome)
 
     @staticmethod
-    def _with_image_marker(user_text: str, image_state: str) -> str:
-        """给本轮正文加上图片标记（设计 §4）。
-
-        `[图片]` 表示这一轮确实带了图；`[图片未提供]` 表示本来有图但没取到 ——
-        让模型知道自己没看到图，而不是以为用户什么都没发。
-        """
-        if image_state == "ok" and user_text:
-            return f"[图片]\n---\n{user_text}"
-        if image_state == "ok":
-            return "[图片]"
-        if image_state != "none" and user_text:
-            return f"[图片未提供]\n---\n{user_text}"
-        return user_text
-
-    @staticmethod
     def _pending_turn(
         request: Request,
         image_state: str,
         blog_state: str,
         *,
         blog_block: str | None = None,
+        user_text: str | None = None,
     ) -> str:
         """构造本轮待提交的用户内容（不含直接引用，见 D-7）。
 
         `blog_block` 只有**外送那一份**才给：引用博客的正文只属于当前轮，历史里只留
-        标记（设计 §3.5）。其余两种情况形状逐字相同。
+        标记（设计 §3.5）。`user_text` 同理——展开过内容引用的正文只属当前轮，
+        省略它就退回用户自己写的原文（历史要走这条）。其余两种情况形状逐字相同。
 
         - 大区：带上站点发言者标签，模型才分得清谁在说话（D-20），
           图片与博客标记在包装**内部**（它们都属于发言人这条消息）；
         - 私聊：就是正文本身。
         """
-        text = BotApp._with_image_marker(request.user_text, image_state)
+        text = with_image_marker(
+            request.user_text if user_text is None else user_text, image_state
+        )
         text = BotApp._with_blog_marker(text, blog_state, blog_block)
         if request.channel_kind != "lobby":
             return text
@@ -945,15 +994,21 @@ class BotApp:
         return f"{head}\n---\n{user_text}"
 
     def _apply_reply_prefix(
-        self, messages: list[dict[str, str]], request: Request
+        self,
+        messages: list[dict[str, str]],
+        request: Request,
+        *,
+        reply_body: str | None = None,
     ) -> None:
         """把当前轮的**直接引用**拼到最后一条 user 消息上（D-7）。
 
         引用文本**绝不**写进 `ContextManager` 历史，否则同一段引用会在该会话后续
         每一轮被反复外送；它只属于引用它的那一轮（设计文档 §2.2.4「当前 reply_to 文本」）。
         即使被引用正文已在历史里也仍然保留这份前缀：有限的重复优于丢失当前指向。
+
+        `reply_body` 是展开过内容引用的引用正文（§25）；省略它就是上一次的行为。
         """
-        prefix = self._reply_prefix(request)
+        prefix = self._reply_prefix(request, reply_body=reply_body)
         if not prefix:
             return
         for index in range(len(messages) - 1, -1, -1):
@@ -966,7 +1021,7 @@ class BotApp:
                 return
 
     @staticmethod
-    def _reply_prefix(request: Request) -> str | None:
+    def _reply_prefix(request: Request, *, reply_body: str | None = None) -> str | None:
         """构造本轮的直接引用前缀；没有引用块时返回 None。
 
         大区与私聊用不同的标签（D-25）：只有大区是「直接引用」——
@@ -980,10 +1035,11 @@ class BotApp:
         reply = request.message.reply
         if reply is None:
             return None
+        context = request.reply_context if reply_body is None else reply_body
         if reply.is_deleted:
             body = _REPLY_DELETED_MARKER
-        elif request.reply_context:
-            body = request.reply_context
+        elif context:
+            body = context
         elif reply.image_url:
             body = _REPLY_IMAGE_MARKER
         else:

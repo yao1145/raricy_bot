@@ -33,7 +33,7 @@ from .comment_models import (
     normalize_uuid,
     strip_comment_content,
 )
-from .models import LOBBY, Author, ChatMessage, _parse_author
+from .models import LOBBY, Author, ChatMessage, Clipboard, Vote, _parse_author
 
 # 会话 Cookie 名（chat-bot.md §3）。
 SESSION_COOKIE_NAME: str = "raricy_session"
@@ -52,13 +52,47 @@ _COMMENTS_PREFIX: str = "/api/blogs"
 _SPIDER_COMMENTS_PATH: str = "/api/spider/comments"
 _SPIDER_BLOGS_PREFIX: str = "/api/spider/blogs"
 _NOTIFICATIONS_PATH: str = "/api/notifications"
+_CLIPBOARD_PREFIX: str = "/api/clipboard"
+_VOTES_PREFIX: str = "/api/votes"
+_IMAGES_PREFIX: str = "/api/images"
 _MAX_COMMENT_RESPONSE_BYTES: int = 8 * 1024 * 1024
 _MAX_COMMENT_TREE_NODES: int = 10000
+
+# 内容引用 ID 的长度即类型（内容引用语法 §三）：8 位剪贴板、9 位投票、10 位图床图片。
+CLIPBOARD_ID_LEN: int = 8
+VOTE_ID_LEN: int = 9
+IMAGE_ID_LEN: int = 10
 
 
 def _messages_path(channel_id: str) -> str:
     """频道消息接口路径。"""
     return f"{_CHANNELS_PREFIX}/{channel_id}/messages"
+
+
+def _content_id(value: str, length: int, *, kind: str) -> str:
+    """校验内容引用 ID：长度固定、只含 ASCII 字母与数字（区分大小写）。
+
+    形态不对就抛 ValueError、**不发请求**——与 `normalize_uuid` 对脏 id 的处理同款。
+    这道校验同时是 URL 安全的那道门：ID 会被拼进路径，收紧到「只可能是字母数字」
+    就注入不进任何东西。
+    """
+    if (
+        not isinstance(value, str)
+        or len(value) != length
+        or not value.isascii()
+        or not value.isalnum()
+    ):
+        raise ValueError(f"{kind} id 形态不合法")
+    return value
+
+
+def image_raw_path(image_id: str) -> str:
+    """图床直链的相对路径（内容引用语法 §三）。
+
+    站点前端也是直接拼这条路径、不做额外请求，所以图片引用**不消耗**任何接口调用。
+    """
+    normalized = _content_id(image_id, IMAGE_ID_LEN, kind="image")
+    return f"{_IMAGES_PREFIX}/{normalized}/raw"
 
 
 def _parse_retry_after(response: httpx.Response) -> float | None:
@@ -346,6 +380,36 @@ class SiteClient:
             title=title if isinstance(title, str) else "",
             content=payload.get("content") if isinstance(payload.get("content"), str) else None,
         )
+
+    async def fetch_clipboard(self, clip_id: str) -> Clipboard:
+        """读取一篇云剪贴板的正文（内容引用语法 §三）。
+
+        站点要求**登录且 Core 以上**：私有剪贴板只有作者本人（与站长）取得到，
+        其他人拿到 403——这在评论区是常见情形而不是故障，由调用方降级成
+        `[剪贴板 <ID> 加载失败]`。
+
+        与 `fetch_image` 同款：401 不重新登录、不重试。引用取不回只是一次降级，
+        不值得为它多一次登录；真正的会话失效由 SSE 那条路负责恢复。
+        """
+        normalized = _content_id(clip_id, CLIPBOARD_ID_LEN, kind="clipboard")
+        payload = await self._call("GET", f"{_CLIPBOARD_PREFIX}/{normalized}")
+        clip = Clipboard.from_payload(payload)
+        if clip is None:
+            raise self._error(200, "malformed clipboard response")
+        return clip
+
+    async def fetch_vote(self, vote_id: str) -> Vote:
+        """读取一个投票的标题、选项与票数（内容引用语法 §三）。
+
+        同样要求登录且 Core 以上。投票是**只读**的：这里只取数据，
+        不会替机器人投票——站点把投票做成可交互组件，机器人没有那个身份。
+        """
+        normalized = _content_id(vote_id, VOTE_ID_LEN, kind="vote")
+        payload = await self._call("GET", f"{_VOTES_PREFIX}/{normalized}")
+        vote = Vote.from_payload(payload)
+        if vote is None:
+            raise self._error(200, "malformed vote response")
+        return vote
 
     async def fetch_notifications(
         self, *, page: int, unread_only: bool = True
