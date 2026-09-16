@@ -36,3 +36,7 @@ config.yaml
 .idea/
 Thumbs.db
 Desktop.ini
+
+# Claude Code 的隔离工作树：它整个是仓库的一份副本，不忽略的话
+# 一次 `git add -A` 就会把整棵树（含未提交的源码）当新文件加进来。
+.claude/worktrees/
