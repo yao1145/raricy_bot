@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import AsyncExitStack
 from typing import Any
 
@@ -42,7 +43,12 @@ class SseMcpProvider(SessionMcpProvider):
             connect_timeout_seconds=connect_timeout_seconds,
             call_timeout_seconds=call_timeout_seconds,
         )
-        self._host_env = dict(host_env or {})
+        # ``None`` 表示「用本进程的环境」，与 stdio / pool 一致。这里原先是
+        # ``dict(host_env or {})``，把 ``None`` 也当成了空环境 —— 而生产装配
+        # （app.py 构造 McpManager）根本不传 host_env，于是 stdio 服务器照常读
+        # ``os.environ`` 启动，只有 SSE 的 zhihu 永远判为缺令牌、被静默停用
+        # （2026-09-16）。空字典仍然是「没有环境」，只有 None 才回落到 os.environ。
+        self._host_env = dict(os.environ if host_env is None else host_env)
         self._redactor = redactor
 
     def resolve_headers(self) -> dict[str, str]:

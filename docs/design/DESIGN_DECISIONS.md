@@ -1617,6 +1617,26 @@ DEPLOYMENT §12 原先那三条命令**只是靠安装顺序的运气**才工作
 `npm install --legacy-peer-deps` 或手动铺 `node_modules` 都是靠副作用。`overrides` 是 npm
 为这件事设计的机制，且能精确表述「只为 wolfram 换 SDK，不动 amap」。
 
+## D-93 `host_env=None` 统一表示「用本进程的环境」，SSE 也照此
+
+原文（`mcp/sse.py`）：`self._host_env = dict(host_env or {})`。stdio（`stdio.py`）与池
+（`pool.py`）写的是 `dict(os.environ if host_env is None else host_env)`。
+
+裁决：SSE 与另外两条传输对齐 —— 只有 `None` 回落到 `os.environ`，显式传入的空字典
+仍然是「没有环境」。参数类型 `dict[str, str] | None` 的两种取值因此含义固定。
+
+理由：这不是风格问题。生产装配（`app.py` 构造 `McpManager`）**根本不传 `host_env`**，
+所以 `None` 是唯一真实取值。`or {}` 把它当成空环境后，stdio 的 amap / wolfram 照常读
+`os.environ` 启动，唯独 SSE 的 zhihu 永远取不到 Bearer 令牌，被判为缺环境而静默停用
+（2026-09-16）。症状极具误导性：日志只有一句 `mcp.provider_disabled server=zhihu
+reason=missing_env`，而**容器里那个变量是有的**（`docker compose exec` 查得到，长度也
+对），于是很容易一路去查 `.env`、`docker compose up -d` 与变量名拼写，全都不是原因。
+
+为什么不是「让 app.py 显式传 `os.environ`」：那只能修好这一条装配路径，参数在别处
+（测试、未来的第二个装配点）仍然有两种解释；把语义钉在参数自身才是一次写对。
+为什么保留空字典的特殊含义：测试替身依赖 `host_env={}` 表示「什么都没有」，
+若让它也回落到真环境，任何忘记传替身环境的测试会静默读到宿主变量，比 bug 更难查。
+
 ## 附录：运行期裁决编号索引（补充裁决 A–H、控制器裁决 R1–R16）
 
 实现期在规划产物里另立了两套编号——`.superpowers/sdd/TASKS.md` 的「补充裁决 A–H」与
