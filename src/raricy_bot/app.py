@@ -1346,11 +1346,12 @@ class BotApp:
         complete_with_tools = getattr(model, "complete_with_tools", None)
         if not callable(complete_with_tools):
             raise CapabilityUnavailable("model_without_tools")
-        # 配置校验只放行能力表里声明过的 feature，所以这里取不到就是「配置根本没写这个
-        # feature 段」，而不是名字写错 —— 名字写错在加载期就已经是 ConfigError。
-        feature = self._config.mcp.features.get(feature_name)
-        if feature is None:
-            raise CapabilityUnavailable("feature_missing")
+        # 这里不再判 `feature is None`：上面那道门已经覆盖了它。`feature_available()`
+        # 在 feature 不在配置里时直接返回 False（registry.py 的 `_features.get` 判空），
+        # 所以「配置根本没写这个 feature 段」走的是 `feature_unavailable`；而「名字写错」
+        # 在加载期就已经是 ConfigError（能力表是封闭的，D-81）。留着那条分支只会让后来的人
+        # 以为存在一条实际上到不了的失败路径。
+        feature = self._config.mcp.features[feature_name]
         tools = tuple(registry.tools_for(feature_name))
         if not tools:
             raise CapabilityUnavailable("no_tools")
