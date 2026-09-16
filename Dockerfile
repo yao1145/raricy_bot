@@ -8,16 +8,22 @@ WORKDIR /opt/mcp-tools
 # 只在构建阶段访问 npm。最终镜像只复制 node、这三个包和入口，不包含 npm，
 # 运行期也不会执行 npx、npm install 或访问 npm registry。
 #
+# 包与版本写在 mcp-tools.package.json 里，它与下面这条 install 一起构成唯一的
+# 安装口径。**不要把依赖改回 `npm install <包名>` 那种写法**：
+# amap 把 @modelcontextprotocol/sdk 精确钉在 1.0.1，一条命令装三个包时 npm 会把
+# 这份 1.0.1 提升到顶层；而 wolfram-mcp 声明的 `^1.0.1` 恰好被 1.0.1 满足，
+# 于是它拿不到自己的嵌套副本 —— 但 1.0.1 里没有 `server/mcp.js`，wolfram 会当场
+# 以 ERR_MODULE_NOT_FOUND 退出，用户只看到 `/wolfram` 不可用（2026-09-16）。
+# 清单里的 overrides 就是为它钉一份真正可用的 SDK，同时不动 amap。
+#
 # 版本一律钉死。exa-mcp-server 只有一个上游（exa-labs），另外两个都没有 repository
 # 字段，无法证明是厂商官方 —— 所以升级必须是显式动作，绝不能靠浮动的 tag 悄悄漂移。
 # 换版本要按 docs/usage/DEPLOYMENT.md 的「上游取样」重新采样本，并同步
 # src/raricy_bot/capabilities.py 的白名单与 config.example.yaml 的注释。
 #
 # 知乎不进这个镜像：它只有远程 MCP-over-SSE，没有子进程（见 mcp/sse.py）。
-RUN npm install --omit=dev --no-audit --no-fund \
-        exa-mcp-server@3.4.1 \
-        @amap/amap-maps-mcp-server@0.0.8 \
-        wolfram-mcp@1.1.2
+COPY mcp-tools.package.json ./package.json
+RUN npm install --omit=dev --no-audit --no-fund
 
 FROM python:3.12-slim-bookworm
 

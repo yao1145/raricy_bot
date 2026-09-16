@@ -90,6 +90,13 @@ MCP 服务器：`exa-mcp-server@3.4.1`、`@amap/amap-maps-mcp-server@0.0.8`、`w
 `/app/data` 命名卷；三个包在运行期**不写任何文件**（静态核对：只有 wolfram 用了一次只读的
 `fs.realpathSync`），所以 `read_only: true` 与它们兼容。
 
+包与版本写在仓库根目录的 `mcp-tools.package.json` 里，Dockerfile 只负责
+`npm install` 它。**不要退回 `npm install <包名>` 那种写法**：一条命令装三个包时，amap 精确
+钉死的 `@modelcontextprotocol/sdk@1.0.1` 会被提升到顶层，而 wolfram 声明的 `^1.0.1` 恰好被
+它满足，于是 wolfram 拿到一份没有 `server/mcp.js` 的 SDK，当场以 `ERR_MODULE_NOT_FOUND`
+退出（2026-09-16）。清单里的 `overrides` 为 wolfram 单独钉一份可用的 SDK，同时不动 amap。
+换版本要同步改清单、`src/raricy_bot/capabilities.py` 的白名单和 `config.example.yaml` 的注释。
+
 国内网络可能很慢或超时。两个不改逻辑的缓解办法：
 
 - 配 `/etc/docker/daemon.json` 的 `registry-mirrors`（可用镜像站变动频繁，自行确认）；
@@ -239,8 +246,13 @@ mcp:
 一次真调用确认**。所以在把 `mcp.features.<name>.enabled` 改成 `true` 之前：
 
 ```bash
-# 在开发机上，装好三个包的对应版本（与 Dockerfile 钉的版本一致）
-npm install --no-audit --no-fund @amap/amap-maps-mcp-server@0.0.8 wolfram-mcp@1.1.2
+# 在开发机上，装好三个包的对应版本（与 mcp-tools.package.json 钉的版本一致）。
+# 必须装**清单**而不是逐个包名：一条命令装多个包时 npm 的提升顺序会让 wolfram 拿到
+# 一份缺 server/mcp.js 的 SDK，取样还没开始子进程就已经退出了（详见 §2.2）。
+mkdir -p /tmp/mcp-fixture
+cp mcp-tools.package.json /tmp/mcp-fixture/package.json   # 在仓库根目录执行
+cd /tmp/mcp-fixture && npm install --omit=dev --no-audit --no-fund
+export PATH="/tmp/mcp-fixture/node_modules/.bin:$PATH"
 
 export AMAP_MAPS_API_KEY=...        # 真实取值，不要提交
 PYTHONPATH=src python tools/capture_mcp_fixture.py \
@@ -965,15 +977,25 @@ docker compose ps
 只有在服务器不方便装 Docker 时才用这条路。
 
 启用任一 stdio MCP 能力时，systemd 主机还需预先安装 Node 22，并在构建/部署阶段固定安装
-对应的 MCP 包。只装你要启用的那些 —— 命令名必须与 `config.yaml` 里的 `command` 一致：
+对应的 MCP 包。**用仓库里的 `mcp-tools.package.json` 装，不要逐个 `npm install -g`**
+（理由见 §2.2：逐个装时谁被提升取决于安装顺序，先装 amap 会让 wolfram 拿到一份没有
+`server/mcp.js` 的 SDK 并当场退出）：
 
 ```bash
 node --version                    # 需为 v22.x
-sudo npm install --global --omit=dev --no-audit --no-fund exa-mcp-server@3.4.1
-sudo npm install --global --omit=dev --no-audit --no-fund @amap/amap-maps-mcp-server@0.0.8
-sudo npm install --global --omit=dev --no-audit --no-fund wolfram-mcp@1.1.2
-command -v exa-mcp-server mcp-amap wolfram-mcp   # 应能找到配置中的三个 stdio 命令
+sudo mkdir -p /opt/mcp-tools
+sudo cp mcp-tools.package.json /opt/mcp-tools/package.json
+cd /opt/mcp-tools && sudo npm install --omit=dev --no-audit --no-fund
+ls /opt/mcp-tools/node_modules/.bin/   # 应有 exa-mcp-server、mcp-amap、wolfram-mcp
 ```
+
+只启用的部分不必删：`config.yaml` 里没配的服务器根本不会被启动。三个命令通过
+`node_modules/.bin` 提供，所以要把它加进服务进程的 `PATH`（下面的单元文件已加）：
+命令名必须与 `config.yaml` 里的 `command` 保持一致。
+
+> 升级包时先改 `mcp-tools.package.json`（连同 `overrides`），再重跑上面的 `npm install`。
+> 换版本还要按 §4.1.2 重新取上游样本，并同步 `src/raricy_bot/capabilities.py` 的白名单与
+> `config.example.yaml` 的注释。
 
 知乎**不需要**这一步：它只有远程 MCP-over-SSE，没有子进程。
 
@@ -1049,6 +1071,8 @@ Group=raricybot
 WorkingDirectory=/opt/raricy_bot
 EnvironmentFile=/etc/raricy-bot.env
 Environment=BOT_CONFIG_PATH=/opt/raricy_bot/config.yaml
+# 仅 mcp.enabled=true 时需要：stdio MCP 命令由这里的 .bin 提供（见本节开头）
+Environment=PATH=/opt/mcp-tools/node_modules/.bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/opt/raricy_bot/.venv/bin/python -m raricy_bot
 Restart=always
 RestartSec=5
@@ -1100,6 +1124,7 @@ journalctl -u raricy-bot -f          # 跟日志
 | 私聊不回                                               | 检查是不是空消息或纯博客（这些只回一次「读不了」提示）；纯图在开了图片输入时会进模型                                                                                                         |
 | 一段时间后完全不回                                     | 可能当日额度用尽（1950 条后停止模型回复，2000 条后完全静默），或账号被禁言                                                                                                                   |
 | 回复里出现`[redacted]`                               | 输出命中已加载的机密被替换了。若被替换的是**机器人自己的名字**，说明有人把用户名注册成了机密——用户名不是机密，不该被注册                                                             |
+| 某个能力（`/search`、`/map`、`/wolfram`、`/zhihu`）恒回「暂不可用」 | 先 `docker compose logs bot \| grep 'event=mcp\.'` 看那台服务器那一行，一行就够定位：`provider_disabled reason=missing_env` = 密钥没给上（改 `.env` 后必须 `docker compose up -d`，`restart` 不会重新读值）；`provider_start_failed` 后面的 `error=` 与 `stderr=` 是子进程给出的退出原因——`ERR_MODULE_NOT_FOUND` 之类说明镜像里的依赖树不对（见 §2.2），不是账号问题 |
 | 日志报`429`                                          | 站点限频。程序会遵循`Retry-After`，没有该头则等 60 秒并退避                                                                                                                                |
 | 日志只有一行行`router.route reason=no_mention`       | 正常噪音，剔掉再看：`grep -v 'reason=no_mention'`                                                                                                                                          |
 

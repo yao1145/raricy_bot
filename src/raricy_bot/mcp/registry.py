@@ -21,6 +21,7 @@ from .contracts import (
     ToolCall,
     ToolDefinition,
     ToolExecution,
+    describe_error,
 )
 from .adapter_kit import CapabilityLimiter
 from .contracts import McpNoResultsError
@@ -78,7 +79,7 @@ class InMemoryToolRegistry:
                     logging.WARNING,
                     "mcp.discovery_failed",
                     server=server_name,
-                    error=type(exc).__name__,
+                    error=describe_error(exc),
                 )
                 continue
             accepted = 0

@@ -65,6 +65,7 @@ from .core.worker import (
 from .kb.service import KnowledgeService
 from .logging_setup import get_logger, log_event
 from .mcp.adapters import build_adapters
+from .mcp.contracts import describe_error
 from .mcp.runtime import McpManager
 from .memory.access import MemoryAccessPolicy
 from .memory.commands import MemoryCommandRequest
@@ -410,7 +411,12 @@ class BotApp:
         try:
             await self._mcp_manager.start()
         except Exception as exc:
-            log_event(_logger, logging.WARNING, "app.mcp_start_failed", error=type(exc).__name__)
+            log_event(
+                _logger,
+                logging.WARNING,
+                "app.mcp_start_failed",
+                error=describe_error(exc),
+            )
         # 知识库同样是软故障扩展：目录不可读、索引为空都只让 `/kb` 本地提示，
         # 不得阻止普通聊天、评论或健康端点启动（D-45）。
         try:

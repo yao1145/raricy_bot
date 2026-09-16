@@ -42,6 +42,14 @@ LOG_FIELDS: frozenset[str] = frozenset(
         "server",
         "tool",
         "feature",
+        # MCP stdio 子进程 stderr 的**末尾片段**（有界、已压成单行）。它是子进程
+        # 自己写出来的字节，内容不受我们控制 —— 之所以敢放进日志，是因为写出前
+        # 一定会过 RedactingFilter，而子进程用到的密钥已由 resolve_environment
+        # 通过 register_secret() 登记到本模块的进程级 Redactor（**必须**是这一个：
+        # 注入给 Provider 的那个只管出站文本，过滤器读不到它）。
+        # 没有这个字段时，「子进程起不来」只能靠外部复刻依赖树反推
+        # （2026-09-16 的 wolfram 故障）。它只出现在启动/重连失败路径上。
+        "stderr",
         # Exa 池与知识库：都是进程内序号或计数，既不含 Key / 环境变量名，
         # 也不含查询、路径、标题或正文（INTERFACES §22 / §23）。
         "slot",

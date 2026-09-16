@@ -1,0 +1,15 @@
+{
+  "name": "raricy-bot-mcp-tools",
+  "private": true,
+  "description": "MCP stdio servers installed at image build time. Versions are pinned; see the Dockerfile.",
+  "dependencies": {
+    "exa-mcp-server": "3.4.1",
+    "@amap/amap-maps-mcp-server": "0.0.8",
+    "wolfram-mcp": "1.1.2"
+  },
+  "overrides": {
+    "wolfram-mcp": {
+      "@modelcontextprotocol/sdk": "1.30.0"
+    }
+  }
+}

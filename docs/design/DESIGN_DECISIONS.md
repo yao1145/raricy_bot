@@ -1566,6 +1566,57 @@ sqlite3 的未定义行为。最小复现在测试里（取消一次操作后第
 生产路径上够得着：关停、`/reset`、超时都会取消 worker 任务，而 `Store.close()`
 就在关停路径上。
 
+## D-91 子进程 stderr 进日志：有界、压成单行、且必须在脱敏之后
+
+原文（`mcp/stdio.py`）：stdio 子进程的 stderr 接 `os.devnull`，丢弃。
+
+裁决：子进程 stderr 收进一个有界的进程内缓冲（末尾 2000 字符），仅在
+`mcp.provider_start_failed` / `mcp.reconnect_failed` 时作为 `stderr=` 字段输出。
+
+理由：2026-09-16 的 wolfram 故障（见 D-92）根因不难修，**难的是看见它**。stderr 被丢掉
+后，日志里只剩 `error=MCPError`，「子进程起不来」和「子进程起来了但不说话」完全同形，
+最后只能靠外部复刻依赖树反推。
+
+为什么不是三个更省事的选择：
+
+- **临时文件**：容器 `read_only: true`，没有可写目录（Dockerfile 的只读根文件系统）。
+- **直接接本进程 stderr**：那样字节绕过日志层的 `RedactingFilter`。上游确实会把 Key 回显
+  在错误正文里（amap 的 Key 校验失败就是），这正是「任何级别不得出现密钥」禁止的。
+- **不读取只接管道**：管道缓冲区只有 64 KiB，写满而无人读会让子进程阻塞。
+
+所以用守护线程做阻塞读、按块截尾。读端**只由读线程自己关闭** —— 别处关掉会有「fd 号被
+复用、读线程读到无关对象」的竞态；`close()` 先关写端再 join，把「管道已读空」变成一个
+确定的时刻，否则 `diagnostics()` 紧跟在失败之后取值时可能漏掉最后一段。
+
+**连带修订（安全）**：`StdioMcpProvider.resolve_environment` 现在同时调用
+`logging_setup.register_secret(value)`。进程里有**两个** `Redactor`：注入的那个管出站文本，
+日志层 `RedactingFilter` 读的是 `logging_setup` 的进程级单例。此前只登记前者，于是
+stderr 尾巴里的 Key 会原样落进日志 —— 与 `site/client.py` 存 Cookie 时两处都登记的做法
+对齐。测试锁定了这一点（去掉那一行，日志里立刻出现明文 Key）。
+
+## D-92 构建期 MCP 依赖走清单 + `overrides`，不用 `npm install <包名>`
+
+原文（`Dockerfile`）：三条独立的 `npm install @amap/...@0.0.8 wolfram-mcp@1.1.2`（Docker 路径）
+与三条独立的 `npm install --global`（DEPLOYMENT §12）。包与版本是对的，**安装口径是错的**。
+
+裁决：包与版本移入仓库根目录的 `mcp-tools.package.json`，Dockerfile 只 `COPY` 它再
+`npm install`。冲突用 npm `overrides` 显式裁决。
+
+理由：`@amap/amap-maps-mcp-server@0.0.8` 把 `@modelcontextprotocol/sdk` **精确钉在 `1.0.1`**。
+一条命令装多个包时 npm 会把这个 1.0.1 提升到顶层；而 `wolfram-mcp@1.1.2` 声明的是 `^1.0.1`，
+**1.0.1 恰好满足 `^1.0.1`**，于是 npm 不为它建嵌套副本。但 1.0.1 的 `dist/server/` 里只有
+`index.js`、`sse.js`、`stdio.js`，没有 wolfram 入口点要导入的 `server/mcp.js` ——
+Node 抛 `ERR_MODULE_NOT_FOUND` 并以 1 退出，客户端只看到连接关闭（`MCPError` `code=-32000`），
+进入无限重连，用户侧表现为「`/wolfram` 不可用」。amap 的入口是 `server/index.js`，在 1.0.1
+里存在，所以同一个 bug 只打中 wolfram。
+
+DEPLOYMENT §12 原先那三条命令**只是靠安装顺序的运气**才工作：先装 exa 会提升 1.26.0
+（含 `mcp.js`），先装 amap 则同样复现。§4.1.2 的取样命令也是这个形状，一并改掉。
+
+为什么是 `overrides` 而不是别的：升级 amap 也解不掉 —— 那是上游自己的钉法；改成
+`npm install --legacy-peer-deps` 或手动铺 `node_modules` 都是靠副作用。`overrides` 是 npm
+为这件事设计的机制，且能精确表述「只为 wolfram 换 SDK，不动 amap」。
+
 ## 附录：运行期裁决编号索引（补充裁决 A–H、控制器裁决 R1–R16）
 
 实现期在规划产物里另立了两套编号——`.superpowers/sdd/TASKS.md` 的「补充裁决 A–H」与

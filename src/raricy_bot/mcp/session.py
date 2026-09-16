@@ -100,6 +100,15 @@ class SessionMcpProvider:
             else:
                 self._cleanup_transport()
 
+    def diagnostics(self) -> str | None:
+        """最近一次失败的可诊断细节（如子进程 stderr 的末尾）；默认没有。
+
+        生命周期管理器在记录 ``mcp.provider_start_failed`` / ``mcp.reconnect_failed``
+        时取它。传输不同，能说的话也不同：stdio 有子进程，所以有 stderr 可看；
+        远程传输没有，于是返回 None 而不是编一个字段出来。
+        """
+        return None
+
     async def list_tools(self) -> tuple[ToolDefinition, ...]:
         """发现服务器工具并转换为领域类型。"""
         session = self._require_session()

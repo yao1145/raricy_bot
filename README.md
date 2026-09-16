@@ -107,6 +107,7 @@ python -m pytest tests -q
 
 三个同类能力，共用 `mcp.enabled` 这个总开关，各自有 `mcp.features.<name>.enabled`。
 它们都由构建期固定版本的 npm 包提供（`@amap/amap-maps-mcp-server@0.0.8`、`wolfram-mcp@1.1.2`），
+版本与安装口径只写在 `mcp-tools.package.json` 里（含裁决 SDK 提升冲突的 `overrides`），
 知乎是个例外 —— 它只有远程 MCP-over-SSE，没有子进程，所以不进镜像。
 
 ```yaml

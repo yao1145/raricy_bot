@@ -47,7 +47,7 @@
 | 文件 | 是什么 | 权威性 |
 |------|--------|--------|
 | `design/INTERFACES.md` | 本项目内部契约：锁定的签名、字段名、默认值、判定谓词 | 改签名前先查全部消费者 |
-| `design/DESIGN_DECISIONS.md` | 设计未明确处的裁决记录（D-1 … D-90） | 觉得某处行为怪，先读对应条目——不少「看起来像 bug」的选择是刻意的 |
+| `design/DESIGN_DECISIONS.md` | 设计未明确处的裁决记录（D-1 … D-92） | 觉得某处行为怪，先读对应条目——不少「看起来像 bug」的选择是刻意的 |
 | `design/SYSTEM_PROMPTS.md` | 系统提示词的正式来源 + 站点速查表 | 提示词正文的权威副本，**但它不参与运行**：改完必须手动同步到 `config.yaml` |
 | `design/SITE_DOCS_KB_DESIGN.md` | `knowledge/` 知识库**内容侧**的取材范围、删减规则、问答写法、留痕与验收口径 | 已实施（2026-09-15，15 篇 / 220 条）。只约束内容，运行行为见 `usage/EXA_POOL_AND_KB.md` |
 
@@ -74,5 +74,6 @@
 | 文件 | 是什么 |
 |------|--------|
 | `../README.md` | 快速开始、命令一览、部署要点。**现行口径之一** |
+| `../mcp-tools.package.json` | 构建期安装的三个 stdio MCP 服务器及其版本，`overrides` 裁决 SDK 提升冲突。**唯一的安装口径**：Dockerfile 与 `usage/DEPLOYMENT.md` §12 都装它，不要退回逐个 `npm install <包名>`（理由见 D-92） |
 | `../CLAUDE.md`、`../AGENTS.md` | 给 AI 助手的项目约定（两份内容一致） |
 | `../tools/capture_mcp_fixture.py` | **仅开发用**的上游取样脚本：调一次真实 MCP 工具并转储成 fixture，用来校准解析器。运行期绝不 import；只能写进 `tests/fixtures/`，写出的内容先过脱敏。什么时候用它见 `usage/DEPLOYMENT.md` §4.1.2 |

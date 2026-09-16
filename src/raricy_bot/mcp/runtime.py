@@ -10,7 +10,7 @@ from typing import Any
 from ..config import TRANSPORT_SSE, McpConfig
 from ..logging_setup import get_logger, log_event
 from ..redact import Redactor
-from .contracts import McpProvider
+from .contracts import McpProvider, describe_error
 from .pool import ExaPooledProvider
 from .registry import InMemoryToolRegistry
 from .sse import SseMcpProvider
@@ -35,6 +35,25 @@ def _required_tools(config: McpConfig, server_name: str) -> tuple[str, ...]:
             }
         )
     )
+
+
+def _provider_diagnostics_fields(provider: McpProvider) -> dict[str, object]:
+    """Provider 能提供的额外诊断字段；没有可说的就返回空字典。
+
+    读不到（替身没有该方法、或它自己抛错）时静默跳过：诊断字段永远不能让
+    一条「记录失败」的日志反过来失败。值由 ``log_event`` 过滤，非白名单字段
+    会被丢弃，所以这里不必自己判断该不该写。
+    """
+    reader = getattr(provider, "diagnostics", None)
+    if not callable(reader):
+        return {}
+    try:
+        detail = reader()
+    except Exception:
+        return {}
+    if not detail:
+        return {}
+    return {"stderr": detail}
 
 
 class McpManager:
@@ -115,14 +134,18 @@ class McpManager:
                 )
             except Exception as exc:
                 # 这里原来是完全静默的：启动失败只换来一个后台重连任务，
-                # 用户侧只表现为"/search 说联网不可用"。异常正文不入日志
-                # （可能含子进程 stderr），只记类型名。
+                # 用户侧只表现为"/search 说联网不可用"。
+                #
+                # 异常正文与子进程 stderr 的末尾一并记下。原先不记正文的顾虑是
+                # 「可能含密钥」，但日志层会在写出前统一脱敏；而丢掉正文的代价
+                # 是 2026-09-16 那次排查只能靠外部复刻依赖树才反推出根因。
                 log_event(
                     _logger,
                     logging.WARNING,
                     "mcp.provider_start_failed",
                     server=name,
-                    error=type(exc).__name__,
+                    error=describe_error(exc),
+                    **_provider_diagnostics_fields(provider),
                 )
                 self.ensure_reconnect(name)
             else:
@@ -198,7 +221,8 @@ class McpManager:
                     return
                 except Exception as exc:
                     # 退避期间必须留痕：否则"重连一直在失败"和"压根没触发重连"
-                    # 在日志里完全一样。
+                    # 在日志里完全一样。正文与 stderr 末尾同样要带上：重试一直
+                    # 失败却不说为什么，等于把排查推回到「复刻现场」。
                     log_event(
                         _logger,
                         logging.WARNING,
@@ -206,7 +230,8 @@ class McpManager:
                         server=name,
                         attempt=attempt,
                         delay=delay,
-                        error=type(exc).__name__,
+                        error=describe_error(exc),
+                        **_provider_diagnostics_fields(provider),
                     )
                     delay = min(delay * 2, self.config.reconnect_max_seconds)
         except asyncio.CancelledError:

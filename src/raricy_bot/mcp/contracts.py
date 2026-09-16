@@ -95,3 +95,30 @@ class McpNoResultsError(ValueError):
 
 
 ToolExecutor = Callable[[ToolCall], Awaitable[ToolExecution]]
+
+
+# 异常细节进日志的上限（字符）。MCP 侧的异常正文要么是 SDK 的固定短语，
+# 要么是上游返回的一小段 JSON-RPC 错误，几百字符足够；设上限是为了让
+# 一条异常无法把日志行撑爆。
+ERROR_DETAIL_CHARS = 300
+
+
+def describe_error(exc: BaseException) -> str:
+    """把异常压成一行可 grep 的细节，供 MCP 生命周期与发现失败使用。
+
+    在此之前只记 ``type(exc).__name__``，于是 ``MCPError`` 的 code 与 message
+    全部丢失 —— 而「连接被对端关闭」和「服务端回了 JSON-RPC 错误」在日志里
+    长得一模一样。2026-09-16 排查 wolfram 时正是卡在这里：日志只说
+    ``error=MCPError``，真正的原因（子进程模块解析失败、当场退出）在另一处。
+
+    正文来自上游，可能含密钥；调用方不必在意 —— 日志层的 ``RedactingFilter``
+    会在写出前统一抹掉。这里只负责把它压成单行并限长。
+    """
+    name = type(exc).__name__
+    text = " ".join(str(exc).split())[:ERROR_DETAIL_CHARS]
+    code = getattr(exc, "code", None)
+    if not text:
+        return f"{name}({code})" if code is not None else name
+    if code is None:
+        return f"{name}: {text}"
+    return f"{name}({code}: {text})"
