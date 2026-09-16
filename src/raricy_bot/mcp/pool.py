@@ -498,7 +498,7 @@ class ExaPooledProvider:
                 return result
             last_result, last_error = result, None
         # 一个 ready 槽位都没有：一次尝试都没发生，这不是超时。用不带池结构的稳定
-        # 错误告诉 Registry 当前不可用，让它映射成 search_unavailable（F1）。
+        # 错误告诉 Registry 当前不可用，让它映射成 tool_unavailable（F1）。
         if not tried:
             log_event(
                 _logger,

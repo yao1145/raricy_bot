@@ -7,8 +7,13 @@
 #   LLM_API_KEY       模型服务的 API Key
 #   EXA_API_KEY       Exa MCP API Key（仅启用 mcp.enabled 时需要）
 #   EXA_API_KEY_1..N  多 Key 池模式下的各槽位 Key（可选；见下面的 account_pool）
+#   AMAP_MAPS_API_KEY    高德地图 Web 服务 Key（仅启用 map 能力时需要）
+#   WOLFRAM_APP_ID       Wolfram AppID（仅启用 wolfram 能力时需要）
+#   ZHIHU_ACCESS_SECRET  知乎开放平台访问密钥（仅启用 zhihu 能力时需要）
 # RARICY_USERNAME、RARICY_PASSWORD、LLM_API_KEY 缺失或为空时程序会直接以配置错误退出；
-# EXA_API_KEY（或池里的槽位变量）缺失时仅停用 Exa MCP，普通聊天仍可启动。
+# 其余四个 MCP 密钥缺失时只停用对应的那一个服务器，普通聊天与其它能力不受影响。
+#
+# zhihu、map、wolfram 三个能力默认关闭，各自的原因写在下面那一段注释里。
 
 site:
   base_url: "https://example.com"
@@ -27,9 +32,10 @@ model:
   # 单张图的下载期硬上限（字节），不得超过站点图床的 10 MiB 上限。
   max_image_bytes: 5242880
 
-# MCP 联网搜索默认关闭。启用后，只有聊天区的显式 `/search <问题>` 会把当前轮交给
-# 模型判断是否调用 Exa；评论区永远不会获得 MCP 工具。
-# API Key 不写在 YAML 中：env_from 的值只是宿主环境变量名，实际值由环境注入。
+# MCP 能力默认关闭。启用后，聊天区的 `/search`、`/zhihu`、`/map`、`/wolfram` 四条命令
+# 各自把当前轮交给模型判断是否调用对应的上游工具；评论区永远不会获得 MCP 工具。
+# 一条消息最多只能带一个能力命令，叠加会被本地拒绝。
+# 密钥不写在 YAML 中：env_from 与 bearer_env 的值都只是宿主环境变量名，实际值由环境注入。
 mcp:
   enabled: false
   connect_timeout_seconds: 10
@@ -68,6 +74,38 @@ mcp:
       env:
         ENABLED_TOOLS: web_search_exa
         DEBUG: "false"
+    # 高德地图（stdio 子进程，Docker 镜像在构建期固定安装
+    # @amap/amap-maps-mcp-server@0.0.8）。
+    # 密钥走 env_from 映射，值只在运行时从宿主环境读取。缺密钥时子进程不会启动，
+    # 只有 /map 报不可用，其它能力不受影响 —— 上游在缺 Key 时是直接 exit(1) 的。
+    amap:
+      enabled: true
+      transport: stdio
+      command: mcp-amap
+      args: []
+      env_from:
+        AMAP_MAPS_API_KEY: AMAP_MAPS_API_KEY
+    # Wolfram（stdio 子进程，构建期固定安装 wolfram-mcp@1.1.2）。
+    # WOLFRAM_APP_ID 同样是映射，不是取值；它含 APP_ID 字样，因此和 KEY/TOKEN/SECRET
+    # 一样不允许明文写在 env: 里。
+    wolfram:
+      enabled: true
+      transport: stdio
+      command: wolfram-mcp
+      args: []
+      env_from:
+        WOLFRAM_APP_ID: WOLFRAM_APP_ID
+    # 知乎开放平台只提供远程 MCP，没有可固定的 stdio 发行包，所以这条走 SSE 传输：
+    # 没有子进程，因此 command/args/env/env_from/account_pool 一律不允许出现。
+    # bearer_env 是宿主环境变量名，值是 Bearer 令牌，只在建连时读取并立即登记脱敏。
+    zhihu:
+      enabled: true
+      transport: sse
+      url: https://developer.zhihu.com/api/mcp/zhihu_search/v1/sse
+      bearer_env: ZHIHU_ACCESS_SECRET
+      # 长连接的读侧超时。它绝不能沿用 call_timeout_seconds：安静期比它长就会被
+      # 判成超时并重连，与站点 SSE 是同一个教训。
+      stream_read_timeout_seconds: 300
   features:
     search:
       enabled: true
@@ -78,6 +116,66 @@ mcp:
       result_item_token_limit: 3000
       history_item_token_limit: 500
       max_query_chars: 500
+      max_tool_calls_per_turn: 1
+      max_concurrency: 1
+      min_interval_seconds: 2
+    # 以下三个能力默认关闭。原因是同一件事：**结果解析还没有用真实调用校准过**。
+    # 上游三个 npm 包都没有 repository 字段，工具名与参数是从 tarball 里逐字读出来的，
+    # 但「真实返回长什么样」只能靠一次真调用确认。启用前请先按
+    # docs/usage/DEPLOYMENT.md 的「上游取样」一节跑一次 tools/capture_mcp_fixture.py。
+    #
+    # 知乎最不确定：官方文档只写「structured XML」，没有公开标签名，所以它的解析器
+    # 刻意与标签名无关（剥掉全部标签与属性、只留文本、不产出任何链接）。样本拿不到
+    # 就保持关闭 —— 这不是保守，是没有可评审的形态就不该发。
+    #
+    # 三个能力的 max_query_chars 上限由能力表钉死：zhihu 100（上游只收 2..100 字符）、
+    # map 100、wolfram 300。写超了会在加载期直接报配置错误。
+    zhihu:
+      enabled: false
+      bindings:
+        - server: zhihu
+          tool: zhihu_search
+      result_count: 5
+      result_item_token_limit: 3000
+      history_item_token_limit: 500
+      max_query_chars: 100
+      max_tool_calls_per_turn: 1
+      max_concurrency: 1
+      min_interval_seconds: 2
+    # 高德只白名单三个「单调用就能完成」的工具。周边搜索、逆地理编码、距离测量都要
+    # 「经度,纬度」，POI 详情要上一轮返回的 POI ID，而单轮工具调用预算固定为 1，
+    # 模型拿不到这些输入，绑上去就是死工具。
+    # 三个绑定是「全有或全无」：任一工具在发现阶段缺失，整个 /map 判为不可用。
+    map:
+      enabled: false
+      bindings:
+        - server: amap
+          tool: maps_geo
+        - server: amap
+          tool: maps_text_search
+        - server: amap
+          tool: maps_weather
+      result_count: 5
+      result_item_token_limit: 3000
+      history_item_token_limit: 500
+      max_query_chars: 100
+      max_tool_calls_per_turn: 1
+      max_concurrency: 1
+      min_interval_seconds: 2
+    # wolfram 是「整条答案」型（single）：result_count 必须为 1，配成别的值会在
+    # 加载期报错。这里的 result_item_token_limit 是**整条答案**的上限，
+    # history_item_token_limit 是它跨轮摘要的上限。
+    # 另外两个上游参数由宿主钉死或丢弃：mode 逐字写成 llm（full/simple 会返回图片），
+    # maxchars 与 assumption 一律丢弃。
+    wolfram:
+      enabled: false
+      bindings:
+        - server: wolfram
+          tool: wolfram_query
+      result_count: 1
+      result_item_token_limit: 3000
+      history_item_token_limit: 500
+      max_query_chars: 300
       max_tool_calls_per_turn: 1
       max_concurrency: 1
       min_interval_seconds: 2

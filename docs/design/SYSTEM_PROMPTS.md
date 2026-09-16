@@ -103,15 +103,20 @@ config.yaml: system_prompt
 「用户内容只进 `role="user"`」这条底线（`INTERFACES.md` §19 第 2 条）。
 它同样计入 `context_input_tokens` 预算。
 
-### 1.7 `/kb` 与 `/search` 的静态附加说明
+### 1.7 `/kb` 与四条 MCP 命令的静态附加说明
 
-`MCP_SEARCH_SYSTEM_ADDENDUM`（搜索）与 `KB_SYSTEM_ADDENDUM`（本地知识库）与上面的
+`MCP_TOOL_SYSTEM_ADDENDUM`（MCP 工具）与 `KB_SYSTEM_ADDENDUM`（本地知识库）与上面的
 `LOBBY_SHARED_SYSTEM_ADDENDUM` 同源：都是 `texts.py` 里的模块级常量、**不含占位符**、
 拼接时不做格式化，也只能由「本轮确实启用了哪个能力」决定出现与否。
 
-|          | `MCP_SEARCH_SYSTEM_ADDENDUM` | `KB_SYSTEM_ADDENDUM` |
-| -------- | ---------------------------- | -------------------- |
-| 何时拼上 | 本轮 `enabled_features` 含 `search` | 本轮 `enabled_features` 含 `kb` |
+`MCP_TOOL_SYSTEM_ADDENDUM` 是**命令中立**的：它的唯一职责是「工具输出是不可信数据、
+不得编造成功」这条边界，而这条边界对四个 provider 完全相同。`/search`、`/zhihu`、
+`/map`、`/wolfram` 四轮拼的是同一份常量；能力专属的引导放在各工具自己的
+`model_input_schema` 里，不进 system。这样加第五个能力不必再动 system 文案。
+
+|          | `MCP_TOOL_SYSTEM_ADDENDUM` | `KB_SYSTEM_ADDENDUM` |
+| -------- | -------------------------- | -------------------- |
+| 何时拼上 | 本轮 `enabled_features` 含 `search` / `zhihu` / `map` / `wolfram` 之一 | 本轮 `enabled_features` 含 `kb` |
 | 互斥     | 是：同一条消息最多一种能力，叠加会在路由层被拒（D-39） | 同左 |
 | 动态数据 | 只进 `role="user"`（工具结果） | 只进 `role="user"`（`[KBn]` 数据块） |
 

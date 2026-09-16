@@ -7,6 +7,7 @@
 - 大区是**公开多人对话**：一条回复链上的所有人共享最近十来轮上下文，回复链内的消息就能加入。
 - 聊天默认**不联网、也不读本地资料**：要联网就发 `/search <问题>`，要查本地资料就发
   `/kb <问题>` —— 每条命令只授权它自己那一轮，下一条普通消息不会被这层授权牵连。
+  另有 `/zhihu`、`/map`、`/wolfram` 三条同类命令，默认关闭。
 - 上下文只存在内存里，进程重启即清空；去重、额度与回复链归属会保留。
 
 ## 在聊天里怎么用它
@@ -22,13 +23,17 @@
 | `/help` | 能力、隐私与限制说明（本地回复，不调用模型） |
 | `/reset` | 开一段新对话，旧的还在 |
 | `/search <问题>` | 授权当前这一轮由模型判断是否调用 Exa 联网搜索；最多一次、最多五条摘要 |
+| `/zhihu <问题>` | 同上，但查知乎站内内容（需开启；见「可选能力」） |
+| `/map <问题>` | 同上，但查高德地图的坐标、地点与天气（需开启） |
+| `/wolfram <问题>` | 同上，但交给 Wolfram 做计算或事实查询（需开启） |
 | `/kb <问题>` | 授权当前这一轮从本地 Markdown 资料里检索（需开启） |
 
-`/search` 与 `/kb` 不能写在同一条消息里，叠加会被本地拒绝。两者都只在私聊和大厅生效，
-博客评论区不解析它们，也不调用搜索或读取知识库。
+这五条命令**不能写在同一条消息里**，任意两条叠加都会被本地拒绝。它们都只在私聊和大厅
+生效，博客评论区不解析它们，也不调用搜索、地图或知识库。
 
-**关于你的消息**：发给它的内容会被转交给第三方模型服务；`/search` 的查询可能转交给 Exa，
-`/kb` 命中的本地资料片段**不会**发给 Exa。写给站内用户的完整说明（可直接发布到站点）
+**关于你的消息**：发给它的内容会被转交给第三方模型服务；`/search`、`/zhihu`、`/map`、
+`/wolfram` 的查询在模型决定调用工具时可能转交给对应的上游服务，`/kb` 命中的本地资料片段
+**不会**发给任何 MCP 上游。写给站内用户的完整说明（可直接发布到站点）
 见 [`docs/usage/USAGE.md`](docs/usage/USAGE.md)。
 
 ## 快速开始
@@ -75,16 +80,19 @@ python -m pytest tests -q
 | `RARICY_USERNAME` | 是 | 站点登录用户名 |
 | `RARICY_PASSWORD` | 是 | 站点登录密码 |
 | `LLM_API_KEY` | 是 | 模型服务 API Key |
-| `EXA_API_KEY` | 否 | Exa MCP API Key；只在启用联网搜索时使用 |
+| `EXA_API_KEY` | 否 | Exa MCP API Key；只在启用 `/search` 时使用 |
 | `EXA_API_KEY_1..N` | 否 | 多 Key 池的各槽位 Key，名字由 `account_pool.host_envs` 指定 |
+| `AMAP_MAPS_API_KEY` | 否 | 高德 Web 服务 Key；只在启用 `/map` 时使用 |
+| `WOLFRAM_APP_ID` | 否 | Wolfram AppID；只在启用 `/wolfram` 时使用 |
+| `ZHIHU_ACCESS_SECRET` | 否 | 知乎开放平台访问密钥；只在启用 `/zhihu` 时使用 |
 | `BOT_CONFIG_PATH` | 否 | 配置文件路径，缺省 `./config.yaml` |
 
 配置有错时进程在启动阶段以退出码 2 结束，并在 stderr 打印一行原因（不打印取值）。
-密钥缺失或为空同样如此；只有 Exa 相关的变量缺失属于软故障，仅停用联网搜索。
+密钥缺失或为空同样如此；只有四个 MCP 密钥属于软故障，各自只停用它对应的那一个能力。
 
 ## 可选能力（默认全部关闭）
 
-四项都默认关闭，默认只跑普通聊天与私聊。不打开就不会有额外的子进程、目录扫描或站点请求。
+以下能力都默认关闭，默认只跑普通聊天与私聊。不打开就不会有额外的子进程、目录扫描或站点请求。
 
 ### 联网搜索 `/search`
 
@@ -94,6 +102,39 @@ python -m pytest tests -q
 多个**已获授权的** Key 可以配成池（`mcp.servers.exa.account_pool`）：每个 Key 一个子进程，
 一次搜索在其中做有界轮询与故障转移，对模型仍然只是一个工具。它提高的是可用性，**不是
 容量绕过**——上线前必须确认这些 Key 的授权，见「上线前人工检查」。
+
+### 知乎 `/zhihu`、高德 `/map`、Wolfram `/wolfram`
+
+三个同类能力，共用 `mcp.enabled` 这个总开关，各自有 `mcp.features.<name>.enabled`。
+它们都由构建期固定版本的 npm 包提供（`@amap/amap-maps-mcp-server@0.0.8`、`wolfram-mcp@1.1.2`），
+知乎是个例外 —— 它只有远程 MCP-over-SSE，没有子进程，所以不进镜像。
+
+```yaml
+mcp:
+  enabled: true
+  features:
+    map:
+      enabled: true      # 再把 amap 服务器的 env_from 配好，并注入 AMAP_MAPS_API_KEY
+```
+
+**这三个在 `config.example.yaml` 里默认 `enabled: false`，启用前必须先取样。** 三个上游的
+npm 包都没有 `repository` 字段，工具名与参数可以逐个从 tarball 读出来并已核对，但**结果
+格式只能靠一次真调用确认**。所以先跑一次：
+
+```bash
+PYTHONPATH=src python tools/capture_mcp_fixture.py \
+    --server amap --tool maps_weather --args '{"city":"上海"}' \
+    --out tests/fixtures/amap_weather.json
+```
+
+脚本只能写进 `tests/fixtures/`，写出的内容先过脱敏（高德的异常正文里带请求 URL，而 URL 里
+带 `key=`），也不会回显宿主密钥。拿到样本后按它校准解析器；**知乎拿不到样本就不要发布
+`/zhihu`**，解析器的细节与取样步骤见
+[`docs/usage/DEPLOYMENT.md`](docs/usage/DEPLOYMENT.md) 的 §4.1.2。
+
+各能力对模型只公开必要的参数，其余由宿主强制或丢弃：`/zhihu` 丢弃 `count`（条数由配置
+决定）、`/map` 丢弃 `types`（上游 schema 与 handler 不一致，那个参数实际被忽略）与
+`photos`（外部图片地址）、`/wolfram` 把 `mode` 钉死为纯文本。
 
 ### 本地知识库 `/kb`
 
@@ -128,8 +169,11 @@ python -m pytest tests -q
 export RARICY_USERNAME=你的账号
 export RARICY_PASSWORD=你的密码
 export LLM_API_KEY=你的模型Key
-# 启用联网搜索时再设置；不要提交，也不要写进 docker-compose.yml
+# 启用 MCP 能力时再设置对应的那个；不要提交，也不要写进 docker-compose.yml
 export EXA_API_KEY=你的ExaKey
+# export AMAP_MAPS_API_KEY=你的高德Key
+# export WOLFRAM_APP_ID=你的WolframAppID
+# export ZHIHU_ACCESS_SECRET=你的知乎密钥
 
 docker compose up -d
 docker compose logs -f bot
@@ -141,7 +185,7 @@ docker compose logs -f bot
   跑两个副本会让同一条消息被回复两遍。
 - `config.yaml` 与知识库目录都以**只读**方式挂载（`/app/config.yaml`、`/app/knowledge`）；
   SQLite 只写 `/app/data` 命名卷。密钥由宿主环境变量注入，Compose 文件里只有 `${VAR}` 引用。
-- 上游 Node 与 `exa-mcp-server` 在构建期固定安装，运行期不访问 npm。
+- 上游 Node 与三个 stdio MCP 包（Exa、高德、Wolfram）在构建期固定安装，运行期不访问 npm。
 - 容器根文件系统只读，运维端口只在容器内 `expose 8080`，不发布到宿主。
 
 首次部署、升级、SELinux、备份与排障的完整步骤见
@@ -170,6 +214,9 @@ Cookie、密码与 API Key 在任何级别都不会落进日志或数据库。
 - [ ] **启用 Exa 多 Key 池前**：确认每个 Key 都已获授权（Exa 书面许可，或同一组织依法管理的
       独立预算，或官方 Team / 付费 / 资助额度），并把批准日期、账号范围与渠道记在案。
       池不绕过任何平台额度政策。
+- [ ] **启用 `/zhihu`、`/map`、`/wolfram` 前**：先用 `tools/capture_mcp_fixture.py` 取过该
+      上游的真实样本，并按样本核对过解析器；知乎拿不到样本就不要发布 `/zhihu`。三个包都
+      没有 `repository` 字段，无法证明是厂商官方，所以这一步不能靠「文档看起来对」跳过。
 - [ ] **启用知识库前**：逐文件清点挂载目录，确认不含密钥、隐私、内部提示词、部署配置、
       日志、数据库或无权转交第三方模型的材料。目录名与文件名本身也会展示给提问者，
       所以命名同样要审；资料负责人要签字确认可见范围。
@@ -225,7 +272,8 @@ raricy_bot/
 │   ├── quota.py             # 聊天：每分钟窗口 + 24 小时额度 + 通知冷却
 │   ├── site/                # 站点 HTTP 客户端、SSE 接收器、聊天与评论 DTO
 │   ├── core/                # 聊天：上下文、路由器、工作器池、发送器
-│   ├── mcp/                 # 通用 MCP Provider、工具注册、Exa 适配与多 Key 池
+│   ├── capabilities.py      # 能力表：命令字面量、上游工具白名单、各能力文案
+│   ├── mcp/                 # MCP 传输（stdio/SSE）、工具注册、四个适配器与多 Key 池
 │   ├── kb/                  # 本地 Markdown 知识库：扫描、分块、词法索引与检索
 │   ├── comments/            # 评论：发现轮询、匹配、配额、发送器、后台服务
 │   ├── memory/              # 长期记忆（Beta）：Markdown 存储、AI 撰写、命令与接入策略

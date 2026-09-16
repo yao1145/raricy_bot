@@ -513,7 +513,7 @@ Provider 可以发现服务器提供的全部工具，但只有 `FeatureBinding`
 
 多个已获授权的 Exa API Key 由一个 `ExaPooledProvider` 包住，对 `InMemoryToolRegistry`
 仍然只是一个 `exa`：模型侧只有一个 `exa__web_search_exa`，`max_tool_calls_per_turn=1`
-与 `SearchLimiter` 的全局最小间隔都不变。一次逻辑调用从游标之后取下一个 `ready` 槽位，
+与 `CapabilityLimiter` 的全局最小间隔都不变。一次逻辑调用从游标之后取下一个 `ready` 槽位，
 每个槽位在同一逻辑调用内**最多尝试一次**，尝试次数不超过当次可用槽位数；成功后立即返回，
 不再尝试任何其它槽位。
 
@@ -561,7 +561,7 @@ SQLite 里既不写 Key，也不写 Key 的散列、长度或任何跨重启稳�
 
 ## D-41 知识库是本地只读能力，不是 MCP 工具
 
-`kb/` 与 `mcp/` 完全分层：知识库不经过 MCP、不经过 Exa、不占 `SearchLimiter`，
+`kb/` 与 `mcp/` 完全分层：知识库不经过 MCP、不经过 Exa、不占 `CapabilityLimiter`，
 `/kb` 用普通 `model.complete()` 而不是 `complete_with_tools`，因此不依赖模型端点的
 tools 能力，也不会因为 MCP 重连逻辑被牵连。反过来，Exa 代码也完全不依赖文件系统检索。
 两条路径唯一的交汇点是 `Request.enabled_features`。
@@ -601,7 +601,7 @@ tools 能力，也不会因为 MCP 重连逻辑被牵连。反过来，Exa 代�
 `exa-mcp-server` 固定版本是否把 401/402/429 与稳定 tag 原样透出，属于**待验证**的外部事实
 （P0-02）。因此分类器只在结构化字段与 `isError` 文本上做严格的固定词匹配，
 其余一律归为 `unknown_upstream`：**不轮换、不冷却**，把原始错误结果交回 Registry，
-由它映射成稳定的 `search_unavailable`。这样即使某个版本的 MCP 把错误压成纯文本，
+由它映射成稳定的 `tool_unavailable`。这样即使某个版本的 MCP 把错误压成纯文本，
 最坏结果也只是「池退化成单 Key 行为」，绝不会因为猜到「额度耗尽」而把一个健康槽位
 冷却六小时。传输层错误（超时、子进程退出、连接失败）不依赖上游格式，始终可分类，
 因此始终参与轮换。启用按额度轮换**必须先有固定样例的契约测试**。
@@ -1392,6 +1392,154 @@ fail-closed，代价也正落在这个默认值上：照旧合同实现、或因
 表现是 `/memory auto on` 永远被拒、自动提取永远不跑，而且**没有报错、没有日志、没有测试失败**
 ——一个静默失效的缺省值。因此修订后的 §32.3 把「装配方必须显式传真实取值」写进签名旁的规则里：
 只留一个自解释的默认值不够，这个默认值恰恰是漏传时的伪装。
+
+## D-81 能力表是命令、白名单与配置校验的唯一真值源；未知 feature 名从「静默可用」变成加载期拒绝
+
+原文（`MCP_CHAT_SEARCH_DESIGN.md` §1.1 目标 7）：
+
+> MCP 接入层不依赖 Exa：后续接入其他服务器或工具时，不需要重写 Router 和模型工具循环。
+
+背景：目标 7 在架构层已经做到（`McpProvider`、`InMemoryToolRegistry`、feature binding、
+两轮工具循环都是通用的），但实现层把 `"search"` 这个名字硬编码进了 App、Router、配置
+校验和文案模块，所以第二个能力实际上加不进来。
+
+裁决：新增 `capabilities.py` 作为命令字面量、上游工具白名单、「一条消息最多一个能力」的
+判定集合与每个能力文案的**唯一真值源**。Router 的解析、`config.py` 的 feature 校验、
+`help_text()` 的能力段落、`CAPABILITY_CONFLICT_TEXT` 的命令列表全部从它取，下一个能力
+只加一行 `Capability`。`kb` 也放进同一张表（`source == "local"`），这样「什么算能力命令」
+只有一个来源，D-39 的冲突判定不可能与解析表漂移。
+
+连带的一条**行为变更**：`mcp.features.<name>` 里出现不在能力表里的名字，从「静默可用」
+（走通用透传）变成加载期 `ConfigError`。
+
+理由：通用透传路径会把上游原文截断后直接交给模型，既不是评审过的清洗形态，也绕过了
+逐条 token 上限 —— 它能存在只是因为首版只有 Exa 一个能力，没人在意。代价是逃生通道
+关闭：加第五个能力必须加一行表，不能再靠 YAML 随手写一个名字。这个代价是**刻意接受**的，
+因为「配置里能启用一个没人评审过解析逻辑的能力」比「加能力要多改一行代码」危险得多。
+
+模块位置是这条裁决的一部分：`capabilities.py` **不能放进 `mcp/`**。`config.py` 要用它做
+加载期校验，而 `mcp/__init__.py` 会拉起 `registry`，`registry` 又依赖 `config`，放进去就
+成环。依赖方向固定为 `texts ← capabilities ← {text_utils, config, core/router, app}`。
+
+## D-82 没有适配器的能力禁止启用（`IMPLEMENTED_FEATURES` 护栏）
+
+原文：无。这是实现期补的一条计划里没有的护栏。
+
+裁决：`capabilities.IMPLEMENTED_FEATURES` 单独声明「已经接了适配器的能力」，
+`config.py` 在加载期拒绝启用不在此集合内的能力。它必须与 `mcp/adapters.py` 的工厂表
+逐项一致，由测试钉住（两处声明放在不同模块是 D-81 的依赖方向决定的，不是疏忽）。
+
+理由：能力表（D-81）是**产品意图**，工厂表是**实现现状**，两者可以短暂不一致 ——
+加表行、写文档、接适配器本来就是三步。但没有适配器时 Registry 会退到通用透传，
+于是「表里有一行、配置也开了」会得到一个谁都没评审过的输出形态，而且它在日志里
+和正常工作完全一样。宁可在启动时大声失败。声明放在 `capabilities.py` 而不是
+`mcp/adapters.py`，正是因为 `config.py` 不能 import `mcp`（D-81）。
+
+## D-83 限流按 feature、适配器按 binding
+
+原文（INTERFACES §22）：限流是全局串行且带最小间隔的。
+
+裁决：`mcp/adapters.py` 的 `build_adapters` 每个 feature 只造**一个**
+`CapabilityLimiter`，注入该 feature 的**全部**绑定；同时每个 binding 各造一个适配器对象。
+
+理由：两半各有一条硬约束。限流那半 —— `/map` 绑了三个工具，若共用一个 limiter 之外的
+东西（或每个工具一个），模型可以连着调三个工具而每次间隔都合规，最小间隔就形同虚设。
+适配器那半 —— `InMemoryToolRegistry` 按**模型侧工具名**查适配器，但只把适配器对象交给
+`prepare_arguments(arguments, feature)`，**不传工具名**；`/map` 三个工具的参数白名单
+各不相同（`address` / `keywords` / `city`），共用一个对象就分不出是谁在调。这条约束是
+既有的 Registry 合同，改它要动 §15，所以形状由它决定，反过来把「一个 binding 一个对象」
+变成了必须。
+
+## D-84 能力命令无正文的 reason 统一为 `<feature>_usage`
+
+原文（INTERFACES §12）：`/search` 无正文时 `reason="empty"`。
+
+裁决：`/search`、`/zhihu`、`/map`、`/wolfram` 四条命令无正文时统一返回
+`reason="<feature>_usage"`，并把四个 reason 加进 `_ACTIONABLE_REASONS`。
+「整条消息就是空的」仍然保留 `empty`。
+
+理由：首版只有 `/search` 一条命令，`empty` 同时是「消息是空的」和「命令后没写问题」
+两种事实的代号，没人分得清也无所谓 —— 反正只有一条命令。五个能力下这个歧义会直接
+变成运维噪音：`reason=empty` 再也回答不了「用户是发了空消息，还是发了 `/map` 却没写
+地址」。分开之后 reason 自身就说明了是哪条命令没带正文。这是一处**刻意的行为变更**，
+既有断言同步更新，不保留兼容分支。
+
+## D-85 高德只白名单「单调用就能完成」的三个工具
+
+原文（`MCP_CHAT_SEARCH_DESIGN.md` §1.1 目标 3）：每轮最多调用一次。
+
+裁决：`@amap/amap-maps-mcp-server@0.0.8` 发现到 12 个工具，
+`capabilities.py` 只白名单 `maps_geo`、`maps_text_search`、`maps_weather` 三个。
+
+理由：其余九个要么需要「经度,纬度」（周边搜索、逆地理编码、距离测量 —— 这些坐标只能
+来自**上一轮**的 `maps_geo`），要么需要 POI ID（`maps_search_detail` 需要上一轮搜索
+返回的 id）。而单轮工具调用预算固定为 1（目标 3，本次未动），模型在一轮里拿不到这些
+输入 —— 绑上去就是永远调不动的死工具，还会占着白名单让模型以为可用。
+
+## D-86 `error_kind` 按能力中立命名，能力名走独立的 `feature` 字段
+
+原文（INTERFACES §22.2）：池的失败映射为 `search_unavailable` / `search_timeout`。
+
+裁决：改名为 `tool_unavailable` / `tool_timeout`。其余
+（`tool_not_allowed` / `invalid_arguments` / `no_results` / `invalid_result` /
+`generation_cancelled` / `tool_budget_exhausted`）不变。`LOG_FIELDS` 白名单不新增字段。
+
+理由：`error_kind` 只在日志和 `core/worker.py`（`invalid_arguments` 不消耗预算）使用，
+模型永远看不到，所以改名是安全的。不改则日志里会出现 `reason=search_unavailable
+feature=map` 这种胡说 —— 一个知道 `/search` 典故的人才读得懂的日志，对排查的人是负资产。
+能力名本来就有独立的 `feature` 字段，不该再编码进错误类型里。
+
+## D-87 SSE 服务器的字段互斥与 https 强制
+
+原文：无。首版只有 stdio（`config.py` 的 transport 只接受 `"stdio"`）。
+
+裁决：`transport: sse` 必须有 `url` 与 `bearer_env`，且**禁止**
+`command`/`args`/`env`/`env_from`/`account_pool`；`transport: stdio` 反过来禁止
+`url`/`bearer_env`/`stream_read_timeout_seconds`。`url` 必须 `https://`。
+`bearer_env` 只是一个**宿主环境变量名**，值不进 YAML，只在构造 Provider 前读取并登记进
+`Redactor`。读侧超时单独配置（`stream_read_timeout_seconds`），默认 300 秒。
+
+理由：字段互斥是「两套连接方式并存时谁生效取决于实现细节」的解药 —— 静默行为正是
+「以为在连远程、其实起的是子进程」这类事故的温床，所以直接拒绝而不是挑一个生效。
+`https` 是硬要求：Bearer 令牌随每个请求发出，明文 http 等于把它交给链路上的任何人。
+单独的读侧超时与站点 SSE 是同一条既有教训（`STREAM_READ_TIMEOUT_SECONDS`）：长连接
+不能继承普通请求超时，否则任何安静期都会被判成超时并重连。注册原值即可覆盖
+`Bearer <token>` 整个头，不需要额外处理。
+
+## D-88 三个新能力默认关闭，启用前必须先取真实样本校准
+
+原文（`MCP_CHAT_SEARCH_DESIGN.md` §23 结尾）：上游形态必须每次现核，不能只改版本号。
+
+裁决：`config.example.yaml` 里 `zhihu`、`map`、`wolfram` 三个 feature 一律
+`enabled: false`，各自附上「先取样再启用」的注释；`docs/usage/DEPLOYMENT.md` 与
+`README.md` 写明取样步骤；新增仅开发用的 `tools/capture_mcp_fixture.py`（运行期绝不
+import），它把一次真实 `CallToolResult` 转储成 fixture，且只能写进 `tests/fixtures/`。
+
+理由：三个上游 npm 包**都没有 `repository` 字段**，无法证明是厂商官方。工具名与参数
+schema 可以从 tarball 里逐字读出来，但**结果格式不行** —— 它只能靠一次真调用确认。
+按读到实现写的解析器（高德、Wolfram）可信度高但同样未经真实调用校准；
+知乎最不确定，官方只写 "structured XML"，没有公开标签名，所以它的解析器刻意做成与标签名
+无关（剥全部标签与属性、只留文本、不产出未校验的链接），最坏情况是少给一点文本。
+**拿不到知乎样本就不发布 `/zhihu`**：把表行与 `IMPLEMENTED_FEATURES` 里的名字一起去掉，
+配置校验会替我们挡住启用（D-81 / D-82）。
+
+取样脚本的三条硬约束由代码而非纪律保证：只能写进 `tests/fixtures/`（`resolve()` 之后再
+比较，`../` 消不掉路径前缀巧合）；写出的每个字符串先过 `Redactor`（高德的异常正文带请求
+URL，URL 里带 `key=`）；只打印变量名与「已设置/未设置」，绝不回显宿主密钥值。
+
+## D-89 `APP_ID` 并入密钥启发式
+
+原文（INTERFACES §1）：`env:` 里的值不得含密钥字样。
+
+裁决：`_SECRET_ENV_PARTS` 增加 `"APP_ID"`，与 KEY/TOKEN/SECRET/PASSWORD/COOKIE 同级。
+四个必需的子进程环境变量名（含 `WOLFRAM_APP_ID`）在 `env:` 被拒、在 `env_from:`
+被接受，由参数化测试覆盖。
+
+理由：这是一条既有的**漏洞**，由新增 Wolfram 暴露出来。`WOLFRAM_APP_ID` 是 Wolfram 的
+凭据，但它不含 KEY/TOKEN/SECRET 任何一个字样，所以原先能明文写进 `env:`；而 `env:` 的值
+**从不注册进 `Redactor`**（只有 `env_from` 会），于是那个值永远不会被脱敏 —— 它可能一路
+出现在日志、错误信息或 SQLite 里。启发式本来就是按「名字像密钥」拦的，`APP_ID` 属于这
+一类；漏掉它不是判断失误，是没人从这个角度看过。
 
 ## 附录：运行期裁决编号索引（补充裁决 A–H、控制器裁决 R1–R16）
 

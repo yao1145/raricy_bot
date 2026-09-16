@@ -28,8 +28,11 @@
    多副本选主不属于首版范围。
 4. **密钥只走环境变量**，不要写进 `config.yaml`、不要写进 `docker-compose.yml`、
    不要提交到任何仓库。站点与模型凭据是 `RARICY_USERNAME`、`RARICY_PASSWORD`、
-   `LLM_API_KEY`；启用联网搜索时另需 `EXA_API_KEY`（多 Key 池则是 `EXA_API_KEY_1..N`），
-   它们只提供给 Exa MCP 子进程。
+   `LLM_API_KEY`；四个 MCP 能力各自另需一个：`EXA_API_KEY`（多 Key 池则是
+   `EXA_API_KEY_1..N`）、`AMAP_MAPS_API_KEY`、`WOLFRAM_APP_ID`、`ZHIHU_ACCESS_SECRET`。
+   前三个只提供给对应的 stdio 子进程，最后一个只用于 SSE 的 `Authorization` 头。
+   `WOLFRAM_APP_ID` 虽然名字里没有 KEY/TOKEN/SECRET，同样**不得**明文写进 `env:`
+   ——它和其它凭据一样被密钥启发式拦截（D-89）。
 5. **Exa 多 Key 池必须先确认授权，再上线。** 池的作用是在多个**已获授权**的 Key 之间轮询，
    它不绕过任何平台额度政策。Exa 的服务条款要求 API 使用遵守其技术文档、使用指南与调用量限制，
    官方团队文档也说明同一 Team 的成员共享该 Team 的限制；官方资料并没有承诺「为叠加免费额度
@@ -49,8 +52,10 @@
 ## 2. 服务器前提
 
 - 一台能访问外网的 Linux（下文命令以 Ubuntu 22.04 / Debian 12 为例）。
-- 出网可达两个地方：站点域名、模型服务地址。**不需要任何入站端口**——
-  机器人只主动外连，运维端点不发布到宿主（见第 7 节）。
+- 出网可达：站点域名、模型服务地址。启用 MCP 能力时**按需**再加对应的上游：
+  `api.exa.ai`（`/search`）、`restapi.amap.com`（`/map`）、`api.wolframalpha.com`
+  （`/wolfram`）、`developer.zhihu.com`（`/zhihu`，走 SSE）。不用的能力不必放行。
+  **不需要任何入站端口**——机器人只主动外连，运维端点不发布到宿主（见第 7 节）。
 - 建议配置：1 核 / 512MB 内存 / 1GB 磁盘足够。SQLite 只存元数据，不存对话正文。
 - **宿主机不需要装 Python 3.12 或 Node**：镜像自带 `python:3.12-slim-bookworm` 与 Node 22。
   代价是构建期要能访问 Docker Hub、PyPI 与 npm registry；运行期不访问 npm。
@@ -78,9 +83,13 @@ docker compose version      # 需要 v2，命令是 `docker compose` 而不是 `
 
 ### 2.2 构建期网络
 
-`docker compose build` 会拉 Python/Node 基础镜像，在构建阶段安装 Python 依赖及固定的
-`exa-mcp-server@3.4.1`。运行阶段只使用镜像内的 Node 与 Exa 文件，不执行 `npx`、`npm install`
-或访问 npm registry。Compose 同时启用只读根文件系统，运行状态只写入 `/app/data` 命名卷。
+`docker compose build` 会拉 Python/Node 基础镜像，在构建阶段安装 Python 依赖及三个固定版本的
+MCP 服务器：`exa-mcp-server@3.4.1`、`@amap/amap-maps-mcp-server@0.0.8`、`wolfram-mcp@1.1.2`
+（知乎不进镜像，它没有子进程）。运行阶段只使用镜像内的 Node 与这三个包，不执行 `npx`、
+`npm install` 或访问 npm registry。Compose 同时启用只读根文件系统，运行状态只写入
+`/app/data` 命名卷；三个包在运行期**不写任何文件**（静态核对：只有 wolfram 用了一次只读的
+`fs.realpathSync`），所以 `read_only: true` 与它们兼容。
+
 国内网络可能很慢或超时。两个不改逻辑的缓解办法：
 
 - 配 `/etc/docker/daemon.json` 的 `registry-mirrors`（可用镜像站变动频繁，自行确认）；
@@ -188,7 +197,7 @@ system_prompt: |
 `minute_attempt_limit: 25`（低于站点 30 次/分的硬限）、`daily_normal_limit: 1950`、
 `daily_absolute_limit: 2000`。
 
-### 4.1 聊天区联网搜索（可选）
+### 4.1 聊天区 MCP 能力（可选）
 
 `config.example.yaml` 中的 `mcp.enabled` 默认是 `false`。保持默认值时，机器人完全不启动
 MCP，普通聊天行为不变。启用 Exa 摘要搜索时，在 `config.yaml` 中打开：
@@ -202,11 +211,60 @@ mcp:
 环境变量映射给 Exa 子进程，不是 API Key 的存储位置；不要把真实值写入 YAML、Compose、日志
 或仓库。搜索仅在私聊和大厅中由用户显式发送 `/search <问题>` 触发，模型可以判断不搜索；
 每轮最多执行一次 `web_search_exa`，最多返回 5 条摘要，每条最多 3000 个估算 token。评论区
-不会解析 `/search`，也不会调用 MCP。
+不会解析任何能力命令，也不会调用 MCP。
 
-缺少 `EXA_API_KEY`、Node、Exa 进程或 MCP 连接失败时，联网功能会提示暂不可用，但普通聊天、
-评论、`/livez` 与 `/readyz` 继续运行。更新环境变量后必须执行 `docker compose up -d`，仅
-`restart` 不会重新创建容器并读取新值。
+`mcp.enabled` 是总开关；四个能力各自另有 `mcp.features.<name>.enabled`。
+
+| 命令 | feature | 需要的环境变量 | 上游 |
+| --- | --- | --- | --- |
+| `/search` | `search` | `EXA_API_KEY` | Exa（stdio） |
+| `/map` | `map` | `AMAP_MAPS_API_KEY` | 高德（stdio） |
+| `/wolfram` | `wolfram` | `WOLFRAM_APP_ID` | Wolfram（stdio） |
+| `/zhihu` | `zhihu` | `ZHIHU_ACCESS_SECRET` | 知乎（远程 SSE） |
+
+**三个新能力在 `config.example.yaml` 里默认 `enabled: false`**，启用前先读 §4.1.2。
+
+启动时现在会起三个子进程（原先一个）。`connect_timeout_seconds` 是全局 10 秒且按顺序启动，
+所以最坏情况是一台坏服务器给启动加 10 秒；它是可接受的取舍，不是遗漏。
+
+缺少某个能力的密钥、Node、子进程或连接失败时，**只有那一个能力**提示暂不可用，其余能力、
+普通聊天、评论、`/livez` 与 `/readyz` 继续运行（三个上游在缺密钥时都是直接 `exit(1)`，
+所以「缺 env 就不启动子进程」是必需的，不是优化）。更新环境变量后必须执行
+`docker compose up -d`，仅 `restart` 不会重新创建容器并读取新值。
+
+### 4.1.2 上游取样：启用 `zhihu`/`map`/`wolfram` 之前必须先做
+
+三个上游的 npm 包**都没有 `repository` 字段**，无法证明是厂商官方。工具名与参数 schema
+可以从 tarball 里逐字读出并已逐个核对（`npm view <pkg> bin` 可复核），但**结果格式只能靠
+一次真调用确认**。所以在把 `mcp.features.<name>.enabled` 改成 `true` 之前：
+
+```bash
+# 在开发机上，装好三个包的对应版本（与 Dockerfile 钉的版本一致）
+npm install --no-audit --no-fund @amap/amap-maps-mcp-server@0.0.8 wolfram-mcp@1.1.2
+
+export AMAP_MAPS_API_KEY=...        # 真实取值，不要提交
+PYTHONPATH=src python tools/capture_mcp_fixture.py \
+    --server amap --tool maps_weather --args '{"city":"上海"}' \
+    --out tests/fixtures/amap_weather.json
+
+# 同理：maps_geo、maps_text_search、wolfram_query（宿主会钉死 mode=llm）
+# 知乎：--server zhihu --tool zhihu_search --args '{"query":"..."}'
+```
+
+脚本只允许写进 `tests/fixtures/`，写出的每个字符串都先过 `Redactor`（高德的异常正文里
+带请求 URL，而 URL 里带 `key=`，原样转储就等于把 Key 写进文件），并且只打印变量名，
+绝不回显宿主密钥。
+
+拿到样本后按它校准解析器：高德看 `mcp/amap.py` 的 `_ITEMS`，Wolfram 看
+`mcp/wolfram.py` 的 `adapt`，**知乎看 `mcp/zhihu.py` 的 `_extract_items`**。知乎最不确定 ——
+官方只写 "structured XML"，没有公开标签名，所以它的解析器刻意与标签名无关（剥全部标签与
+属性、只留文本、不产出未校验的链接），最坏情况是少给一点文本。**拿不到知乎样本就不发布
+`/zhihu`**：把 `capabilities.py` 里的表行与 `IMPLEMENTED_FEATURES` 里的名字一起去掉，
+配置校验会挡住任何启用它的尝试（D-81 / D-82）。
+
+**版本漂移**：不要静默升级。要么留在钉住的版本并记录失败，要么当成契约变更处理 ——
+重新采集该服务器**全部**样本、diff、更新 `capabilities.py` 的 `allowed_tools`、同步
+本文档与 `Dockerfile` 的版本号，并补一条裁决记录。
 
 ### 4.1.1 Exa 多 Key 池（可选；上线前先读 §1 第 5 条）
 
@@ -512,6 +570,10 @@ EXA_API_KEY=Exa服务的Key
 # EXA_API_KEY_1=第一个Key
 # EXA_API_KEY_2=第二个Key
 # EXA_API_KEY_3=第三个Key
+# 三个新能力各自一个，只在启用对应能力时填；变量名必须与 config.yaml 里逐字一致
+# AMAP_MAPS_API_KEY=高德Web服务Key
+# WOLFRAM_APP_ID=WolframAppID
+# ZHIHU_ACCESS_SECRET=知乎开放平台访问密钥
 EOF
 chmod 600 .env
 ```
@@ -902,16 +964,21 @@ docker compose ps
 
 只有在服务器不方便装 Docker 时才用这条路。
 
-启用 Exa 搜索时，systemd 主机还需预先安装 Node 22，并在构建/部署阶段固定安装 MCP 包：
+启用任一 stdio MCP 能力时，systemd 主机还需预先安装 Node 22，并在构建/部署阶段固定安装
+对应的 MCP 包。只装你要启用的那些 —— 命令名必须与 `config.yaml` 里的 `command` 一致：
 
 ```bash
 node --version                    # 需为 v22.x
 sudo npm install --global --omit=dev --no-audit --no-fund exa-mcp-server@3.4.1
-command -v exa-mcp-server         # 应能找到配置中的 stdio 命令
+sudo npm install --global --omit=dev --no-audit --no-fund @amap/amap-maps-mcp-server@0.0.8
+sudo npm install --global --omit=dev --no-audit --no-fund wolfram-mcp@1.1.2
+command -v exa-mcp-server mcp-amap wolfram-mcp   # 应能找到配置中的三个 stdio 命令
 ```
 
+知乎**不需要**这一步：它只有远程 MCP-over-SSE，没有子进程。
+
 这是一次性的部署步骤；服务运行时不执行 `npx`、`npm install`，也不依赖 npm registry。
-若不启用 `mcp.enabled`，无需安装 Exa 或 Node。
+若不启用 `mcp.enabled`，无需安装任何 MCP 包或 Node。
 
 ```bash
 # 1) Python 3.12+（Ubuntu 22.04 自带 3.10，需要另装）
@@ -959,6 +1026,10 @@ EXA_API_KEY=Exa服务的Key
 # EXA_API_KEY_1=第一个Key
 # EXA_API_KEY_2=第二个Key
 # EXA_API_KEY_3=第三个Key
+# 三个新能力各自一个，只在启用对应能力时填；变量名必须与 config.yaml 里逐字一致
+# AMAP_MAPS_API_KEY=高德Web服务Key
+# WOLFRAM_APP_ID=WolframAppID
+# ZHIHU_ACCESS_SECRET=知乎开放平台访问密钥
 EOF
 sudo chmod 600 /etc/raricy-bot.env
 ```
@@ -1165,6 +1236,8 @@ docker compose logs --tail=200 bot | grep -E 'router\.route|sender\.send|app\.'
 - [ ] `config.yaml` 权限是 **644**，`.env` 权限是 **600**
 - [ ] `.env` 存在且 `chmod 600`，站点与模型三个必需密钥都非空，变量名未改
 - [ ] 若启用 `mcp.enabled`：`EXA_API_KEY` 已注入，且 `/search` 能完成一次摘要搜索；未启用时可保持为空
+- [ ] 若要启用 `zhihu`/`map`/`wolfram`：已按 §4.1.2 用 `tools/capture_mcp_fixture.py` 取过真实样本、
+      按样本校准过解析器、并确认对应密钥已注入；只启用其中一部分时其余保持 `enabled: false`
 - [ ] `docker compose ps` 显示 `(healthy)`，`RestartCount` 不再增长
 - [ ] `/readyz` 返回 `ready`
 - [ ] 大区里精确 @ 机器人能得到回复，且回复引用了原消息
@@ -1184,8 +1257,11 @@ docker compose logs --tail=200 bot | grep -E 'router\.route|sender\.send|app\.'
 
 - 不支持博客理解与通用工具调用。**长期记忆是默认关闭的 Beta 可选项**（灰度步骤、单副本约束、
   回退与备份见 §4.2.2）：开启后也只保存被模型整理成**条目**的内容，不是「记住整段对话」，
-  且不改变短上下文的规则（仍然只在内存、重启即空）。聊天区联网搜索是**默认关闭**的可选项，
-  仅 `/search <问题>` 触发 Exa 摘要查询；评论区不联网。图片理解是**可选项**：
+  且不改变短上下文的规则（仍然只在内存、重启即空）。聊天区 MCP 能力是**默认关闭**的可选项，
+  四条命令各只授权自己那一轮：`/search` 查 Exa、`/zhihu` 查知乎、`/map` 查高德、
+  `/wolfram` 算 Wolfram；一条消息最多带一个能力命令，叠加会被本地拒绝。
+  其中 `zhihu`/`map`/`wolfram` 三个在示例配置里默认关闭，启用前必须先取样校准（§4.1.2）。
+  评论区不联网。图片理解是**可选项**：
   `model.vision_enabled` 默认 `false`，开启后也只把当前轮那一张图取回内存交给模型
   （不落库、不写日志、不进历史），且要求模型本身支持视觉。
 - 对话上下文只存内存，**进程重启即清空**（去重、大区链归属与配额状态保留）。

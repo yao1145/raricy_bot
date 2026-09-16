@@ -95,7 +95,7 @@ CAPABILITIES: tuple[Capability, ...] = (
         usage_text=texts.MAP_USAGE_TEXT,
         unavailable_text=texts.MAP_UNAVAILABLE_TEXT,
         system_addendum=texts.MCP_TOOL_SYSTEM_ADDENDUM,
-        # 只白名单单调用可完成的三个工具（D-65）：周边搜索/逆地理编码/距离测量都需要
+        # 只白名单单调用可完成的三个工具（D-85）：周边搜索/逆地理编码/距离测量都需要
         # 「经度,纬度」，POI 详情需要上一轮返回的 POI ID，而单轮预算固定为 1，模型拿不到这些输入。
         allowed_tools=frozenset({"maps_geo", "maps_text_search", "maps_weather"}),
         max_bindings=3,

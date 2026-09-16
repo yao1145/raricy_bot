@@ -8,6 +8,10 @@
 #   # 多 Key 池（可选）：逐个显式导出，不要在命令行里拼接或打印
 #   export EXA_API_KEY_1=...
 #   export EXA_API_KEY_2=...
+#   # 以下三个只在启用对应能力时才需要；缺失只会停用那一个能力
+#   export AMAP_MAPS_API_KEY=... # /map
+#   export WOLFRAM_APP_ID=...    # /wolfram
+#   export ZHIHU_ACCESS_SECRET=...# /zhihu（先读 docs/usage/DEPLOYMENT.md 的取样一节）
 #   docker compose up -d
 services:
   bot:
@@ -31,6 +35,12 @@ services:
       EXA_API_KEY_1: ${EXA_API_KEY_1:-}
       EXA_API_KEY_2: ${EXA_API_KEY_2:-}
       EXA_API_KEY_3: ${EXA_API_KEY_3:-}
+      # 另三个 MCP 服务器的凭据。同样只透传给容器，再由配置里的 env_from / bearer_env
+      # 交给对应的子进程或 SSE 连接；变量名必须与 config.yaml 里写的**完全一致**。
+      # 留空只会让那一个能力判为不可用，不影响普通聊天与其它能力。
+      AMAP_MAPS_API_KEY: ${AMAP_MAPS_API_KEY:-}
+      WOLFRAM_APP_ID: ${WOLFRAM_APP_ID:-}
+      ZHIHU_ACCESS_SECRET: ${ZHIHU_ACCESS_SECRET:-}
     volumes:
       # 配置只读挂载；其中 storage.db_path 用默认的 ./data/bot.db 即可。
       - ./config.yaml:/app/config.yaml:ro
