@@ -1541,6 +1541,31 @@ URL，URL 里带 `key=`）；只打印变量名与「已设置/未设置」，�
 出现在日志、错误信息或 SQLite 里。启发式本来就是按「名字像密钥」拦的，`APP_ID` 属于这
 一类；漏掉它不是判断失误，是没人从这个角度看过。
 
+## D-90 `Store` 用线程锁串行化连接，不用 `asyncio.Lock`
+
+原文（INTERFACES §9 / `store.py` 模块注释）：单条 `sqlite3` 连接（`check_same_thread=False`）
++ `asyncio.Lock` 串行化，语句在 `asyncio.to_thread` 里执行。
+
+裁决：连接的串行化改由一把 `threading.Lock`（`_conn_lock`）承担，**由真正在用连接的
+那个工作线程持有**；`open`/`close` 的状态转换另用一把 `asyncio.Lock`（`_state_lock`）。
+
+理由：`asyncio.Lock` 在这个位置上有一个**取消语义漏洞**，而且它不是理论上的 ——
+2026-09-16 全量测试跑十次崩一次，`Windows fatal exception: access violation`，
+崩点在工作线程的 `conn.execute()`。
+
+机制：工作线程**无法被取消**。`asyncio.to_thread` 的 await 被取消时只让协程立刻抛
+`CancelledError`，`async with self._lock` 随即释放锁，而 worker 还停在 sqlite3 里；
+此时下一个操作（或 `close()`）拿到锁，在**另一个线程**上使用同一条连接 ——
+sqlite3 的未定义行为。最小复现在测试里（取消一次操作后第二个操作必须被挡住），
+不修时稳定抛 `sqlite3.InterfaceError: bad parameter or other API misuse`。
+
+为什么不是「在协程侧持锁 + 取消时等线程收尾」：那需要 `shield` 加 `uncancel` 的循环，
+而正确性仍然依赖每个调用点都记得这么做；把锁交给线程则一次写对、处处成立 ——
+连接的使用者和锁的持有者是同一个东西，取消与否都不影响。
+
+生产路径上够得着：关停、`/reset`、超时都会取消 worker 任务，而 `Store.close()`
+就在关停路径上。
+
 ## 附录：运行期裁决编号索引（补充裁决 A–H、控制器裁决 R1–R16）
 
 实现期在规划产物里另立了两套编号——`.superpowers/sdd/TASKS.md` 的「补充裁决 A–H」与

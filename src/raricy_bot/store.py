@@ -3,8 +3,11 @@
 只保存运行元数据：事件与水位、私聊频道、已发回复、发送尝试时间、冷却状态。
 **不保存**消息正文、模型输入输出、Cookie、密码或 API Key（§19.1 红线）。
 
-实现方式：单条 `sqlite3` 连接（`check_same_thread=False`）+ `asyncio.Lock` 串行化，
-具体语句在 `asyncio.to_thread` 里执行，避免阻塞事件循环。全部方法都是 async。
+实现方式：单条 `sqlite3` 连接（`check_same_thread=False`），具体语句在
+`asyncio.to_thread` 里执行，避免阻塞事件循环；串行化用一把**线程锁**，由真正在用
+连接的那个工作线程持有（`_conn_lock`）。不用 `asyncio.Lock` 串行化连接是有原因的：
+工作线程无法被取消，协程侧持锁时一次取消就会让锁在 worker 还停在 sqlite3 里时
+释放，两个线程随即并发使用同一条连接（未定义行为）。全部方法都是 async。
 时间一律是 `time.time()` 的 epoch 秒（REAL），不使用 datetime 字符串。
 """
 
@@ -12,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -491,25 +495,42 @@ class Store:
         self._dedupe_retention_seconds = dedupe_retention_seconds
         # 构造时不建连接：open() 里才落盘/建表。
         self._conn: sqlite3.Connection | None = None
-        self._lock = asyncio.Lock()
+        # 两把锁分工不同，缺一不可：
+        # `_state_lock` 是 asyncio 锁，管 open/close 的**状态转换**。两者都跨 await，
+        # 不串行化会出现「close 看到 None 提前返回、随后 open 又建了一条连接」的泄漏。
+        # `_conn_lock` 是线程锁，管连接的**使用**：连接是在工作线程里用的，而工作线程
+        # 无法被取消，所以这把锁必须由用它的那个线程持有到它结束 —— asyncio 锁做不到，
+        # 取消 await 会让它在 worker 还停在 sqlite3 里时就放锁（见 _execute）。
+        self._state_lock = asyncio.Lock()
+        self._conn_lock = threading.Lock()
 
     # --- 生命周期 -----------------------------------------------------------
 
     async def open(self) -> None:
         """建立连接并建表；可重复调用（幂等）。"""
-        async with self._lock:
+        async with self._state_lock:
             if self._conn is not None:
                 return
             self._conn = await asyncio.to_thread(self._connect)
 
     async def close(self) -> None:
         """关闭连接；可重复调用（幂等）。"""
-        async with self._lock:
+        async with self._state_lock:
             conn = self._conn
             self._conn = None
             if conn is None:
                 return
-            await asyncio.to_thread(conn.close)
+            await asyncio.to_thread(self._close_conn, conn)
+
+    def _close_conn(self, conn: sqlite3.Connection) -> None:
+        """在工作线程里关连接。
+
+        先取 `_conn_lock`：`self._conn` 已经在上面的协程里置空，所以排队中的操作
+        会在拿到锁后看到「连接已经不是当前这条」并拒绝执行，而正在执行的操作
+        会把这段临界区走完再放锁 —— close 因此永远不可能关上一条正在被使用的连接。
+        """
+        with self._conn_lock:
+            conn.close()
 
     def _connect(self) -> sqlite3.Connection:
         """在工作线程里建连接、设 PRAGMA 并建表。"""
@@ -532,12 +553,28 @@ class Store:
         return conn
 
     async def _execute(self, operation: Callable[[sqlite3.Connection], _T]) -> _T:
-        """在锁内把一次数据库操作丢进线程执行，保证单连接被串行使用。"""
-        async with self._lock:
-            conn = self._conn
-            if conn is None:
-                raise RuntimeError("Store 尚未 open()，无法执行操作")
-            return await asyncio.to_thread(operation, conn)
+        """把一次数据库操作丢进线程执行，保证单连接被串行使用。
+
+        串行化发生在**工作线程**里（`_conn_lock`），不在协程里：连接的使用者是线程，
+        而线程不能被取消。若在协程侧持锁，取消 await 会在 worker 还停在 sqlite3 里时
+        就放锁，下一个操作随即在另一个线程上并发使用同一条连接 —— sqlite3 的未定义
+        行为（实测抛 `InterfaceError: bad parameter or other API misuse`，在 Windows
+        上表现为访问冲突，直接把进程打死）。
+        """
+        conn = self._conn
+        if conn is None:
+            raise RuntimeError("Store 尚未 open()，无法执行操作")
+        return await asyncio.to_thread(self._run_locked, operation, conn)
+
+    def _run_locked(
+        self, operation: Callable[[sqlite3.Connection], _T], conn: sqlite3.Connection
+    ) -> _T:
+        """在工作线程里取锁并执行；锁由这个线程自己持有到操作结束。"""
+        with self._conn_lock:
+            if conn is not self._conn:
+                # 排队期间被 close() 了：连接要么已经关掉，要么正等着这条锁。
+                raise RuntimeError("Store 已关闭，无法执行操作")
+            return operation(conn)
 
     # --- 事件与水位（去重主键是 message_id，不是 event_id）------------------
 
