@@ -17,6 +17,12 @@ from typing import Any
 import yaml
 
 from . import texts
+from .capabilities import (
+    CAPABILITY_BY_FEATURE,
+    IMPLEMENTED_FEATURES,
+    SHAPE_SINGLE,
+    SOURCE_MCP,
+)
 
 # 默认配置文件路径；可被环境变量 BOT_CONFIG_PATH 覆盖。
 DEFAULT_CONFIG_PATH: str = "./config.yaml"
@@ -98,6 +104,13 @@ class McpServerConfig:
     env: dict[str, str] = field(default_factory=dict)
     # 非空时该服务器是多 Key 池（INTERFACES §22.4）；与 env_from 互斥。
     account_pool: McpAccountPoolConfig | None = None
+    # 以下三项只属于 transport="sse"（远程服务器，没有子进程）。
+    # `url` 是 SSE 端点；`bearer_env` 是**宿主环境变量名**，值是 Bearer 令牌。
+    url: str = ""
+    bearer_env: str = ""
+    # 长连接的读侧超时：站点 SSE 的既有教训是它绝不能继承普通请求超时，
+    # 否则任何安静期都会把连接掐断重连。SDK 默认 300s，显式写进配置。
+    stream_read_timeout_seconds: float = 300.0
 
 
 @dataclass(frozen=True)
@@ -699,7 +712,14 @@ def _comments(container: Mapping[str, Any]) -> CommentConfig:
 
 
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_SECRET_ENV_PARTS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "COOKIE")
+# 疑似秘密的环境变量名片段。`APP_ID` 是后补的：Wolfram 的 WOLFRAM_APP_ID 不含
+# KEY/TOKEN/SECRET 字样，却能通过 `env:` 明文写进 YAML —— 而 `env:` 的值从不会注册进
+# Redactor，写进去就是一个永远不会被脱敏的秘密。
+_SECRET_ENV_PARTS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "COOKIE", "APP_ID")
+
+# 传输方式。stdio = 启动子进程；sse = 连接远程 HTTP+SSE 端点（MCP 2024-11-05 传输）。
+TRANSPORT_STDIO = "stdio"
+TRANSPORT_SSE = "sse"
 
 
 def _mcp(container: Mapping[str, Any]) -> McpConfig:
@@ -731,12 +751,26 @@ def _mcp(container: Mapping[str, Any]) -> McpConfig:
         if not isinstance(raw_value, dict):
             raise ConfigError(f"配置 mcp.servers.{name} 必须是映射")
         server_enabled = _bool_flag(raw_value, "enabled", f"mcp.servers.{name}", True)
-        transport = raw_value.get("transport", "stdio")
-        if not isinstance(transport, str) or transport.strip().lower() != "stdio":
-            raise ConfigError(f"配置 mcp.servers.{name}.transport 首版必须是 stdio")
+        raw_transport = raw_value.get("transport", "stdio")
+        if not isinstance(raw_transport, str) or raw_transport.strip().lower() not in (
+            TRANSPORT_STDIO,
+            TRANSPORT_SSE,
+        ):
+            raise ConfigError(
+                f"配置 mcp.servers.{name}.transport 只能是 {TRANSPORT_STDIO} 或 {TRANSPORT_SSE}"
+            )
+        transport = raw_transport.strip().lower()
+        if transport == TRANSPORT_SSE:
+            servers[name] = _mcp_sse_server(
+                raw_value, name, server_enabled, raw_transport
+            )
+            continue
         command = raw_value.get("command")
         if not isinstance(command, str) or not command.strip():
             raise ConfigError(f"缺少必填配置 mcp.servers.{name}.command")
+        # stdio 服务器不得带 SSE 字段：两套连接方式并存时谁生效取决于实现细节，
+        # 直接拒绝，避免出现「以为在连远程、其实起的是子进程」的静默行为。
+        _reject_server_fields(raw_value, name, ("url", "bearer_env", "stream_read_timeout_seconds"))
         args = _mcp_args(raw_value.get("args", []), name)
         env_from = _mcp_env_map(raw_value.get("env_from", {}), name, allow_secret=True)
         env = _mcp_env_map(raw_value.get("env", {}), name, allow_secret=False)
@@ -749,7 +783,7 @@ def _mcp(container: Mapping[str, Any]) -> McpConfig:
         servers[name] = McpServerConfig(
             name=name,
             enabled=server_enabled,
-            transport="stdio",
+            transport=TRANSPORT_STDIO,
             command=command.strip(),
             args=args,
             env_from=env_from,
@@ -779,6 +813,54 @@ def _mcp(container: Mapping[str, Any]) -> McpConfig:
         reconnect_max_seconds=reconnect_max,
         servers=servers,
         features=features,
+    )
+
+
+def _reject_server_fields(
+    raw: Mapping[str, Any], name: str, forbidden: tuple[str, ...]
+) -> None:
+    """拒绝不属于当前传输的字段；出现即配置错误，不静默忽略。"""
+    for field in forbidden:
+        if field in raw:
+            raise ConfigError(
+                f"配置 mcp.servers.{name} 的 {field} 不适用于当前 transport"
+            )
+
+
+def _mcp_sse_server(
+    raw: Mapping[str, Any], name: str, enabled: bool, transport: str
+) -> McpServerConfig:
+    """解析远程 SSE 服务器：只保存环境变量名，不读也不存它的值。
+
+    `bearer_env` 是**宿主环境变量名**；值只在构造 Provider 时读取并登记进 Redactor，
+    与 `env_from` 是同一条「密钥不进 YAML」的红线。
+    """
+    # 远程服务器没有子进程，因此子进程字段一律非法。
+    _reject_server_fields(
+        raw,
+        name,
+        ("command", "args", "env", "env_from", "account_pool"),
+    )
+    url = raw.get("url")
+    if not isinstance(url, str) or not url.strip():
+        raise ConfigError(f"缺少必填配置 mcp.servers.{name}.url")
+    url = url.strip()
+    if not url.lower().startswith("https://"):
+        # Bearer 令牌会随每个请求发出，明文 http 等于把它交给链路上的任何人。
+        raise ConfigError(f"配置 mcp.servers.{name}.url 必须是 https 地址")
+    bearer_env = raw.get("bearer_env")
+    if not isinstance(bearer_env, str) or not _ENV_NAME_RE.match(bearer_env.strip()):
+        raise ConfigError(f"配置 mcp.servers.{name}.bearer_env 必须是合法的环境变量名")
+    stream_read_timeout = _positive_number(
+        raw, "stream_read_timeout_seconds", f"mcp.servers.{name}", 300.0
+    )
+    return McpServerConfig(
+        name=name,
+        enabled=enabled,
+        transport=TRANSPORT_SSE,
+        url=url,
+        bearer_env=bearer_env.strip(),
+        stream_read_timeout_seconds=stream_read_timeout,
     )
 
 
@@ -1134,16 +1216,37 @@ def _mcp_feature(
         seen.add(pair)
         bindings.append(McpBindingConfig(server=server, tool=tool))
 
-    if name == "search" and enabled and (
-        len(bindings) != 1 or bindings[0].tool != "web_search_exa"
-    ):
+    # 白名单与绑定上限取自能力表（capabilities.py）—— 命令解析、帮助文案和这里用的是
+    # 同一份声明，所以它们不可能各自漂移。未知 feature 名在这里就被拒绝：能力表是封闭的，
+    # 加第五个能力要加一行表，而不是在 YAML 里随手写一个名字。
+    spec = CAPABILITY_BY_FEATURE.get(name)
+    if spec is None or spec.source != SOURCE_MCP:
+        raise ConfigError(f"配置 mcp.features.{name} 不是已声明的 MCP 能力")
+    if enabled and name not in IMPLEMENTED_FEATURES:
+        # 没有适配器时 Registry 会走通用透传：把上游原文截断后直接交给模型。
+        # 那既不是评审过的清洗形态，也绕过了逐条 token 上限，所以宁可在启动时报错。
+        raise ConfigError(f"配置 mcp.features.{name} 的能力尚未实现，不能启用")
+    if enabled and not bindings:
+        raise ConfigError(f"配置 mcp.features.{name} 必须至少绑定一个工具")
+    for binding in bindings:
+        if binding.tool not in spec.allowed_tools:
+            raise ConfigError(
+                f"配置 mcp.features.{name} 不允许绑定工具：{binding.tool}"
+            )
+    if len(bindings) > spec.max_bindings:
         raise ConfigError(
-            "配置 mcp.features.search 首版必须只绑定一个 web_search_exa 工具"
+            f"配置 mcp.features.{name} 的绑定数量不能超过 {spec.max_bindings}"
         )
 
     result_count = _positive_int(container, "result_count", f"mcp.features.{name}", 5)
     if result_count > 5:
         raise ConfigError(f"配置 mcp.features.{name}.result_count 不能大于 5")
+    if spec.result_shape == SHAPE_SINGLE and result_count != 1:
+        # `single` 的能力本轮只产出一条答案，`result_count` 参与的是
+        # `result_count × result_item_token_limit` 这个整体上限，配成 5 就是 5 倍预算。
+        raise ConfigError(
+            f"配置 mcp.features.{name} 是整条答案型能力，result_count 必须为 1"
+        )
     item_limit = _positive_int(
         container, "result_item_token_limit", f"mcp.features.{name}", 3000
     )
@@ -1154,9 +1257,15 @@ def _mcp_feature(
         raise ConfigError(
             f"配置 mcp.features.{name}.history_item_token_limit 不能大于 result_item_token_limit"
         )
+    # 默认值取能力表给该能力的上限，而不是全局的 500：知乎上游只收 2..100 字符，
+    # 用 500 当默认会让每一个「看起来正常」的知乎配置在加载期就失败。
     max_query_chars = _positive_int(
-        container, "max_query_chars", f"mcp.features.{name}", 500
+        container, "max_query_chars", f"mcp.features.{name}", spec.max_query_chars
     )
+    if max_query_chars > spec.max_query_chars:
+        raise ConfigError(
+            f"配置 mcp.features.{name}.max_query_chars 不能大于 {spec.max_query_chars}"
+        )
     max_tool_calls = _positive_int(
         container, "max_tool_calls_per_turn", f"mcp.features.{name}", 1
     )

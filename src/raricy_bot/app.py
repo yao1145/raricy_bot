@@ -37,6 +37,7 @@ from typing import Any
 import httpx
 
 from . import texts
+from .capabilities import CAPABILITIES, Capability
 from .comments.quota import CommentQuotaGuard
 from .comments.router import CommentRouter
 from .comments.sender import CommentSender
@@ -63,8 +64,7 @@ from .core.worker import (
 )
 from .kb.service import KnowledgeService
 from .logging_setup import get_logger, log_event
-from .mcp.exa import ExaSearchAdapter, SearchLimiter
-from .mcp.registry import model_tool_name
+from .mcp.adapters import build_adapters
 from .mcp.runtime import McpManager
 from .memory.access import MemoryAccessPolicy
 from .memory.commands import MemoryCommandRequest
@@ -119,10 +119,10 @@ def _ref_source_texts(request: Request) -> tuple[str, str | None]:
     return request.user_text, None
 
 
-class SearchUnavailable(Exception):
-    """搜索授权前的本地能力门判否，并携带可判别的稳定原因码。
+class CapabilityUnavailable(Exception):
+    """能力授权前的本地门判否，并携带可判别的稳定原因码。
 
-    它不是 ``ModelError``：模型压根没被调用，且用户侧文案相同、只有原因不同。
+    它不是 ``ModelError``：模型压根没被调用，且用户侧文案按能力取自能力表、只有原因不同。
     用独立的异常类型可以让"我们自己的门"和"模型端点说它不支持 tools"
     在日志里各记一行、互不重复。
     """
@@ -337,25 +337,11 @@ class BotApp:
         self._shutdown_event = asyncio.Event()
 
     def _build_mcp_manager(self) -> McpManager:
-        """装配 Exa feature 适配器；Provider/Registry 本身保持通用。"""
-        feature = self._config.mcp.features.get("search")
-        adapters: dict[str, Any] = {}
-        if feature is not None:
-            limiter = SearchLimiter(feature.min_interval_seconds)
-            adapter = ExaSearchAdapter(
-                result_count=feature.result_count,
-                result_item_token_limit=feature.result_item_token_limit,
-                history_item_token_limit=feature.history_item_token_limit,
-                max_query_chars=feature.max_query_chars,
-                limiter=limiter,
-            )
-            for binding in feature.bindings:
-                if binding.tool == "web_search_exa":
-                    adapters[model_tool_name(binding.server, binding.tool)] = adapter.adapt
+        """装配各 feature 的适配器；Provider/Registry 本身保持通用。"""
         return McpManager(
             self._config.mcp,
             redactor=self._redactor,
-            adapters=adapters,
+            adapters=build_adapters(self._config.mcp),
         )
 
     # --- 生命周期 -----------------------------------------------------------
@@ -1127,14 +1113,20 @@ class BotApp:
             )
             if kb_text is not None:
                 pending = f"{pending}\n\n{kb_text}" if pending else kb_text
+            # 本轮唯一启用的 MCP 能力（D-39 保证至多一个）；本地能力（`/kb`）不走这条口子，
+            # 它在上面已经收口，取不到模型也不用再判一次。
+            capability = self._enabled_capability(request)
             system_addenda: list[str] = []
             if request.channel_kind == "lobby":
                 system_addenda.append(texts.LOBBY_SHARED_SYSTEM_ADDENDUM)
-            if "search" in request.enabled_features:
-                system_addenda.append(texts.MCP_SEARCH_SYSTEM_ADDENDUM)
-            elif "kb" in request.enabled_features:
-                # 与搜索说明互斥：一条消息里最多一种能力（D-39）。
+            if "kb" in request.enabled_features:
+                # 与 MCP 工具说明互斥：一条消息里最多一种能力（D-39）。
                 system_addenda.append(texts.KB_SYSTEM_ADDENDUM)
+            elif capability is not None:
+                # 四个 MCP 能力共用同一份「工具输出不可信」说明；按能力表取，同样只出现一次。
+                addendum = capability.system_addendum
+                if addendum is not None:
+                    system_addenda.append(addendum)
             # 记忆候选只在本轮作者可用时取（§34.3）；取失败传空元组继续，绝不打断聊天（D-60）。
             # 位置在 `/kb` 的本地收口之后：那些分支本来就不调模型，也就没有必要读记忆。
             supplemental: tuple[SupplementalItem, ...] = ()
@@ -1176,16 +1168,18 @@ class BotApp:
                 attach_image(messages, part)
             model = self._model
             if model is None:
-                if "search" in request.enabled_features:
-                    await self._send_search_unavailable(request, "model_missing")
+                if capability is not None:
+                    await self._send_capability_unavailable(
+                        request, capability, "model_missing"
+                    )
                 else:
                     await self._notify_failure(request)
                 return
             history_context: str | None = None
             try:
-                if "search" in request.enabled_features:
-                    text, history_context = await self._complete_search(
-                        model, messages, request
+                if capability is not None:
+                    text, history_context = await self._complete_capability(
+                        model, messages, request, capability
                     )
                 else:
                     async with self._model_gate:
@@ -1193,16 +1187,16 @@ class BotApp:
             except ToolGenerationCancelled:
                 # /reset 在工具循环的任一异步边界作废了本轮；不发通知、不写历史。
                 return
-            except SearchUnavailable as exc:
-                # 本地能力门判否；reason 已在 _complete_search 的判定点确定。
-                await self._send_search_unavailable(request, exc.reason)
+            except CapabilityUnavailable as exc:
+                # 本地能力门判否；reason 已在 _complete_capability 的判定点确定。
+                await self._send_capability_unavailable(request, capability, exc.reason)
                 return
             except ModelError as exc:
-                if "search" in request.enabled_features and exc.kind in {
+                if capability is not None and exc.kind in {
                     "tools_unavailable",
                     "tools_unsupported",
                 }:
-                    await self._send_search_unavailable(request, exc.kind)
+                    await self._send_capability_unavailable(request, capability, exc.kind)
                     return
                 log_event(
                     _logger,
@@ -1320,34 +1314,50 @@ class BotApp:
             parts.extend(reply.image_parts)
         return resolved.text, reply_text, tuple(parts)
 
-    async def _complete_search(
+    @staticmethod
+    def _enabled_capability(request: Request) -> Capability | None:
+        """本轮唯一启用的 MCP 能力；没有则 None。
+
+        D-39 保证一条消息里最多一个能力命令，所以这里按能力表顺序取第一个命中的即可 ——
+        顺序固定才让同一份请求在任何进程里都得到同一个答案。
+        """
+        for spec in CAPABILITIES:
+            if spec.source == "mcp" and spec.feature in request.enabled_features:
+                return spec
+        return None
+
+    async def _complete_capability(
         self,
         model: ModelClient,
         messages: list[dict[str, Any]],
         request: Request,
+        capability: Capability,
     ) -> tuple[str, str | None]:
-        """执行一轮显式搜索授权；MCP 调用不占用模型并发门。"""
+        """执行一轮显式能力授权；MCP 调用不占用模型并发门。"""
+        feature_name = capability.feature
         # 每道门都必须给出可判别的 reason：用户看到的都是同一句本地文案，
         # 没有 reason 时"总开关关了 / Provider 没起来 / 没发现工具 / 模型不认 tools"
         # 在日志里完全一样 —— 2026-09-14 的线上排查正是卡在这里。
         if not self._config.mcp.enabled:
-            raise SearchUnavailable("mcp_disabled")
+            raise CapabilityUnavailable("mcp_disabled")
         registry = self._mcp_manager.registry
-        if not registry.feature_available("search"):
-            raise SearchUnavailable("feature_unavailable")
+        if not registry.feature_available(feature_name):
+            raise CapabilityUnavailable("feature_unavailable")
         complete_with_tools = getattr(model, "complete_with_tools", None)
         if not callable(complete_with_tools):
-            raise SearchUnavailable("model_without_tools")
-        feature = self._config.mcp.features.get("search")
+            raise CapabilityUnavailable("model_without_tools")
+        # 配置校验只放行能力表里声明过的 feature，所以这里取不到就是「配置根本没写这个
+        # feature 段」，而不是名字写错 —— 名字写错在加载期就已经是 ConfigError。
+        feature = self._config.mcp.features.get(feature_name)
         if feature is None:
-            raise SearchUnavailable("feature_missing")
-        tools = tuple(registry.tools_for("search"))
+            raise CapabilityUnavailable("feature_missing")
+        tools = tuple(registry.tools_for(feature_name))
         if not tools:
-            raise SearchUnavailable("no_tools")
+            raise CapabilityUnavailable("no_tools")
 
         async def execute(call):
             return await registry.execute(
-                "search",
+                feature_name,
                 call,
                 generation_is_current=lambda: (
                     self._ctx.generation(request.session_key) == request.generation
@@ -1451,21 +1461,28 @@ class BotApp:
         )
         self._note_forbidden(outcome)
 
-    async def _send_search_unavailable(self, request: Request, reason: str) -> None:
-        """搜索显式授权但能力不可用时只发本地提示，并记下可判别的 reason。"""
+    async def _send_capability_unavailable(
+        self, request: Request, capability: Capability, reason: str
+    ) -> None:
+        """显式授权了能力但它不可用时只发本地提示，并记下可判别的 feature 与 reason。"""
+        # 只有本地能力没有这句文案，而它们在自己的代码路径上收口（如 `/kb`），不会到这里。
+        text = capability.unavailable_text
+        if text is None:
+            return
         if self._ctx.generation(request.session_key) != request.generation:
             return
         log_event(
             _logger,
             logging.INFO,
-            "app.search_unavailable",
+            "app.capability_unavailable",
             reason=reason,
+            feature=capability.feature,
             channel_id=request.channel_id,
             channel_kind=request.channel_kind,
         )
         outcome = await self._sender.send(
             request.channel_id,
-            texts.SEARCH_UNAVAILABLE_TEXT,
+            text,
             request.message.id,
             kind="notice_local",
             thread_root_id=request.thread_root_id,

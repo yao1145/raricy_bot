@@ -7,12 +7,13 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
-from ..config import McpConfig
+from ..config import TRANSPORT_SSE, McpConfig
 from ..logging_setup import get_logger, log_event
 from ..redact import Redactor
 from .contracts import McpProvider
 from .pool import ExaPooledProvider
 from .registry import InMemoryToolRegistry
+from .sse import SseMcpProvider
 from .stdio import MissingEnvironmentError, StdioMcpProvider
 
 _logger = get_logger("mcp.runtime")
@@ -68,7 +69,11 @@ class McpManager:
                 "connect_timeout_seconds": config.connect_timeout_seconds,
                 "call_timeout_seconds": config.call_timeout_seconds,
             }
-            if server.account_pool is None:
+            if server.transport == TRANSPORT_SSE:
+                # 远程服务器没有子进程：池（多 Key 轮换）与 `provider_factory` 都
+                # 只对 stdio 有意义，这里不接受它们的注入。
+                self.providers[name] = SseMcpProvider(server, **common)
+            elif server.account_pool is None:
                 self.providers[name] = provider_factory(server, **common)
             else:
                 self.providers[name] = pooled_provider_factory(

@@ -22,7 +22,8 @@ from .contracts import (
     ToolDefinition,
     ToolExecution,
 )
-from .exa import ExaNoResultsError, SearchLimiter
+from .adapter_kit import CapabilityLimiter
+from .contracts import McpNoResultsError
 
 _MODEL_NAME_RE = re.compile(r"[^A-Za-z0-9_-]")
 
@@ -213,7 +214,7 @@ class InMemoryToolRegistry:
         if provider is None or not provider.available:
             self._notify_provider_failure(definition.server_name, provider)
             return self._decline(
-                call, "search_unavailable", "tool_unavailable",
+                call, "tool_unavailable", "tool unavailable",
                 definition=definition, feature=feature_name,
             )
 
@@ -232,16 +233,16 @@ class InMemoryToolRegistry:
                 raw = await limiter.run(
                     call_provider, should_run=generation_is_current
                 )
-                if raw is SearchLimiter.SKIPPED:
+                if raw is CapabilityLimiter.SKIPPED:
                     # 生成已被 /reset 作废：正常竞态，不是故障。
                     return self._decline(
-                        call, "generation_cancelled", "search cancelled",
+                        call, "generation_cancelled", "capability cancelled",
                         definition=definition, feature=feature_name, level=logging.DEBUG,
                     )
             else:
                 if generation_is_current is not None and not generation_is_current():
                     return self._decline(
-                        call, "generation_cancelled", "search cancelled",
+                        call, "generation_cancelled", "capability cancelled",
                         definition=definition, feature=feature_name, level=logging.DEBUG,
                     )
                 raw = await call_provider()
@@ -249,7 +250,7 @@ class InMemoryToolRegistry:
             # 池在换槽位之前发现本轮已被 `/reset` 作废：正常竞态，不是故障，
             # 也不该触发「整个 Provider 不可用」的重连。
             return self._decline(
-                call, "generation_cancelled", "search cancelled",
+                call, "generation_cancelled", "capability cancelled",
                 definition=definition, feature=feature_name, level=logging.DEBUG,
             )
         except McpProviderUnavailable:
@@ -257,30 +258,30 @@ class InMemoryToolRegistry:
             # 冷却里），由池的后台恢复任务处理，因此**不**通知 Manager 重连整个
             # Provider——那会把还在冷却的槽位提前拉起，属于额外升级。
             return self._decline(
-                call, "search_unavailable", "tool_unavailable",
+                call, "tool_unavailable", "tool unavailable",
                 definition=definition, feature=feature_name,
             )
         except McpCallTimeoutError:
             self._notify_provider_failure(definition.server_name, provider)
             return self._decline(
-                call, "search_timeout", "search timed out",
+                call, "tool_timeout", "tool timed out",
                 definition=definition, feature=feature_name,
             )
         except Exception:
             self._notify_provider_failure(definition.server_name, provider)
             return self._decline(
-                call, "search_unavailable", "tool_unavailable",
+                call, "tool_unavailable", "tool unavailable",
                 definition=definition, feature=feature_name,
             )
         if _result_is_error(raw):
             return self._decline(
-                call, "search_unavailable", "tool unavailable",
+                call, "tool_unavailable", "tool unavailable",
                 definition=definition, feature=feature_name,
             )
         if adapter is not None:
             try:
                 execution = adapter(raw, call.call_id)
-            except ExaNoResultsError:
+            except McpNoResultsError:
                 return self._decline(
                     call, "no_results", "no results",
                     definition=definition, feature=feature_name,

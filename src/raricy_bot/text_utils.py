@@ -9,6 +9,7 @@ import math
 import string
 from typing import Any
 
+from .capabilities import CAPABILITY_COMMANDS
 from .texts import TRUNCATION_SUFFIX
 
 # 用户名合法字符：字母、数字、下划线与连字符（对应 chat-bot.md §2.1）。
@@ -147,15 +148,13 @@ def is_reset_command(text: str) -> bool:
 
 
 # 单轮能力命令：命令字面量 -> 写入 Request.enabled_features 的通用能力名。
-# 顺序即 Router 的判定顺序；两个命令互斥，一条消息里最多剥离一个（D-39）。
-_CAPABILITY_COMMANDS: tuple[tuple[str, str], ...] = (
-    ("/search", "search"),
-    ("/kb", "kb"),
-)
+# 真值源是 capabilities.CAPABILITIES，这里只做转写，不再各自维护一份。
+# 顺序即 Router 的判定顺序；所有命令互斥，一条消息里最多剥离一个（D-39）。
+_CAPABILITY_COMMANDS: tuple[tuple[str, str], ...] = CAPABILITY_COMMANDS
 
 
-def _parse_capability_command(text: str, command: str) -> str | None:
-    """解析开头的独立能力命令，返回去掉命令后的正文；不命中返回 None。
+def _match_capability_command(text: str, command: str) -> str | None:
+    """在 ``text`` 开头匹配 ``command``，返回去掉命令后的正文；不命中返回 None。
 
     命令只在消息开头生效，命令名与正文之间必须是空白或正文结束，
     因此 ``/searching``、``/kbase``、``/kb-x`` 都不会误触发。命令本身大小写不敏感。
@@ -171,24 +170,36 @@ def _parse_capability_command(text: str, command: str) -> str | None:
     return stripped[length:].strip()
 
 
+def parse_capability_command(text: str) -> tuple[str, str] | None:
+    """解析开头的独立能力命令，返回 ``(能力名, 去掉命令后的正文)``；不命中返回 None。
+
+    这是 Router 唯一的能力解析入口：命令集合、判定顺序都来自能力表，新增能力不必改这里。
+    """
+    for command, feature in _CAPABILITY_COMMANDS:
+        body = _match_capability_command(text, command)
+        if body is not None:
+            return feature, body
+    return None
+
+
 def parse_search_command(text: str) -> str | None:
     """解析开头的独立 /search，返回去掉命令后的正文。"""
-    return _parse_capability_command(text, "/search")
+    return _match_capability_command(text, "/search")
 
 
 def parse_kb_command(text: str) -> str | None:
     """解析开头的独立 /kb，返回去掉命令后的正文。"""
-    return _parse_capability_command(text, "/kb")
+    return _match_capability_command(text, "/kb")
 
 
 def leading_capability_command(text: str) -> str | None:
-    """正文开头若是独立的能力命令，返回其能力名（"search" / "kb"），否则 None。
+    """正文开头若是独立的能力命令，返回其能力名（"search" / "kb" / …），否则 None。
 
     只服务于「一条消息最多一个能力」的冲突判定：剥离一个前缀之后剩余正文若仍以
     能力命令开头，就说明用户想在一轮里叠加两种能力，Router 直接本地拒绝。
     """
     for command, feature in _CAPABILITY_COMMANDS:
-        if _parse_capability_command(text, command) is not None:
+        if _match_capability_command(text, command) is not None:
             return feature
     return None
 

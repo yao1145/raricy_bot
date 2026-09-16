@@ -85,4 +85,13 @@ class McpCallCancelled(Exception):
     """池或 Registry 在尝试前发现本轮已被作废；不得映射为故障。"""
 
 
+class McpNoResultsError(ValueError):
+    """上游返回了内容，但没有一条结果通过安全解析。
+
+    继承 ``ValueError`` 是为了让「没有结果」与「结果格式不认识」在 Registry 里能分开映射：
+    前者是 ``no_results``（上游确实没查到），后者是 ``invalid_result``（我们不敢用）。
+    适配器各自的名字（如 ``ExaNoResultsError``）都是它的别名。
+    """
+
+
 ToolExecutor = Callable[[ToolCall], Awaitable[ToolExecution]]

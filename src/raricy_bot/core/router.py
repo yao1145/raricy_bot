@@ -22,6 +22,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .. import texts
+from ..capabilities import CAPABILITY_BY_FEATURE
 from ..config import BehaviorConfig, StorageConfig
 from ..logging_setup import get_logger, log_event
 from ..memory.access import MemoryAccessPolicy
@@ -38,8 +39,7 @@ from ..text_utils import (
     has_media,
     is_help_command,
     leading_capability_command,
-    parse_kb_command,
-    parse_search_command,
+    parse_capability_command,
     is_reset_command,
     is_secret_probe,
     strip_bot_mention,
@@ -69,6 +69,11 @@ _ACTIONABLE_REASONS: frozenset[str] = frozenset(
         "too_long",
         "secret_probe",
         "kb_usage",
+        # 无参数的能力命令：reason 按能力名取，运维一眼看得出用户想用哪个能力。
+        "search_usage",
+        "zhihu_usage",
+        "map_usage",
+        "wolfram_usage",
         "capability_conflict",
         # 记忆命令的四个结果（§34.1）：都会入队或回一条本地文案，同样值得运维看见。
         # 它们只承载稳定短标识，不含命令名、命令参数或用户 ID（§37 的日志红线）。
@@ -135,6 +140,7 @@ class MessageRouter:
         memory_access: MemoryAccessPolicy | None = None,
         memory_queue: asyncio.Queue[MemoryCommandRequest] | None = None,
         private_enabled: Callable[[str | None], bool] | None = None,
+        capabilities: frozenset[str] = frozenset(),
     ) -> None:
         self._self_user_id = self_user_id
         self._bot_username = bot_username
@@ -154,6 +160,9 @@ class MessageRouter:
         # 只影响 /help 的措辞：由 app 接到 `MemoryService.private_settings_cached`（D-67），
         # 必须同步、无 I/O；未注入或取不到时按未开启处理。
         self._private_enabled = private_enabled
+        # 同样只影响 /help 说不说实话：能力没开时不得宣传对应命令。
+        # **不参与命令解析** —— 关闭的能力仍会被识别成本地不可用提示，与 /search 的既有行为一致。
+        self._capabilities = capabilities
         self._logger = _logger
 
     # --- 事件分派 -----------------------------------------------------------
@@ -345,29 +354,23 @@ class MessageRouter:
         # 9.1 解析单轮能力命令（D-39）。命令本身不是聊天正文，不进入模型；一条消息里
         # **最多剥离一个**前缀，剥离后若正文又以能力命令开头就本地拒绝 —— 用户只理解
         # 一套披露时，`/search /kb ...` 会同时把查询发给 Exa、把本地资料发给模型。
+        # 命令集合与用法文案都取自能力表（capabilities.py），这里不再有 per-能力 分支。
         enabled_features: frozenset[str] = frozenset()
         capability: str | None = None
-        search_text = parse_search_command(user_text)
-        if search_text is not None:
-            capability, user_text = "search", search_text
-        else:
-            kb_text = parse_kb_command(user_text)
-            if kb_text is not None:
-                capability, user_text = "kb", kb_text
+        parsed = parse_capability_command(user_text)
+        if parsed is not None:
+            capability, user_text = parsed
         if capability is not None:
             enabled_features = frozenset({capability})
             if not user_text:
+                spec = CAPABILITY_BY_FEATURE[capability]
                 return self._emit(
                     "reply_now",
-                    "kb_usage" if capability == "kb" else "empty",
+                    f"{capability}_usage",
                     channel_id=channel_id,
                     message_id=message.id,
                     reply_to=message.id,
-                    text=(
-                        texts.KB_USAGE_TEXT
-                        if capability == "kb"
-                        else texts.SEARCH_USAGE_TEXT
-                    ),
+                    text=spec.usage_text,
                     channel_kind=channel_kind,
                     thread_root_id=thread_root_id,
                     event_id=event_id,
@@ -554,11 +557,8 @@ class MessageRouter:
         而且一条消息里最多剥离一个前缀（D-39）。`/search /kb /reset` 会在 9.1 被
         判成能力冲突，这里也自然看不到 `/reset`。
         """
-        for parser in (parse_search_command, parse_kb_command):
-            inner = parser(user_text)
-            if inner is not None:
-                return inner
-        return user_text
+        parsed = parse_capability_command(user_text)
+        return user_text if parsed is None else parsed[1]
 
     def _help_text(self, channel_kind: str, user_id: str | None) -> str:
         """帮助文案（§34.1 第 3 条）：能力开关 × 当前作者的记忆状态，不夸大能力。
@@ -575,6 +575,7 @@ class MessageRouter:
             kb_enabled=self._kb_enabled,
             memory_allowed=memory_allowed,
             private_enabled=self._private_enabled_for(user_id),
+            capabilities=self._capabilities,
         )
 
     # --- 记忆命令（§34.1） ---------------------------------------------------

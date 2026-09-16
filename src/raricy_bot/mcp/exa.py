@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
-import time
-import urllib.parse
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from ..logging_setup import get_logger, log_event
 from ..text_utils import estimate_tokens
-from ..texts import TRUNCATION_SUFFIX
+from .adapter_kit import (
+    CapabilityLimiter,
+    clip_plain_tokens as _clip_plain_tokens,
+    text_blocks as _text_blocks,
+    truncate_tokens as _truncate_tokens,
+    valid_http_url as _valid_url,
+)
+from .contracts import McpNoResultsError
 
 _logger = get_logger("mcp.exa")
 
@@ -36,8 +40,8 @@ class ExaSearchOutput:
     results: tuple[ExaSearchResult, ...]
 
 
-class ExaNoResultsError(ValueError):
-    """Exa 返回了内容，但没有一个结果通过安全解析。"""
+# 保留这个名字：调用点与测试按它写，而语义由共享的 McpNoResultsError 定义。
+ExaNoResultsError = McpNoResultsError
 
 
 def parse_exa_result(
@@ -75,6 +79,21 @@ def parse_exa_result(
         content=content,
         history_context="\n".join(history),
         results=tuple(candidates),
+    )
+
+
+def build(feature: Any, limiter: CapabilityLimiter, *, tool: str) -> ExaSearchAdapter:
+    """按 feature 配置造一个 Exa 适配器（`mcp/adapters.py` 的工厂协议）。
+
+    Exa 只有一个绑定工具，`tool` 参数在这里不参与决策；保留它是为了让工厂协议对所有
+    provider 一致。
+    """
+    return ExaSearchAdapter(
+        result_count=feature.result_count,
+        result_item_token_limit=feature.result_item_token_limit,
+        history_item_token_limit=feature.history_item_token_limit,
+        max_query_chars=feature.max_query_chars,
+        limiter=limiter,
     )
 
 
@@ -146,61 +165,8 @@ class ExaSearchAdapter:
         )
 
 
-class SearchLimiter:
-    """全局串行且带最小间隔的搜索限流器。"""
-
-    SKIPPED = object()
-
-    def __init__(self, min_interval_seconds: float = 2.0, *, clock=None, sleep=None) -> None:
-        if min_interval_seconds <= 0:
-            raise ValueError("min_interval_seconds must be positive")
-        self.min_interval_seconds = float(min_interval_seconds)
-        self._clock = clock or time.monotonic
-        self._sleep = sleep or asyncio.sleep
-        self._lock = asyncio.Lock()
-        self._last_start: float | None = None
-
-    async def run(self, operation, *, should_run=None):
-        """等待间隔后执行 operation；取消等待不会推进上次调用时间。"""
-        async with self._lock:
-            if should_run is not None and not should_run():
-                return self.SKIPPED
-            now = self._clock()
-            if self._last_start is not None:
-                delay = self.min_interval_seconds - (now - self._last_start)
-                if delay > 0:
-                    await self._sleep(delay)
-            if should_run is not None and not should_run():
-                return self.SKIPPED
-            self._last_start = self._clock()
-            return await operation()
-
-
-def _text_blocks(result: Any) -> list[str]:
-    """只接受 MCP content 中的 text 块，不把任意对象直传模型。"""
-    if isinstance(result, dict):
-        if result.get("isError", result.get("is_error", False)):
-            raise ValueError("Exa MCP returned an error")
-    elif bool(getattr(result, "isError", getattr(result, "is_error", False))):
-        raise ValueError("Exa MCP returned an error")
-    content = getattr(result, "content", None)
-    if content is None and isinstance(result, dict):
-        content = result.get("content")
-    if not isinstance(content, list) or not content:
-        raise ValueError("invalid Exa MCP content")
-    blocks: list[str] = []
-    for item in content:
-        kind = getattr(item, "type", None)
-        text = getattr(item, "text", None)
-        if isinstance(item, dict):
-            kind, text = item.get("type"), item.get("text")
-        if kind != "text" or not isinstance(text, str):
-            raise ValueError("non-text Exa MCP content")
-        if text.strip():
-            blocks.append(text)
-    if not blocks:
-        raise ValueError("empty Exa MCP content")
-    return blocks
+# 沿用小写别名，既有调用点与测试不必改；实现与限流语义由 adapter_kit 定义。
+SearchLimiter = CapabilityLimiter
 
 
 _FIELD_RE = re.compile(r"(?im)^\s*(Title|URL|Highlights|Text|Published|Author)\s*:\s*(.*)$")
@@ -224,28 +190,6 @@ def _parse_block(block: str) -> ExaSearchResult | None:
     return ExaSearchResult(title=title[:512], url=url, snippet=snippet)
 
 
-def _valid_url(value: str) -> bool:
-    """仅允许无控制字符的 HTTP(S) URL。"""
-    if any(ord(ch) < 32 or ch.isspace() for ch in value):
-        return False
-    try:
-        parsed = urllib.parse.urlsplit(value)
-        # 访问 port 会主动校验端口是否为整数且在合法范围；hostname 则排除
-        # ``http://:`` 这类虽有 netloc、实际没有主机的伪 URL。
-        hostname = parsed.hostname
-        _ = parsed.port
-    except ValueError:
-        # urlsplit 对畸形 IPv6、端口等输入会直接抛出；这类结果应被丢弃，
-        # 不能让第三方返回内容把整个搜索轮次变成未分类异常。
-        return False
-    return (
-        parsed.scheme.lower() in {"http", "https"}
-        and bool(hostname)
-        and parsed.username is None
-        and parsed.password is None
-    )
-
-
 def _format_item(item: ExaSearchResult, limit: int) -> str:
     prefix = f"Title: {item.title}\nURL: {item.url}\nSnippet: "
     if estimate_tokens(prefix) >= limit:
@@ -264,34 +208,3 @@ def _format_history_item(item: ExaSearchResult, limit: int, index: int) -> str:
         item.snippet, max(1, limit - estimate_tokens(prefix)), limit, prefix
     )
     return _clip_plain_tokens(value, limit)
-
-
-def _truncate_tokens(text: str, budget: int, total_limit: int, prefix: str) -> str:
-    """按现有 token 估算截断摘要，截断提示计入总上限。"""
-    if estimate_tokens(prefix + text) <= total_limit:
-        return text
-    suffix = TRUNCATION_SUFFIX.strip()
-    available = max(0, budget - estimate_tokens(suffix))
-    low, high = 0, len(text)
-    while low < high:
-        middle = (low + high + 1) // 2
-        if estimate_tokens(text[:middle]) <= available:
-            low = middle
-        else:
-            high = middle - 1
-    clipped = text[:low].rstrip()
-    return f"{clipped}{TRUNCATION_SUFFIX}" if clipped else suffix[: max(1, available)]
-
-
-def _clip_plain_tokens(text: str, limit: int) -> str:
-    """为整体硬上限提供一个不依赖 tokenizer 的保守裁剪。"""
-    if estimate_tokens(text) <= limit:
-        return text
-    low, high = 0, len(text)
-    while low < high:
-        middle = (low + high + 1) // 2
-        if estimate_tokens(text[:middle]) <= limit:
-            low = middle
-        else:
-            high = middle - 1
-    return text[:low].rstrip()
