@@ -4,7 +4,7 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 状态 | 产品行为已确认，待实现 |
+| 状态 | 已实施（本文 §15 六项任务全部完成，验证结果见下） |
 | 日期 | 2026-09-17 |
 | 目标 | 保留现有大区公开回复链，同时把机器人被唤起前的近期大区消息作为一次性上下文交给模型 |
 | 上游约束 | `docs/materials/chat-bot.md` 只读且优先级最高；本功能不增加站点 API |
@@ -14,6 +14,22 @@
 本文前半部分用较短篇幅定义设计思路、项目架构和用户可见行为；后半部分给出接口、算法、
 文件级改动、任务顺序和验收标准。实现前应以本文同步更新 `INTERFACES.md` 与
 `DESIGN_DECISIONS.md`，不能只改代码而留下互相矛盾的合同。
+
+**落地结果**（2026-09-17）：
+
+| 任务 | 落点 |
+| --- | --- |
+| 1 契约与文案 | `INTERFACES.md` §38（含 §38.4 故障与日志）、`DESIGN_DECISIONS.md` D-95、`SYSTEM_PROMPTS.md`、`texts.py` |
+| 2 独立缓冲 | `core/lobby_context.py`、`tests/test_lobby_context.py` |
+| 3 路由接入 | `core/router.py` 第 0 步与快照、`app.py` 持有缓冲、`tests/test_router.py` |
+| 4 预算内组装 | `core/context.py` 的 `transient_user_items` 通道、`app.py` 的回复前缀前移、`tests/test_context.py`、`tests/test_app.py` |
+| 5 帮助与使用文档 | `texts.py`、`docs/usage/USAGE.md` §2/§8、`docs/usage/DEPLOYMENT.md` |
+| 6 安全审计与回归 | `tests/test_logging_safety.py` 六条用例；§14.5 四条命令全部零 warning 通过，全量 2268 passed |
+
+实施期间的两处偏离，均已同步回 `INTERFACES.md`：`vision.attach_image()` 的调用时机说明改成
+「在 `build_messages()` 之后」（原先绑在已删除的 `_apply_reply_prefix` 上）；近期块的分隔符
+（与记忆块之间 `\n\n`、与当前正文之间 `\n\n---\n`）计入预算，这一点原先只在 §7 里隐含。
+
 
 ---
 

@@ -39,11 +39,17 @@ def speaker_wrapper(username: str, text: str) -> str:
     正文**原样保留**：它本来就是不可信数据，转义与否都不改变这一点，
     而原样保留更利于模型理解上下文。
     """
-    return f"[站点发言者：@{_sanitize_username(username)}]\n---\n{text}"
+    return f"[站点发言者：@{sanitize_username(username)}]\n---\n{text}"
 
 
-def _sanitize_username(username: str) -> str:
-    """把控制字符替换为空格。"""
+def sanitize_username(username: str) -> str:
+    """把用户名里的控制字符替换为空格。
+
+    单独导出是因为大区近期消息（`core/lobby_context.py`）也要用**同一条**规则：
+    那个块的每条消息前面同样有一个站点发言者标签，只是形状不由 `speaker_wrapper`
+    决定（§5.2 的版面没有 `---` 分隔行）。清洗规则只能有一份实现 —— 两处一旦分叉，
+    用户名就能在其中一个出口伪造出额外的行。
+    """
     return "".join(" " if ord(ch) < 32 or ord(ch) == 127 else ch for ch in username)
 
 
@@ -130,6 +136,15 @@ def _render_supplemental_block(items: Sequence[SupplementalItem]) -> str:
     return _BLOCK_SEPARATOR.join(blocks)
 
 
+def _render_transient_block(header: str, items: Sequence[str]) -> str:
+    """把选中的单轮临时条目渲染成注入用的文本块（LOBBY_RECENT_CONTEXT_DESIGN §7.1）。
+
+    形如：块头行 + 空行 + 逐条正文（条与条之间一个空行）。块头是静态常量（D-24），
+    条目本身由调用方渲染好，这里不再加工 —— 尤其不解析、不展开其中的任何标记。
+    """
+    return f"{header}{_BLOCK_SEPARATOR}{_BLOCK_SEPARATOR.join(items)}"
+
+
 def _exceeds_group_caps(
     items: Sequence[SupplementalItem], caps: tuple[SupplementalCap, ...]
 ) -> bool:
@@ -208,6 +223,8 @@ class ContextManager:
         feature_context: bool = False,
         supplemental_items: tuple[SupplementalItem, ...] = (),
         supplemental_caps: tuple[SupplementalCap, ...] = (),
+        transient_user_items: tuple[str, ...] = (),
+        transient_user_header: str | None = None,
     ) -> list[dict[str, str]]:
         """拼装模型消息：第一条 system，其后是裁剪后的历史，最后是本轮未提交的用户内容。
 
@@ -231,7 +248,24 @@ class ContextManager:
         同一份预算的分组）的**渲染后**大小，超了就跳过该条目——条目仍然不可拆分，绝不截半句。
         它与整轮预算（`max_input_tokens`）是两道独立的门，都满足才选入；传空元组时行为与
         没有这个参数完全一致（`supplemental_items=()` 的逐字节一致不受影响）。
+
+        `transient_user_items` / `transient_user_header` 是**只属于当前轮**的临时条目
+        （大区近期公开消息，§38.3）：入参顺序已经是旧到新，调用方负责渲染逐条文本，
+        本模块不认识它们的类型，也不 import `lobby_context.py`（通用上下文模块不反向依赖
+        具体频道 DTO，与 D-61 同源）。两个参数必须同时为空或同时非空，否则抛 `ValueError`。
+        选中的条目按**最新连续后缀**扩展（装不下下一条更老的就停，不跳洞），渲染成
+        `块头 + 空行 + 条目...` 的一整块，拼在末尾那条 user 消息里、记忆块之后、
+        当前正文之前。它们**不**触发 `MEMORY_SYSTEM_ADDENDUM`（近期公开消息不是记忆），
+        也**绝不**写进 `_sessions`。
         """
+        has_transient = bool(transient_user_items)
+        if has_transient != bool(transient_user_header):
+            # 只给块头不给条目（或反过来）是调用方写错了。静默吞掉会让「为什么模型没看到
+            # 近期消息」变成一个查不出来的问题。
+            raise ValueError(
+                "transient_user_items 与 transient_user_header 必须同时为空或同时非空"
+            )
+
         system = system_prompt
         system_tokens = estimate_tokens(system_prompt)
         if system_addendum:
@@ -251,9 +285,10 @@ class ContextManager:
                 > self._max_input_tokens
             )
 
-        block = ""
-        if supplemental_items:
-            history, block = self._plan_supplemental(
+        head = ""
+        memory_selected = False
+        if supplemental_items or has_transient:
+            history, head, memory_selected = self._plan_turn(
                 history,
                 base_tokens,
                 feature_context,
@@ -262,6 +297,8 @@ class ContextManager:
                 # 分隔符也占预算；没有正文时资料自成一条 user 消息，不存在分隔符。
                 has_pending_body=pending_user is not None,
                 caps=supplemental_caps,
+                transient_items=transient_user_items,
+                transient_header=transient_user_header,
             )
         elif feature_context:
             # 硬上限：历史整对丢到一条不剩也要让本轮内容装进去（D-38）。
@@ -272,23 +309,24 @@ class ContextManager:
             while len(history) > 2 and over_budget():
                 del history[:2]
 
-        if block:
-            # 只有确实选入至少一条资料时才追加：零条选中时 system 与改动前逐字节一致。
-            # 追加方式与 system_addendum 相同，且与它一样单独计入预算（在 _plan_supplemental 里）。
+        if memory_selected:
+            # 只有确实选入至少一条**记忆**时才追加：零条选中时 system 与改动前逐字节一致。
+            # 近期块刻意不走这条路（§11.2）：大区公开消息不是记忆，给它挂这条说明是错的。
+            # 追加方式与 system_addendum 相同，且与它一样单独计入预算（在 _plan_turn 里）。
             system = f"{system}\n\n{MEMORY_SYSTEM_ADDENDUM}"
 
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend({"role": turn.role, "content": turn.content} for turn in history)
         if pending_user is not None:
-            content = f"{block}{_BODY_SEPARATOR}{pending_user}" if block else pending_user
+            content = f"{head}{_BODY_SEPARATOR}{pending_user}" if head else pending_user
             messages.append({"role": "user", "content": content})
-        elif block:
+        elif head:
             # 没有本轮正文可挂时（调用方只传了资料），资料自己成为末尾那条 user 消息：
             # 它必须留在 role="user" 里，又不能改写历史。
-            messages.append({"role": "user", "content": block})
+            messages.append({"role": "user", "content": head})
         return messages
 
-    def _plan_supplemental(
+    def _plan_turn(
         self,
         history: list[Turn],
         base_tokens: int,
@@ -297,24 +335,34 @@ class ContextManager:
         *,
         has_pending_body: bool,
         caps: tuple[SupplementalCap, ...] = (),
-    ) -> tuple[list[Turn], str]:
-        """按规划 §6.2 的次序决定「留哪些历史、选哪些资料」，返回 (保留的历史, 资料块)。
+        transient_items: tuple[str, ...] = (),
+        transient_header: str | None = None,
+    ) -> tuple[list[Turn], str, bool]:
+        """按规划 §6.2 的次序决定「留哪些历史、选哪些块」，返回 (历史, 前置块, 有无记忆)。
 
-        前提：`items` 非空。返回空串表示一条都没选入 —— 此时调用方必须**不**追加
-        `MEMORY_SYSTEM_ADDENDUM`，输出与没有补充资料时逐字节一致。
+        前置块的组装次序是「近期块 → 记忆块」，整个块再与 `pending_user` 用 `_BODY_SEPARATOR`
+        连接成末尾那一条 user 消息（§38.3）。第三项只表示**记忆**是否入选：`system` 要不要追加
+        `MEMORY_SYSTEM_ADDENDUM` 由它决定，近期块不参与。
 
-        预算的分配次序：
+        前提：`items` 与 `transient_items` 不同时为空。返回的前置块为空串表示两个块一条都没选入
+        —— 此时调用方必须**不**追加 `MEMORY_SYSTEM_ADDENDUM`，输出与没有这两个参数时逐字节一致。
+
+        预算的分配次序（§7.2 与 §11.3）：
         1. system、静态 addendum 与本轮 `pending_user` 已经算进 `base_tokens`，不会动它们
            —— 因此 `/kb` 与引用的博客正文（它们就在 `pending_user` 里）天然优先于全部资料。
         2. 普通聊天先锁定最近一组完整历史（规则 3）；能力轮次不锁定，历史可以被资料挤光
            （D-38 的硬上限不变）。
-        3. 资料按 `priority` 从小到大逐条尝试，装不下就跳过该条并继续试后面的（规则 4）；
+        3. 记忆资料按 `priority` 从小到大逐条尝试，装不下就跳过该条并继续试后面的（规则 4）；
            `caps` 里的分组上限用同一套取舍逻辑（先渲染再估）叠加在整轮预算之上。
-        4. 剩下的预算从新到旧补更早的完整历史对（规则 6）。
+        4. 近期消息在最后一组链历史**之后**、更早的历史对**之前**：从最新向旧选出连续后缀。
+        5. 剩下的预算从新到旧补更早的完整历史对（规则 6）。
 
-        `has_pending_body` 表示资料块会拼在本轮正文之前：组装体是
-        `block + _BODY_SEPARATOR + pending_user`，分隔符同样是外送内容，选中资料后必须一并
+        `has_pending_body` 表示前置块会拼在本轮正文之前：组装体是
+        `块 + _BODY_SEPARATOR + pending_user`，分隔符同样是外送内容，选中任一块后必须一并
         计入已用预算，否则后面的历史对会把它顶穿（D-38 的硬上限）。
+
+        两个块都在 `pending_user` 之前，因此**永远挤不掉** system 与本轮正文 —— 挤不下的
+        只会是块自己（近期块可以为零条）与更早的历史。
         """
         used = base_tokens
         keep_start = len(history)
@@ -340,16 +388,41 @@ class ContextManager:
                 continue
             selected = candidate
 
-        block = ""
+        memory_block = ""
         if selected:
-            block = _render_supplemental_block(selected)
-            used += estimate_tokens(block) + addendum_tokens
+            memory_block = _render_supplemental_block(selected)
+            used += estimate_tokens(memory_block) + addendum_tokens
             if has_pending_body:
-                # 组装体是 `block + _BODY_SEPARATOR + pending_user`：分隔符同样是外送内容。
+                # 组装体是 `块 + _BODY_SEPARATOR + pending_user`：分隔符同样是外送内容。
                 # 零条选中时不加这一笔，那一路要回退到改动前的输出（逐字节一致）。
                 used += estimate_tokens(_BODY_SEPARATOR)
 
-        # 规则 6：剩余预算从新到旧补更早的完整历史对。整对不可拆、也不跳着补，
+        # 规则 4：近期消息从最新向旧扩展**连续后缀**。装不下下一条更老的就停，不跳洞 ——
+        # 模型看到的因此始终是真正的「最近一段」，不会出现时间线中间缺一条的伪上下文。
+        # 块头与条目一起变，所以每次都整块重渲染：估算口径与最终交出去的文本永远一致
+        # （与 `_exceeds_group_caps` 的「先渲染再估」同源）。条数上限是 50，重算的代价可以忽略。
+        transient_block = ""
+        if transient_items:
+            # 选中至少一条时才会出现的那一个分隔符：后面接记忆块，或直接接当前正文。
+            tail = (
+                _BLOCK_SEPARATOR
+                if memory_block
+                else (_BODY_SEPARATOR if has_pending_body else "")
+            )
+            tail_tokens = estimate_tokens(tail)
+            for start in range(len(transient_items) - 1, -1, -1):
+                candidate = _render_transient_block(transient_header or "", transient_items[start:])
+                if used + estimate_tokens(candidate) + tail_tokens > self._max_input_tokens:
+                    break
+                transient_block = candidate
+            if transient_block:
+                used += estimate_tokens(transient_block) + tail_tokens
+
+        head = _BLOCK_SEPARATOR.join(
+            part for part in (transient_block, memory_block) if part
+        )
+
+        # 规则 5：剩余预算从新到旧补更早的完整历史对。整对不可拆、也不跳着补，
         # 因此只要有一对装不下就停 —— 保留的历史始终是连续的一段后缀，与旧行为一致。
         while keep_start >= 2:
             pair = history[keep_start - 2 : keep_start]
@@ -359,7 +432,7 @@ class ContextManager:
             used += cost
             keep_start -= 2
 
-        return history[keep_start:], block
+        return history[keep_start:], head, bool(selected)
 
     def session_count(self) -> int:
         """当前有历史的会话数。"""

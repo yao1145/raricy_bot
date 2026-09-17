@@ -11,6 +11,11 @@
 不碰 Markdown、不调 AI、不让任何记忆正文流进 `Request` 或模型消息。三个记忆参数
 （`memory_access` / `memory_queue` / `private_enabled`）都不注入时整条记忆路径不存在，
 行为与升级前逐字节一致（D-60 的回退路径），此时 `Request.memory_allowed` 恒为 `False`。
+
+大区近期消息（INTERFACES.md §38、D-95）是这一层的第二件新职责：**每条**大区消息
+（包括机器人自己的公开回复与未 `@` 的普通消息）在进入任何过滤之前先交给缓冲器观察，
+但只有真正构造出 `Request` 且成功入队时才消费那一批。本地回复、被忽略的消息与队列满
+都不消费，因此不需要为它们各写一次清理。缓冲器不注入时这条路径整体不存在。
 """
 
 from __future__ import annotations
@@ -45,6 +50,7 @@ from ..text_utils import (
     strip_bot_mention,
 )
 from .context import ContextManager, dm_session_key, lobby_thread_session_key
+from .lobby_context import LobbyRecentContextBuffer, LobbyRecentMessage
 
 _logger = get_logger("core.router")
 
@@ -102,6 +108,9 @@ class Request:
     # 当前作者是否可用共同记忆（§34.1 第 2 条）：由 Router 用 `message.author.id` 算出。
     # 记忆未注入或门禁关闭时恒为 `False`，worker 据此决定要不要取记忆上下文（§34.3）。
     memory_allowed: bool = False
+    # 这条消息被唤起之前积累的大区公开消息（§38.2），入队那一刻固化；**私聊恒为空元组**。
+    # 用不可变 tuple 而不是引用：请求进了队列之后，缓冲器还可以继续被 SSE 改动。
+    lobby_recent: tuple[LobbyRecentMessage, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -141,6 +150,7 @@ class MessageRouter:
         memory_queue: asyncio.Queue[MemoryCommandRequest] | None = None,
         private_enabled: Callable[[str | None], bool] | None = None,
         capabilities: frozenset[str] = frozenset(),
+        lobby_recent: LobbyRecentContextBuffer | None = None,
     ) -> None:
         self._self_user_id = self_user_id
         self._bot_username = bot_username
@@ -163,6 +173,9 @@ class MessageRouter:
         # 同样只影响 /help 说不说实话：能力没开时不得宣传对应命令。
         # **不参与命令解析** —— 关闭的能力仍会被识别成本地不可用提示，与 /search 的既有行为一致。
         self._capabilities = capabilities
+        # 大区近期消息缓冲（§38）：注入与否就是这条路径的总开关，与记忆同款。
+        # 它是**外部持有**的实例（app 装配），不是模块全局 —— 测试之间不共享状态。
+        self._lobby_recent = lobby_recent
         self._logger = _logger
 
     # --- 事件分派 -----------------------------------------------------------
@@ -218,6 +231,14 @@ class MessageRouter:
     ) -> RouteResult:
         """消息的判定顺序（§12）；`record_event` 在第 6 步才调用（D-15）。"""
         is_lobby = channel_id == LOBBY
+
+        # 0. 大区近期消息观察（§38.2）。**必须排在所有过滤之前**：机器人自己的公开回复
+        #    也要被看见，未 @ 的普通消息也要被看见，而 observe() 自己负责文本准入
+        #    （图片、拍一拍、已删除、空正文）。它是同步纯内存操作，放在最前面不会产生
+        #    「哪条消息绕过去了」的空档。私聊不观察：那是一对一的私有频道。
+        trigger_sequence: int | None = None
+        if is_lobby:
+            trigger_sequence = self._observe_lobby_message(message)
 
         # 1. 私聊频道登记（大区不登记）。
         if not is_lobby:
@@ -507,6 +528,9 @@ class MessageRouter:
             )
 
         # 10. 入队交给 worker；队列满则回 busy。
+        # 近期消息快照必须先取、再入队、入队成功后丢弃（§38.2）。三步之间没有 await，
+        # 因此同一事件循环里不会被 SSE 回调或 resync 任务插进来 —— 快照与删除边界一致。
+        lobby_recent = self._peek_lobby_recent(trigger_sequence)
         request = Request(
             event_id=event_id,
             channel_id=channel_id,
@@ -521,10 +545,13 @@ class MessageRouter:
             thread_root_id=thread_root_id,
             enabled_features=enabled_features,
             memory_allowed=self._memory_allowed(message.author.id),
+            lobby_recent=lobby_recent,
         )
         try:
             self._queue.put_nowait(request)
         except asyncio.QueueFull:
+            # 队列满 = 没有模型请求入队 = 这一批不算消费：一条都不删，
+            # 留给下一次真正跑起来的唤起（设计 §13.2）。
             return self._emit(
                 "busy",
                 "queue_full",
@@ -537,6 +564,10 @@ class MessageRouter:
                 thread_root_id=thread_root_id,
                 event_id=event_id,
             )
+        # 请求已经躺在队列里了，这一刻才算消费：连同触发消息自己一起越过边界。
+        # 之后模型失败、额度拒绝、发送失败、代次失效或进程退出都不回滚（D-95 第 2 条）。
+        if trigger_sequence is not None and self._lobby_recent is not None:
+            self._lobby_recent.discard_through(trigger_sequence)
         return self._emit(
             "queued",
             queued_reason if queued_reason is not None else "queued",
@@ -548,6 +579,52 @@ class MessageRouter:
             thread_root_id=thread_root_id,
             event_id=event_id,
         )
+
+    # --- 大区近期消息（§38） -------------------------------------------------
+
+    def _observe_lobby_message(self, message: ChatMessage) -> int | None:
+        """把一条大区消息交给近期消息缓冲，返回它这一轮的消费边界序号。
+
+        未注入缓冲器时返回 `None`：整条路径不存在，行为与升级前逐字节一致。
+        缓冲器只保存文本副本，一次失败不该影响任何一条消息的判定，因此异常在这里收口 ——
+        丢了这一条顶多少一点背景，绝不能让一条正常消息因为旁观上下文而出错。
+        """
+        buffer = self._lobby_recent
+        if buffer is None:
+            return None
+        try:
+            return buffer.observe(message)
+        except Exception as exc:
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "router.lobby_observe_failed",
+                channel_id=LOBBY,
+                message_id=message.id,
+                error=type(exc).__name__,
+            )
+            return None
+
+    def _peek_lobby_recent(self, trigger_sequence: int | None) -> tuple[LobbyRecentMessage, ...]:
+        """取触发消息之前的近期消息快照；未启用或取不到边界时返回空元组。
+
+        与 `_observe_lobby_message` 同样吞异常：这里返回空元组只是这一轮少一点背景，
+        而让异常穿过会连累一条本来能正常回复的消息。
+        """
+        buffer = self._lobby_recent
+        if buffer is None or trigger_sequence is None:
+            return ()
+        try:
+            return buffer.peek_before(trigger_sequence)
+        except Exception as exc:  # pragma: no cover - 纯内存遍历，理论上不会失败
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "router.lobby_peek_failed",
+                channel_id=LOBBY,
+                error=type(exc).__name__,
+            )
+            return ()
 
     @staticmethod
     def _inner_text(user_text: str) -> str:

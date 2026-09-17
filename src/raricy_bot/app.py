@@ -52,6 +52,7 @@ from .core.context import (
     lobby_thread_session_key,
     speaker_wrapper,
 )
+from .core.lobby_context import LobbyRecentContextBuffer, render_lobby_recent
 from .core.router import MessageRouter, Request, RouteResult
 from .core.sender import MessageSender, SendResult
 from .core.vision import ImageLoader, attach_image, with_image_marker
@@ -247,6 +248,10 @@ class BotApp:
         self._ctx = ContextManager(
             config.behavior.context_turns, config.behavior.context_input_tokens
         )
+        # 大区近期消息缓冲（§38.1）：纯内存对象，构造它不做任何 I/O，也没有开关 ——
+        # 容量 50 / 正文 500 字是本功能的固定合同。全进程只有这一个实例，
+        # `start()` 把它注入路由器；不做模块全局，测试之间因此不会串状态。
+        self._lobby_recent = LobbyRecentContextBuffer()
         # 聊天和评论共用同一模型门；评论 worker 仍保持自身 concurrency=1。
         self._model_gate = asyncio.Semaphore(config.behavior.concurrency)
         self._quota = QuotaGuard(self._store, config.behavior)
@@ -405,6 +410,7 @@ class BotApp:
             memory_access=self._memory_access if memory_on else None,
             memory_queue=self._memory_queue if memory_on else None,
             private_enabled=self._memory_private_enabled if memory_on else None,
+            lobby_recent=self._lobby_recent,
         )
         # MCP 是可选扩展：任何连接、发现或子进程错误只让对应 feature 不可用，
         # 不得阻止普通聊天、评论或健康端点启动。
@@ -1119,6 +1125,15 @@ class BotApp:
             )
             if kb_text is not None:
                 pending = f"{pending}\n\n{kb_text}" if pending else kb_text
+            # 直接引用（D-7）在**这里**就拼进本轮正文，而不是等 `build_messages` 之后再改
+            # 最后一条消息（§11.1）：它同样是外送内容，必须参与这一轮的 token 预算，
+            # 否则引用正文会把预算顶穿，而模型看到的顺序也会与规划的不一致。
+            reply_prefix = self._reply_prefix(
+                request, reply_body=reply_text, reply_image_state=reply_image_state
+            )
+            if reply_prefix:
+                # 与改动前逐字节一致：引用块与当前正文之间仍是 `\n---\n`。
+                pending = f"{reply_prefix}\n---\n{pending}"
             # 本轮唯一启用的 MCP 能力（D-39 保证至多一个）；本地能力（`/kb`）不走这条口子，
             # 它在上面已经收口，取不到模型也不用再判一次。
             capability = self._enabled_capability(request)
@@ -1138,6 +1153,9 @@ class BotApp:
             supplemental: tuple[SupplementalItem, ...] = ()
             if request.memory_allowed:
                 supplemental = await self._memory_context_items(request)
+            # 大区近期公开消息（§38.3）在这里渲染成逐条字符串：`ContextManager` 不认识
+            # `LobbyRecentMessage`，只负责预算与拼装。DM 的 `lobby_recent` 恒为空元组，
+            # 两个参数保持「同时为空」，整条路径与升级前逐字节一致。
             messages = self._ctx.build_messages(
                 request.session_key,
                 self._config.system_prompt,
@@ -1153,14 +1171,15 @@ class BotApp:
                 # §26.1 的两个 token 旋钮在这里生效：共同记忆与私有记忆各有一份上限，
                 # 记忆因此不能把整轮预算吃光、把历史挤掉（取舍仍由 `build_messages` 做，D-62）。
                 supplemental_caps=self._supplemental_caps(),
+                # 近期消息与块头要么都给、要么都不给：没有条目时不传表头，否则
+                # `build_messages` 会按契约抛 ValueError。
+                transient_user_items=tuple(
+                    render_lobby_recent(item) for item in request.lobby_recent
+                ),
+                transient_user_header=(
+                    texts.LOBBY_RECENT_CONTEXT_HEADER if request.lobby_recent else None
+                ),
             )
-            self._apply_reply_prefix(
-                messages,
-                request,
-                reply_body=reply_text,
-                reply_image_state=reply_image_state,
-            )
-            # 必须排在 _apply_reply_prefix 之后：那一步按字符串拼接 content。
             if image_part is not None:
                 attach_image(messages, image_part)
             # 被引用的那张缩略图紧随消息自己的图，然后是各处引用换出来的图：
@@ -1560,37 +1579,6 @@ class BotApp:
             return head
         return f"{head}\n---\n{user_text}"
 
-    def _apply_reply_prefix(
-        self,
-        messages: list[dict[str, str]],
-        request: Request,
-        *,
-        reply_body: str | None = None,
-        reply_image_state: str = "none",
-    ) -> None:
-        """把当前轮的**直接引用**拼到最后一条 user 消息上（D-7）。
-
-        引用文本**绝不**写进 `ContextManager` 历史，否则同一段引用会在该会话后续
-        每一轮被反复外送；它只属于引用它的那一轮（设计文档 §2.2.4「当前 reply_to 文本」）。
-        即使被引用正文已在历史里也仍然保留这份前缀：有限的重复优于丢失当前指向。
-
-        `reply_body` 是展开过内容引用的引用正文（§25）；`reply_image_state` 是被引用
-        消息那张缩略图的取回结果（§20），两者省略时都是上一次的行为。
-        """
-        prefix = self._reply_prefix(
-            request, reply_body=reply_body, reply_image_state=reply_image_state
-        )
-        if not prefix:
-            return
-        for index in range(len(messages) - 1, -1, -1):
-            if messages[index].get("role") == "user":
-                original = messages[index].get("content", "")
-                messages[index] = {
-                    "role": "user",
-                    "content": f"{prefix}\n---\n{original}",
-                }
-                return
-
     @staticmethod
     def _reply_image_marker(image_state: str) -> str:
         """被引用消息的图片标记：取到了 `[图片]`，本来有图但没取到 `[图片未提供]`。
@@ -1612,6 +1600,12 @@ class BotApp:
         reply_image_state: str = "none",
     ) -> str | None:
         """构造本轮的直接引用前缀；没有引用块时返回 None。
+
+        这是一个**纯文本**步骤（§11.1）：调用方把它拼在 `pending_user` 之前，于是引用
+        与当前正文一起参与这一轮的 token 预算。引用文本**绝不**写进 `ContextManager`
+        历史，否则同一段引用会在该会话后续每一轮被反复外送；它只属于引用它的那一轮
+        （设计文档 §2.2.4「当前 reply_to 文本」）。即使被引用正文已在历史里也仍然保留
+        这份前缀：有限的重复优于丢失当前指向。
 
         大区与私聊用不同的标签（D-25）：只有大区是「直接引用」——
         它的历史里本来就有别的发言者，需要与发言者标签区分开。

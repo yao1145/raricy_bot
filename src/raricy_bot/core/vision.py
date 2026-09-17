@@ -65,7 +65,8 @@ def attach_image(messages: list[dict[str, Any]], part: dict[str, Any]) -> None:
     文本内容（str）就地升级为内容块列表，已是列表则追加。找不到 user 消息时不做任何事
     —— 调用方（app 的 worker）保证最后一轮一定存在 user 消息。
 
-    调用时机：必须在 `_apply_reply_prefix` **之后**，因为后者按 str 拼接 content。
+    调用时机：必须在 `ContextManager.build_messages()` **之后**。拼文本的一切
+    （近期消息块、记忆块、直接引用、当前正文）都由那一步一次做完，图片只往成品上挂。
     """
     for index in range(len(messages) - 1, -1, -1):
         if messages[index].get("role") != "user":
