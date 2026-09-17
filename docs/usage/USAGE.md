@@ -153,11 +153,11 @@
 
 | 命令 | 作用 |
 |------|------|
-| `/memory status` | 看自己的私有记忆与自动记忆是开还是关、有几条 |
+| `/memory status` | 看私有记忆与自动记忆是开还是关、私有条目数与公开条目数 |
 | `/memory on` / `/memory off` | 开启或暂停在私聊回复里**参考**你的私有记忆；`off` 会一并关掉自动记忆（已有条目都保留） |
 | `/memory auto on` / `/memory auto off` | 开关**自动记忆**：是否从你的私聊内容里自动整理条目（需站长的部署开关也打开） |
 | `/memory list` | 列出你自己的私有条目（`/memory list all_user` 或 `lobby` 列出已生效的共同记忆） |
-| `/memory list public` | 列出你已公开的条目（每条都带自己的条数上限，与私有上限不是一个数） |
+| `/memory list public` | 列出你已公开的条目；回复里会说明公开条目有独立的条数上限（与私有上限不是一个数），并给出 `/memory unpublic` 撤回入口 |
 | `/memory public <UM-ID>` | 把一条私有条目**公开**出去：确认里会回显这条的 ID 与正文，并说明它能被谁用在哪儿 |
 | `/memory unpublic <UM-ID>` | 撤回它的公开副本；私人条目本身不动 |
 | `/memory forget <UM-ID>` | 删除一条私有记忆 |
