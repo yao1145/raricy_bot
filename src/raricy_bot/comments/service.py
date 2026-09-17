@@ -1305,7 +1305,16 @@ class CommentService:
                     user_block = self._comment_body(username, user_text)
                 published = self._published_text(outcome, text)
                 if published is not None:
-                    context.append_exchange(session_key, user_block, published)
+                    # 这一轮作者的会话 subject 随历史一起提交（§45.1、R25）：评论会话的
+                    # 「参与者短历史」（§45.1、公开设计 §16）正是从这条路径长出来的，构造
+                    # 输入时 `recent_subjects` 读到的是**已经送达**的那些轮次。subject 与聊天
+                    # 路径同一个来源（Router 算好的 `public_memory_subject`），未装配时是 None。
+                    context.append_exchange(
+                        session_key,
+                        user_block,
+                        published,
+                        subject=getattr(request, "public_memory_subject", None),
+                    )
             # CommentSender normally performs this write after a remote success.  Keep
             # the service-level transition too so a narrow sender adapter cannot leave
             # a successfully delivered event pending.
