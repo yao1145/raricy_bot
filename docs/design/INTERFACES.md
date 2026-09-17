@@ -2801,6 +2801,12 @@ class MemoryService:
   `enabled=false` 时返回 `None`。`user_id` 非空时先查该用户的私有快照、再查共同快照；为空只查
   共同快照。它服务于 §32.3 的**先查后撰写**：Controller 必须先调它、命中就不许再调 AI
   （写入侧的顺序由本模块自己保证，撰写侧的顺序只能由调用方保证）。
+  **2026-09-17 修订（公开个人记忆，§42.1；D-103 第 11 条）**：公开投影有自己的一份 `operations`，
+  因此 `user_id` 非空时的查询范围扩为**三处**：该用户的私有快照 → 该用户的**公开快照** →
+  共同快照（顺序固定，理由见 §42.1）；`user_id` 为空时仍只查共同快照。公开命令的幂等键
+  （`publish:<message_id>`、`unpublish:<message_id>`、`cmd:<message_id>:unpublish`）因此能跨重启
+  命中 —— 只按本条上面的两路描述实现，会让公开设计 §12.1 第 2 步在重启后失效，重放时会再执行
+  一次 publish。
 - **目录布局**（规划 §5.1）：`<root_dir>/common.md` 与 `<root_dir>/users/<64位用户存储键>.md`。
   用户文件名是 §27.3 的 `user_storage_key`，原始 user ID 不出现在文件名里。
 - `redactor`：**生产装配必须传入**。传 `BotApp` 自有的那个实例即同时覆盖三类机密——它在构造时
@@ -2993,6 +2999,7 @@ class MemoryCommandRequest:
     session_key: str
     user_id: str
     command: MemoryCommand
+    username: str = ""      # 2026-09-17 新增（公开个人记忆，§47.1；D-103 第 11 条）
 
 
 @dataclass(frozen=True)
@@ -3741,7 +3748,7 @@ STATUS_PUBLIC_CONFLICT: str = "public_conflict"
 - 语义：**AI 撰写或自动提取试图更新一条仍然公开的来源条目**（公开设计 §10.2、§12.5）。
 - 它与 `conflict` 不是一回事：`conflict` 是「磁盘摘要与内存快照不一致，拒绝覆盖」（§30.2）；
   `public_conflict` 是「这条来源正被用户主动公开着，任何静默改写都会扩大用户批准过的授权范围」。
-  两者必须有**独立**的用户文案，`public_conflict` 的固定文案见 §50.3（公开设计 §10.2 的原文）。
+  两者必须有**独立**的用户文案，`public_conflict` 的固定文案见 §50.1（公开设计 §10.2 的原文）。
 - 加入 §27.4 的稳定集合后，`operations` 的允许值、codec 校验（§41）、Controller 映射（§52）
   与测试全部同步扩展；状态总数是十一。
 
@@ -3965,7 +3972,7 @@ PUBLIC_ENTRY_FIELDS: tuple[str, ...] = (
 9. 同 ID 已存在且 **key 与正文完全一致** → `noop`（幂等）；**不一致** → `conflict`（R3：
    快照不是动态引用，绝不静默覆盖用户批准过的旧版本）；
 10. 成功后更新内存公开索引；
-11. 回复展示 ID、正文、公开场景、第三方模型传输范围与撤回命令（文案 §50.3）。
+11. 回复展示 ID、正文、公开场景、第三方模型传输范围与撤回命令（文案 §50.1）。
 
 ### 42.5 `/memory unpublic <UM-ID>` 与两阶段删除
 
@@ -4004,7 +4011,7 @@ PUBLIC_ENTRY_FIELDS: tuple[str, ...] = (
 - 检查只发生在 `update` / 「同 key add 替换」这两条会改动**已有条目**的路径上；删除由用户命令
   触发，不经这里（§52）。
 - 自动提取遇到 `public_conflict` **静默跳过且不追加写入披露**；显式 `/remember` 返回专用说明
-  （§50.3、§52）。
+  （§50.1、§52）。
 
 ### 42.7 公开读取（`public_context_for`）
 
@@ -4367,7 +4374,7 @@ class MemoryCommandRequest:
 - `username` 是**命令路径**的唯一用户名来源（公开设计 §4.2）：`/memory public` 据此写
   `owner_username`（§42.4 第 6 步）。
 - 缺省空串表示拿不到身份：`publish_private` 按 R8 返回 `invalid_proposal`，Controller 映射到
-  `MEMORY_PUBLIC_IDENTITY_TEXT`（§50.3、§52）。
+  `MEMORY_PUBLIC_IDENTITY_TEXT`（§50.1、§52）。
 - 它不改变既有命令的行为：`user_id` 仍是门禁与寻址的唯一身份，`username` 只用于公开命令。
 
 ### 47.2 `Request` 的公开记忆字段
@@ -4480,7 +4487,7 @@ class CommentMemoryInputs:
 
 ```python
     memory_context: Callable[
-        [CommentMemoryInputs], Awaitable[Iterable[SupplementalItem]]
+        [CommentMemoryInputs], Awaitable[tuple[SupplementalItem, ...]]
     ] | None = None
 ```
 
