@@ -1035,7 +1035,12 @@ class BotApp:
            结论由 `CommentRouter` 用真实 ID 判过、由载体带过这一段。
         2. **公开个人记忆**：由 `public_context_for` 从公开投影里取（§42.7、§48.2）；
            它不经过载体，因此载体的 fail-open 构造扩大不了任何范围（D-76 的 2026-09-17 补充）。
+
+        `memory_allowed` 为假时两路都不读：门禁由评论服务在调用前判过（§48.2），走到这里
+        时它恒为真，这一层只是纵深防御 —— 将来哪个调用方改了门禁，也不会让读取面静默变宽。
         """
+        if not inputs.memory_allowed:
+            return ()
         items: tuple[SupplementalItem, ...] = ()
         service = self._memory_service
         if service is not None:
