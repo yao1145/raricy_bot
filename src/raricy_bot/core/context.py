@@ -11,6 +11,12 @@
 `MEMORY_SYSTEM_ADDENDUM` 的追加都由 `build_messages` 决定（只有它同时知道历史、
 `pending_user` 与预算）。资料正文只进 `role="user"` 的当前轮，**绝不**进 system、
 **绝不**进历史。本模块不 import memory（D-61），记忆只是 `SupplementalItem` 的第一个使用者。
+
+**会话参与者（`ConversationSubject`，§45.1）同样是通用元数据，不是记忆类型**：它只装一个
+不可逆的 owner key 与一个展示用的用户名标签，由调用方算好后挂到 `Turn` 上。本模块因此仍然
+不 import memory（D-61）—— 算 key 是调用方的事（`user_storage_key`），这里只保存与查询。
+subject **不渲染进任何一条消息**，也不参与预算：它随历史淘汰、`reset()` 与 `invalidate()`
+自然消失，不另建参与者表（公开设计 §14.1）。
 """
 
 from __future__ import annotations
@@ -54,11 +60,30 @@ def sanitize_username(username: str) -> str:
 
 
 @dataclass(frozen=True)
+class ConversationSubject:
+    """一个会话参与者的不可逆身份（§45.1、公开设计 §14.1）。
+
+    `key` 是 `user_storage_key(user_id)`，即固定域前缀后的 SHA-256 摘要：它**不可逆**，
+    原始作者 id 不藏在里面，也不能由它反推。`label` 是给展示用的站点用户名，构造方必须
+    先用 `sanitize_username` 清洗控制字符 —— 同一份规则只能有一个实现（§38.1）。
+
+    这是通用类型，不是记忆专属：本模块不认识它由谁产生、给谁使用。构造方负责算 key，
+    本模块只负责随历史保存与按会话查询（`recent_subjects`）。
+    """
+
+    key: str
+    label: str
+
+
+@dataclass(frozen=True)
 class Turn:
     """一条历史记录。"""
 
     role: str  # "user" | "assistant"
     content: str
+    # 说话人的会话 subject（§45.1）；只有 user 那一半会被填，assistant 恒为 None。
+    # 它不参与渲染、不参与预算：`build_messages` 除了历史正文什么也不看。
+    subject: ConversationSubject | None = None
 
 
 @dataclass(frozen=True)
@@ -145,6 +170,26 @@ def _render_transient_block(header: str, items: Sequence[str]) -> str:
     return f"{header}{_BLOCK_SEPARATOR}{_BLOCK_SEPARATOR.join(items)}"
 
 
+def _fit_transient_suffix(items: Sequence[str], header: str, budget: int) -> int:
+    """从最新向旧试装**连续后缀**，返回装得下的**最长后缀条数**（0 = 一条都装不下）。
+
+    规则与 `LOBBY_RECENT_CONTEXT_DESIGN` §7.2 的近期块逐条一致：从长度 1 的后缀开始向更旧
+    扩展，装不下下一条更老的就停，**不跳洞**；每次整块重渲染，估算口径因此与最终交出去的
+    文本永远一致。`budget` 是这个块自己可用的 token 额度（整轮上限减去已用额度，以及它
+    后面那个连接符）。
+
+    `_plan_turn` 与 `select_recent_suffix` **共用**本函数：两处必须是同一份连续后缀规则，
+    各写一遍迟早分叉（§45.2 明写「估算口径必须与 `_plan_turn` 完全一致」）。
+    """
+    length = 0
+    for start in range(len(items) - 1, -1, -1):
+        candidate = _render_transient_block(header, items[start:])
+        if estimate_tokens(candidate) > budget:
+            break
+        length = len(items) - start
+    return length
+
+
 def _exceeds_group_caps(
     items: Sequence[SupplementalItem], caps: tuple[SupplementalCap, ...]
 ) -> bool:
@@ -173,17 +218,48 @@ class ContextManager:
         # 会话代次：reset / invalidate 时递增。用途见 reset() 的注释。
         self._generations: dict[str, int] = {}
 
-    def append_exchange(self, session_key: str, user: str, assistant: str) -> None:
+    def append_exchange(
+        self,
+        session_key: str,
+        user: str,
+        assistant: str,
+        *,
+        subject: ConversationSubject | None = None,
+    ) -> None:
         """提交一组**完整**的 (user, assistant) 轮次；这是唯一的历史写入方式。
 
         调用时机：模型回复**已经送达**之后。任何失败路径都不要调用它。
+
+        `subject` 是当前说话人的会话身份（§45.1），默认 None 时与升级前逐字节一致：
+        它只在成功送达、整轮提交时随历史一起保存。失败轮次（模型报错、额度拒绝、发送失败、
+        代次失效）根本不写历史，也就不会留下一个用户从没被回答过的参与者。
+
+        subject **不渲染进任何一条消息**，也不改变历史正文：用户名的可见标签仍由调用方
+        包装好的 user 正文提供（大区的 `speaker_wrapper`、评论的 `_comment_body`）。
         """
         turns = self._sessions.setdefault(session_key, [])
         # 每轮固定两条记录，因此阈值是 max_turns * 2。
         if len(turns) >= self._max_turns * 2:
             del turns[:2]
-        turns.append(Turn(role="user", content=user))
+        turns.append(Turn(role="user", content=user, subject=subject))
         turns.append(Turn(role="assistant", content=assistant))
+
+    def recent_subjects(self, session_key: str) -> tuple[ConversationSubject, ...]:
+        """会话里最近出现过的参与者，按**最近一次出现从新到旧**、按 `key` 去重（§45.1）。
+
+        只读、同步、无 I/O：不改历史、不推进代次。同一个 owner key 只出现一次，
+        `label` 取最近一次的值（用户可能改过名）。会话不存在时返回空元组。
+
+        它**不另建参与者表**：参与者就挂在历史的 `Turn` 上，历史淘汰、`reset()` 与
+        `invalidate()` 之后这里自然看不到已经离开的说话人（公开设计 §14.1）。
+        """
+        latest: dict[str, ConversationSubject] = {}
+        for turn in reversed(self._sessions.get(session_key, [])):
+            subject = turn.subject
+            if subject is None or subject.key in latest:
+                continue
+            latest[subject.key] = subject
+        return tuple(latest.values())
 
     def reset(self, session_key: str) -> bool:
         """清空指定会话的历史并**递增其代次**；会话原本不存在时返回 False。
@@ -399,8 +475,7 @@ class ContextManager:
 
         # 规则 4：近期消息从最新向旧扩展**连续后缀**。装不下下一条更老的就停，不跳洞 ——
         # 模型看到的因此始终是真正的「最近一段」，不会出现时间线中间缺一条的伪上下文。
-        # 块头与条目一起变，所以每次都整块重渲染：估算口径与最终交出去的文本永远一致
-        # （与 `_exceeds_group_caps` 的「先渲染再估」同源）。条数上限是 50，重算的代价可以忽略。
+        # 规则本身在 `_fit_transient_suffix` 里，与 `select_recent_suffix` 共用一份。
         transient_block = ""
         if transient_items:
             # 选中至少一条时才会出现的那一个分隔符：后面接记忆块，或直接接当前正文。
@@ -410,12 +485,15 @@ class ContextManager:
                 else (_BODY_SEPARATOR if has_pending_body else "")
             )
             tail_tokens = estimate_tokens(tail)
-            for start in range(len(transient_items) - 1, -1, -1):
-                candidate = _render_transient_block(transient_header or "", transient_items[start:])
-                if used + estimate_tokens(candidate) + tail_tokens > self._max_input_tokens:
-                    break
-                transient_block = candidate
-            if transient_block:
+            count = _fit_transient_suffix(
+                transient_items,
+                transient_header or "",
+                self._max_input_tokens - used - tail_tokens,
+            )
+            if count:
+                transient_block = _render_transient_block(
+                    transient_header or "", transient_items[len(transient_items) - count :]
+                )
                 used += estimate_tokens(transient_block) + tail_tokens
 
         head = _BLOCK_SEPARATOR.join(
@@ -433,6 +511,65 @@ class ContextManager:
             keep_start -= 2
 
         return history[keep_start:], head, bool(selected)
+
+    def select_recent_suffix(
+        self,
+        session_key: str,
+        system_prompt: str,
+        *,
+        pending_user: str | None = None,
+        system_addendum: str | None = None,
+        feature_context: bool = False,
+        transient_user_items: tuple[str, ...] = (),
+        transient_user_header: str | None = None,
+    ) -> tuple[str, ...]:
+        """算出**本轮候选的近期消息后缀 S1**，供装配层在解析 subject 之前调用（§45.2、R2）。
+
+        返回 S1 的条目（入参顺序，旧到新）：只有落在 S1 里的大区近期消息才可以贡献公开
+        记忆的 subject，调用方随后把 S1 原样交给 `build_messages`。参数与 `build_messages`
+        的同名预算输入逐条对应，估算口径也完全一致 —— 两处一旦分叉，S1 就不再是
+        「`_plan_turn` 最终选择的上界」。
+
+        **不预留记忆块的额度**：计算时假定本轮既没有记忆资料块、也没有记忆的 system 说明。
+        `_plan_turn` 里记忆块**先于**近期块取（lobby 设计 §11.3 的既有合同，不翻转），所以
+        真正挑选近期消息时可用额度只会比这里更紧，它选中的条目必然是 S1 的**子集**：
+        不在 S1 里的消息永不贡献 subject。
+
+        已知的保守面（R2 的刻意取舍）：S1 内、随后被记忆块挤掉的那几条**仍会**贡献
+        subject —— 它们在这一步是装得下的。精确解需要在记忆块与近期块之间求不动点，
+        而两边互相挤压时不动点可能振荡，因此宁可放宽这一点。
+
+        纯只读：不改历史、不推进代次、不写 `_sessions`；`_plan_turn` 与 `build_messages`
+        的行为一个字都不变。`transient_user_items` 为空时返回空元组（这一轮没有近期消息，
+        也就没有 S1）。
+        """
+        if not transient_user_items:
+            return ()
+        # 与 `build_messages` 同款：system 与静态 addendum **分别**估算（先拼接再估会少算
+        # 非 CJK 分段的取整项），再计入本轮正文。
+        used = estimate_tokens(system_prompt)
+        if system_addendum:
+            used += estimate_tokens(system_addendum)
+        if pending_user is not None:
+            used += estimate_tokens(pending_user)
+        history = self._sessions.get(session_key, [])
+        if not feature_context and history:
+            # 规则 3 的同一笔预留：普通聊天先锁定最近一组完整历史，近期块只能争剩下的。
+            # 能力轮次（feature_context）不锁定，历史可以被挤光（D-38）。
+            used += _history_tokens(history[max(0, len(history) - 2) :])
+        # 假定没有记忆块：块后面要么直接接本轮正文（`_BODY_SEPARATOR` 那一路），要么本轮
+        # 没有正文、连分隔符都不存在。记忆块在场时 `_plan_turn` 的尾部连接符是更短的
+        # `_BLOCK_SEPARATOR`，但它同时要付整块的额度，可用空间只会更小 —— 子集关系
+        # 因此不依赖这一笔的取值。
+        tail_tokens = estimate_tokens(_BODY_SEPARATOR) if pending_user is not None else 0
+        count = _fit_transient_suffix(
+            transient_user_items,
+            transient_user_header or "",
+            self._max_input_tokens - used - tail_tokens,
+        )
+        if not count:
+            return ()
+        return tuple(transient_user_items[len(transient_user_items) - count :])
 
     def session_count(self) -> int:
         """当前有历史的会话数。"""
