@@ -859,7 +859,8 @@ class MemoryService:
             # 第一层身份校验（R8）：codec 的 `_check_public` 是第二层，两层都不接受任意文本。
             return OperationResult(STATUS_INVALID_PROPOSAL, None, 0)
         async with self._write_lock:
-            state = self._public_state(owner_key)
+            # R24：以磁盘上这一刻的公开文档为基线（幂等键与条目判重都读它），不走 TTL 缓存。
+            state = self._public_state(owner_key, force=True)
             if not isinstance(state.document, PublicMemoryDocument):
                 return OperationResult(STATUS_UNAVAILABLE, None, state.revision)
             hit = state.document.operations.get(operation_id)
@@ -937,7 +938,10 @@ class MemoryService:
         if owner_key is None:
             return OperationResult(STATUS_FORBIDDEN, None, 0)
         async with self._write_lock:
-            state = self._public_state(owner_key)
+            # R24：销毁路径强制读盘。撤回步的 `not_found` 是 R19 授权删除私人来源的前提，必须
+            # 意味着「读过公开文件，里面确实没有这条」；TTL 缓存会把它退化成「我没看见」，
+            # 于是 TTL 窗口内落到盘上的公开条目会被漏撤，变成「私人删掉、公开遗留」。
+            state = self._public_state(owner_key, force=True)
             if not isinstance(state.document, PublicMemoryDocument):
                 return OperationResult(STATUS_UNAVAILABLE, None, state.revision)
             hit = state.document.operations.get(operation_id)
@@ -1325,7 +1329,15 @@ class MemoryService:
             self._users.popitem(last=False)
 
     def _public_state(self, owner_key: str, *, force: bool = False) -> _Snapshot:
-        """公开快照：与用户私有文件**同一套**惰性加载 + 有界 LRU + TTL 摘要比对（§42.2）。"""
+        """公开快照：与用户私有文件**同一套**惰性加载 + 有界 LRU + TTL 摘要比对（§42.2）。
+
+        **写入与销毁路径必须 `force=True`**（R24）：`publish_private` / `unpublish_private` /
+        `unpublish_all` 与 §42.6 的公开保护都要以**磁盘上这一刻**的公开文档为基线。走 TTL 缓存会
+        把「TTL 窗口内落到盘上的条目」变成看不见的东西，而 `unpublish_private` 的 `not_found`
+        是 R19 授权删除私人来源的前提——它必须意味着「我读了公开文件，里面没有这条」，不能退化成
+        「我碰巧没看见」。只读路径（`public_entries` / `public_context_for` / `find_operation` /
+        索引扫描）保持缓存，读者不为此付代价。
+        """
         state = self._public.get(owner_key)
         fresh = self._inspect(
             self._public_view(owner_key),
@@ -1611,6 +1623,10 @@ class MemoryService:
 
         判据是「这次调用会不会改动**已有条目**」：私人文件里没有这条目标时就什么都不改，
         因此不查公开投影、由既有逻辑回 `not_found`（§42.6 的原话就是这个范围）。
+
+        读公开基线时**强制读盘**（R24）：这道门是唯一拦住「AI 静默改写已公开条目」的地方，
+        它的答案必须来自磁盘上这一刻的公开文档；TTL 窗口内落到盘上的条目（人工编辑、从备份恢复）
+        用缓存看不见，那道门就会在用户以为内容还公开着的时候放行一次改写。
         """
         if proposal.action == ProposalAction.UPDATE:
             target = _find_by_memory_id(list(document.entries), proposal.target_id, PREFIX_USER)
@@ -1631,7 +1647,7 @@ class MemoryService:
         owner_key = _storage_key(user_id)
         if owner_key is None:
             return None
-        state = self._public_state(owner_key)
+        state = self._public_state(owner_key, force=True)
         if not state.available or not isinstance(state.document, PublicMemoryDocument):
             # 公开状态无法确认：不给「也许它没公开」留任何猜测空间。
             return OperationResult(STATUS_UNAVAILABLE, None, state.revision)
