@@ -21,6 +21,14 @@
 
 失败一律映射成 §27.4 的稳定状态，不抛异常；只有 `asyncio.CancelledError` 原样传播
 （软故障 D-60：这里抛出去，用户就既看不到回复、也看不到错误）。
+
+公开个人记忆（§52.2）在编排上只有两处新东西，都不改变上面的顺序纪律：
+
+- **公开动作不经过任何模型**（设计 §2、§12.1）：`public` / `unpublic` 只查幂等、读写公开快照，
+  撰写器一次都不调用。
+- **`forget` / `clear` 是两阶段的**（设计 §12.3 / §12.4、R13）：先撤回公开副本、再删私人来源，
+  两个步骤各有自己的 `operation_id`，重放先命中撤回步再继续删除步；撤回步没到位**绝不**删私人
+  文件（R19 的例外只有「没有公开副本」这一种，见 `_revoke_step_failure`）。
 """
 
 from __future__ import annotations
@@ -32,7 +40,7 @@ from collections.abc import Awaitable, Callable
 from .. import texts
 from ..logging_setup import get_logger, log_event
 from .access import MemoryAccessPolicy
-from .codec import PREFIX_ALL_USER, PREFIX_CANDIDATE, PREFIX_LOBBY
+from .codec import PREFIX_ALL_USER, PREFIX_CANDIDATE, PREFIX_LOBBY, PREFIX_USER
 from .commands import USAGE_COMMAND, MemoryCommandRequest, MemoryCommandResult
 from .models import (
     STATUS_CONFLICT,
@@ -42,14 +50,17 @@ from .models import (
     STATUS_NOT_FOUND,
     STATUS_NOOP,
     STATUS_OK,
+    STATUS_PUBLIC_CONFLICT,
     STATUS_SECRET_DETECTED,
     STATUS_UNAVAILABLE,
     MemoryCandidate,
     MemoryCaptureResult,
     MemoryEntry,
+    MemoryProposal,
     MemoryScope,
     OperationResult,
     ProposalAction,
+    PublicMemoryEntry,
 )
 from .service import MemoryService
 from .writer import MemoryWriter
@@ -61,19 +72,32 @@ _logger = get_logger("memory")
 # 私有能力（读取、命令、自动提取）的频道口径：只有 DM（§28）。
 _DM_KIND: str = "dm"
 
-# `operation_id` 的三个来源前缀（§29.1 的形状 `<来源>:<message_id>`）。
-# `remember:` 是**稳定合同**（§32.3）；另外两个是宿主自定义，本模块钉死在这里。
+# `operation_id` 的来源前缀（§29.1 的形状 `<来源>:<message_id>`）。`remember:` 是**稳定合同**
+# （§32.3）；`publish:` / `unpublish:` 由 §42.4 / §42.5 点名；其余是宿主自定义，本模块钉死在这里。
 _COMMAND_SOURCE: str = "cmd"
 _REMEMBER_SOURCE: str = "remember"
 _AUTO_CAPTURE_SOURCE: str = "chat"
+_PUBLISH_SOURCE: str = "publish"
+_UNPUBLISH_SOURCE: str = "unpublish"
 
 # 一条消息可能触发两个 mutation（`/memory off` 关读取 + 关自动；`/memory auto on` 开读取 +
 # 开自动），两个键必须不同，否则第二次调用会被第一次的 `operations` 命中而静默跳过。
 _SECOND_STEP_SUFFIX: str = ":second"
 
-# 失败状态 → 固定文案（§36）。成功只有 `ok` 与 `noop` 两种，其余任何状态（含 Beta 不产生的
-# `duplicate`）都不会落进成功分支，见 `_from_outcome` 的防御分支。`forbidden` 是表外的例外：
-# 它的文案取决于命令是管理命令还是普通命令，见 `_service_forbidden_text`。
+# 两阶段命令（`forget` / `clear`）撤回步的后缀（§12.3 / §12.4 逐字固定、R13）：
+# 撤回步是 `cmd:<message_id>:unpublish`，删除步沿用既有的 `cmd:<message_id>`。
+_REVOKE_STEP_SUFFIX: str = ":unpublish"
+
+# 公开动作的命令名与 `list` 的公开实参（§52.1、R11）。
+_PUBLISH_COMMAND: str = "public"
+_UNPUBLISH_COMMAND: str = "unpublic"
+_PUBLIC_ARGUMENT: str = "public"
+
+# 失败状态 → 固定文案（§36、§50.1）。成功只有 `ok` 与 `noop` 两种，其余任何状态（含 Beta 不
+# 产生的 `duplicate`）都不会落进成功分支，见 `_from_outcome` 的防御分支。`forbidden` 是表外的
+# 例外：它的文案取决于命令是管理命令还是普通命令，见 `_service_forbidden_text`。`public_conflict`
+# 与 `conflict` 各有各的文案：前者是「AI 更新一条仍然公开的条目被拒」（§42.6），后者是「磁盘摘要
+# 与内存快照不一致」，两句说的不是同一件事（§40.3）。
 _FAILURE_TEXTS: dict[str, str] = {
     STATUS_UNAVAILABLE: texts.MEMORY_UNAVAILABLE_TEXT,
     STATUS_CONFLICT: texts.MEMORY_CONFLICT_TEXT,
@@ -81,17 +105,25 @@ _FAILURE_TEXTS: dict[str, str] = {
     STATUS_SECRET_DETECTED: texts.MEMORY_SECRET_DETECTED_TEXT,
     STATUS_NOT_FOUND: texts.MEMORY_NOT_FOUND_TEXT,
     STATUS_INVALID_PROPOSAL: texts.MEMORY_WRITE_FAILED_TEXT,
+    STATUS_PUBLIC_CONFLICT: texts.MEMORY_PUBLIC_CONFLICT_TEXT,
 }
 
 # 需要 admin 的命令（§32.2 的第二组）；Controller 与 Service 两层都查（§32.3、R14）。
+# 公开动作是普通用户的命令，不在这一组里。
 _ADMIN_COMMANDS: frozenset[str] = frozenset({"suggest", "candidates", "approve", "reject", "delete"})
 
 # 不接收实参的命令：对它们来说 `argument is None` 是正常形状，只有缺参数形状的命令才回用法（§32.2）。
 _NO_ARGUMENT_COMMANDS: frozenset[str] = frozenset(
-    {"status", "on", "off", "auto_on", "auto_off", "list", "clear", "candidates"}
+    {"status", "on", "off", "auto_on", "auto_off", "clear", "candidates"}
 )
 
-# 命令名 → 处理方法（D-67 钉死的十四个名字）。`_run` 在分派前完成门禁、admin 判定与用法检查。
+# 实参可有可无的命令（§52.1）：`list` 不带实参看私有条目、带 `public` 看公开条目。
+# 它**不**在 `_NO_ARGUMENT_COMMANDS` 里，否则带实参的 `/memory list public` 会被反向形状检查
+# 当成「不给实参却塞了实参」而只回用法。
+_OPTIONAL_ARGUMENT_COMMANDS: frozenset[str] = frozenset({"list"})
+
+# 命令名 → 处理方法（D-67 钉死的十四个名字 + §52.1 新增的 `public` / `unpublic`）。
+# `_run` 在分派前完成门禁、admin 判定与用法检查。
 _Handler = Callable[
     ["MemoryController", MemoryCommandRequest], Awaitable[MemoryCommandResult]
 ]
@@ -190,8 +222,13 @@ class MemoryController:
             # 第一层 admin 判定（§32.3）；Service 的四个管理 mutation 各自还会独立复查（R14）。
             # 文案是**权限**拒绝，与接入门的拒绝（MEMORY_BETA_DENIED_TEXT）不是同一件事。
             return self._result(STATUS_FORBIDDEN, texts.MEMORY_ADMIN_REQUIRED_TEXT)
-        if request.command.argument is None and name not in _NO_ARGUMENT_COMMANDS:
-            # 具名命令缺参数（含 `/memory forget <非法 ID>`）：固定用法，不进 AI（§32.2）。
+        if (
+            request.command.argument is None
+            and name not in _NO_ARGUMENT_COMMANDS
+            and name not in _OPTIONAL_ARGUMENT_COMMANDS
+        ):
+            # 具名命令缺参数（含 `/memory forget <非法 ID>`、`/memory public <非法 ID>`）：
+            # 固定用法，不进 AI（§32.2）。
             return self._result(STATUS_NOOP, _usage_text(name))
         if request.command.argument is not None and name in _NO_ARGUMENT_COMMANDS:
             # 反向的形状错误（不给实参的命令却带了实参）：同样只回用法，绝不「猜着执行」。
@@ -200,15 +237,17 @@ class MemoryController:
         return await _HANDLERS[name](self, request)
 
     async def _status(self, request: MemoryCommandRequest) -> MemoryCommandResult:
-        """`/memory status`：私有记忆与自动记忆的开关、私有条目数（§32.2）。"""
+        """`/memory status`：两个开关、私有条目数与公开条目数（§32.2、§50.1）。"""
         settings = await self.service.private_settings(request.user_id)
         entries = await self.service.private_entries(request.user_id)
+        public = await self.service.public_entries(request.user_id)
         return self._result(
             STATUS_OK,
             texts.memory_status_text(
                 private_enabled=settings.private_enabled,
                 auto_capture=settings.auto_capture,
                 entry_count=len(entries),
+                public_entry_count=len(public),
             ),
         )
 
@@ -267,6 +306,25 @@ class MemoryController:
             return None
         return await self._from_outcome(request, outcome.status, outcome.object_id)
 
+    async def _revoke_step_failure(
+        self, request: MemoryCommandRequest, outcome: OperationResult
+    ) -> MemoryCommandResult | None:
+        """两阶段命令的撤回步判定（R13 / R19）：可以继续时返回 None，否则返回撤回步的失败回复。
+
+        三种状态允许继续：
+
+        - `ok`：撤回步真的生效了（或幂等命中第一次的 `ok`）；
+        - `not_found`：该 ID 从来没有公开过（`unpublish_private`）——没有公开副本就没有要保护的
+          副本，而用户要的删除必须照做（R19）；
+        - `noop`：`unpublish_all` 本来就空（§42.5 明说「对调用方则同样是撤回步已经到位」）。
+
+        **其余任何状态都停在这里**，尤其 `unavailable`：公开文档读不出来时无法确认撤回是否已经
+        生效，此时去删私人来源就会留下无法回收的公开副本（设计 §3.5、§18.3 的最坏状态）。
+        """
+        if outcome.status in (STATUS_OK, STATUS_NOT_FOUND, STATUS_NOOP):
+            return None
+        return await self._from_outcome(request, outcome.status, outcome.object_id)
+
     async def _auto_off(self, request: MemoryCommandRequest) -> MemoryCommandResult:
         """`/memory auto off`：只关自动提取，读取保持原样（不隐含关闭读取）。"""
         outcome = await self.service.set_auto_capture(
@@ -275,50 +333,124 @@ class MemoryController:
         return await self._from_outcome(request, outcome.status, outcome.object_id)
 
     async def _list(self, request: MemoryCommandRequest) -> MemoryCommandResult:
-        """`/memory list`：无参看调用者自己的私有条目；带作用域看**已生效**共同记忆（§32.3）。
+        """`/memory list` 的三种形式（§32.3、§52.1）：无参看自己的私有条目、`public` 看自己的
+        公开条目、带作用域看**已生效**共同记忆。
 
-        两种形式都只展示已生效内容：候选不在这里出现，只有管理员能用 `/memory candidates` 看。
+        三种形式都只展示已生效内容：候选不在这里出现，只有管理员能用 `/memory candidates` 看。
+        私有一栏还标出每条是否已公开（设计 §5.1）：标记来自公开快照，不看私人文件就能算出来。
         """
         scope = request.command.scope
-        if scope is None:
-            entries = await self.service.private_entries(request.user_id)
-        else:
+        argument = request.command.argument
+        if scope is not None:
             entries = await self.service.common_entries(scope)
+            lines = tuple(
+                texts.memory_entry_line(memory_id=entry.memory_id, content=entry.content)
+                for entry in entries
+            )
+            return self._result(
+                STATUS_OK,
+                texts.memory_entry_list_text(scope=scope.value, lines=lines),
+            )
+        if argument == _PUBLIC_ARGUMENT:
+            public_lines = tuple(
+                texts.memory_entry_line(memory_id=entry.memory_id, content=entry.content)
+                for entry in await self.service.public_entries(request.user_id)
+            )
+            return self._result(
+                STATUS_OK, texts.memory_public_entry_list_text(lines=public_lines)
+            )
+        if argument is not None:
+            # 手搓请求里的未知实参（解析器只会给出 `public`）：只回固定用法，绝不「猜着执行」。
+            return self._result(STATUS_NOOP, texts.MEMORY_USAGE_TEXT)
+        published = await self._published_ids(request.user_id)
+        entries = await self.service.private_entries(request.user_id)
         lines = tuple(
-            texts.memory_entry_line(memory_id=entry.memory_id, content=entry.content)
+            texts.memory_entry_line(
+                memory_id=entry.memory_id,
+                content=entry.content,
+                published=entry.memory_id in published,
+            )
             for entry in entries
         )
         # 空列举是**成功**：用户没有点名任何目标，问题（当前有哪些条目）也已经回答，空态由
         # 文案自己说清（§36）。回 `not_found` 会让 `_log_command` 把一次日常查看记成失败，
         # 污染日志派生的健康信号 —— §27.4 的 `not_found` 只指「目标条目或候选不存在」。
         return self._result(
-            STATUS_OK,
-            texts.memory_entry_list_text(
-                scope=None if scope is None else scope.value, lines=lines
-            ),
+            STATUS_OK, texts.memory_entry_list_text(scope=None, lines=lines)
         )
 
-    async def _forget(self, request: MemoryCommandRequest) -> MemoryCommandResult:
-        """`/memory forget <UM-ID>`：删除一条私有条目，保留其余条目与设置。"""
-        outcome = await self.service.delete_private(
+    async def _public(self, request: MemoryCommandRequest) -> MemoryCommandResult:
+        """`/memory public <UM-ID>`：把一条私有条目抄成公开快照（设计 §12.1、INTERFACES §42.4）。
+
+        固定顺序：门禁（`_run` 已查）→ `publish:<message_id>` 的幂等查询 → `publish_private`。
+        查询**先于**任何读取：重放时连私人文件都不必查，结果就是第一次的那一份（§12.1 第 2 步、
+        §32.3 的同一条纪律）。全程**不调用撰写器**（设计 §2、§12.1）——公开不经过任何模型。
+        """
+        operation_id = self._publish_operation_id(request)
+        replay = await self.service.find_operation(operation_id, user_id=request.user_id)
+        if replay is not None:
+            return await self._from_outcome(request, replay.status, replay.object_id)
+        outcome = await self.service.publish_private(
+            request.user_id,
+            # 站点用户名只来自 Router 落下的 `username`（R12、§47.1）：命令路径不查网络。
+            request.username,
+            request.command.argument or "",
+            operation_id=operation_id,
+        )
+        return await self._from_outcome(request, outcome.status, outcome.object_id)
+
+    async def _unpublic(self, request: MemoryCommandRequest) -> MemoryCommandResult:
+        """`/memory unpublic <UM-ID>`：只撤回公开副本，**不改私人来源**（§12.2、§42.5）。"""
+        operation_id = self._unpublish_operation_id(request)
+        replay = await self.service.find_operation(operation_id, user_id=request.user_id)
+        if replay is not None:
+            return await self._from_outcome(request, replay.status, replay.object_id)
+        outcome = await self.service.unpublish_private(
             request.user_id,
             request.command.argument or "",
-            operation_id=self._operation_id(request),
+            operation_id=operation_id,
+        )
+        return await self._from_outcome(request, outcome.status, outcome.object_id)
+
+    async def _forget(self, request: MemoryCommandRequest) -> MemoryCommandResult:
+        """`/memory forget <UM-ID>`：隐私优先的两步删除（设计 §12.3、R13）。
+
+        步骤 A 撤回公开副本（`cmd:<message_id>:unpublish`），步骤 B 删除私人条目
+        （`cmd:<message_id>`）。两步都幂等，重放先命中 A 再继续 B；A 没到位就**绝不**执行 B，
+        最坏状态因此是「公开副本已撤回、私人来源仍保留」（设计 §3.5）。
+        """
+        memory_id = request.command.argument or ""
+        revoke = await self.service.unpublish_private(
+            request.user_id, memory_id, operation_id=self._revoke_operation_id(request)
+        )
+        failure = await self._revoke_step_failure(request, revoke)
+        if failure is not None:
+            return failure
+        outcome = await self.service.delete_private(
+            request.user_id, memory_id, operation_id=self._operation_id(request)
         )
         return await self._from_outcome(request, outcome.status, outcome.object_id)
 
     async def _clear(self, request: MemoryCommandRequest) -> MemoryCommandResult:
-        """`/memory clear`：删全部私有条目，保留幂等元数据，因此旧命令重放不会再次执行（D-59）。
+        """`/memory clear`：先撤回全部公开条目，再清空私人条目（§12.4、R13）。
 
-        删掉的条数在清理**之前**数出来并交给文案：`clear_private` 只回状态与修订号，
-        而重放时条目早就不在了（重放那一次确实一条都没删，文案如实报 0）。
+        删掉的条数与撤回的条数都在各自步骤**之前**数出来：`clear_private` 与 `unpublish_all`
+        只回状态与修订号，而重放时两边都已不在（重放那一次确实一条都没撤回、也没删，如实报 0）。
+        设置与幂等元数据都保留，因此旧命令重放不会再次执行（D-59）。
         """
+        revoked = len(await self.service.public_entries(request.user_id))
+        step = await self.service.unpublish_all(
+            request.user_id, operation_id=self._revoke_operation_id(request)
+        )
+        failure = await self._revoke_step_failure(request, step)
+        if failure is not None:
+            return failure
         removed = len(await self.service.private_entries(request.user_id))
         outcome = await self.service.clear_private(
             request.user_id, operation_id=self._operation_id(request)
         )
         return await self._from_outcome(
-            request, outcome.status, outcome.object_id, removed=removed
+            request, outcome.status, outcome.object_id, removed=removed, revoked=revoked
         )
 
     async def _candidates(self, request: MemoryCommandRequest) -> MemoryCommandResult:
@@ -372,6 +504,12 @@ class MemoryController:
         outcome = await self.service.apply_private_proposal(
             request.user_id, proposal, operation_id=operation_id
         )
+        if outcome.status == STATUS_PUBLIC_CONFLICT and _add_carries_a_target(proposal):
+            # 服务端的公开保护在形状校验**之前**查表，因此「新增却带了目标 ID」这个畸形形状
+            # （`_valid_proposal_shape` 会判 `invalid_proposal`）可能拿到 `public_conflict`
+            # （Task 3 的复核记录）。对一条根本没写成功的畸形提案说「这条已公开、请先撤回」
+            # 是错的，按撰写失败的文案渲染，状态也照它本来的归属报。
+            return self._result(STATUS_INVALID_PROPOSAL, texts.MEMORY_WRITE_FAILED_TEXT)
         if outcome.status != STATUS_OK:
             return await self._from_outcome(request, outcome.status, outcome.object_id)
         # 保存成功即隐式打开读取（§32.3）；说明挂在这次成功回复上，不记录「已经说过」（D-66）。
@@ -496,12 +634,16 @@ class MemoryController:
         *,
         opened: bool = False,
         removed: int | None = None,
+        revoked: int | None = None,
     ) -> MemoryCommandResult:
         """把稳定状态与对象 ID 渲染成一次结果；重放走同一条路径，因此回复取自同一批文案。
 
-        `removed` 只给 `/memory clear` 用（清理前的条数），其余命令不传。
+        `removed` / `revoked` 只给 `/memory clear` 用（两个步骤之前数出来的条数），其余命令不传。
+        命令专属的失败文案（§52.2，如 `public` 的 `invalid_proposal` 与 `full`）优先于通用映射。
         """
-        text = _FAILURE_TEXTS.get(status)
+        text = _command_failure_text(request, status)
+        if text is None:
+            text = _FAILURE_TEXTS.get(status)
         if text is None and status == STATUS_FORBIDDEN:
             # 本模块自己的门禁之外，Service 也会回 `forbidden`（admin 复查或能力未启用）。
             text = _service_forbidden_text(request)
@@ -512,7 +654,9 @@ class MemoryController:
             # 但将来多出一个未知状态时也不许落进成功文案 —— 那会让用户看到「成功」形状的确认，
             # 却配上对不上的对象 ID。按不可用处理：状态与文案成对，且不假装认识这个状态。
             return self._result(STATUS_UNAVAILABLE, texts.MEMORY_UNAVAILABLE_TEXT)
-        text = await self._success_text(request, memory_id, opened=opened, removed=removed)
+        text = await self._success_text(
+            request, memory_id, opened=opened, removed=removed, revoked=revoked
+        )
         return self._result(status, text, memory_id)
 
     async def _success_text(
@@ -522,6 +666,7 @@ class MemoryController:
         *,
         opened: bool = False,
         removed: int | None = None,
+        revoked: int | None = None,
     ) -> str:
         """成功（`ok` / `noop`）时的回复：一律由 `texts.py` 的组合文案拼成（§36）。
 
@@ -545,8 +690,18 @@ class MemoryController:
                 return texts.MEMORY_TARGET_GONE_TEXT
             return texts.memory_forgotten_text(memory_id=memory_id)
         if name == "clear":
-            # `removed` 是清理前数出来的条数；防御分支（调用方没传）按 0 处理。
-            return texts.memory_cleared_text(removed=removed if removed is not None else 0)
+            # 两个计数都是各步骤之前数出来的；防御分支（调用方没传）按 0 处理。
+            return texts.memory_cleared_text(
+                removed=removed if removed is not None else 0,
+                revoked=revoked if revoked is not None else 0,
+            )
+        if name == _PUBLISH_COMMAND:
+            return await self._publish_text(request, memory_id)
+        if name == _UNPUBLISH_COMMAND:
+            # 撤回的确认只报 ID（§12.2）：正文连参数都没有，回显不了也就不会回显。
+            if memory_id is None:
+                return texts.MEMORY_TARGET_GONE_TEXT
+            return texts.memory_unpublished_text(memory_id=memory_id)
         if name == "suggest":
             candidate = await self._candidate(memory_id)
             if candidate is None:
@@ -601,6 +756,45 @@ class MemoryController:
             opened=opened,
         )
 
+    async def _publish_text(self, request: MemoryCommandRequest, memory_id: str | None) -> str:
+        """`/memory public` 的成功回复：回显**实际公开的** ID 与正文（设计 §3.2、§50.1）。
+
+        重放时 `operations` 里只有 `{status, object_id, revision}`，没有正文，因此正文从公开
+        快照里取（还在公开着的时候，那正是用户此刻能看到的正文）。条目已经被撤回时按「目标
+        已不可见」处理，绝不编造正文。
+
+        `memory_id` 为空时退回**命令里那个 ID**：服务在回 `noop`（同一条内容再公开一次）时
+        不给对象 ID（`_write_document` 对非 `ok` 的状态一律回 None），而公开快照里那一份正是
+        用户要看的正文。回显的 ID 取快照里的那一个，不是用户输入的原样。
+        """
+        entry = await self._public_entry(
+            request.user_id, memory_id or request.command.argument
+        )
+        if entry is None:
+            return texts.MEMORY_TARGET_GONE_TEXT
+        return texts.memory_published_text(memory_id=entry.memory_id, content=entry.content)
+
+    async def _public_entry(
+        self, user_id: str, memory_id: str | None
+    ) -> PublicMemoryEntry | None:
+        """该用户公开快照里的这一条（只读 `public/`，与 `_private_entry` 分开）。
+
+        比对用 `_same_memory_id` 的归一化口径：人工改窄过 ID 的公开文件（`UM-6`）也要能被
+        `UM-000006` 命中（§41.3 的 ID 归一化）。
+        """
+        if memory_id is None:
+            return None
+        for entry in await self.service.public_entries(user_id):
+            if _same_memory_id(entry.memory_id, memory_id):
+                return entry
+        return None
+
+    async def _published_ids(self, user_id: str) -> frozenset[str]:
+        """该用户已公开的条目 ID 集合：`/memory list` 的 `[私有]` / `[已公开]` 标记据此计算。"""
+        return frozenset(
+            entry.memory_id for entry in await self.service.public_entries(user_id)
+        )
+
     async def _private_entry(self, user_id: str, memory_id: str | None) -> MemoryEntry | None:
         if memory_id is None:
             return None
@@ -640,6 +834,18 @@ class MemoryController:
         """一条消息触发两个 mutation 时的第二个键（见 `_SECOND_STEP_SUFFIX` 的注释）。"""
         return f"{_COMMAND_SOURCE}:{request.message_id}{_SECOND_STEP_SUFFIX}"
 
+    def _revoke_operation_id(self, request: MemoryCommandRequest) -> str:
+        """两阶段命令撤回步的幂等键：`cmd:<message_id>:unpublish`（§12.3 / §12.4，逐字固定、R13）。"""
+        return f"{_COMMAND_SOURCE}:{request.message_id}{_REVOKE_STEP_SUFFIX}"
+
+    def _publish_operation_id(self, request: MemoryCommandRequest) -> str:
+        """`/memory public` 的幂等键：`publish:<message_id>`（§42.4 第 2 步）。"""
+        return f"{_PUBLISH_SOURCE}:{request.message_id}"
+
+    def _unpublish_operation_id(self, request: MemoryCommandRequest) -> str:
+        """`/memory unpublic` 的幂等键：`unpublish:<message_id>`（§42.5）。"""
+        return f"{_UNPUBLISH_SOURCE}:{request.message_id}"
+
     def _remember_operation_id(self, request: MemoryCommandRequest) -> str:
         """显式 `/remember` 的幂等键是稳定合同：`remember:<message_id>`（§32.3）。"""
         return f"{_REMEMBER_SOURCE}:{request.message_id}"
@@ -667,8 +873,61 @@ class MemoryController:
 
 
 def _usage_text(name: str) -> str:
-    """缺参数与非法 ID 的固定用法文案（§32.2）：`/remember` 与 `/memory` 各一条。"""
-    return texts.REMEMBER_USAGE_TEXT if name == "remember" else texts.MEMORY_USAGE_TEXT
+    """缺参数与非法 ID 的固定用法文案（§32.2、§52.1）：`/remember`、公开动作与其余各一条。"""
+    if name == "remember":
+        return texts.REMEMBER_USAGE_TEXT
+    if name in (_PUBLISH_COMMAND, _UNPUBLISH_COMMAND):
+        return texts.MEMORY_PUBLIC_USAGE_TEXT
+    return texts.MEMORY_USAGE_TEXT
+
+
+def _command_failure_text(request: MemoryCommandRequest, status: str) -> str | None:
+    """命令专属的失败文案（§52.2）：同一个状态在不同命令上说的不是同一件事。
+
+    - `public` 的 `invalid_proposal` 是「拿不到合法 username」（R8），不是「撰写失败」；
+    - `public` 的 `full` 是**公开条目**上限，不能说成私有条目上限（§39.1）；
+    - `public` 的 `conflict` 是「已公开副本与当前私人条目不一致」（R3），
+      与 `public_conflict`（AI 更新受阻）各有各的文案，两句不得共用（§40.3）。
+
+    其余命令返回 None，走 `_FAILURE_TEXTS` 的通用映射。
+    """
+    if request.command.name != _PUBLISH_COMMAND:
+        return None
+    if status == STATUS_INVALID_PROPOSAL:
+        return texts.MEMORY_PUBLIC_IDENTITY_TEXT
+    if status == STATUS_FULL:
+        return texts.MEMORY_PUBLIC_FULL_TEXT
+    if status == STATUS_CONFLICT:
+        return texts.MEMORY_PUBLIC_MISMATCH_TEXT
+    return None
+
+
+def _same_memory_id(left: str | None, right: str | None) -> bool:
+    """两个 UM-ID 指的是不是同一条：**宽度不算数**（`UM-6` 与 `UM-000006` 同一条，§41.3）。
+
+    只服务「拿命令里的 ID 去公开快照里找那一条」这一件事：公开命令回 `noop` 时服务不返回
+    对象 ID，而用户完全可能写 `UM-6` 这种人工改窄过的序号。宽度不同的两个 `UM-` ID 只要序号
+    的数值形态相同就算同一条；其余形状一律按逐字相等处理（不做任何猜测）。
+    """
+    if left is None or right is None:
+        return False
+    if left == right:
+        return True
+    if not left.startswith(PREFIX_USER) or not right.startswith(PREFIX_USER):
+        return False
+    left_digits = left[len(PREFIX_USER) :]
+    right_digits = right[len(PREFIX_USER) :]
+    if not left_digits.isdigit() or not right_digits.isdigit():
+        return False
+    return left_digits.lstrip("0") == right_digits.lstrip("0")
+
+
+def _add_carries_a_target(proposal: MemoryProposal) -> bool:
+    """提案是不是「新增却带了目标 ID」这个畸形形状（§31.2：`add` 不带目标、`update` 带同前缀目标）。
+
+    只用来挑文案：它的归属是 `invalid_proposal`（见 `_remember` 的注释）。
+    """
+    return proposal.action is ProposalAction.ADD and proposal.target_id is not None
 
 
 def _service_forbidden_text(request: MemoryCommandRequest) -> str:
@@ -690,6 +949,8 @@ _HANDLERS: dict[str, _Handler] = {
     "auto_on": MemoryController._auto_on,
     "auto_off": MemoryController._auto_off,
     "list": MemoryController._list,
+    _PUBLISH_COMMAND: MemoryController._public,
+    _UNPUBLISH_COMMAND: MemoryController._unpublic,
     "forget": MemoryController._forget,
     "clear": MemoryController._clear,
     "candidates": MemoryController._candidates,
