@@ -98,12 +98,18 @@ class ResolvedRefs:
 
     `image_attempts` 是这一趟**试了几张**图（含失败的），供调用方扣减自己手上的
     名额：计成功数会让失败的那几张把名额退回去，于是「试几张」失控。
+
+    `expanded_texts` 是这一趟**真正取回并渲染成功**的剪贴板正文与投票文本（R10、§49），
+    按展开顺序排列，装的是**实际拼进 `text` 的那一份**（含长度截断）：公开记忆只允许扫描
+    「本轮真的会提供给模型的文本」（公开设计 §6.3），截断后才给模型看的那半段不该参与匹配。
+    **不含**原文本、不含加载失败标记、不含图片，也不含因预算或额度没取回的引用。
     """
 
     text: str
     image_parts: tuple[dict[str, Any], ...] = ()
     expanded: int = 0
     image_attempts: int = 0
+    expanded_texts: tuple[str, ...] = ()
 
 
 def _kind_for_id(value: str) -> str | None:
@@ -278,6 +284,7 @@ class ContentRefResolver:
         images = 0
         expanded = 0
         parts: list[dict[str, Any]] = []
+        texts: list[str] = []
 
         for ref in refs:
             out.append(text[cursor : ref.start])
@@ -313,6 +320,8 @@ class ContentRefResolver:
             if len(rendered) > cap:
                 rendered = rendered[:cap].rstrip() + TRUNCATION_SUFFIX
             remaining -= len(rendered) - len(ref.text)
+            # 记的是截断之后的那一份：它与 `text` 里真正会外送的内容逐字一致。
+            texts.append(rendered)
             out.append(rendered)
             expanded += 1
 
@@ -322,6 +331,7 @@ class ContentRefResolver:
             image_parts=tuple(parts),
             expanded=expanded,
             image_attempts=images,
+            expanded_texts=tuple(texts),
         )
 
     async def _resolve_image(
