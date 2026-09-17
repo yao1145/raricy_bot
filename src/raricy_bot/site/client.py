@@ -12,8 +12,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
+import re
 import urllib.parse
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
@@ -33,7 +35,7 @@ from .comment_models import (
     normalize_uuid,
     strip_comment_content,
 )
-from .models import LOBBY, Author, ChatMessage, Clipboard, Vote, _parse_author
+from .models import LOBBY, Author, ChatMessage, ChatUserSummary, Clipboard, Vote, _parse_author
 
 # 会话 Cookie 名（chat-bot.md §3）。
 SESSION_COOKIE_NAME: str = "raricy_session"
@@ -52,6 +54,7 @@ _COMMENTS_PREFIX: str = "/api/blogs"
 _SPIDER_COMMENTS_PATH: str = "/api/spider/comments"
 _SPIDER_BLOGS_PREFIX: str = "/api/spider/blogs"
 _NOTIFICATIONS_PATH: str = "/api/notifications"
+_CHAT_USERS_PATH: str = "/api/chat/users"
 _CLIPBOARD_PREFIX: str = "/api/clipboard"
 _VOTES_PREFIX: str = "/api/votes"
 _IMAGES_PREFIX: str = "/api/images"
@@ -62,6 +65,41 @@ _MAX_COMMENT_TREE_NODES: int = 10000
 CLIPBOARD_ID_LEN: int = 8
 VOTE_ID_LEN: int = 9
 IMAGE_ID_LEN: int = 10
+
+# 用户搜索的固定分页（INTERFACES §44、chat-bot.md §9.1）：调用方不得传分页参数。
+_USER_SEARCH_LIMIT: int = 30
+_USER_SEARCH_OFFSET: int = 0
+
+# 响应形状上游未文档化（§44）：信封下这几个键里的数组都当作用户列表，其余一律认不出。
+_USER_LIST_KEYS: tuple[str, ...] = ("users", "data", "items", "results")
+
+# 站点用户名合同（chat-bot.md §2.1）：3–20 字符，仅 ASCII 字母、数字、`_`、`-`，
+# 首尾不得是 `-` 或 `_`。查询词先过这条闸：形态不可能匹配到人的取值不发请求。
+_USERNAME_RE: re.Pattern[str] = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,18}[A-Za-z0-9]")
+
+
+def _is_searchable_username(value: object) -> bool:
+    """查询词是否是站点用户名合同允许的形状（只认字符串，其余为否）。"""
+    return isinstance(value, str) and _USERNAME_RE.fullmatch(value) is not None
+
+
+def _user_items(payload: object) -> list[Any] | None:
+    """从搜索响应里取用户数组；认不出的容器返回 None，由调用方降级为空结果。
+
+    只认两种容器（R22）：顶层数组，或 `code == 200` 的信封下 `users` / `data` /
+    `items` / `results` 里的数组。**刻意不猜**更深的结构：猜错会把别的东西当成用户
+    列表，而这个结果唯一的下游用途是身份精确校验。
+    """
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, Mapping):
+        code = payload.get("code")
+        if isinstance(code, int) and not isinstance(code, bool) and code == 200:
+            for key in _USER_LIST_KEYS:
+                value = payload.get(key)
+                if isinstance(value, list):
+                    return value
+    return None
 
 
 def _messages_path(channel_id: str) -> str:
@@ -411,6 +449,55 @@ class SiteClient:
             raise self._error(200, "malformed vote response")
         return vote
 
+    async def search_chat_users(self, query: str) -> tuple[ChatUserSummary, ...]:
+        """按用户名搜索可见用户（§44；`chat-bot.md` §9.1 的 `GET /api/chat/users`）。
+
+        只读的一次查询：固定 `limit=30&offset=0`，**不创建私聊频道**——上游把这条接口
+        介绍成「主动私聊的第一步」，但这里只需要它的稳定用户 ID，发私聊不在职责里。
+
+        上游只文档化了这条路径本身，**没有文档化响应形状**，所以解析按宽容口径来（R22）：
+        顶层数组，或 `code == 200` 信封下 `users` / `data` / `items` / `results` 里的数组
+        都接受；单条坏条目逐个丢掉；认不出的容器一律返回空元组（fail-closed，绝不猜）。
+        429、网络错误与非法响应抛 `SiteError`，由调用方统一吞掉；调用方按**可降级失败**
+        处理它，不得让它影响聊天或评论。
+
+        提交的 `q`、返回的 username 与 id **不进日志**：本方法自己不出声，底层只可能按
+        既有的 `site.network_error` / `site.session_expired` 记异常的**类型名**。
+        """
+        if not _is_searchable_username(query):
+            # 形态不可能有匹配结果，也不该把任意文本拼进查询串：不发请求。
+            return ()
+        await self.ensure_session()
+        params = {"q": query, "limit": _USER_SEARCH_LIMIT, "offset": _USER_SEARCH_OFFSET}
+        status, payload, retry_after = await self._request_authenticated_json(
+            _CHAT_USERS_PATH, params=params
+        )
+        code = payload.get("code") if isinstance(payload, Mapping) else None
+        if isinstance(code, int) and not isinstance(code, bool) and code == 401:
+            # 会话失效：与 fetch_notifications 同款，只重登一次再试一次。
+            await self._relogin()
+            status, payload, retry_after = await self._request_authenticated_json(
+                _CHAT_USERS_PATH, params=params
+            )
+            code = payload.get("code") if isinstance(payload, Mapping) else None
+        if isinstance(code, int) and not isinstance(code, bool) and code != 200:
+            # 刻意不复用信封里的 `message`：这条接口的错误文案可能把查询词原样回显，
+            # 而查询词不进日志、也不该出现在异常文案里（§44、§51）。只报 code 与 HTTP 状态。
+            raise self._error(
+                code, f"code={code} http={status}", retry_after if code == 429 else None
+            )
+        raw_items = _user_items(payload)
+        if raw_items is None:
+            return ()
+        summaries: list[ChatUserSummary] = []
+        for item in raw_items:
+            summary = ChatUserSummary.from_dict(item)
+            if not summary.id or not summary.username:
+                # 缺字段的条目做不了身份校验，逐个丢掉（§44 的「缺字段 → 可降级失败」）。
+                continue
+            summaries.append(summary)
+        return tuple(summaries)
+
     async def fetch_notifications(
         self, *, page: int, unread_only: bool = True
     ) -> NotificationPage:
@@ -518,6 +605,32 @@ class SiteClient:
             return json.loads(raw)
         except (ValueError, UnicodeDecodeError) as exc:
             raise self._error(status, "malformed response") from exc
+
+    async def _request_authenticated_json(
+        self, path: str, *, params: Any = None
+    ) -> tuple[int, object, float | None]:
+        """带 Cookie 拉一次 JSON 并原样交回载荷（**不要求**信封），供形状未文档化的接口用。
+
+        与 `_request_public_json` 的两处差别：带上会话 Cookie；把 HTTP 状态与响应头里的
+        `Retry-After` 一并带回来，让调用方能按**信封 code**（而不是 HTTP 状态）判成败。
+        字节上限与网络错误映射都复用既有机制。
+        """
+        headers: dict[str, str] = {"Accept": "application/json"}
+        headers.update(self._cookie_headers())
+        try:
+            async with self._require_client().stream(
+                "GET", path, headers=headers, params=params
+            ) as response:
+                status = int(response.status_code)
+                retry_after = _parse_retry_after(response)
+                raw = await self._bounded_response_bytes(response)
+        except httpx.HTTPError as exc:
+            raise self._network_error(exc) from exc
+        try:
+            payload = json.loads(raw)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise self._error(status, "malformed response") from exc
+        return status, payload, retry_after
 
     async def _request_comment_envelope(
         self,

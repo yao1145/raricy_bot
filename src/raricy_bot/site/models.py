@@ -273,6 +273,26 @@ class Vote:
 
 
 @dataclass(frozen=True)
+class ChatUserSummary:
+    """一次用户搜索命中的人（`GET /api/chat/users`，chat-bot.md §9.1）。
+
+    上游**没有文档化这个接口的响应形状**，所以只保留宿主需要的两个字段，其余一律丢弃
+    （§44）。解析取宽容口径：字段缺失或类型不对就是空串，由调用方按空值丢弃，
+    解析本身**永不抛异常**。
+    """
+
+    id: str
+    username: str
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ChatUserSummary":
+        """从一条搜索命中的 JSON 对象解析；非映射退化为两个空字段。"""
+        if not isinstance(data, Mapping):
+            return cls(id="", username="")
+        return cls(id=_as_str(data.get("id")), username=_as_str(data.get("username")))
+
+
+@dataclass(frozen=True)
 class ChatMessage:
     """一条站内消息。"""
 
