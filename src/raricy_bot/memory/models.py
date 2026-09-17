@@ -10,7 +10,8 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from enum import StrEnum
 
 # 仅为让 `MemoryContext.items` 的字符串前向引用在运行期可解析；core/context.py 不依赖本包。
@@ -48,6 +49,9 @@ STATUS_INVALID_PROPOSAL: str = "invalid_proposal"
 STATUS_CONFLICT: str = "conflict"
 STATUS_FULL: str = "full"
 STATUS_SECRET_DETECTED: str = "secret_detected"
+# 第十一个稳定状态（INTERFACES §40.3）：AI 撰写或自动提取试图更新一条**仍然公开**的来源条目。
+# 它与 `conflict`（磁盘摘要与内存快照不一致）不是一回事：静默改写会扩大用户批准过的授权范围。
+STATUS_PUBLIC_CONFLICT: str = "public_conflict"
 
 
 @dataclass(frozen=True)
@@ -130,6 +134,53 @@ class MemoryCaptureResult:
     memory_id: str | None
     content: str
     action: ProposalAction
+
+
+@dataclass(frozen=True)
+class PublicMemoryEntry:
+    """一条公开个人记忆条目（INTERFACES §40.1）。
+
+    它是私人条目在**发布那一刻**的显式快照，不是动态引用：`source_created_at` /
+    `source_updated_at` 原样复制来源条目的 `created_at` / `updated_at`，来源条目之后的变化不会
+    反映到这里。`memory_id` 沿用来源的 `UM-` ID，重复公开同一条目保持原 ID 与原快照。
+    """
+
+    memory_id: str
+    key: str
+    content: str
+    pinned: bool
+    source_created_at: str
+    source_updated_at: str
+    published_at: str
+
+
+@dataclass(frozen=True)
+class PublicMemoryDocument:
+    """一个 owner 的公开投影文件（INTERFACES §40.1）。
+
+    `owner_username` 必须满足站点用户名合同（§40.2 第 2 条）；`operations` 与私有文件同款，
+    键是宿主的 `operation_id`，值是 `OperationResult`。
+    """
+
+    schema_version: int = 1
+    revision: int = 0
+    owner_username: str = ""
+    operations: Mapping[str, OperationResult] = field(default_factory=dict)
+    entries: tuple[PublicMemoryEntry, ...] = ()
+
+
+@dataclass(frozen=True)
+class PublicMemorySubject:
+    """本轮选入的一个公开投影所有者（INTERFACES §40.2）。
+
+    `source_priority` 只表达**本轮的选择顺序**（越小越优先），不落盘、不进日志。
+    只包含不可逆的 `owner_key` 与已满足站点用户名合同的 `username`：没有原始 user ID、没有正文、
+    没有来源文本；它是**宿主计算**的结果，模型不参与身份决策。
+    """
+
+    owner_key: str
+    username: str
+    source_priority: int
 
 
 @dataclass(frozen=True)

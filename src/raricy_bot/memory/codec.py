@@ -1,4 +1,8 @@
-"""`common.md` 与用户私有文件的严格解析与确定性渲染（INTERFACES §29、规划 §5.2 … §5.4）。
+"""`common.md`、用户私有文件与公开投影文件的严格解析与确定性渲染（INTERFACES §29、§41）。
+
+公开投影（`public/<owner_key>.md`）是第三类文件：结构与用户文件同款，字段换成
+`PUBLIC_ENTRY_FIELDS`，front matter 里多一个 `owner_username`。它与另外两类共用同一套失败
+reason、同一套标量引号规则与同一套防伪造结构，现有格式既不迁移也不重写。
 
 纯同步、无文件 I/O、不 import `app.py`（裁决 G）。解析失败只抛 `CodecError`，`reason` 只取六个稳定
 值之一；异常字符串、参数与日志**不含任何原始内容**——记忆正文是敏感数据（§29.2 第 7 条、§37）。
@@ -25,7 +29,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 import yaml
 
@@ -39,6 +43,7 @@ from .models import (
     STATUS_NOT_FOUND,
     STATUS_NOOP,
     STATUS_OK,
+    STATUS_PUBLIC_CONFLICT,
     STATUS_SECRET_DETECTED,
     STATUS_UNAVAILABLE,
     MemoryCandidate,
@@ -46,6 +51,8 @@ from .models import (
     MemoryScope,
     OperationResult,
     ProposalAction,
+    PublicMemoryDocument,
+    PublicMemoryEntry,
 )
 
 __all__ = [
@@ -56,8 +63,10 @@ __all__ = [
     "PrivateDocument",
     "parse_common",
     "parse_private",
+    "parse_public",
     "render_common",
     "render_private",
+    "render_public",
 ]
 
 # 六个稳定 reason（INTERFACES §29.2 第 7 条）。超出这个集合的失败是编程错误，不是用户可预期失败。
@@ -76,6 +85,7 @@ CODEC_REASONS: tuple[str, ...] = (
 # 正文结构常量（§29.1）。
 TITLE_COMMON: str = "# 共同记忆"
 TITLE_PRIVATE: str = "# 用户私有记忆"
+TITLE_PUBLIC: str = "# 用户公开个人记忆"
 SECTION_ALL_USER: str = "all_user"
 SECTION_LOBBY: str = "lobby"
 SECTION_CANDIDATES: str = "candidates"
@@ -92,6 +102,13 @@ ID_DIGITS: int = 6
 ENTRY_FIELDS: tuple[str, ...] = ("key", "pinned", "created_at", "updated_at")
 CANDIDATE_FIELDS: tuple[str, ...] = ("scope", "action", "target_id", "key", "created_at")
 OPERATION_FIELDS: tuple[str, ...] = ("status", "object_id", "revision")
+PUBLIC_ENTRY_FIELDS: tuple[str, ...] = (
+    "key",
+    "pinned",
+    "source_created_at",
+    "source_updated_at",
+    "published_at",
+)
 FRONT_COMMON: tuple[str, ...] = (
     "schema_version",
     "revision",
@@ -108,8 +125,14 @@ FRONT_PRIVATE: tuple[str, ...] = (
     "next_id",
     "operations",
 )
+FRONT_PUBLIC: tuple[str, ...] = (
+    "schema_version",
+    "revision",
+    "owner_username",
+    "operations",
+)
 
-# 稳定状态集合（§27.4）：只有这十个值可以出现在 `operations` 的 status 里。
+# 稳定状态集合（§27.4、§40.3）：只有这十一个值可以出现在 `operations` 的 status 里。
 STATUS_VALUES: tuple[str, ...] = (
     STATUS_OK,
     STATUS_NOOP,
@@ -121,10 +144,14 @@ STATUS_VALUES: tuple[str, ...] = (
     STATUS_CONFLICT,
     STATUS_FULL,
     STATUS_SECRET_DETECTED,
+    STATUS_PUBLIC_CONFLICT,
 )
 
 # 映射深度上限：front matter 是「根 → operations → 单条结果」三层；更深的嵌套直接拒绝。
 MAX_FRONT_DEPTH: int = 3
+
+# 私有条目与公开条目的共同形状（都带 `memory_id`）：排序与判重共用同一套助手。
+_EntryLike = TypeVar("_EntryLike", MemoryEntry, PublicMemoryEntry)
 
 _DIGITS = re.compile(r"[0-9]+")
 _TIMESTAMP = re.compile(
@@ -132,6 +159,16 @@ _TIMESTAMP = re.compile(
 )
 _FENCE = "---"
 _SCALAR_WIDTH = 10**9
+
+# 站点用户名合同（`docs/materials/chat-bot.md` §2.1、Global Constraints 第 15 条）：
+# 3–20 字符，仅 ASCII 字母、数字、`_`、`-`，且首尾不得是 `-` 或 `_`。公开文件的 owner_username
+# 与公开索引里的 username 都按这一条判定；不接受任意文本。
+USERNAME_MIN_LENGTH = 3
+USERNAME_MAX_LENGTH = 20
+_USERNAME_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+)
+_USERNAME_EDGE_CHARS = "-_"
 
 
 class CodecError(Exception):
@@ -275,6 +312,48 @@ def render_private(document: PrivateDocument) -> bytes:
     lines.append(TITLE_PRIVATE)
     for item in _sorted_entries(document.entries):
         lines.extend(_render_entry(item, 2, PREFIX_USER))
+    return _encode(lines)
+
+
+def parse_public(data: bytes, cfg: MemoryConfig) -> PublicMemoryDocument:
+    """解析公开投影文件；失败抛 `CodecError`（§41.2）。
+
+    比对私有文件多的两处严格性：front matter 的**键序**也是结构（顺序不对 → malformed），
+    `owner_username` 必须满足站点用户名合同（纵深防御的第二层，第一层在发布入口）。
+    """
+    text = _decode(data, cfg)
+    front_text, body = _split_front_matter(text)
+    front = _load_front(front_text)
+    _check_front(front, FRONT_PUBLIC)
+    if tuple(front) != FRONT_PUBLIC:
+        # 键集合已经对上了，这里拒的是**顺序**不同（§41.1、§41.2 第 2 条）。
+        raise CodecError("malformed")
+    document = PublicMemoryDocument(
+        schema_version=front["schema_version"],
+        revision=front["revision"],
+        owner_username=front["owner_username"],
+        operations=_parse_operations(front["operations"], cfg),
+        entries=_parse_public_body(body),
+    )
+    _check_public(document, cfg)
+    return document
+
+
+def render_public(document: PublicMemoryDocument) -> bytes:
+    """确定性渲染公开投影文件（§41.3）：条目按 UM-ID 数值序，字段顺序固定，重复渲染逐字节相同。"""
+    _check_public(document, None)
+    lines = _render_front_matter(
+        (
+            ("schema_version", document.schema_version),
+            ("revision", document.revision),
+            ("owner_username", document.owner_username),
+        ),
+        document.operations,
+    )
+    lines.append("")
+    lines.append(TITLE_PUBLIC)
+    for item in _sorted_entries(document.entries):
+        lines.extend(_render_public_entry(item))
     return _encode(lines)
 
 
@@ -487,6 +566,39 @@ def _parse_candidate(lines: list[str], index: int) -> tuple[MemoryCandidate, int
     return result, index
 
 
+def _parse_public_entry(lines: list[str], index: int) -> tuple[PublicMemoryEntry, int]:
+    memory_id = _heading_id(lines[index])
+    fields, index = _read_fields(lines, index + 1, PUBLIC_ENTRY_FIELDS)
+    content, index = _read_body(lines, index)
+    result = PublicMemoryEntry(
+        memory_id=memory_id,
+        key=fields["key"],
+        content=content,
+        pinned=fields["pinned"],
+        source_created_at=fields["source_created_at"],
+        source_updated_at=fields["source_updated_at"],
+        published_at=fields["published_at"],
+    )
+    return result, index
+
+
+def _parse_public_body(lines: list[str]) -> tuple[PublicMemoryEntry, ...]:
+    """读取公开文档正文；零条目是合法文档（R9、D-100），标题与块形状仍必须严格。"""
+    entries: list[PublicMemoryEntry] = []
+    index = _skip_blank(lines, 0)
+    if index >= len(lines) or lines[index].rstrip() != TITLE_PUBLIC:
+        raise CodecError("malformed")
+    index += 1
+    while True:
+        index = _skip_blank(lines, index)
+        if index >= len(lines):
+            return tuple(entries)
+        if not lines[index].rstrip().startswith("## "):
+            raise CodecError("malformed")
+        item, index = _parse_public_entry(lines, index)
+        entries.append(item)
+
+
 def _parse_private_body(lines: list[str]) -> tuple[MemoryEntry, ...]:
     entries: list[MemoryEntry] = []
     index = _skip_blank(lines, 0)
@@ -601,6 +713,23 @@ def _check_key(value: object) -> None:
             raise CodecError("malformed")
 
 
+def _check_username(value: object) -> None:
+    """公开投影的 owner_username 必须满足站点用户名合同（§40.2 第 2 条、§41.2 第 3 条）。
+
+    只认 ASCII 字母、数字、`_`、`-`，长度 3–20，首尾不得是 `-` 或 `_`。**不接受任意文本**：
+    这份值会进公开索引、进 `SupplementalItem` 的标签，写进文件前就必须是宿主校验过的形状。
+    """
+    if not isinstance(value, str):
+        raise CodecError("malformed")
+    if not USERNAME_MIN_LENGTH <= len(value) <= USERNAME_MAX_LENGTH:
+        raise CodecError("malformed")
+    if value[0] in _USERNAME_EDGE_CHARS or value[-1] in _USERNAME_EDGE_CHARS:
+        raise CodecError("malformed")
+    for char in value:
+        if char not in _USERNAME_CHARS:
+            raise CodecError("malformed")
+
+
 def _check_operation_id(value: object) -> None:
     """幂等键是不含空白的非空字符串（形状 `<来源>:<message_id>`，但取值由宿主决定）。"""
     if not isinstance(value, str) or not value:
@@ -666,6 +795,17 @@ def _check_entry(item: MemoryEntry, prefix: str) -> None:
     _check_content(item.content)
 
 
+def _check_public_entry(item: PublicMemoryEntry) -> None:
+    """公开条目的字段校验：与私有条目同款，只是时间戳换成来源与发布时刻（§41.2 第 5 条）。"""
+    _check_id(item.memory_id, PREFIX_USER)
+    _check_key(item.key)
+    _check_bool(item.pinned)
+    _check_timestamp(item.source_created_at)
+    _check_timestamp(item.source_updated_at)
+    _check_timestamp(item.published_at)
+    _check_content(item.content)
+
+
 def _check_candidate(candidate: MemoryCandidate) -> None:
     """候选的附加规则：作用域只能是共同记忆，动作只能是 add/update，目标必须与作用域同前缀。
 
@@ -708,6 +848,33 @@ def _check_operations(operations: object, cfg: MemoryConfig | None) -> None:
 def _check_capacity(count: int, limit: int | None) -> None:
     if limit is not None and count > limit:
         raise CodecError("malformed")
+
+
+def _check_public(document: PublicMemoryDocument, cfg: MemoryConfig | None) -> None:
+    """公开投影文件的全部语义校验；parse 与 render 都走这里（§41）。
+
+    容量上限（条目数与正文长度）与私有文件同款：`cfg` 只在 parse 侧可得，render 侧由发布路径
+    自己保证不越界。零条目在这里是合法的——空公开文档必须能读回（R9、D-100）。
+    """
+    _check_schema_version(document.schema_version)
+    _check_plain_int(document.revision)
+    _check_username(document.owner_username)
+    _check_operations(document.operations, cfg)
+    entries = tuple(document.entries)
+    _check_capacity(
+        len(entries), cfg.max_public_entries_per_user if cfg is not None else None
+    )
+    for item in entries:
+        _check_public_entry(item)
+        _check_capacity(
+            len(item.content), cfg.max_entry_chars if cfg is not None else None
+        )
+    # 判重与排序共用 `_id_key` 的规范形式：`UM-7` 与 `UM-000007` 是同一个 ID（§41.3）。
+    _check_unique(
+        [PREFIX_USER + _id_key(_check_id(i.memory_id, PREFIX_USER)) for i in entries],
+        "duplicate_id",
+    )
+    _check_unique([item.key for item in entries], "duplicate_key")
 
 
 def _check_unique(values: Sequence[str], reason: CodecReason) -> None:
@@ -862,6 +1029,22 @@ def _render_entry(item: MemoryEntry, level: int, prefix: str) -> list[str]:
     return lines
 
 
+def _render_public_entry(item: PublicMemoryEntry) -> list[str]:
+    lines = [
+        "",
+        f"## {PREFIX_USER}{_check_id(item.memory_id, PREFIX_USER).zfill(ID_DIGITS)}",
+        "",
+        f"- key: {_scalar_line(item.key)}",
+        f"- pinned: {_scalar_line(item.pinned)}",
+        f"- source_created_at: {_scalar_line(item.source_created_at)}",
+        f"- source_updated_at: {_scalar_line(item.source_updated_at)}",
+        f"- published_at: {_scalar_line(item.published_at)}",
+        "",
+    ]
+    lines.extend(_body_lines(item.content))
+    return lines
+
+
 def _render_candidate(candidate: MemoryCandidate) -> list[str]:
     lines = [
         "",
@@ -878,13 +1061,14 @@ def _render_candidate(candidate: MemoryCandidate) -> list[str]:
     return lines
 
 
-def _sorted_entries(entries: Sequence[MemoryEntry]) -> tuple[MemoryEntry, ...]:
-    """按 ID 升序排序：序号按数值比较，因此 `UM-9` 排在 `UM-10` 之前（§29.3）。
+def _sorted_entries(entries: Sequence[_EntryLike]) -> tuple[_EntryLike, ...]:
+    """按 UM-ID 的**数值序**升序：`UM-9` 排在 `UM-10` 之前（§29.3、§41.3）。
 
     排序键是 `_id_key` 的结果（先比长度再比字典序），与判重共用同一套规范化，任意宽度都成立。
+    私有条目与公开条目共用它：两者 ID 同前缀、同宽度规范，各写一套排序必然分叉。
     """
 
-    def sort_key(item: MemoryEntry) -> tuple[int, str]:
+    def sort_key(item: _EntryLike) -> tuple[int, str]:
         canonical = _id_key(_check_id(item.memory_id, PREFIX_USER))
         return (len(canonical), canonical)
 
