@@ -531,6 +531,49 @@ MEMORY_SECRET_DETECTED_TEXT: str = (
     "请去掉这类内容后再试。"
 )
 
+# ---- 公开个人记忆（INTERFACES §50.1）----
+# 用户把自己的私有条目主动公开出去之后的全部文案。红线与私有记忆同款：不回显宿主路径、原始
+# user ID、用户存储键或模型返回的正文；发布成功的确认**必须**回显实际公开的条目 ID 与正文
+# （设计 §3.2、§50.1），撤回成功的确认则**绝不**回显已经撤下的正文（设计 §12.2）。
+
+# `/memory public` 与 `/memory unpublic` 的用法（缺参数或非法 ID，§52.1）。
+MEMORY_PUBLIC_USAGE_TEXT: str = (
+    "用法：/memory public <UM-ID> 把一条私有条目公开；/memory unpublic <UM-ID> 撤回它的公开副本；"
+    "/memory list public 查看你已公开的条目。公开之后，大区与博客评论里出现或精确提到你时，"
+    "这些条目可能随该轮请求一起发送给第三方模型。这些命令只在私聊里可用。"
+)
+
+# 拿不到合法站点用户名时的拒绝（R8）：与「撰写失败」不是一回事，因此有自己的文案。
+MEMORY_PUBLIC_IDENTITY_TEXT: str = (
+    "这次没有公开：我没能确认你在站点的有效用户名（用户名是 3 到 20 个字符，只能用字母、数字、"
+    "下划线和连字符）。请稍后再试；如果一直这样，请联系站点管理员。"
+)
+
+# 公开条目达到上限（full）：必须说清是**公开条目**的上限 —— 它与私有条目上限是两个数
+# （§39.1、§50.1），不能沿用 MEMORY_FULL_TEXT 的私有口径。
+MEMORY_PUBLIC_FULL_TEXT: str = (
+    "你的公开条目已经达到上限（这是公开条目的上限，与私有条目上限不是一个数），这一条没有公开，"
+    "我也不会自动撤回已有的公开条目。可以先用 /memory list public 查看，"
+    "再用 /memory unpublic <UM-ID> 撤回不需要的条目。"
+)
+
+# AI 撰写或自动提取试图更新一条仍然公开的来源条目（设计 §10.2、§40.3）：文案逐字取自设计原文。
+# 它与 `conflict`（磁盘摘要与内存快照不一致）不是一回事，两句不得共用。
+MEMORY_PUBLIC_CONFLICT_TEXT: str = "该条目当前已公开，请先撤回公开，再修改并重新发布。"
+
+# 重复公开同一条但内容已经不一样（R3）：公开的是发布那一刻的快照，绝不静默覆盖用户批准过的旧版本。
+# 与 MEMORY_PUBLIC_CONFLICT_TEXT 分开：那句说的是 AI 更新受阻，这句说的是用户自己重复公开。
+MEMORY_PUBLIC_MISMATCH_TEXT: str = (
+    "这条已经公开过，但公开的那份副本和现在的私人条目已经不一样了。公开的是发布那一刻的快照，"
+    "我不会覆盖你已经公开过的内容；请先用 /memory unpublic <UM-ID> 撤回，"
+    "确认内容后再用 /memory public <UM-ID> 重新公开。"
+)
+
+# 公开列表的空态：列举类命令没有内容时也要给一句完整的话（§36）。
+MEMORY_PUBLIC_LIST_EMPTY_TEXT: str = (
+    "你还没有公开任何条目。可以用 /memory public <UM-ID> 把一条私有条目公开出去。"
+)
+
 # 首次开启私有记忆的说明（设计 §11、D-66）：挂在 /memory on、/memory auto on 的成功回复，
 # 以及隐式打开读取的 /remember 成功回复上。必须覆盖保存了什么、可能发送给第三方模型、
 # 只在本私聊使用、如何查看与删除；不加任何持久标记。
@@ -568,9 +611,11 @@ MEMORY_AUTO_ON_DONE_TEXT: str = (
 )
 
 # `/memory off` 的确认：读取与自动提取一并关闭，已有条目保留（规划 §7.1）。
+# 最后一句是设计 §5.1 的硬要求：off 只暂停私聊里的私人读取，**不撤回**已公开条目，回复必须明说。
 MEMORY_OFF_DONE_TEXT: str = (
     "已暂停私有记忆，自动记忆也一并关闭：之后的私聊里我不会再参考你的条目，"
     "也不会自动保存新内容。已有条目都还在，可以用 /memory on 重新开启。"
+    "你此前公开过的条目仍然公开；不想让它们继续公开，请用 /memory unpublic <UM-ID> 逐一撤回。"
 )
 
 # `/memory auto off` 的确认：只关自动提取，私有记忆读取保持原样。
@@ -593,6 +638,10 @@ MEMORY_CANDIDATES_EMPTY_TEXT: str = "当前没有待批准的候选。"
 # 状态与列举里的固定词，只此一处来源。
 _MEMORY_SWITCH_ON: str = "已开启"
 _MEMORY_SWITCH_OFF: str = "未开启"
+
+# 私有列表里两种条目的标记（设计 §5.1）：只在私人文件里的条目与另有一份公开副本的条目。
+_MEMORY_ENTRY_PRIVATE_MARK: str = "[私有]"
+_MEMORY_ENTRY_PUBLIC_MARK: str = "[已公开]"
 _MEMORY_SCOPE_LABELS: dict[str, str] = {"all_user": "所有用户", "lobby": "大区"}
 _MEMORY_ACTION_LABELS: dict[str, str] = {"add": "新增", "update": "更新"}
 
@@ -648,10 +697,16 @@ def _memory_action_label(action: str) -> str:
     return _MEMORY_ACTION_LABELS.get(action, action)
 
 
-def memory_status_text(*, private_enabled: bool, auto_capture: bool, entry_count: int) -> str:
-    """`/memory status` 的回复：私有记忆与自动记忆的开关状态、私有条目数（§32.2）。
+def memory_status_text(
+    *,
+    private_enabled: bool,
+    auto_capture: bool,
+    entry_count: int,
+    public_entry_count: int,
+) -> str:
+    """`/memory status` 的回复：两个开关的状态、私有条目数与公开条目数（§32.2、§50.1）。
 
-    三个参数都是普通值（bool / int），因此本模块仍然不 import 任何 memory 模块。
+    四个参数都是普通值（bool / int），因此本模块仍然不 import 任何 memory 模块。
     `str()` 只把计数转成十进制填入句子，不是格式化：本模块一律不做字符串插值，
     唯一允许的拼接方式是 `+`（见 `tests/test_texts.py` 的源码级防线）。
     """
@@ -664,18 +719,28 @@ def memory_status_text(*, private_enabled: bool, auto_capture: bool, entry_count
         + auto
         + "\n私有条目："
         + str(entry_count)
+        + " 条\n公开条目："
+        + str(public_entry_count)
         + " 条\n"
         + "开启或暂停私有记忆用 /memory on 与 /memory off；自动记忆用 /memory auto on 与 "
-        "/memory auto off；查看条目用 /memory list。"
+        "/memory auto off；查看条目用 /memory list，查看已公开的条目用 /memory list public。"
     )
 
 
-def memory_entry_line(*, memory_id: str, content: str) -> str:
-    """记忆列表里的一行：`<条目 ID>：<正文>`。
+def memory_entry_line(
+    *, memory_id: str, content: str, published: bool | None = None
+) -> str:
+    """记忆列表里的一行：`<条目 ID>：<正文>`，私有列表另带 `[私有]` / `[已公开]` 标记（设计 §5.1）。
 
-    正文是条目所有者自己的内容，展示给本人属于 §37 允许的三处之一。
+    正文是条目所有者自己的内容，展示给本人属于 §37 允许的三处之一。`published` 为 None 表示
+    这一行不属于「自己的私有条目」清单（共同记忆），因此不带标记；为真表示这条私有条目另有
+    一份公开副本，为假表示它只在私人文件里。
     """
-    return memory_id + "：" + content
+    line = memory_id + "：" + content
+    if published is None:
+        return line
+    mark = _MEMORY_ENTRY_PUBLIC_MARK if published else _MEMORY_ENTRY_PRIVATE_MARK
+    return mark + " " + line
 
 
 def memory_entry_list_text(*, scope: str | None, lines: tuple[str, ...]) -> str:
@@ -699,6 +764,49 @@ def memory_entry_list_text(*, scope: str | None, lines: tuple[str, ...]) -> str:
         )
         foot = "这些条目对所有使用者生效；管理员可以用 /memory delete <GM-ID> 删除其中一条。"
     return head + "\n" + "\n".join(lines) + "\n" + foot
+
+
+def memory_public_entry_list_text(*, lines: tuple[str, ...]) -> str:
+    """`/memory list public` 的回复：表头 + 每行一条 + 撤回入口与上限口径；没有条目时回显式空态。
+
+    上限那一句只说「有独立的条数上限」，因为具体的数值来自部署配置，而本模块拿不到它
+    （与 `_blog_body_line` 的「数字必须由调用方传」是同一条理由：拿不到的数字不许写死）。
+    """
+    if not lines:
+        return MEMORY_PUBLIC_LIST_EMPTY_TEXT
+    return (
+        "你已公开的个人记忆，共 "
+        + str(len(lines))
+        + " 条：\n"
+        + "\n".join(lines)
+        + "\n公开条目有独立的条数上限（与私有条目上限不是一个数）；"
+        "用 /memory unpublic <UM-ID> 可以撤回其中一条。"
+    )
+
+
+def memory_published_text(*, memory_id: str, content: str) -> str:
+    """`/memory public` 的成功回复：回显实际公开的 ID 与正文，并说明公开范围与撤回入口（§50.1）。
+
+    三条披露缺一不可：公开使用范围（大区与博客评论、出现或精确提到你）、第三方模型传输、
+    以及 `/memory unpublic` 这个撤回入口。正文是用户自己公开的内容，展示给本人属于 §37
+    允许的三处之一。
+    """
+    return (
+        "已公开 " + memory_id + "：" + content + "\n"
+        "它现在是你主动公开的个人记忆：大区与博客评论里出现或精确提到你时，"
+        "这一条可能随该轮请求一起发送给第三方模型。公开的是这一份快照，"
+        "之后修改私人条目不会自动更新它。用 /memory unpublic "
+        + memory_id
+        + " 可以撤回公开。"
+    )
+
+
+def memory_unpublished_text(*, memory_id: str) -> str:
+    """`/memory unpublic` 的成功回复：只确认 ID 已不再用于公开请求（设计 §12.2）。
+
+    签名里只有 ID —— 已经撤下的正文没有位置可放，这就是「不回显」的结构性保证。
+    """
+    return "已撤回 " + memory_id + "：它不再用于公开请求，你的私人条目没有被改动。"
 
 
 def memory_candidate_line(
@@ -789,16 +897,19 @@ def memory_forgotten_text(*, memory_id: str) -> str:
     return "已删除私有记忆 " + memory_id + "。"
 
 
-def memory_cleared_text(*, removed: int) -> str:
-    """`/memory clear` 的成功回复：报出本次删掉的条数。
+def memory_cleared_text(*, removed: int, revoked: int) -> str:
+    """`/memory clear` 的成功回复：报出本次撤回的公开条目数与删除的私有条目数（§12.4、§50.1）。
 
-    removed 由调用方在清理之前数出来：幂等命中不会重放删除动作，因此重放那一次确实一条都没删，
-    如实报 0 而不是复述第一次的条数（`operations` 里没有地方存这个计数）。
+    两个计数都由调用方在各自步骤**之前**数出来（顺序照设计 §12.4：先撤回、再清空）：幂等命中
+    不会重放那两个动作，因此重放那一次确实一条都没撤回、也没删除，如实报 0 而不是复述第一次的
+    条数（`operations` 里没有地方存它们）。
     """
     return (
-        "已清空你的私有记忆，本次删除了 "
+        "已清空你的私有记忆：本次先撤回了 "
+        + str(revoked)
+        + " 条公开条目，再删除了 "
         + str(removed)
-        + " 条条目；设置保持不变，需要的内容可以用 /remember 重新保存。"
+        + " 条私有条目；设置保持不变，需要的内容可以用 /remember 重新保存。"
     )
 
 
