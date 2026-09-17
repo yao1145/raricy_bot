@@ -1980,6 +1980,24 @@ A 的公开偏好当成 B 的——那是本功能唯一可能真正伤到人的
       §12.1 第 2 步、§12.2）。§42.1 是它的展开说明。
     - §32.1 的 `MemoryCommandRequest` 字段表：补上 R12 的 `username: str = ""`（§47.1 给出的
       同名新字段），避免两处字段表互相矛盾。
+12. **公开 codec 的 front matter 只校验键集合，不校验键序**（§41.1、§41.2）：既有 codec 的
+    `_check_front` 只比 `set(front) != set(expected)`（`memory/codec.py`），§29.1 / §29.2 从头
+    没有键序规则；公开侧另加一条更严的键序判定会拒绝人工调换过键顺序的合法文件（§29.1 明确
+    容忍手改文件，同一条宽容只读立场），而设计 §11 对顺序的要求只落在**渲染**侧（「字段顺序
+    固定」）。因此解析只查键集合，键序由渲染器固定为 `schema_version, revision,
+    owner_username, operations`。加严不在本功能的选项里。
+13. **公开 codec 的三个常量名**（§41.1）：`TITLE_PUBLIC`、`FRONT_PUBLIC`、`PUBLIC_ENTRY_FIELDS`
+    由本合同钉死（设计 §11 只给了示例文件，没给标识符名）。
+14. **`append_exchange` 的 `subject` 参数名**（§45.1）：设计 §14.1 只说历史条目要带上 subject，
+    参数名由本合同钉死；它默认 `None`，既有调用点逐字节不变。
+15. **`recent_subjects` 的排序方向**（§45.1）：按最近一次出现**从新到旧**返回，按 `key` 去重、
+    `label` 取最近一次的值。设计只说「参与者」，次序是实现必须选一个的地方。
+16. **公开条目同样触发 `MEMORY_SYSTEM_ADDENDUM`**（§45.3）：公开条目也是记忆条目，因此选入公开
+    条目时既追加 `PUBLIC_PERSONAL_MEMORY_SYSTEM_ADDENDUM`，也满足既有说明的触发条件；两条说明
+    各自生效，`_plan_turn` 的可行性判断必须把两者都计入。
+17. **`ChatUserSearch` Protocol**（§43.2）：设计 §13.3 只说「查询站点」，本功能把 resolver 需要的
+    最小接口钉成一个 Protocol（只有 `search_chat_users` 一个方法，生产实现是 §44 的
+    `SiteClient`），使 `memory/subjects.py` 不 import `site/client.py`。
 
 理由：与 D-67 同款 —— 这些条目都是「实现必须选一个、但设计没说」的地方。写进裁决记录，是为了
 让下一个读到它们的人知道这是**冻结过的合同**，而不是某个实现者的随手选择；也让后续任务在遇到
@@ -2032,7 +2050,7 @@ D-67 与 INTERFACES §26–§37）。`memory/service.py` 另有一处**未编号
 | R5 `source_priority` 取值表 | INTERFACES §43.3；D-98 |
 | R6 身份校验的触发条件 | INTERFACES §43.4；D-99 |
 | R7 身份缓存与节流的代码常量 | INTERFACES §43.4；D-99 |
-| R8 发布时 username 非法 → `invalid_proposal` + 专用文案 | INTERFACES §42.4、§50.1、§52.2；D-101 |
+| R8 发布时 username 非法 → `invalid_proposal` + 专用文案 | INTERFACES §42.4、§50.1、§52.2 |
 | R9 空公开文档保留、不做尽力删除 | INTERFACES §42.5；D-100 |
 | R10 `ResolvedRefs.expanded_texts` | INTERFACES §49；D-98 |
 | R11 `/memory list public` 的解析结果 | INTERFACES §52.1 |
