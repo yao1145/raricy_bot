@@ -9,9 +9,16 @@ from __future__ import annotations
 # 模型输出过长被截断时追加的提示，保持以空行分隔段落。
 TRUNCATION_SUFFIX: str = "\n\n（内容过长，已截断）"
 
-# /help 的三个组成部分：首尾是两份文案共用的，中间那句按是否开启图片输入二选一。
-# 大区共享会话的四点写在 _HELP_TAIL_ABOUT_LOBBY 里（设计文档 §4.7），整条不得超过站点单条消息上限。
-# 记忆开启时的如实披露由 help_text() 组装（INTERFACES §36、D-64）。
+# /help 的文案由下面几组积木按开关拼装（INTERFACES §36）。整条不得超过站点单条消息上限
+# （5000 字，`docs/materials/chat-bot.md` 的长度上限表）。
+#
+# 排版约定：小标题一律用 **粗体**，**不用** Markdown 的 `#`。站点只放行
+# `p br hr strong b em i u s del code pre blockquote ul ol li a`（chat-bot.md §7.3），
+# `##` 会被净化器剥成裸文本；列表项前面同样要留空行，marked 认了空行才当列表。
+#
+# 诚实性：凡是部署配置决定的事实 —— 图片能不能读、有哪些能力、博客正文上限、记忆状态 ——
+# 都必须由调用方传进来，不得写死在文案里。写死的那一版曾经对一个博客正文上限配成 50000 的
+# 部署说「超过 1000 字时不会提供正文」。数字一律用 `+ str(n) +` 拼接，本模块不做字符串格式化。
 _HELP_HEAD: str = (
     "我是本站的聊天与博客评论机器人，不是真人，发言不代表站方立场。\n"
     "我能做的事：在大区里精确 @ 我、在博客评论里首次 @ 我，或直接回复我的评论；"
@@ -19,148 +26,196 @@ _HELP_HEAD: str = (
     "请注意：你发送的消息可能会被转交给第三方模型服务处理。\n"
 )
 
-_HELP_CAPABILITY_SEARCH: str = (
-    "默认不会联网；如需查询当前信息，可发送 /search 加上问题。搜索问题可能发送给第三方 Exa，"
-    "每次只处理当前一轮，评论区不支持搜索。"
+# 会话命令组：/help 与 /reset 永远存在，与任何能力开关无关。
+_HELP_SESSION_COMMANDS: str = (
+    "\n**会话命令**\n"
+    "\n"
+    "- `/help` —— 重新发送这份说明。\n"
+    "- `/reset` —— 开始一段新对话；旧的那段不会被删除。\n"
 )
 
-# 只有知识库开启时才出现的一句。命中片段会发给模型，必须说清楚；同时说明它不会发给搜索服务，
-# 因为那正是「/search 与 /kb 不能叠加」的理由（见 D-39）。
-_HELP_CAPABILITY_KB: str = (
-    "也可以发送 /kb 加上问题，从机器人本地的资料目录检索：命中的资料片段会随当前轮次一起发送给"
-    "第三方模型，但不会发送给搜索服务。该能力是否对你可用取决于运维是否为你开通；"
-    "未开通时会收到一条无权限提示。"
+# 能力命令组：标题与开场句固定，命令行按部署开关出现（见 _capability_commands）。
+# 开场句承担了三条以前逐句重复的披露 —— 默认不联网、只作用于当前这一轮、博客评论区不支持，
+# 于是每条命令行只需说清「它做什么」与「数据交给哪个第三方」。
+_HELP_CAPABILITY_HEAD: str = (
+    "\n**能力命令**\n"
+    "\n"
+    "默认不会联网。下面这些命令只作用于当前这一轮，一条消息里最多用一个，博客评论区不支持。\n"
+    "\n"
 )
 
-# 三个新增能力的披露句：每句都必须说清「数据发给哪个第三方」与「只作用于当前这一轮」。
-# 它们**只**由 help_text 的清单拼装使用，绝不进入下面四个既存常量（R5 的逐字节回归门）。
-# 长度纪律：每句控制在 110 字符内，五个能力全开时整条仍要低于站点单条消息上限。
-_HELP_CAPABILITY_ZHIHU: str = (
-    "也可以发送 /zhihu 加上问题，检索知乎上的内容：检索词会发送给第三方知乎开放平台，"
-    "每次只处理当前一轮。"
+_HELP_COMMAND_SEARCH: str = "- `/search 你的问题` —— 本轮联网搜索；问题会交给第三方 Exa。\n"
+
+_HELP_COMMAND_ZHIHU: str = (
+    "- `/zhihu 你的问题` —— 检索知乎上的内容；检索词会交给第三方知乎开放平台。\n"
 )
 
-_HELP_CAPABILITY_MAP: str = (
-    "也可以发送 /map 加上问题，查询地点、地址与天气等地理信息：查询词会发送给第三方高德，"
-    "每次只处理当前一轮。"
+_HELP_COMMAND_MAP: str = (
+    "- `/map 你的问题` —— 查询地点、地址与天气；查询词会交给第三方高德。\n"
 )
 
-_HELP_CAPABILITY_WOLFRAM: str = (
-    "也可以发送 /wolfram 加上问题，做数学、科学与事实类计算：问题会发送给第三方 Wolfram Alpha，"
-    "每次只处理当前一轮。"
+_HELP_COMMAND_WOLFRAM: str = (
+    "- `/wolfram 你的问题` —— 数学、科学与事实类计算；问题会交给第三方 Wolfram Alpha。\n"
 )
 
-_HELP_CAPABILITY_NO_MEDIA: str = (
-    "不能查看图片、附件或被引用的博客内容；博客正文不超过 "
-    "1000 字时，可能随当前轮次一并发送给第三方模型，超过 1000 字时不会提供正文。\n"
+# 知识库是本地能力，不把数据发给第三方搜索服务 —— 那正是「/search 与 /kb 不能叠加」的
+# 理由（见 D-39），所以命令行里必须写明数据去了哪儿、又没去哪儿。
+_HELP_COMMAND_KB: str = (
+    "- `/kb 你的问题` —— 从机器人本地的资料目录检索；命中的资料片段会随本轮问题一起交给"
+    "第三方模型，但不会交给搜索服务。是否可用取决于运维是否为你开通；"
+    "未开通时会收到一条无权限提示。\n"
 )
 
-_HELP_CAPABILITY_VISION: str = (
-    "可以查看你发来的图片：图片同样会转交给第三方模型处理。"
-    "不能读附件或被引用的博客正文；博客正文不超过 1000 字时，"
-    "可能随当前轮次一并发送给第三方模型，超过 1000 字时不会提供正文。\n"
+# 媒体组。图片一行按视觉开关二选一；博客正文一行由 _blog_body_line() 按配置拼；
+# 收尾一行说明两者都只属当前轮 —— 正文不进历史（blog.py 在历史里只留一行 [引用博客] 标记）。
+_HELP_MEDIA_HEAD: str = "\n**关于图片与被引用的博客**\n\n"
+
+_HELP_MEDIA_IMAGE_OFF: str = "- 不能查看你发来的图片；你可以用文字描述想问的内容。\n"
+
+_HELP_MEDIA_IMAGE_ON: str = (
+    "- 可以查看你发来的图片；图片同样会转交给第三方模型处理。\n"
 )
 
-_HELP_CAPABILITY_TEXT_ONLY: str = _HELP_CAPABILITY_SEARCH + _HELP_CAPABILITY_NO_MEDIA
-
-_HELP_CAPABILITY_TEXT_VISION: str = _HELP_CAPABILITY_SEARCH + _HELP_CAPABILITY_VISION
-
-_HELP_CAPABILITY_TEXT_KB: str = (
-    _HELP_CAPABILITY_SEARCH + _HELP_CAPABILITY_KB + _HELP_CAPABILITY_NO_MEDIA
+_HELP_MEDIA_TURN_OFF: str = (
+    "- 读到的博客正文只在当前这一轮有效，之后的对话里不会保留。\n"
 )
 
-_HELP_CAPABILITY_TEXT_VISION_KB: str = (
-    _HELP_CAPABILITY_SEARCH + _HELP_CAPABILITY_KB + _HELP_CAPABILITY_VISION
+_HELP_MEDIA_TURN_ON: str = (
+    "- 图片与博客正文都只在当前这一轮有效，之后的对话里不会保留。\n"
 )
 
-# 「关于大区」整段：大区共享链条的四点说明（设计文档 §4.7）。两种 channel_kind 都拼它——
-# 记忆关闭时它留在原位置，DM 文案里也有（D-64：「大区段落留在 DM 文本里的原位置」）——
-# 因此名字按内容取，不按变体取，免得读成「只有大区变体才用」。
+# 「关于大区」整段（设计文档 §4.7 与 LOBBY_RECENT_CONTEXT_DESIGN §8）。两种 channel_kind
+# 都拼它 —— 记忆关闭时它留在原位置，DM 文案里也有 —— 因此名字按内容取，不按变体取，
+# 免得读成「只有大区变体才用」。
+#
+# 首句与第四条是同一件事的两面：机器人**回复**仍然只由精确 @ 触发，但它看得到的公开消息
+# 不止这些。旧文案的「别人的发言我看不见」已被 LOBBY_RECENT_CONTEXT_DESIGN 取代，
+# 不得写回。第四条同时兜住「装得下的部分」—— 50 条是内存容量，实际外送量还受
+# behavior.context_input_tokens 约束，写成「全部都会发送」就是超额承诺。
 _HELP_TAIL_ABOUT_LOBBY: str = (
-    "关于大区：那里是公开的多人对话，只有精确 @ 我的消息会进来，别人的发言我看不见。"
-    "想接着聊就回复（引用）我的消息，这样会留在同一段对话里；"
-    "别人加入后，这段对话里最近的内容会再次发送给模型。"
-    "新开的对话与旧的不相干，对话归属保留 7 天，之后回复旧消息等于开一段新的。\n"
+    "\n**关于大区**\n"
+    "\n"
+    "大区是公开的多人对话，只有精确 @ 我的消息会触发回复。\n"
+    "\n"
+    "- 想接着聊就回复（引用）我的消息，这样会留在同一段对话里。\n"
+    "- 别人加入后，这段对话里最近的内容会再次发送给模型。\n"
+    "- 新开的对话与旧的不相干；对话归属保留 7 天，之后回复旧消息等于开一段新的。\n"
+    "- 为理解大区里正在发生的讨论，我会在内存里临时保留最近的大区文字消息：最多 50 条，"
+    "每条最多保留前 500 字。你唤起我时，其中装得下的部分会连同这段对话一起发送给第三方模型；"
+    "图片和拍一拍不会进入这份上下文，用过之后就被删除，重启也会丢失。\n"
 )
 
-# 记忆未启用（功能关闭或用户未通过 Beta 门）时的事实陈述，逐字节保持重构前的内容（D-64）。
-_HELP_TAIL_NO_MEMORY: str = "我重启之后可能会忘记先前聊过什么，没有长期记忆。\n"
+# 记忆未启用（功能关闭或用户未通过 Beta 门）时的事实陈述；前导换行让它自成一段。
+_HELP_TAIL_NO_MEMORY: str = "\n我重启之后可能会忘记先前聊过什么，没有长期记忆。\n"
 
 _HELP_TAIL_FOOT: str = (
-    "发送 /help 可以再次查看这份说明，发送 /reset 可以开始一段新对话（不删除旧的那段）。"
-    "重启后短期上下文会丢失；每条评论回复都会真实通知被回复的人。"
+    "\n重启后短期上下文会丢失；每条评论回复都会真实通知被回复的人。\n"
 )
-
-# 只由上面三段拼成；四个既有 HELP 常量复用它，内容与重构前逐字节相同（D-64）。
-_HELP_TAIL: str = _HELP_TAIL_ABOUT_LOBBY + _HELP_TAIL_NO_MEMORY + _HELP_TAIL_FOOT
 
 # 记忆允许（memory_allowed=True）时的如实披露，对应设计 §11 的七条。共同部分说明共同记忆、
 # 传输范围与保存范围：第 4 条（记忆可能随相关请求发送给第三方模型）不带任何限定，必须同时
 # 覆盖私有记忆——设计 §11 恰恰把私有记忆列为更敏感的一类（「私有记忆可能包含个人信息」）。
 # 私有部分按 channel_kind 与 private_enabled 二选一；收尾说明查看与删除入口，以及 /reset
-# 不等于删除长期记忆。三段合成后整条仍要塞进站点单条消息上限。
+# 不等于删除长期记忆。整条仍要塞进站点单条消息上限。
+#
+# 披露段里的命令名**不带**反引号：这一段是陈述句而非命令清单，与下面 _HELP_MEMORY_CMDS 的
+# 排版有意区分（命令清单里才用 code 字形）。
 _HELP_MEMORY_DISCLOSURE_HEAD: str = (
-    "关于长期记忆：我有一份所有使用者共享的共同记忆；无论是共同记忆还是私有记忆，"
-    "其内容都可能随相关请求发送给第三方模型；普通聊天内容不会被完整保存。"
+    "\n**关于长期记忆**\n"
+    "\n"
+    "- 我有一份所有使用者共享的共同记忆。\n"
+    "- 无论是共同记忆还是私有记忆，其内容都可能随相关请求发送给第三方模型；"
+    "普通聊天内容不会被完整保存。\n"
 )
 
 # 大区里的口径：当场声明不读任何人的私有记忆（INTERFACES §36）。
 _HELP_MEMORY_DISCLOSURE_LOBBY_ON: str = (
-    "大区里不会使用任何人的私有记忆；你已经开启的私有记忆只在私聊中使用。"
+    "- 大区里不会使用任何人的私有记忆；你已经开启的私有记忆只在私聊中使用。\n"
 )
 _HELP_MEMORY_DISCLOSURE_LOBBY_OFF: str = (
-    "大区里不会使用任何人的私有记忆；你可以用 /memory on 开启只属于自己的私有记忆，"
-    "它只在私聊中使用。"
+    "- 大区里不会使用任何人的私有记忆；你可以用 /memory on 开启只属于自己的私有记忆，"
+    "它只在私聊中使用。\n"
 )
 
 # 私聊里的口径：声明私有记忆只在本私聊中使用（INTERFACES §36）。
-_HELP_MEMORY_DISCLOSURE_DM_ON: str = "你的私有记忆已经开启，只在本次私聊中使用。"
+_HELP_MEMORY_DISCLOSURE_DM_ON: str = (
+    "- 你的私有记忆已经开启，只在本次私聊中使用。\n"
+)
 _HELP_MEMORY_DISCLOSURE_DM_OFF: str = (
-    "你还没有开启私有记忆；打开后它只在本次私聊中使用，可以随时关闭。"
+    "- 你还没有开启私有记忆；打开后它只在本次私聊中使用，可以随时关闭。\n"
 )
 
 _HELP_MEMORY_DISCLOSURE_FOOT: str = (
-    "你可以用 /memory list 查看、用 /remember 纠正或补充、用 /memory forget <UM-ID> 删除自己的"
-    "私有记忆。/reset 只是开始一段新对话，不等于删除长期记忆。\n"
+    "- 你可以用 /memory list 查看自己的私有记忆，用 /remember 纠正或补充，"
+    "用 /memory forget <UM-ID> 删除其中一条。\n"
+    "- /reset 只是开始一段新对话，不等于删除长期记忆。\n"
 )
 
-# 图片输入关闭时（默认）的完整说明。
-HELP_TEXT: str = _HELP_HEAD + _HELP_CAPABILITY_TEXT_ONLY + _HELP_TAIL
-
-# 图片输入开启时的完整说明；只替换中间那句能力描述，其余逐字相同。
-HELP_TEXT_WITH_VISION: str = _HELP_HEAD + _HELP_CAPABILITY_TEXT_VISION + _HELP_TAIL
-
-# 知识库开启时（图片输入关闭/开启各一份）。帮助文案必须说实话：KB 关掉时不得宣传 /kb。
-HELP_TEXT_WITH_KB: str = _HELP_HEAD + _HELP_CAPABILITY_TEXT_KB + _HELP_TAIL
-HELP_TEXT_WITH_VISION_AND_KB: str = (
-    _HELP_HEAD + _HELP_CAPABILITY_TEXT_VISION_KB + _HELP_TAIL
+# 记忆命令组：只在私聊里可用（§32.2）。未通过接入门的账号调用会拿到固定拒绝，所以收尾
+# 那句话必须点明「普通聊天不受影响」，免得没权限的人以为整个机器人都不能用了。
+_HELP_MEMORY_CMDS: str = (
+    "\n**记忆命令**（只在私聊里可用）\n"
+    "\n"
+    "- `/memory status` —— 查看私有记忆与自动记忆的开关状态、私有条目数。\n"
+    "- `/memory on` 与 `/memory off` —— 开启或暂停在回复中使用你的私有记忆。\n"
+    "- `/memory auto on` 与 `/memory auto off` —— 开关自动记忆；"
+    "开启后私聊内容可能被自动整理成条目。\n"
+    "- `/memory list` —— 查看自己的私有条目。\n"
+    "- `/remember 内容` —— 把一段内容整理成私有记忆；保存后会展示正文与条目 ID。\n"
+    "- `/memory forget <UM-ID>` —— 删除一条私有记忆。\n"
+    "- `/memory clear` —— 清空全部私有记忆。\n"
+    "\n"
+    "当前账号若还没有记忆使用资格，调用这些命令会收到一条说明；普通聊天不受影响。\n"
 )
 
+def _capability_commands(*, kb_enabled: bool, capabilities: frozenset[str]) -> str:
+    """能力命令组：开场句 + 按部署开关出现的命令行。
 
-def _capability_paragraph(
-    *, vision_enabled: bool, kb_enabled: bool, capabilities: frozenset[str]
-) -> str:
-    """能力段：按清单拼装，而不是为每个开关组合枚举一份常量。
-
-    以前只有 vision × kb 两个布尔，还能枚举四份；加上三个能力开关就是 32 份。
-    拼装顺序固定，且 `capabilities` 为空时结果与既有的 `_HELP_CAPABILITY_TEXT_*` 逐字节相同：
+    拼装顺序固定：
 
     1. 联网句永远第一 —— 「默认不会联网」必须是最先说出口的一条；
-    2. 新增能力按声明顺序跟在后面，只在开启时出现；
-    3. 知识库句排在 MCP 能力之后，因为它是本地能力，不把数据发给第三方搜索服务；
-    4. 图片句固定收尾 —— 它以前面各句为背景作对比，读起来才通顺。
+    2. 新增能力按能力表（capabilities.CAPABILITIES）的声明顺序跟在后面，只在开启时出现；
+    3. 知识库句固定收尾 —— 它是本地能力，不把数据发给第三方搜索服务。
+
+    `capabilities` 为空集时只剩联网句：帮助文案不得宣传没开启的能力，而联网句是无条件的，
+    与 /search 的既有行为一致（能力关掉时命令仍被识别，只是回一条「当前联网搜索不可用」）。
     """
-    parts = [_HELP_CAPABILITY_SEARCH]
+    parts = [_HELP_CAPABILITY_HEAD, _HELP_COMMAND_SEARCH]
     if "zhihu" in capabilities:
-        parts.append(_HELP_CAPABILITY_ZHIHU)
+        parts.append(_HELP_COMMAND_ZHIHU)
     if "map" in capabilities:
-        parts.append(_HELP_CAPABILITY_MAP)
+        parts.append(_HELP_COMMAND_MAP)
     if "wolfram" in capabilities:
-        parts.append(_HELP_CAPABILITY_WOLFRAM)
+        parts.append(_HELP_COMMAND_WOLFRAM)
     if kb_enabled:
-        parts.append(_HELP_CAPABILITY_KB)
-    parts.append(_HELP_CAPABILITY_VISION if vision_enabled else _HELP_CAPABILITY_NO_MEDIA)
+        parts.append(_HELP_COMMAND_KB)
     return "".join(parts)
+
+
+def _blog_body_line(blog_max_chars: int) -> str:
+    """引用博客那一行：上限来自部署配置，因此必须拼进来（见模块顶部注释）。
+
+    `blog_max_chars` 与 `core/blog.py` 的判定同源：正文长度**不超过**上限时随本轮交给模型，
+    超过时只给标题。本模块不做字符串格式化，数字用 `+ str(n) +` 拼接。
+    """
+    n = str(blog_max_chars)
+    return (
+        "- 你引用一篇博客时，我能读到它的标题与正文：正文不超过 "
+        + n
+        + " 字时会随这一轮一起交给第三方模型，超过 "
+        + n
+        + " 字时只有标题；已删除或取不到的博客读不到，我会直接告诉你。\n"
+    )
+
+
+def _media_section(*, vision_enabled: bool, blog_max_chars: int) -> str:
+    """媒体组：图片一行按视觉开关二选一，博客一行按配置拼，收尾一行说明只属当前轮。"""
+    return (
+        _HELP_MEDIA_HEAD
+        + (_HELP_MEDIA_IMAGE_ON if vision_enabled else _HELP_MEDIA_IMAGE_OFF)
+        + _blog_body_line(blog_max_chars)
+        + (_HELP_MEDIA_TURN_ON if vision_enabled else _HELP_MEDIA_TURN_OFF)
+    )
 
 
 def help_text(
@@ -170,23 +225,31 @@ def help_text(
     kb_enabled: bool,
     memory_allowed: bool,
     private_enabled: bool,
+    blog_max_chars: int,
     capabilities: frozenset[str] = frozenset(),
 ) -> str:
-    """/help 的文案：能力组合 × 记忆状态 × 频道（INTERFACES §36）。
+    """/help 的文案：能力组合 × 媒体 × 记忆状态 × 频道（INTERFACES §36）。
 
-    memory_allowed=False 时（记忆未启用，或用户未通过 Beta 门）输出与重构前的四个常量
-    逐字节相同：此时 channel_kind 与 private_enabled 都不参与拼接，大区段落留在原位置（D-64）。
-    memory_allowed=True 时才把「没有长期记忆」那句换成如实披露，并按 channel_kind 声明私有
-    记忆的作用范围；private_enabled 决定私有记忆的措辞是已开启还是如何开启。
+    `blog_max_chars` 是本次部署的引用博客正文上限（`behavior.quoted_blog_max_chars`），
+    必须由调用方传入 —— 文案里的那个数字曾经写死成 1000，对上限配成别的值的部署就是假话。
 
-    `capabilities` 是本次部署真正开启的 MCP 能力名集合；默认空集保证既有调用点输出不变。
+    memory_allowed=False 时（记忆未启用，或用户未通过 Beta 门）收尾只陈述「没有长期记忆」，
+    此时 channel_kind 与 private_enabled 都不参与拼接。memory_allowed=True 时才换成如实披露，
+    并按 channel_kind 声明私有记忆的作用范围；private_enabled 决定私有记忆的措辞是已开启
+    还是如何开启。
+
+    `capabilities` 是本次部署真正开启的 MCP 能力名集合；默认空集表示一个都没开。
     """
-    capability = _capability_paragraph(
-        vision_enabled=vision_enabled, kb_enabled=kb_enabled, capabilities=capabilities
+    text = (
+        _HELP_HEAD
+        + _HELP_SESSION_COMMANDS
+        + _capability_commands(kb_enabled=kb_enabled, capabilities=capabilities)
+        + _media_section(vision_enabled=vision_enabled, blog_max_chars=blog_max_chars)
+        + _HELP_TAIL_ABOUT_LOBBY
     )
 
     if not memory_allowed:
-        return _HELP_HEAD + capability + _HELP_TAIL
+        return text + _HELP_TAIL_NO_MEMORY + _HELP_TAIL_FOOT
 
     # 只有 "lobby" 走大区口径；其余取值（含 "dm"）一律按私聊口径，避免调用方写错就抛异常。
     if channel_kind == "lobby":
@@ -202,49 +265,105 @@ def help_text(
             else _HELP_MEMORY_DISCLOSURE_DM_OFF
         )
     return (
-        _HELP_HEAD
-        + capability
-        + _HELP_TAIL_ABOUT_LOBBY
+        text
         + _HELP_MEMORY_DISCLOSURE_HEAD
         + private
         + _HELP_MEMORY_DISCLOSURE_FOOT
+        + _HELP_MEMORY_CMDS
         + _HELP_TAIL_FOOT
     )
 
 
 # 评论区专用帮助文案；不调用模型，由 CommentRouter 直接发送。
-# 这一份是**记忆未注入**（默认部署）时用的：与升级前逐字节相同（§26.3、§35）。
-COMMENT_HELP_TEXT: str = (
-    "我是公开博客评论区机器人，不是真人。首次精确 @ 我会触发一轮，之后直接回复我的评论"
-    "即可继续；普通评论和旁支不会触发。每轮会读取文章标题，正文不超过 1000 字时可能发送"
-    "给第三方模型，超过 1000 字时不提供正文。\n"
-    "我不支持图片、附件或被引用博客的理解。重启会丢失短期上下文，/reset 会创建新会话而不"
-    "删除旧会话。每条成功评论都会真实通知被回复的人，请只发送明确希望公开回复的内容。"
+#
+# 与聊天侧的差别只有一处是能力性的，其余都是排版：评论区不读被引用的博客（router 的
+# `_has_quoted_blog` 只用来判断「有没有读不到的东西」），但**会**读评论自带的图片 ——
+# 前提是部署开了图片输入（app.py 的 `_comment_vision` = vision_enabled 且评论图片名额大于零）。
+# 因此图片那句按开关二选一，不得再笼统地写「我不支持图片、附件」：这个站上「附件」就是
+# image_id 与 blog_id 两样，笼统写会同时说错两件事。
+_COMMENT_HELP_HEAD: str = "我是公开博客评论区机器人，不是真人。\n"
+
+_COMMENT_HELP_TRIGGER: str = (
+    "\n**怎么触发我**\n"
+    "\n"
+    "- 首次精确 @ 我会触发一轮；之后直接回复我的评论即可继续。\n"
+    "- 普通评论和旁支不会触发。\n"
 )
 
-# 评论区**确实**可能读取共同记忆时（评论路由器拿到了记忆策略）才用的披露版：评论侧最多只会
-# 用到 all_user 共同记忆，绝不使用私有记忆，因此不得再承诺「没有长期记忆」
-# （INTERFACES §36：本功能唯一一处允许的既有评论侧文案改动）。
-COMMENT_HELP_TEXT_WITH_MEMORY: str = (
-    "我是公开博客评论区机器人，不是真人。首次精确 @ 我会触发一轮，之后直接回复我的评论"
-    "即可继续；普通评论和旁支不会触发。每轮会读取文章标题，正文不超过 1000 字时可能发送"
-    "给第三方模型，超过 1000 字时不提供正文。\n"
-    "我不支持图片、附件或被引用博客的理解。重启会丢失短期上下文，/reset 会创建新会话而不"
-    "删除旧会话。评论区最多只会用到所有人共享的共同记忆（它会随本轮请求一并发送给第三方"
-    "模型），不会用到任何人的私有记忆。每条成功评论都会真实通知被回复的人，"
-    "请只发送明确希望公开回复的内容。"
+_COMMENT_HELP_COMMANDS: str = (
+    "\n**会话命令**\n"
+    "\n"
+    "- `/help` —— 重新发送这份说明。\n"
+    "- `/reset` —— 创建一段新会话；旧会话不会被删除。\n"
+    "- 评论区不支持 `/search`、`/kb`、`/memory` 等命令；需要它们请到聊天里使用。\n"
+)
+
+_COMMENT_HELP_CONTENT_HEAD: str = "\n**关于内容**\n\n"
+
+_COMMENT_HELP_IMAGE_OFF: str = "- 不能查看你评论里带的图片。\n"
+
+_COMMENT_HELP_IMAGE_ON: str = (
+    "- 可以看到你评论里带的图片；图片同样会转交给第三方模型处理。\n"
+)
+
+_COMMENT_HELP_QUOTED_BLOG: str = "- 被引用的博客我读不到。\n"
+
+# 评论区**确实**可能读取共同记忆时（评论路由器拿到了记忆策略）才加上的一条：评论侧最多只会
+# 用到 all_user 共同记忆，绝不使用私有记忆，因此不得再承诺「没有长期记忆」（§26.3、§36）。
+# 它描述的是评论区的上限（「最多只会用到」），因此按部署选择、不随评论作者的角色变化 ——
+# 同一段评论线程里，两个人看同一句说明不该得到两种措辞。
+_COMMENT_HELP_MEMORY: str = (
+    "- 评论区最多只会用到所有人共享的共同记忆（它会随本轮请求一并发送给第三方模型），"
+    "不会用到任何人的私有记忆。\n"
+)
+
+_COMMENT_HELP_FOOT: str = (
+    "\n**请注意**\n"
+    "\n"
+    "重启会丢失短期上下文。每条成功评论都会真实通知被回复的人，"
+    "请只发送明确希望公开回复的内容。\n"
 )
 
 
-def comment_help_text(*, memory_injected: bool) -> str:
-    """评论区的 /help 文案：记忆能力**有没有被注入**，决定用哪一份常量（§35、§36）。
+def _comment_article_line(article_max_chars: int) -> str:
+    """文章正文那一行：上限来自 `comments.article_max_chars`，与评论服务的判定同源。
 
-    memory_injected=False（默认部署，或记忆未启用）时输出与升级前逐字节相同：帮助文案不得凭空
-    声称「共同记忆可能随本轮请求发送给第三方模型」（§26.3）。披露版描述的是评论区的上限
-    （「最多只会用到」），因此按部署选择、不随评论作者的角色变化——同一段评论线程里，两个人
-    看同一句说明不该得到两种措辞。
+    评论服务按 `len(正文) <= article_max_chars` 决定给不给正文，超过时只给标题，
+    所以这个数字必须由调用方传入，不能写死在文案里。
     """
-    return COMMENT_HELP_TEXT_WITH_MEMORY if memory_injected else COMMENT_HELP_TEXT
+    n = str(article_max_chars)
+    return (
+        "- 每轮会读取文章标题；正文不超过 "
+        + n
+        + " 字时可能随本轮一起交给第三方模型，超过 "
+        + n
+        + " 字时只给标题。\n"
+    )
+
+
+def comment_help_text(
+    *, memory_injected: bool, vision_enabled: bool, article_max_chars: int
+) -> str:
+    """评论区的 /help 文案（§35、§36）。
+
+    memory_injected=False（默认部署，或记忆未启用）时不出现共同记忆那句：帮助文案不得凭空
+    声称「共同记忆可能随本轮请求发送给第三方模型」（§26.3）。
+
+    `vision_enabled` 是**评论区自己的**图片开关（`app._comment_vision`，与聊天侧同源但额外
+    要求评论图片名额大于零）；`article_max_chars` 是 `comments.article_max_chars`。
+    """
+    text = (
+        _COMMENT_HELP_HEAD
+        + _COMMENT_HELP_TRIGGER
+        + _COMMENT_HELP_COMMANDS
+        + _COMMENT_HELP_CONTENT_HEAD
+        + _comment_article_line(article_max_chars)
+        + (_COMMENT_HELP_IMAGE_ON if vision_enabled else _COMMENT_HELP_IMAGE_OFF)
+        + _COMMENT_HELP_QUOTED_BLOG
+    )
+    if memory_injected:
+        text += _COMMENT_HELP_MEMORY
+    return text + _COMMENT_HELP_FOOT
 
 
 # 评论模型的静态 system 附加说明；评论、文章和用户名只能进入 role=user。

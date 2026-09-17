@@ -3268,9 +3268,9 @@ class MessageRouter:
 - 评论只可能使用 `all_user`；帮助文案按记忆是否注入二选一——未注入时与升级前逐字节相同，
   注入后才换成不承诺「没有长期记忆」的披露版（`texts.comment_help_text`，§36）。
 
-## 36. `texts.py`（记忆文案）
+## 36. `texts.py`（帮助与记忆文案）
 
-为避免 vision × KB × memory 继续组合出更多常量，`/help` 重构为一个函数（规划 §11）：
+`/help` 由一组固定积木按**部署事实**拼装，不再为每个开关组合枚举常量（D-94）：
 
 ```python
 def help_text(
@@ -3280,19 +3280,38 @@ def help_text(
     kb_enabled: bool,
     memory_allowed: bool,
     private_enabled: bool,
+    blog_max_chars: int,                     # behavior.quoted_blog_max_chars
+    capabilities: frozenset[str] = frozenset(),
+) -> str: ...
+
+def comment_help_text(
+    *,
+    memory_injected: bool,
+    vision_enabled: bool,                    # app._comment_vision
+    article_max_chars: int,                  # comments.article_max_chars
 ) -> str: ...
 ```
 
 行为：
 
-- `memory_allowed=False`（记忆未启用，或用户未通过 Beta 门）时，**两种 `channel_kind` 的输出都与
-  今天的四个常量逐字节相同**：大区段落留在 DM 文本里的原位置，`_HELP_TAIL` 的排布不因新参数而变。
-  既有测试必须原样通过，不得改动（裁决 F / D-64）。四个常量可以保留为函数结果或兼容常量。
+- **凡是由部署配置决定的事实都必须由调用方传入**，不得写死在文案里：图片开关、能力清单、
+  引用博客正文上限（聊天，`behavior.quoted_blog_max_chars`）与文章正文上限（评论区，
+  `comments.article_max_chars`，**另一个键**）、记忆状态。数字用 `+ str(n) +` 拼接，
+  本模块不做字符串格式化的源码级防线不变。
+- 排版：小标题用 `**粗体**`，**不得**用 `#` —— 站点只放行
+  `p br hr strong b em i u s del code pre blockquote ul ol li a`（`chat-bot.md` §7.3），
+  `##` 会被净化器剥成裸文本；列表项前面要留空行，marked 才认列表。能力组的开场句承担
+  三条共用披露（默认不联网、只作用于当前这一轮、博客评论区不支持），命令行不再逐句重复。
+- 大区段落（`_HELP_TAIL_ABOUT_LOBBY`）两种 `channel_kind` 都拼，首句与第四条按
+  `LOBBY_RECENT_CONTEXT_DESIGN.md` §8 的口径：回复仍只由精确 @ 触发，但旁观消息会临时保留
+  并可能外送。「别人的发言我看不见」不得写回。
+- 四个 `HELP_TEXT*` 常量已删除：文案与配置无关这个前提不再成立，留着它们只会再造一个
+  「配置改了、常量没改」的假话来源。
 - `channel_kind` **只在 `memory_allowed=True` 时起作用**：`"lobby"` 变体声明「大区里不会使用
   任何人的私有记忆」，`"dm"` 变体声明「你的私有记忆只在本次私聊中使用」。
-- 只有 `memory_allowed=True` 才需要把「没有长期记忆」那句换成披露，因此 `_HELP_TAIL` 仍要拆成
-  可组合的两段（拆分只影响启用记忆时的输出，关闭时的输出逐字节不变）。
-- `_HELP_TAIL` 里「我重启之后可能会忘记先前聊过什么，没有长期记忆。」按 `memory_allowed`
+- 只有 `memory_allowed=True` 才需要把「没有长期记忆」那句换成披露，因此收尾段仍要拆成
+  可组合的两段。
+- 「我重启之后可能会忘记先前聊过什么，没有长期记忆。」按 `memory_allowed`
   条件化：允许时换成如实披露（设计 §11 的七条）：
   1. 机器人存在共同记忆；
   2. 用户可以选择使用私有记忆（`private_enabled` 决定措辞）；
@@ -3302,7 +3321,7 @@ def help_text(
   6. 用户可以查看、纠正和删除自己的私有记忆；
   7. `/reset` 不等于删除长期记忆。
 - `private_enabled` 的两种取值产生**不同措辞**（已开启 / 未开启）。
-- 帮助文案仍须能整条塞进站点单条消息上限（现状已满足，不要把长度翻倍）。
+- 帮助文案仍须能整条塞进站点单条消息上限（**5000 字**；重组后最长形态约 1.6k，不要把长度翻倍）。
 - 新增固定文案全部集中在 `texts.py`（标识符由实现决定，语义与触发点见下表），全部中文，
   **不回显宿主路径、原始 user ID 或模型错误正文**：
 

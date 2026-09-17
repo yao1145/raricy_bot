@@ -563,8 +563,9 @@ class MessageRouter:
     def _help_text(self, channel_kind: str, user_id: str | None) -> str:
         """帮助文案（§34.1 第 3 条）：能力开关 × 当前作者的记忆状态，不夸大能力。
 
-        vision / kb 是部署开关，记忆状态则按**当前消息的作者**求值。记忆未启用或作者
-        未通过 Beta 门时 `help_text` 的输出与重构前的四个常量逐字节相同（D-64）。
+        vision / kb 与引用博客的正文上限都是部署开关，记忆状态则按**当前消息的作者**求值。
+        `blog_max_chars` 必须传：文案里那句正文上限曾经写死成 1000，对上限配成别的值的
+        部署就是假话（`behavior.quoted_blog_max_chars` 是权威来源）。
         """
         memory_allowed = self._memory_allowed(user_id)
         # `private_enabled` 只在 memory_allowed 为真时影响措辞，但回调本身同步无 I/O
@@ -575,6 +576,7 @@ class MessageRouter:
             kb_enabled=self._kb_enabled,
             memory_allowed=memory_allowed,
             private_enabled=self._private_enabled_for(user_id),
+            blog_max_chars=self._cfg.quoted_blog_max_chars,
             capabilities=self._capabilities,
         )
 

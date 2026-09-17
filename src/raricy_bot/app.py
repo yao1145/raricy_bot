@@ -574,7 +574,7 @@ class BotApp:
         """记忆装配的第一段（§34.2 第 1-3 步）；`enabled=false` 时整体跳过（D-60）。
 
         关闭时连策略也不构造注入：Router 的三个记忆参数都为 `None`，`/remember` 仍是普通聊天，
-        `/search /remember x` 仍是普通搜索请求，`/help` 仍走四个旧常量——升级前的行为逐字节不变。
+        `/search /remember x` 仍是普通搜索请求，`/help` 也不出现长期记忆与记忆命令两段。
         """
         if not self._memory_enabled:
             return

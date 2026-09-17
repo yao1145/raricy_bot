@@ -553,15 +553,22 @@ class CommentRouter:
         return access.permits_common(author_id)
 
     def _comment_help_text(self) -> str:
-        """评论区 `/help` 的文案（§35、§36）：只按记忆**有没有被注入**二选一。
+        """评论区 `/help` 的文案（§35、§36）：按记忆注入与否、图片开关与文章正文上限拼装。
 
-        未注入（默认部署，或 `memory.enabled=false`）时用的是升级前那份常量、逐字节相同：
-        那时评论区一次都不会用到共同记忆，文案就不能声称它会随本轮请求发送（§26.3）。
-        注入后才改用披露版（评论侧最多只用 `all_user`，绝不使用私有记忆）。
-        判据不放宽到「当前作者能否读取」：披露句讲的是评论区的上限（「最多只会用到」），
-        同一段评论线程里的两个人不该因为各自在不在名单里而看到两种措辞。
+        记忆未注入（默认部署，或 `memory.enabled=false`）时不出现共同记忆那句：那时评论区
+        一次都不会用到共同记忆，文案就不能声称它会随本轮请求发送（§26.3）。注入后才加上
+        （评论侧最多只用 `all_user`，绝不使用私有记忆）。判据不放宽到「当前作者能否读取」：
+        披露句讲的是评论区的上限（「最多只会用到」），同一段评论线程里的两个人不该因为
+        各自在不在名单里而看到两种措辞。
+
+        图片与文章上限都来自部署配置，所以都从自己身上取，不写死在文案里：
+        图片句按 `self._vision_enabled` 二选一，正文数字取自 `comments.article_max_chars`。
         """
-        return texts.comment_help_text(memory_injected=self._memory_access is not None)
+        return texts.comment_help_text(
+            memory_injected=self._memory_access is not None,
+            vision_enabled=self._vision_enabled,
+            article_max_chars=self._cfg.article_max_chars,
+        )
 
     @staticmethod
     def _coerce_claim(value: Any, comment_id: str) -> CommentClaim:
