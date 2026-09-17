@@ -22,6 +22,17 @@
 只有 `ok` 会写文件，其余状态一律不落盘、因此也不进 `operations`（§27.4）；`operations` 超过
 `max_operations` 时按插入顺序淘汰最旧的键；候选的目标条目用 `updated_at > created_at` 判「已被改动」；
 外部版本合法但本次操作已不适用时，采纳外部版本并返回该操作自己的状态（not_found / full / conflict）。
+
+**公开投影**（第三类文件，§42）与私人/共同文件共用这一整套机制：同一个写锁、同一套七步原子写、
+同一套快照缓存（TTL 与 LRU 的形状都对私有文件那一套逐条照搬），只是多了一份 username 索引。
+两条结构性的边界在这里落地：
+
+- **公开读路径只读 `public/`**：`public_context_for` 与 `public_entries` 只会走
+  `public_path_from_owner_key` → `_public_state`，从不调用 `private_path` / `_user_state`
+  （§3.1、Global Constraints 第 7 条）。不是「读了再过滤」，是结构上读不到。
+- **AI 不能静默改写已公开的来源条目**（§42.6）：`apply_private_proposal` 在改动既有条目的两条
+  路径（`update` / 同 key 的 `add` 替换）上先查公开投影，命中即 `public_conflict` 且两个文件都不写；
+  公开状态无法确认时保守拒绝（`unavailable`）。删除不经这道门——它只由用户命令触发（§52）。
 """
 
 from __future__ import annotations
@@ -37,7 +48,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from typing import IO, Any
+from typing import IO, Any, TypeVar
 
 from ..config import MemoryConfig
 from ..core.context import SupplementalItem
@@ -55,8 +66,10 @@ from .codec import (
     PrivateDocument,
     parse_common,
     parse_private,
+    parse_public,
     render_common,
     render_private,
+    render_public,
 )
 from .models import (
     STATUS_CONFLICT,
@@ -66,6 +79,7 @@ from .models import (
     STATUS_NOT_FOUND,
     STATUS_NOOP,
     STATUS_OK,
+    STATUS_PUBLIC_CONFLICT,
     STATUS_SECRET_DETECTED,
     STATUS_UNAVAILABLE,
     MemoryCandidate,
@@ -75,6 +89,9 @@ from .models import (
     MemoryScope,
     OperationResult,
     ProposalAction,
+    PublicMemoryDocument,
+    PublicMemoryEntry,
+    PublicMemorySubject,
     user_storage_key,
 )
 
@@ -85,23 +102,47 @@ _logger = get_logger("memory")
 # 频道类型（§30.2）：只有 dm 会碰用户私有文件，lobby 与 comment 连读都不读。
 _DM: str = "dm"
 _LOBBY: str = "lobby"
+_COMMENT: str = "comment"
 
-# `SupplementalItem.group` 的三个稳定取值（§30.2、§33）。
+# 公开读路径唯一接受的两种频道（§42.1、R4）：dm 与未知值一律空结果。私有文件的读取门是
+# 「只有 dm」，公开投影的读取门正好相反——它只出现在大区与评论里。
+_PUBLIC_CHANNELS: frozenset[str] = frozenset((_LOBBY, _COMMENT))
+
+# `SupplementalItem.group` 的四个稳定取值（§30.2、§33、§45.3）。
 _GROUP_ALL_USER: str = "memory_all_user"
 _GROUP_LOBBY: str = "memory_lobby"
 _GROUP_USER: str = "memory_user"
+_GROUP_PUBLIC: str = "memory_public_personal"
 
 # `priority` 数值是实现细节（D-62）：只表达「DM 私有优先于 all_user，lobby 优先于 all_user」的
 # 组间次序。`SupplementalItem.priority` 是一个整数（§33），组间次序只能靠**步长**表达，因此步长
 # 在构造时按容量上限现算（见 `__init__`），不能写死——§26.2 只要求上限是正整数，不保证它小于
 # 某个固定的步长。
 
+# 公开个人记忆的组间基数（§45.3）：它必须**整体晚于**既有三组（数值更大），因此取「已用基数的
+# 下一个」。既有基数只有 0（lobby / 私有）与 1（all_user），最大名次是 `max_common - 1`，而步长
+# 至少是 `max_common + 1`，所以 2 * 步长 > 1 * 步长 + max_common - 1 恒成立（见 `__init__` 的
+# 现算注释）。公开组是最后一组，它自己的名次再大也不会撞进别的组。
+_PUBLIC_PRIORITY_BASE: int = 2
+
 # 用户快照 LRU 的容量：只影响内存，淘汰不删文件（§30.4）。
 _USER_CACHE_SIZE: int = 64
+
+# 公开快照 LRU 的容量（§42.2）：与用户快照同款的「惰性加载 + 有界 LRU」，但**独立一份**，
+# 两类快照的容量因此可以各自演化。同样只影响内存，淘汰不删文件。
+_PUBLIC_CACHE_SIZE: int = 64
+
+# 公开索引扫描的文件数量硬上限（§42.2、R14）：**代码常量**，不可由 YAML 改，也不受
+# `max_private_entries_per_user`（那是条目数上限）管辖。超出的文件不索引、只记一个稳定 reason：
+# 一个被塞了几万个文件的目录不能拖垮进程，也不能让索引构建变成一次长时间占用。
+MAX_PUBLIC_FILES: int = 4096
 
 # 临时文件：与目标文件同目录、独占创建；测试据此断言成功与失败路径都清理干净（§5.5 第 1、7 步）。
 _TEMP_PREFIX: str = ".memory-tmp-"
 _TEMP_SUFFIX: str = ".tmp"
+
+# 三类记忆文件的扩展名；索引扫描按它筛 `public/` 下的候选文件名。
+_MD_SUFFIX: str = ".md"
 
 # 幂等键与 ID 的 ASCII 十进制序号（与 codec 同一口径，`digit()` 会放过非 ASCII 数字）。
 _ASCII_DIGITS = re.compile(r"[0-9]+")
@@ -112,14 +153,25 @@ _ID_PREFIXES: tuple[str, ...] = (PREFIX_ALL_USER, PREFIX_LOBBY, PREFIX_USER, PRE
 # 稳定失败原因里表示「文件系统错误」的那个（codec 的六个 reason 之外唯一允许进日志的值）。
 _REASON_IO: str = "io"
 
-# 共同文件与用户文件的解析结果。
-_MemoryDocument = CommonDocument | PrivateDocument
+# `public/` 目录里文件数超过 `MAX_PUBLIC_FILES` 时的稳定 reason（R14）：同样只记 token，
+# 不记文件名、路径或数量之外的任何东西。
+_REASON_TOO_MANY_FILES: str = "too_many_files"
+
+# 三类文件的解析结果。
+_MemoryDocument = CommonDocument | PrivateDocument | PublicMemoryDocument
 
 # 纯函数形式的操作：给定基线文档，返回（新文档, 稳定状态, 对象 ID）；状态非 ok 时新文档为 None。
 _ApplyFn = Callable[[Any], "tuple[Any | None, str, str | None]"]
 
 # 密钥筛的取材函数：给定基线文档，返回本次将要写进 Markdown 的文本（正文与 key）。
 _ScreenFn = Callable[[Any], "tuple[str, ...]"]
+
+# 私有条目与公开条目共享的「带 memory_id 的条目」形状：ID 收敛对两者是同一套规则（§41.3）。
+_EntryLike = TypeVar("_EntryLike", MemoryEntry, PublicMemoryEntry)
+
+# owner key 的形状：`user_storage_key` 的输出，64 位小写十六进制（§10.1）。
+_OWNER_KEY_LENGTH: int = 64
+_OWNER_KEY_CHARS = frozenset("0123456789abcdef")
 
 
 @dataclass(frozen=True)
@@ -195,6 +247,8 @@ class MemoryService:
         self._root: str = str(config.root_dir)
         self._common_path: str = os.path.join(self._root, "common.md")
         self._users_dir: str = os.path.join(self._root, "users")
+        # 公开投影目录：只在 `enabled=true` 时由 `start()` 创建，读路径永不创建（§42.2）。
+        self._public_dir: str = os.path.join(self._root, "public")
         # 刷新周期同时是用户文件的缓存 TTL：到期后的**下一次访问**才检查摘要（§30.4）。
         self._refresh_seconds: float = float(config.refresh_seconds)
         # priority 的组间步长：严格大于任何一组在容量上限内可能出现的最大名次，否则一个把上限
@@ -207,6 +261,13 @@ class MemoryService:
         self._write_lock = asyncio.Lock()
         self._common: _Snapshot | None = None
         self._users: "OrderedDict[str, _Snapshot]" = OrderedDict()
+        # 公开快照按 owner key 索引（owner key 是不可逆的存储键，原始 user ID 不参与索引）。
+        self._public: "OrderedDict[str, _Snapshot]" = OrderedDict()
+        # username → owner key(s)：**一次引用替换**发布给读者（§42.2、§42.3）。它是不可变映射的
+        # 语义（只整体替换，绝不就地改），因此读者要么看到旧的一整份、要么看到新的一整份。
+        self._public_index: Mapping[str, tuple[str, ...]] = {}
+        # 最近一次扫描记下的稳定 reason（超上限 / 目录不可读）：只在取值变化时记一条日志（§42.3）。
+        self._public_scan_reason: str | None = None
         self._refresh_task: asyncio.Task[None] | None = None
 
     # --- 生命周期 ---------------------------------------------------------
@@ -250,6 +311,9 @@ class MemoryService:
                 scope="common",
                 error=type(exc).__name__,
             )
+        # 公开投影是**独立**的软故障面（§42.8）：`public/` 建不出来或扫不动都不影响上面已经就位的
+        # common、刷新循环与聊天，因此它放在同一个 try 之外。
+        self._start_public()
 
     async def stop(self) -> None:
         """停掉刷新任务；未启用或未启动时什么都不做，绝不抛出（§30.1）。"""
@@ -270,11 +334,12 @@ class MemoryService:
             )
 
     async def _refresh_loop(self) -> None:
-        """按 `refresh_seconds` 检查 `common.md` 的外部编辑（§30.4）。被取消即退出。"""
+        """按 `refresh_seconds` 检查 `common.md` 与 `public/` 的外部编辑（§30.4、§42.3）。被取消即退出。"""
         while True:
             await asyncio.sleep(self._refresh_seconds)
             try:
                 self._refresh_common()
+                self._refresh_public()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # 兜底：刷新任务永远不能把异常带出协程。
@@ -293,6 +358,110 @@ class MemoryService:
         self._common = self._inspect(
             self._common_view(), self._common, ttl=None, event="memory.refresh_failed", force=True
         )
+
+    # --- 公开投影：目录、索引与扫描 -----------------------------------------
+
+    def _start_public(self) -> None:
+        """建 `public/` 并扫描一次索引（§42.2、§42.3）；失败只降级，绝不抛出。"""
+        try:
+            os.makedirs(self._public_dir, exist_ok=True)
+        except OSError as exc:
+            # 建不出来（路径被文件占着、权限不足）：公开投影整块不可用，其余照常。
+            self._log_scan_failure(_REASON_IO, error=type(exc).__name__)
+            return
+        try:
+            count = self._refresh_public()
+        except Exception as exc:  # 扫描自身的兜底：索引构建永远不能把异常带出去。
+            self._log_scan_failure(_REASON_IO, error=type(exc).__name__)
+            return
+        if count is None:
+            return
+        log_event(
+            _logger, logging.INFO, "memory.ready", scope="public", public_entry_count=count
+        )
+
+    def _refresh_public(self) -> int | None:
+        """重扫 `public/` 并**一次引用替换**索引；返回索引到的公开条目总数（§42.3）。
+
+        目录不可读时返回 None（调用方据此不记 ready）。
+
+        每个文件走与用户私有文件同款的快照助手（惰性加载 + 有界 LRU + 摘要比对），因此摘要没变
+        的文件不重新解析。索引项的移除只发生在三种情形：文件消失/变坏、文档变成空文档、
+        条目全部被撤回（§42.3）——因此入索引的判据是**这一次检查是好的**（`reason is None`）而非
+        「有最后一份有效快照」：坏文件仍然可以被已有 subject 读到旧内容（§42.8），但它不该继续
+        出现在 username 索引里。
+        """
+        if not self._enabled:
+            return None
+        keys = self._public_file_keys()
+        if keys is None:
+            # 目录不可读：保留最后一份索引与全部快照，只第一次记一条稳定 reason（§42.8）。
+            return None
+        index: dict[str, list[str]] = {}
+        total = 0
+        for owner_key in keys:
+            state = self._public_state(owner_key, force=True)
+            document = state.document
+            if state.reason is not None or not isinstance(document, PublicMemoryDocument):
+                continue
+            if not document.entries:
+                # 空公开文档不入索引（R9）：它只是幂等元数据的载体。
+                continue
+            index.setdefault(document.owner_username, []).append(owner_key)
+            total += len(document.entries)
+        self._publish_index(index)
+        return total
+
+    def _public_file_keys(self) -> tuple[str, ...] | None:
+        """`public/` 下的 owner key 列表（按文件名排序）；目录不可读返回 None。
+
+        非法的文件名（不是 `.md`、或 `.md` 的主干不是 64 位小写十六进制的 owner key 形状）直接跳过：
+        那不是任何 owner 的公开文件，也就没有可归属的「坏文件」要记。文件数超过 `MAX_PUBLIC_FILES`
+        时按排序截断，只记一个稳定 reason（R14）。
+        """
+        try:
+            with os.scandir(self._public_dir) as scan:
+                names = [entry.name for entry in scan]
+        except FileNotFoundError:
+            # 目录不存在（还没启用过、或被人删掉）：没有任何公开投影，不是失败。
+            self._note_scan_reason(None)
+            return ()
+        except OSError as exc:
+            self._log_scan_failure(_REASON_IO, error=type(exc).__name__)
+            return None
+        keys = sorted(
+            name[: -len(_MD_SUFFIX)]
+            for name in names
+            if name.endswith(_MD_SUFFIX) and _valid_owner_key(name[: -len(_MD_SUFFIX)])
+        )
+        if len(keys) > MAX_PUBLIC_FILES:
+            self._log_scan_failure(_REASON_TOO_MANY_FILES)
+            keys = keys[:MAX_PUBLIC_FILES]
+        else:
+            self._note_scan_reason(None)
+        return tuple(keys)
+
+    def _publish_index(self, index: Mapping[str, list[str]]) -> None:
+        """把刚建好的索引发布给读者：一次引用替换，读到索引的人不会看到半个（§42.2）。"""
+        self._public_index = {name: tuple(keys) for name, keys in index.items()}
+
+    def _log_scan_failure(self, reason: str, **fields: object) -> None:
+        """扫描失败只记一条稳定 reason；同一份失败重复出现不再刷屏（§42.3、§51）。"""
+        if self._public_scan_reason == reason:
+            return
+        self._public_scan_reason = reason
+        log_event(
+            _logger, logging.WARNING, "memory.load_failed", scope="public", reason=reason, **fields
+        )
+
+    def _note_scan_reason(self, reason: str | None) -> None:
+        """扫描恢复正常时清掉上次的失败标记，让下一次失败还能被记下来。"""
+        self._public_scan_reason = reason
+
+    def _reindex_owner(self, owner_key: str, document: _MemoryDocument | None) -> None:
+        """一次 mutation 之后把该 owner 的索引项换成文档的当前事实（§42.4 第 10 步、§42.5）。"""
+        current = document if isinstance(document, PublicMemoryDocument) else None
+        self._public_index = _reindex(self._public_index, owner_key, current)
 
     # --- 读路径 -----------------------------------------------------------
 
@@ -420,6 +589,40 @@ class MemoryService:
             key = _invalid_id_path_key(user_id)
         return os.path.join(self._users_dir, f"{key}.md")
 
+    def public_path_from_owner_key(self, owner_key: str) -> str:
+        """该 owner 公开投影的路径（`<root_dir>/public/<owner_key>.md`；目录不存在时**不创建**）。
+
+        这是公开路径的唯一入口（§42.1，与 `private_path` 的 D-65 同款）：测试与上层都从这里拿
+        路径，不再自己拼文件名。**同步、只读、绝不抛出**——`owner_key` 形状非法（含路径分隔符、
+        不是 64 位小写十六进制等）时返回一条同形、稳定、不含原始取值且不可能有文件的兜底路径。
+        因此公开读路径在结构上只可能落在 `public/` 里，一个伪造的 owner key 越不出去。
+        """
+        key = owner_key if _valid_owner_key(owner_key) else _invalid_owner_key_path_key(owner_key)
+        return os.path.join(self._public_dir, f"{key}{_MD_SUFFIX}")
+
+    def public_username_index(self) -> Mapping[str, tuple[str, ...]]:
+        """当前 username 索引的一次引用快照（§42.1、§42.3）：`username -> tuple[owner_key, ...]`。
+
+        **同步、只读、大小写敏感**。调用方不得跨轮缓存它，也不得修改返回值（整体替换是发布方式，
+        就地修改会破坏「读者要么看到旧的一整份、要么看到新的一整份」这条保证）。
+        """
+        return self._public_index
+
+    async def public_entries(self, user_id: str) -> tuple[PublicMemoryEntry, ...]:
+        """该用户自己的公开条目（`/memory list public` 与发布确认的数据源）；不可用时返回空元组。
+
+        只读 `public/`：它不碰私人文件，也不因为「这条私有条目发不发布得出去」去读 `users/`。
+        """
+        if not self._enabled or not user_id:
+            return ()
+        owner_key = _storage_key(user_id)
+        if owner_key is None:
+            return ()
+        state = self._public_state(owner_key)
+        if not isinstance(state.document, PublicMemoryDocument):
+            return ()
+        return tuple(state.document.entries)
+
     async def private_entries(self, user_id: str) -> tuple[MemoryEntry, ...]:
         """该用户已生效的私有条目；不可用时返回空元组。"""
         if not self._enabled or not user_id:
@@ -454,7 +657,9 @@ class MemoryService:
 
         §32.3 要求「重复 SSE、resync 或崩溃重放先查 Markdown 的 `operations`；命中时不再调用 AI」，
         而 §30.1 的接口表没有给查询入口，本方法就是那个入口（补充裁决，已写进任务报告）。
-        `user_id` 非空时先查该用户的私有快照，再查共同快照；为空只查共同快照。
+        `user_id` 非空时依次查三处：该用户的私有快照 → 该用户的**公开快照** → 共同快照（§42.1）；
+        为空只查共同快照——公开快照只按 owner 索引，没有 `user_id` 就没有可查的键，因此不给匿名
+        调用者留一个按 operation_id 探测公开文档形状的口子。
         """
         if not self._enabled or not operation_id:
             return None
@@ -464,10 +669,100 @@ class MemoryService:
                 hit = state.document.operations.get(operation_id)
                 if hit is not None:
                     return hit
+            owner_key = _storage_key(user_id)
+            if owner_key is not None:
+                state = self._public_state(owner_key)
+                if isinstance(state.document, PublicMemoryDocument):
+                    hit = state.document.operations.get(operation_id)
+                    if hit is not None:
+                        return hit
         state = self._common_state()
         if isinstance(state.document, CommonDocument):
             return state.document.operations.get(operation_id)
         return None
+
+    async def public_context_for(
+        self,
+        *,
+        subjects: tuple[PublicMemorySubject, ...],
+        channel_kind: str,
+    ) -> MemoryContext:
+        """按已选定的 subject 取公开个人记忆条目（§42.7）；任何失败都返回空 items，绝不抛出。
+
+        **只读 `public/`**：本方法在任何分支下都不会调用 `private_path` / `_user_state`，因此
+        「未公开的私有条目永不进入大区或评论」是结构性的，不是靠过滤（§3.1、Global Constraints
+        第 7 条）。viewer 的接入门在 Router/App 判定；这里复查的是频道与 subject 的形状。
+
+        两个 revision 字段不承载公开语义：公开投影可能跨多个 owner，没有单一份修订号，两个字段
+        只保留类型形状（R4）。预算取舍也不在这里（D-62）：本方法只按 subject 次序返回，
+        分组上限与整轮预算由 `ContextManager.build_messages` 决定。
+        """
+        empty = MemoryContext(common_revision=0, private_revision=None, items=())
+        if not self._enabled or channel_kind not in _PUBLIC_CHANNELS:
+            # DM 与未知频道一律空结果（R4）：公开投影只出现在大区与评论里。
+            return empty
+        try:
+            items = self._public_items(subjects)
+        except Exception as exc:  # 兜底：公开读取是可选增强，绝不能外溢给聊天（D-60）。
+            self._log_omitted("public", "internal", error=type(exc).__name__)
+            return empty
+        return MemoryContext(
+            common_revision=0, private_revision=None, items=tuple(items)
+        )
+
+    def _public_items(self, subjects: tuple[PublicMemorySubject, ...]) -> list[SupplementalItem]:
+        """按 subject 次序取条目并给出 `priority`（§42.7、§45.3 的组间次序）。
+
+        - 形状复查：只接受形状合法的 subject（owner key 是 64 位小写十六进制、username 满足站点
+          用户名合同、`source_priority` 是整数），形状不对的直接跳过——这是纵深防御，不是
+          对调用方的信任（§42.1）。同一个 owner 只取第一次出现（调用方已经去过重，这里再兜一次）。
+        - 组内次序：pinned 在前，再按 `published_at`、`source_updated_at` 新到旧（§7.3 第 5 条）。
+        - `priority` 在**输出次序**上递增，整体晚于既有三组（`_PUBLIC_PRIORITY_BASE`）。
+        """
+        if not subjects:
+            return []  # 一个候选都没有：连目录都不看（这条路径因此是零 I/O 的）。
+        if not self._public_dir_readable():
+            # 目录不可读：本轮无公开个人记忆，聊天照常（§42.8）。
+            self._log_omitted("public", _REASON_IO)
+            return []
+        # 先按次序收集「(标签里的 username, 条目)」，再一次性翻成条目：priority 只跟最终名次有关。
+        ordered: list[tuple[str, PublicMemoryEntry]] = []
+        seen: set[str] = set()
+        for subject in subjects:
+            if not _valid_subject(subject) or subject.owner_key in seen:
+                continue
+            seen.add(subject.owner_key)
+            state = self._public_state(subject.owner_key)
+            if not state.available or not isinstance(state.document, PublicMemoryDocument):
+                # 冷启动就没有有效快照：这个 owner 本轮省略（§42.8）。
+                self._log_omitted("public", state.reason)
+                continue
+            entries = _ordered_public_entries(state.document.entries)
+            ordered.extend((subject.username, entry) for entry in entries)
+        base = _PUBLIC_PRIORITY_BASE * self._priority_stride
+        return [
+            SupplementalItem(
+                group=_GROUP_PUBLIC,
+                label=f"@{username} / {entry.memory_id}",
+                content=entry.content,
+                priority=base + rank,
+            )
+            for rank, (username, entry) in enumerate(ordered)
+        ]
+
+    def _public_dir_readable(self) -> bool:
+        """`public/` 目录本身能不能列：不能就是「本轮无公开个人记忆」（§42.8）。
+
+        目录**不存在**是正常路径而不是失败：那时一个公开文件也没有，逐 owner 读到的同样是空文档，
+        结果一样是空的（也不记日志）。只有「存在但读不动」才降级成本轮无结果。
+        """
+        try:
+            with os.scandir(self._public_dir):
+                return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
 
     # --- mutation：私有 ----------------------------------------------------
 
@@ -498,11 +793,17 @@ class MemoryService:
     async def apply_private_proposal(
         self, user_id: str, proposal: MemoryProposal, *, operation_id: str
     ) -> OperationResult:
-        """把撰写器的提案落到该用户的私有文件（规划 §4.3 的写入路径）。"""
+        """把撰写器的提案落到该用户的私有文件（规划 §4.3 的写入路径）。
+
+        会改动**已有条目**的两条路径（`update` 与同 key 的 `add` 替换）先过 §42.6 的公开保护：
+        目标已经在公开投影里时返回 `public_conflict`，两个文件都不写。
+        """
         return await self._mutate_private(
             user_id,
             operation_id,
-            lambda document: self._apply_private_proposal(document, proposal, operation_id),
+            lambda document: self._apply_guarded_proposal(
+                document, user_id, proposal, operation_id
+            ),
             screen=lambda _document: (proposal.key, proposal.content),
         )
 
@@ -523,6 +824,139 @@ class MemoryService:
             operation_id,
             lambda document: self._apply_private_clear(document, operation_id),
         )
+
+    # --- mutation：公开投影 -------------------------------------------------
+
+    async def publish_private(
+        self,
+        user_id: str,
+        username: str,
+        memory_id: str,
+        *,
+        operation_id: str,
+    ) -> OperationResult:
+        """把一条私有条目**复制**成公开快照（§42.4 的固定顺序；全程不调用 `MemoryWriter`）。
+
+        顺序：入口先校验 username（R8）→ 公开文档的幂等键 → 私人快照定位 UM-ID → 密钥筛 →
+        以公开文档当前版本为基线原子添加。私人文件只读不写，公开文件只在成功时被替换。
+
+        两处判定与 §42.4 的步骤编号有意不同，理由都写在代码里：
+
+        - **username 校验放在最前**：R8 明说「`publish_private` 入口先…校验 username」，
+          `invalid_proposal` 因此优先于 `not_found`；这条错误回的是「拿不到你的有效身份」，
+          与被点名的条目存不存在无关。
+        - **同 ID 的 noop / conflict 先于容量判定**：§3.2 要求「重复执行 `public` 对同一条目是
+          幂等的」，而容量只该拦住**新增**。反过来（先判 full）会让一个已满员用户在重放同一条
+          命令时收到「公开条目已达上限」，既不是幂等，也说不到点子上；R3 的 conflict 更会被
+          一句 full 盖掉，用户看不出真正的原因。
+        """
+        if not self._enabled or not user_id:
+            return OperationResult(STATUS_FORBIDDEN, None, 0)
+        owner_key = _storage_key(user_id)
+        if owner_key is None:
+            return OperationResult(STATUS_FORBIDDEN, None, 0)
+        if not _valid_username(username):
+            # 第一层身份校验（R8）：codec 的 `_check_public` 是第二层，两层都不接受任意文本。
+            return OperationResult(STATUS_INVALID_PROPOSAL, None, 0)
+        async with self._write_lock:
+            state = self._public_state(owner_key)
+            if not isinstance(state.document, PublicMemoryDocument):
+                return OperationResult(STATUS_UNAVAILABLE, None, state.revision)
+            hit = state.document.operations.get(operation_id)
+            if hit is not None:
+                # 幂等命中：返回第一次的稳定结果，不再读私人文件，也不重写公开文件（§42.4 第 2 步）。
+                return hit
+            private = self._user_state(user_id, force=True)
+            if not isinstance(private.document, PrivateDocument):
+                # 私人文件读不回来：定位不了来源条目，保守拒绝（§42.8）。
+                return OperationResult(STATUS_UNAVAILABLE, None, private.revision)
+            target = _find_by_memory_id(list(private.document.entries), memory_id, PREFIX_USER)
+            if target is None:
+                return OperationResult(STATUS_NOT_FOUND, None, private.revision)
+            if self._contains_secret((target.key, target.content)):
+                # 第二道密钥筛（§42.4 第 5 步）：人工编辑过的私人 Markdown 也绕不过去。
+                return OperationResult(STATUS_SECRET_DETECTED, None, state.revision)
+            status, object_id, written = self._write_document(
+                self._public_view(owner_key),
+                state,
+                lambda document: self._apply_publish(document, target, username, operation_id),
+            )
+            if written is not state:
+                self._store_public(owner_key, written)
+                # §42.4 第 10 步：成功（含接手了外部版本）之后更新内存索引。
+                self._reindex_owner(owner_key, written.document)
+            if status == STATUS_OK:
+                self._log_updated(
+                    "memory.updated",
+                    scope="public",
+                    revision=written.revision,
+                    memory_id=object_id,
+                )
+            return OperationResult(status=status, object_id=object_id, revision=written.revision)
+
+    async def unpublish_private(
+        self, user_id: str, memory_id: str, *, operation_id: str
+    ) -> OperationResult:
+        """撤回一条公开条目（§42.5）：只改公开文档，**不改私人来源**。
+
+        撤到零条之后保留一个合法的空公开文档（R9）：它不进索引、不影响模型可见行为，但保住
+        `operations` 的跨重启幂等。**不做**「尽力删除」，也不回显已经撤下的正文（文案由 Task 4 决定）。
+        """
+        return await self._mutate_public(
+            user_id,
+            operation_id,
+            lambda document: self._apply_unpublish(document, memory_id, operation_id),
+        )
+
+    async def unpublish_all(self, user_id: str, *, operation_id: str) -> OperationResult:
+        """撤回该 owner 的全部公开条目并清索引（§42.5，`/memory clear` 的撤回步）。
+
+        本来就一条都没有时是 `noop`：不写文件（不给从未发布过的用户凭空造一份空公开文档），
+        对调用方则同样是「撤回步已经到位」——`/memory clear` 因此照常继续删私人条目。
+        """
+        return await self._mutate_public(
+            user_id,
+            operation_id,
+            lambda document: self._apply_unpublish_all(document, operation_id),
+        )
+
+    async def _mutate_public(
+        self,
+        user_id: str,
+        operation_id: str,
+        apply_fn: _ApplyFn,
+    ) -> OperationResult:
+        """公开文件的 mutation 骨架：门禁 → 幂等 → 原子写（§42.2）。
+
+        与 `_mutate_private` 同款，只是把「用户文件」换成「公开文件」：同一个 `asyncio.Lock`
+        （**不新建第二把锁**），同一套 `_write_document` 七步原子写与同一套快照替换。
+        """
+        if not self._enabled or not user_id:
+            return OperationResult(STATUS_FORBIDDEN, None, 0)
+        owner_key = _storage_key(user_id)
+        if owner_key is None:
+            return OperationResult(STATUS_FORBIDDEN, None, 0)
+        async with self._write_lock:
+            state = self._public_state(owner_key)
+            if not isinstance(state.document, PublicMemoryDocument):
+                return OperationResult(STATUS_UNAVAILABLE, None, state.revision)
+            hit = state.document.operations.get(operation_id)
+            if hit is not None:
+                return hit
+            status, object_id, written = self._write_document(
+                self._public_view(owner_key), state, apply_fn
+            )
+            if written is not state:
+                self._store_public(owner_key, written)
+                self._reindex_owner(owner_key, written.document)
+            if status == STATUS_OK:
+                self._log_updated(
+                    "memory.updated",
+                    scope="public",
+                    revision=written.revision,
+                    memory_id=object_id,
+                )
+            return OperationResult(status=status, object_id=object_id, revision=written.revision)
 
     # --- mutation：共同（四个管理操作各自独立复查 admin，§32.3 / 裁决 R14） ------
 
@@ -833,6 +1267,8 @@ class MemoryService:
     def _render(self, document: _MemoryDocument) -> bytes:
         if isinstance(document, PrivateDocument):
             return render_private(document)
+        if isinstance(document, PublicMemoryDocument):
+            return render_public(document)
         return render_common(document)
 
     # --- 快照、缓存与刷新 --------------------------------------------------
@@ -847,6 +1283,15 @@ class MemoryService:
             path=self.private_path(user_id), parser=parse_private, fresh=PrivateDocument, scope="user"
         )
 
+    def _public_view(self, owner_key: str) -> _DocumentView:
+        """公开文件的视图：与用户文件同款，只是换成公开解析器与 `public/` 下的路径（§42.2）。"""
+        return _DocumentView(
+            path=self.public_path_from_owner_key(owner_key),
+            parser=parse_public,
+            fresh=PublicMemoryDocument,
+            scope="public",
+        )
+
     def _common_state(self) -> _Snapshot:
         """共同快照：惰性加载一次；之后的刷新由 `start()` 起的任务负责（§30.4）。"""
         if self._common is None:
@@ -855,14 +1300,19 @@ class MemoryService:
             )
         return self._common
 
-    def _user_state(self, user_id: str) -> _Snapshot:
-        """用户快照：惰性加载 + 有界 LRU；TTL 到期后的下一次访问检查摘要（§30.4）。"""
+    def _user_state(self, user_id: str, *, force: bool = False) -> _Snapshot:
+        """用户快照：惰性加载 + 有界 LRU；TTL 到期后的下一次访问检查摘要（§30.4）。
+
+        `force=True` 绕开 TTL 直接读盘：发布要用**这一刻**的私有条目做快照（§3.2 的「当时的
+        私有条目」），人工改过的 Markdown 因此不会躲在 TTL 后面绕过密钥筛（§42.4 第 5 步）。
+        """
         state = self._users.get(user_id)
         fresh = self._inspect(
             self._private_view(user_id),
             state,
             ttl=self._refresh_seconds,
             event="memory.refresh_failed" if state is not None else "memory.load_failed",
+            force=force,
         )
         self._store_user(user_id, fresh)
         return fresh
@@ -873,6 +1323,26 @@ class MemoryService:
         self._users.move_to_end(user_id)
         while len(self._users) > _USER_CACHE_SIZE:
             self._users.popitem(last=False)
+
+    def _public_state(self, owner_key: str, *, force: bool = False) -> _Snapshot:
+        """公开快照：与用户私有文件**同一套**惰性加载 + 有界 LRU + TTL 摘要比对（§42.2）。"""
+        state = self._public.get(owner_key)
+        fresh = self._inspect(
+            self._public_view(owner_key),
+            state,
+            ttl=self._refresh_seconds,
+            event="memory.refresh_failed" if state is not None else "memory.load_failed",
+            force=force,
+        )
+        self._store_public(owner_key, fresh)
+        return fresh
+
+    def _store_public(self, owner_key: str, state: _Snapshot) -> None:
+        """公开快照的 LRU：与用户快照同款，淘汰只释放内存（§42.2）。"""
+        self._public[owner_key] = state
+        self._public.move_to_end(owner_key)
+        while len(self._public) > _PUBLIC_CACHE_SIZE:
+            self._public.popitem(last=False)
 
     def _inspect(
         self,
@@ -1095,6 +1565,158 @@ class MemoryService:
         self, document: PrivateDocument, operation_id: str
     ) -> tuple[PrivateDocument | None, str, str | None]:
         """清空条目，保留设置、计数器与幂等元数据（`next_id` 不回收，避免 ID 被复用）。"""
+        revision = document.revision + 1
+        return (
+            replace(
+                document,
+                revision=revision,
+                entries=(),
+                operations=self._record(document.operations, operation_id, STATUS_OK, None, revision),
+            ),
+            STATUS_OK,
+            None,
+        )
+
+    def _apply_guarded_proposal(
+        self,
+        document: PrivateDocument,
+        user_id: str,
+        proposal: MemoryProposal,
+        operation_id: str,
+    ) -> tuple[PrivateDocument | None, str, str | None]:
+        """§42.6 的公开保护 + 既有提案逻辑。
+
+        保护放在 applier 里而不是 `_mutate_private` 的入口：applier 会被 `_write_document`
+        用两次——一次以内存快照为基线、一次以接手的**外部版本**为基线（§5.5 第 4 步）——
+        所以「同 key 的 add 到底替不替换」这个问题会在每一份真正成为前提的基线上重新判一次。
+        """
+        blocked = self._public_guard(document, user_id, proposal)
+        if blocked is not None:
+            return None, blocked.status, None
+        return self._apply_private_proposal(document, proposal, operation_id)
+
+    def _public_guard(
+        self, document: PrivateDocument, user_id: str, proposal: MemoryProposal
+    ) -> OperationResult | None:
+        """目标 UM-ID 是否已经在公开投影里（§42.6）：命中返回拒绝结果，否则 None。
+
+        | 情况 | 返回 |
+        |------|------|
+        | 目标已公开 | `public_conflict`（私人与公开文件都不写） |
+        | 公开状态无法确认 | `unavailable`（保守拒绝） |
+        | 目标未公开 | None（沿用现有更新逻辑） |
+
+        只有 `update` 与「同 key 的 `add` 替换」会走到查表：`add` 的新 key 不可能已经在公开投影里
+        （§12.5），`noop` 什么都不改，删除与清空只由用户命令触发、不经这里（§52）。
+
+        判据是「这次调用会不会改动**已有条目**」：私人文件里没有这条目标时就什么都不改，
+        因此不查公开投影、由既有逻辑回 `not_found`（§42.6 的原话就是这个范围）。
+        """
+        if proposal.action == ProposalAction.UPDATE:
+            target = _find_by_memory_id(list(document.entries), proposal.target_id, PREFIX_USER)
+            if target is None:
+                return None
+            target_id = target.memory_id
+        elif proposal.action == ProposalAction.ADD:
+            existing = _find_by_key(list(document.entries), proposal.key, None)
+            if existing is None:
+                return None  # 新增条目：新 ID 不可能已经被公开
+            target_id = existing.memory_id
+        else:
+            return None
+        if _canonical(target_id, PREFIX_USER) is None:
+            # 目标形状不是 UM-ID：形状校验交给 `_apply_private_proposal`（落 invalid_proposal），
+            # 这里没有可查的公开条目。
+            return None
+        owner_key = _storage_key(user_id)
+        if owner_key is None:
+            return None
+        state = self._public_state(owner_key)
+        if not state.available or not isinstance(state.document, PublicMemoryDocument):
+            # 公开状态无法确认：不给「也许它没公开」留任何猜测空间。
+            return OperationResult(STATUS_UNAVAILABLE, None, state.revision)
+        if _find_public_entry(state.document.entries, target_id) is not None:
+            return OperationResult(STATUS_PUBLIC_CONFLICT, None, state.revision)
+        return None
+
+    # --- mutation：公开投影的纯函数实现 -------------------------------------
+
+    def _apply_publish(
+        self,
+        document: PublicMemoryDocument,
+        source: MemoryEntry,
+        username: str,
+        operation_id: str,
+    ) -> tuple[PublicMemoryDocument | None, str, str | None]:
+        """把一条私有条目加成公开快照（§42.4 第 8、9 步）。
+
+        R3：同 ID 已存在且 key 与正文**完全一致** → `noop`（幂等）；不一致 → `conflict`——
+        公开副本是发布那一刻的显式快照，`.md` 不是动态引用，绝不静默覆盖用户批准过的旧版本
+        （§3.2）。判定先于容量：`noop` / `conflict` 都不新增条目，容量只该拦住新增。
+        """
+        published = _public_entry_of(source, self._timestamp())
+        existing = _find_public_entry(document.entries, published.memory_id)
+        if existing is not None:
+            if existing.key == published.key and existing.content == published.content:
+                return None, STATUS_NOOP, existing.memory_id
+            return None, STATUS_CONFLICT, None
+        if len(document.entries) >= self._config.max_public_entries_per_user:
+            return None, STATUS_FULL, None
+        revision = document.revision + 1
+        entries = tuple(document.entries) + (published,)
+        return (
+            replace(
+                document,
+                revision=revision,
+                owner_username=username,
+                entries=entries,
+                operations=self._record(
+                    document.operations, operation_id, STATUS_OK, published.memory_id, revision
+                ),
+            ),
+            STATUS_OK,
+            published.memory_id,
+        )
+
+    def _apply_unpublish(
+        self, document: PublicMemoryDocument, memory_id: str, operation_id: str
+    ) -> tuple[PublicMemoryDocument | None, str, str | None]:
+        """撤回一条公开条目；前缀不对或不存在都落 `not_found`（§42.5）。
+
+        撤到零条时**保留**这个文件（R9）：它仍然是幂等元数据的载体，只是不进索引。
+        """
+        target = _find_public_entry(document.entries, memory_id)
+        if target is None:
+            return None, STATUS_NOT_FOUND, None
+        kept = tuple(
+            entry
+            for entry in document.entries
+            if _canonical(entry.memory_id, PREFIX_USER) != _canonical(target.memory_id, PREFIX_USER)
+        )
+        revision = document.revision + 1
+        return (
+            replace(
+                document,
+                revision=revision,
+                entries=kept,
+                operations=self._record(
+                    document.operations, operation_id, STATUS_OK, target.memory_id, revision
+                ),
+            ),
+            STATUS_OK,
+            target.memory_id,
+        )
+
+    def _apply_unpublish_all(
+        self, document: PublicMemoryDocument, operation_id: str
+    ) -> tuple[PublicMemoryDocument | None, str, str | None]:
+        """撤回全部公开条目（§42.5、`/memory clear` 的撤回步）。
+
+        本来就是空的 → `noop` 且**不写文件**：不给从未发布过的用户凭空造一份空公开文档，
+        对调用方则同样是「撤回步已经到位」（`_step_failure` 的既有口径把 `noop` 当成功）。
+        """
+        if not document.entries:
+            return None, STATUS_NOOP, None
         revision = document.revision + 1
         return (
             replace(
@@ -1415,7 +2037,7 @@ def _remove_quietly(path: str) -> None:
         pass
 
 
-def _canonical_entry(entry: MemoryEntry, prefix: str) -> MemoryEntry:
+def _canonical_entry(entry: _EntryLike, prefix: str) -> _EntryLike:
     """把条目的 ID 规范成渲染形态；形状不对时原样返回（§29.1）。
 
     人工改窄过宽度的文件在这里收敛：不收敛的话内存快照会一直停在 `GM-L-7`，而文件里写着
@@ -1437,6 +2059,13 @@ def _canonical_document(document: _MemoryDocument) -> _MemoryDocument:
     原样保留（与 `_canonical_entry` 同口径），真正的拒绝由 codec 的校验负责。
     """
     if isinstance(document, PrivateDocument):
+        return replace(
+            document,
+            entries=tuple(_canonical_entry(item, PREFIX_USER) for item in document.entries),
+            operations=_canonical_operations(document.operations),
+        )
+    if isinstance(document, PublicMemoryDocument):
+        # 公开条目的 ID 沿用来源的 `UM-` 序号，因此与私有条目同一套收敛规则（§41.3）。
         return replace(
             document,
             entries=tuple(_canonical_entry(item, PREFIX_USER) for item in document.entries),
@@ -1599,6 +2228,124 @@ def _candidate_texts(document: Any, candidate_id: str) -> tuple[str, ...]:
     if found is None:
         return ()
     return (found.key, found.content)
+
+
+def _valid_owner_key(value: object) -> bool:
+    """owner key 是否是 `user_storage_key` 的形态：64 位小写十六进制（§10.1、D-103）。
+
+    这是**路径安全**的第一道闸：非法取值（`../`、绝对路径、任意文本）都要落进兜底路径，
+    绝不能被拼进 `public/` 下面的文件名。
+    """
+    if not isinstance(value, str) or len(value) != _OWNER_KEY_LENGTH:
+        return False
+    return all(char in _OWNER_KEY_CHARS for char in value)
+
+
+def _invalid_owner_key_path_key(owner_key: object) -> str:
+    """形状非法的 owner key 的兜底文件名：同形、稳定、不含原始取值。
+
+    与 `_invalid_id_path_key` 同款但用**另一个**域前缀，因此与任何合法 owner key 的文件名都不会
+    互相覆盖；`surrogatepass` 让这次编码永远成立（孤立代理项也编码得出来），读路径因此永不抛出。
+    """
+    text = owner_key if isinstance(owner_key, str) else repr(owner_key)
+    raw = f"raricy-memory-invalid-owner-key\0{text}".encode("utf-8", "surrogatepass")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _valid_username(username: object) -> bool:
+    """username 是否满足站点用户名合同（§40.2 第 2 条、R8 的第一层）。
+
+    复用 codec 的渲染校验而不是再写一份判定：`_check_username` 是这份规则唯一的实现，
+    服务侧复制一遍就会多出一处会漂移的地方（公开设计 §6.2 的宽松描述就是这么来的）。
+    空文档 + 这个 username 渲染得出来，就说明 username 本身合法。
+    """
+    if not isinstance(username, str) or not username:
+        return False
+    try:
+        render_public(PublicMemoryDocument(owner_username=username))
+    except CodecError:
+        return False
+    return True
+
+
+def _valid_subject(subject: object) -> bool:
+    """subject 的形状复查（§42.1）：owner key、username 与优先级都必须是合同里的形状。
+
+    形状不对的 subject 直接跳过——`PublicMemorySubject` 自己不做任何校验（§40.2 的两条规则
+    由宿主保证），服务这一层因此独立复查一遍，绝不把「调用方已经筛过」当成前提。
+    """
+    if not isinstance(subject, PublicMemorySubject):
+        return False
+    if not _valid_owner_key(subject.owner_key) or not _valid_username(subject.username):
+        return False
+    return isinstance(subject.source_priority, int) and not isinstance(
+        subject.source_priority, bool
+    )
+
+
+def _public_entry_of(source: MemoryEntry, published_at: str) -> PublicMemoryEntry:
+    """把一条私有条目复制成公开快照（§3.2、§12.1）：来源之后的变化不反映到这里。"""
+    return PublicMemoryEntry(
+        memory_id=source.memory_id,
+        key=source.key,
+        content=source.content,
+        pinned=source.pinned,
+        source_created_at=source.created_at,
+        source_updated_at=source.updated_at,
+        published_at=published_at,
+    )
+
+
+def _find_public_entry(
+    entries: tuple[PublicMemoryEntry, ...], memory_id: str | None
+) -> PublicMemoryEntry | None:
+    """按归一化后的 `UM-` ID 找公开条目：人工改成 `UM-6` 的文件仍能被 `UM-000006` 命中（§41.3）。"""
+    wanted = _canonical(memory_id, PREFIX_USER)
+    if wanted is None:
+        return None
+    for entry in entries:
+        if _canonical(entry.memory_id, PREFIX_USER) == wanted:
+            return entry
+    return None
+
+
+def _ordered_public_entries(
+    entries: tuple[PublicMemoryEntry, ...],
+) -> tuple[PublicMemoryEntry, ...]:
+    """同一 owner 内的次序（§42.7、设计 §7.3 第 5 条）：pinned 在前，再按发布时间、来源更新时间新到旧。
+
+    两个时间都参与（合同写的是「`published_at` **或** `source_updated_at` 新到旧」）：发布时间
+    是主要判据，来源更新时间只做同刻的次级判据，因此两种读法给出的前半段一致。
+    """
+    return tuple(
+        sorted(
+            entries,
+            key=lambda entry: (
+                0 if entry.pinned else 1,
+                _descending_stamp(entry.published_at),
+                _descending_stamp(entry.source_updated_at),
+            ),
+        )
+    )
+
+
+def _reindex(
+    index: Mapping[str, tuple[str, ...]],
+    owner_key: str,
+    document: PublicMemoryDocument | None,
+) -> dict[str, tuple[str, ...]]:
+    """给出该 owner 在索引里的新位置：**整份重建**，一次引用替换（§42.2、§42.3）。
+
+    只有「文档可用且至少一条有效条目」才在索引里（R9 的空公开文档不入索引）。重建而不是就地改，
+    是为了让 `public_username_index()` 的读者永远看到完整的一份；桶内次序保持既有相对次序，
+    新用户名追加在末尾。
+    """
+    updated: dict[str, list[str]] = {
+        name: [key for key in keys if key != owner_key] for name, keys in index.items()
+    }
+    if document is not None and document.entries and document.owner_username:
+        updated.setdefault(document.owner_username, []).append(owner_key)
+    return {name: tuple(keys) for name, keys in updated.items() if keys}
 
 
 def _valid_key(value: object) -> bool:
