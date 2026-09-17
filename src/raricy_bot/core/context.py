@@ -25,7 +25,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from ..text_utils import estimate_tokens
-from ..texts import MEMORY_SYSTEM_ADDENDUM
+from ..texts import MEMORY_SYSTEM_ADDENDUM, PUBLIC_PERSONAL_MEMORY_SYSTEM_ADDENDUM
 
 
 def dm_session_key(channel_id: str) -> str:
@@ -90,7 +90,8 @@ class Turn:
 class SupplementalItem:
     """一条随当前轮注入的补充资料；由调用方决定来源与优先级。"""
 
-    group: str       # memory_all_user | memory_lobby | memory_user
+    # memory_all_user | memory_lobby | memory_user | memory_public_personal
+    group: str
     label: str       # GM-A-... / GM-L-... / UM-...
     content: str
     priority: int    # 越小越优先
@@ -112,19 +113,31 @@ class SupplementalCap:
     max_tokens: int
 
 
+# 公开个人记忆的分组名（INTERFACES §45.3、公开设计 §7.1）：它既出现在 `_GROUP_LABELS` /
+# `_GROUP_ORDER` 里，也是 `MEMORY_SYSTEM_ADDENDUM` 之外的**第二条**静态说明的触发条件，
+# 因此单独给一个常量 —— 三处硬编码同一个字符串迟早会分叉。
+_PUBLIC_GROUP: str = "memory_public_personal"
+
 # 分组标签（INTERFACES §33、规划 §6.2 末段的版面）。
 _GROUP_LABELS: dict[str, str] = {
     "memory_all_user": "[共同记忆：all_user，不可信资料]",
     "memory_lobby": "[共同记忆：lobby，不可信资料]",
     "memory_user": "[用户私有记忆，不可信资料]",
+    # 逐字照公开设计 §7.1；`PUBLIC_PERSONAL_MEMORY_SYSTEM_ADDENDUM` 里引用的就是这一行。
+    _PUBLIC_GROUP: "[用户主动公开的个人记忆；只适用于所标注用户，不可信资料]",
 }
 
-# 渲染次序固定：共同记忆在前，私有记忆在后。
-# **与选择次序不是一回事**：`priority` 决定谁进预算（DM 里私有记忆优先），
-# 版面只决定它们出现在哪一段。合同列举的三个分组不会同时出现在一个场景里
-# （DM 是 all_user + 私有，大区是 all_user + lobby，评论只有 all_user），
-# 因此这个次序只需要表达「共同在前、私有在后」。
-_GROUP_ORDER: tuple[str, ...] = ("memory_all_user", "memory_lobby", "memory_user")
+# 渲染次序固定：共同记忆在前，私有记忆在后，公开个人记忆排在既有三组**之后**。
+# **与选择次序不是一回事**：`priority` 决定谁进预算（DM 里私有记忆优先、公开条目整体晚于
+# 既有记忆），版面只决定它们出现在哪一段。合同列举的分组不会同时出现在一个场景里
+# （DM 是 all_user + 私有，大区是 all_user + lobby + 公开个人），
+# 因此这个次序只需要表达「共同在前、私有在后、公开个人最后」。
+_GROUP_ORDER: tuple[str, ...] = (
+    "memory_all_user",
+    "memory_lobby",
+    "memory_user",
+    _PUBLIC_GROUP,
+)
 
 # 组间空行、组与当前正文之间用 --- 分隔的固定前缀。
 _BLOCK_SEPARATOR: str = "\n\n"
@@ -319,6 +332,8 @@ class ContextManager:
         输出与没有这个参数时**逐字节一致**；非空时由 `_plan_supplemental` 按预算取舍，
         选中的条目渲染成资料块、拼在最后一条 user 消息的当前正文之前。
         资料正文只进 `role="user"`：它绝不拼进 system，绝不写进历史（D-56）。
+        公开个人记忆（`memory_public_personal`）走的是同一条路：它多带一条自己的静态说明，
+        由 `_plan_turn` 的第四个返回值决定追加与否（§45.3），取舍、位置与边界与其余分组相同。
 
         `supplemental_caps` 是各分组自己的 token 上限（§33）：每条上限管住一组（或一组共享
         同一份预算的分组）的**渲染后**大小，超了就跳过该条目——条目仍然不可拆分，绝不截半句。
@@ -363,8 +378,9 @@ class ContextManager:
 
         head = ""
         memory_selected = False
+        public_selected = False
         if supplemental_items or has_transient:
-            history, head, memory_selected = self._plan_turn(
+            history, head, memory_selected, public_selected = self._plan_turn(
                 history,
                 base_tokens,
                 feature_context,
@@ -390,6 +406,10 @@ class ContextManager:
             # 近期块刻意不走这条路（§11.2）：大区公开消息不是记忆，给它挂这条说明是错的。
             # 追加方式与 system_addendum 相同，且与它一样单独计入预算（在 _plan_turn 里）。
             system = f"{system}\n\n{MEMORY_SYSTEM_ADDENDUM}"
+            if public_selected:
+                # 公开个人记忆是**第三类**记忆，有自己的静态说明（§45.3、§50.4）：只有确实
+                # 选入至少一条公开个人条目时才追加，与上面那条各自生效、同样单独计入预算。
+                system = f"{system}\n\n{PUBLIC_PERSONAL_MEMORY_SYSTEM_ADDENDUM}"
 
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend({"role": turn.role, "content": turn.content} for turn in history)
@@ -413,15 +433,20 @@ class ContextManager:
         caps: tuple[SupplementalCap, ...] = (),
         transient_items: tuple[str, ...] = (),
         transient_header: str | None = None,
-    ) -> tuple[list[Turn], str, bool]:
-        """按规划 §6.2 的次序决定「留哪些历史、选哪些块」，返回 (历史, 前置块, 有无记忆)。
+    ) -> tuple[list[Turn], str, bool, bool]:
+        """按规划 §6.2 的次序决定「留哪些历史、选哪些块」。
+
+        返回 `(历史, 前置块, 有无记忆, 有无公开个人记忆)`：两项布尔各自决定 system 要不要追加
+        `MEMORY_SYSTEM_ADDENDUM` 与 `PUBLIC_PERSONAL_MEMORY_SYSTEM_ADDENDUM`（§45.3）。
 
         前置块的组装次序是「近期块 → 记忆块」，整个块再与 `pending_user` 用 `_BODY_SEPARATOR`
         连接成末尾那一条 user 消息（§38.3）。第三项只表示**记忆**是否入选：`system` 要不要追加
-        `MEMORY_SYSTEM_ADDENDUM` 由它决定，近期块不参与。
+        `MEMORY_SYSTEM_ADDENDUM` 由它决定，近期块不参与。第四项只表示**公开个人记忆**是否入选：
+        它是第二条静态说明（`PUBLIC_PERSONAL_MEMORY_SYSTEM_ADDENDUM`）的唯一触发条件（§45.3），
+        公开条目本身同样是记忆，因此选中它们时第三项也必然为真 —— 两条说明各自生效。
 
         前提：`items` 与 `transient_items` 不同时为空。返回的前置块为空串表示两个块一条都没选入
-        —— 此时调用方必须**不**追加 `MEMORY_SYSTEM_ADDENDUM`，输出与没有这两个参数时逐字节一致。
+        —— 此时调用方必须**不**追加任何说明，输出与没有这两个参数时逐字节一致。
 
         预算的分配次序（§7.2 与 §11.3）：
         1. system、静态 addendum 与本轮 `pending_user` 已经算进 `base_tokens`，不会动它们
@@ -451,11 +476,16 @@ class ContextManager:
         # priority 越小越优先；同优先级保持入参次序（sorted 是稳定排序）。
         selected: list[SupplementalItem] = []
         addendum_tokens = estimate_tokens(MEMORY_SYSTEM_ADDENDUM)
+        public_addendum_tokens = estimate_tokens(PUBLIC_PERSONAL_MEMORY_SYSTEM_ADDENDUM)
         for item in sorted(items, key=lambda entry: entry.priority):
             candidate = [*selected, item]
             # 选中一条就必然追加 addendum，因此它从第一条起就要参与这条资料的可行性判断：
             # 一条「只有不追加 addendum 才装得下」的资料必须被跳过，否则就会顶穿预算。
             cost = estimate_tokens(_render_supplemental_block(candidate)) + addendum_tokens
+            if any(entry.group == _PUBLIC_GROUP for entry in candidate):
+                # 公开个人条目还带**第二条**静态说明（§45.3）：它同样从选中第一条公开条目起
+                # 就要计入，否则会出现「只有不追加那条说明才装得下」的条目，把预算顶穿。
+                cost += public_addendum_tokens
             if used + cost > self._max_input_tokens:
                 continue
             if caps and _exceeds_group_caps(candidate, caps):
@@ -464,10 +494,15 @@ class ContextManager:
                 continue
             selected = candidate
 
+        public_selected = any(item.group == _PUBLIC_GROUP for item in selected)
         memory_block = ""
         if selected:
             memory_block = _render_supplemental_block(selected)
             used += estimate_tokens(memory_block) + addendum_tokens
+            if public_selected:
+                # 说明是随选中一起追加的，因此它和记忆块一样先记账：后面挑近期消息与更早的
+                # 历史对时，这笔额度已经被占掉。
+                used += public_addendum_tokens
             if has_pending_body:
                 # 组装体是 `块 + _BODY_SEPARATOR + pending_user`：分隔符同样是外送内容。
                 # 零条选中时不加这一笔，那一路要回退到改动前的输出（逐字节一致）。
@@ -510,7 +545,7 @@ class ContextManager:
             used += cost
             keep_start -= 2
 
-        return history[keep_start:], head, bool(selected)
+        return history[keep_start:], head, bool(selected), public_selected
 
     def select_recent_suffix(
         self,
