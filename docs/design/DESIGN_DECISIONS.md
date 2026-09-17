@@ -1737,8 +1737,9 @@ reason=missing_env`，而**容器里那个变量是有的**（`docker compose ex
 D-96 … D-103 记录「用户公开个人记忆」（功能名 `public_personal_memory`）的裁决。引文里的
 「设计」指 `docs/design/PUBLIC_PERSONAL_MEMORY_DESIGN.md`，「实施计划」指
 `.superpowers/sdd/PUBLIC_PERSONAL_MEMORY_PLAN.md`（它的控制者裁决 R1–R14 与 D-55 … D-95
-引用的 R1–R16 是**两套编号**，映射见文末附录），接口小节号（§N）指 `docs/design/INTERFACES.md`
-的 §39 … §52。
+引用的 R1–R16 是**两套编号**，映射见文末附录；本组裁决里引用的「Global Constraints 第 N 条」
+是该实施计划的开工约束清单，归档在同一个目录），接口小节号（§N）指
+`docs/design/INTERFACES.md` 的 §39 … §52。
 
 原文（设计 §1、§3.1、§23）：
 

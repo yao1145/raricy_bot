@@ -3775,7 +3775,7 @@ schema_version, revision, owner_username, operations
 
 ## UM-000006
 
-- key: "preferred_python_version"
+- key: preferred_python_version
 - pinned: false
 - source_created_at: "2026-09-16T02:00:00Z"
 - source_updated_at: "2026-09-16T02:00:00Z"
@@ -3783,6 +3783,9 @@ schema_version, revision, owner_username, operations
 
 > 偏好使用 Python 3.12。
 ```
+
+（标量的引号由既有渲染规则决定：`_scalar_line` 只在必要时加引号（`key` 不加），三个时间戳按
+强制加引号输出 —— 示例就是渲染器实际写出的样子，公开侧不新增引号规则。）
 
 **与公开设计 §11 示例的两处收口**（示例标题写的是「建议格式」，其余条文要求「与现有 codec
 一致」，此处按后者收口）：
@@ -3795,7 +3798,7 @@ schema_version, revision, owner_username, operations
    复制来源条目的值（它们本来就已通过 UTC 校验），`published_at` 由 Service 生成（§42.2 的
    `_timestamp` 形态）。
 
-常量（本合同的标识符，Task 2 照此实现）：
+常量（本合同的标识符，实现照此命名）：
 
 ```python
 TITLE_PUBLIC: str = "# 用户公开个人记忆"
@@ -3924,6 +3927,12 @@ PUBLIC_ENTRY_FIELDS: tuple[str, ...] = (
   `os.replace`、一次引用替换内存快照）。**不新建第二把锁**（公开设计 §18.2）。
 - 公开快照与 username 索引都用**一次引用替换**发布给读者：读者要么看到旧的一整份，要么看到新的
   一整份，不会看到「快照已换、索引没换」的中间态。
+- `operations` 复用现有 `max_operations` 容量与**按插入序淘汰最旧**的规则（公开设计 §11、§30.1
+  的 `_record`）：公开文档的幂等记录因此在容量与淘汰口径上与私人/共同文档逐条一致，parse 侧
+  的超限判定见 §41.2 第 7 条。
+- `published_at` 由 Service 在发布时生成（使用 §30.1 的 `_timestamp` 形态）；`publish:` /
+  `unpublish:` / `cmd:` 三种 operation ID 由 Controller 传入（§52.2），服务不改写它、也不自己
+  拼键。
 - 索引扫描的文件数量有硬上限 **`MAX_PUBLIC_FILES = 4096`（代码常量，不可由 YAML 改）**：
   超出的文件不索引、只记一个稳定 reason，避免异常目录拖垮进程（R14）。这与
   `max_private_entries_per_user` 无关，后者是条目数上限，管不到文件数。
