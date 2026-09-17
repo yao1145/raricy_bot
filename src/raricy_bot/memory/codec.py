@@ -318,16 +318,15 @@ def render_private(document: PrivateDocument) -> bytes:
 def parse_public(data: bytes, cfg: MemoryConfig) -> PublicMemoryDocument:
     """解析公开投影文件；失败抛 `CodecError`（§41.2）。
 
-    比对私有文件多的两处严格性：front matter 的**键序**也是结构（顺序不对 → malformed），
-    `owner_username` 必须满足站点用户名合同（纵深防御的第二层，第一层在发布入口）。
+    front matter 只校验**键集合**（`_check_front`，与既有两类文件同款），**不比键序**：手改过、
+    按键名排序过的文件仍要读得回，否则一次外部编辑就会让这个 owner 的公开记忆整份消失。
+    键序只在渲染侧固定。`owner_username` 则必须满足站点用户名合同（纵深防御的第二层，
+    第一层在发布入口）。
     """
     text = _decode(data, cfg)
     front_text, body = _split_front_matter(text)
     front = _load_front(front_text)
     _check_front(front, FRONT_PUBLIC)
-    if tuple(front) != FRONT_PUBLIC:
-        # 键集合已经对上了，这里拒的是**顺序**不同（§41.1、§41.2 第 2 条）。
-        raise CodecError("malformed")
     document = PublicMemoryDocument(
         schema_version=front["schema_version"],
         revision=front["revision"],

@@ -9,7 +9,7 @@
 本包不 import `app.py`，装配全部留在 `app.py`（D-61）。这里先导出类型底座与 Beta 门禁的公开名，
 后续任务的模块在这里继续补。
 
-公开个人记忆（第三类记忆，§39 … §45）在本包里的底座是 `codec` 的 `parse_public` / `render_public`
+公开个人记忆（第三类记忆，§39 … §52）在本包里的底座是 `codec` 的 `parse_public` / `render_public`
 与 `models` 的 `PublicMemoryEntry` / `PublicMemoryDocument` / `PublicMemorySubject`。
 """
 
