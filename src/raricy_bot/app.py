@@ -17,6 +17,10 @@
 - 自动提取（§34.4）只在主模型给出回答之后、回答发出之前尝试一次：全部前置条件同时成立
   才交给 `MemoryController.auto_capture`，成功写入时把确定性披露拼在回答末尾（并为它预留
   输出空间，D-63），失败一律原样发出；披露绝不进历史；
+- 公开个人记忆（§47.4）：记忆路径真的装好之后再单独装配 `PublicMemorySubjectResolver`；
+  聊天轮在内容引用、博客、`/kb`、`pending_user` 与近期块的预算判定**全部确定之后**才解析
+  subject，只用 S1 里的大区近期消息，公开候选与共同/私有候选合并成一组交给 `ContextManager`；
+  DM 不解析、`memory_allowed=false` 不解析，任何失败都只让本轮少一份可选资料（§47.5）；
 - 模型失败的 `failure` 通知同样用 `notice` + 触发者冷却；额度用尽补发一次 `quota` 通知；
 - 403 进入不可用状态，按 `ready_probe_seconds` 探测恢复（D-4）；
 - 优雅关闭总超时 10 秒，`stop()` 可重复调用；记忆 worker 必须早于模型客户端关闭（§34.2）。
@@ -52,7 +56,11 @@ from .core.context import (
     lobby_thread_session_key,
     speaker_wrapper,
 )
-from .core.lobby_context import LobbyRecentContextBuffer, render_lobby_recent
+from .core.lobby_context import (
+    LobbyRecentContextBuffer,
+    LobbyRecentMessage,
+    render_lobby_recent,
+)
 from .core.router import MessageRouter, Request, RouteResult
 from .core.sender import MessageSender, SendResult
 from .core.vision import ImageLoader, attach_image, with_image_marker
@@ -73,6 +81,7 @@ from .memory.commands import MemoryCommandRequest
 from .memory.controller import MemoryController
 from .memory.models import STATUS_OK, ProposalAction
 from .memory.service import MemoryService
+from .memory.subjects import PublicMemoryInputs, PublicMemorySubjectResolver
 from .memory.writer import MemoryWriter
 from .ops import OpsServer
 from .quota import QuotaGuard, notice_cooldown_key
@@ -296,6 +305,10 @@ class BotApp:
         self._memory_service = memory_service
         self._memory_writer = memory_writer
         self._memory_controller = memory_controller
+        # 公开 subject 的解析器（§47.4）：与 `_memory_armed` 同时装配，只在记忆路径真的
+        # 跑起来之后才存在。为 None 时整个公开个人记忆路径不存在（`enabled=false`、
+        # 装配失败或解析器构造失败），DM 与普通聊天一个字都不受影响（D-60）。
+        self._public_memory_resolver: PublicMemorySubjectResolver | None = None
         self._memory_queue: asyncio.Queue[MemoryCommandRequest] = asyncio.Queue(
             maxsize=config.memory.queue_size
         )
@@ -643,6 +656,25 @@ class BotApp:
                 scope="memory",
                 error=type(exc).__name__,
             )
+            return
+        # §47.4：公开 subject 的解析器在记忆路径**真的装好之后**单独装配 —— 它失败只该让
+        # 「公开个人记忆」这一格缺席，不该把已经装好的共同/私有记忆一起关掉（D-60）。
+        # 索引取自服务的内存快照（同步、无 I/O），站点查询复用同一个 `SiteClient`。
+        try:
+            self._public_memory_resolver = PublicMemorySubjectResolver(
+                index_provider=service.public_username_index,
+                client=self._client,
+                max_subjects=self._config.memory.max_public_subjects_per_turn,
+            )
+        except Exception as exc:
+            log_event(
+                _logger,
+                logging.WARNING,
+                "memory.load_failed",
+                scope="public",
+                reason="resolver",
+                error=type(exc).__name__,
+            )
 
     def _memory_private_enabled(self, user_id: str | None) -> bool:
         """`/help` 的 `private_enabled` 回调（§34.1 第 3 条，D-67）。
@@ -664,7 +696,9 @@ class BotApp:
 
         共同记忆（`all_user` 与 `lobby`）**合计**一份预算、私有记忆（`memory_user`）单独一份，
         与 `config.example.yaml` 里那句「all_user 与 lobby 合计使用这一份共同记忆预算」一致
-        —— 传两个分组名进同一个上限，而不是各给一份。
+        —— 传两个分组名进同一个上限，而不是各给一份。公开个人记忆有**自己**的一份
+        （`public_personal_context_tokens`，§45.3、公开设计 §7.3）：DM 用「共同 + 私有」、
+        大区用「共同 + 公开个人」，三份上限各自独立、与整轮预算是两道独立的门。
 
         取值只来自配置（上限按分组名传，`core/context.py` 不认识任何记忆类型，D-61）；
         上限只管**选哪些条目**，整轮预算与历史回补的账目一个字都不动。记忆关闭时这些上限
@@ -676,6 +710,9 @@ class BotApp:
                 ("memory_all_user", "memory_lobby"), memory.common_context_tokens
             ),
             SupplementalCap(("memory_user",), memory.private_context_tokens),
+            SupplementalCap(
+                ("memory_public_personal",), memory.public_personal_context_tokens
+            ),
         )
 
     async def _memory_context_items(self, request: Request) -> tuple[SupplementalItem, ...]:
@@ -709,6 +746,100 @@ class BotApp:
             )
             return ()
         return tuple(context.items)
+
+    def _public_memory_active(self, request: Request) -> bool:
+        """本轮的公开个人记忆路径是否生效（§47.4 第 2 条）；三个条件缺一不可。
+
+        - 解析器已装配：`memory.enabled=false` 或记忆装配失败时它不存在，这一格整段跳过；
+        - `request.memory_allowed`：作者没过 Beta 门时连本地公开索引都不该看；
+        - 频道是 `"lobby"`：**DM 绝不加载任何人的公开个人记忆**（R4 的同一条口径），
+          连一次站点查询都不发。
+        """
+        return (
+            self._public_memory_resolver is not None
+            and request.memory_allowed
+            and request.channel_kind == "lobby"
+        )
+
+    async def _public_memory_items(
+        self,
+        request: Request,
+        *,
+        reply_text: str | None,
+        blog_text: str | None,
+        expanded_texts: tuple[str, ...],
+        lobby_recent: tuple[LobbyRecentMessage, ...],
+    ) -> tuple[SupplementalItem, ...]:
+        """解析本轮公开记忆的 subject 并取回条目（§47.4、§47.5）；任何失败都返回空元组。
+
+        输入只放**本轮真的会提供给模型**的文本（公开设计 §6.3、§15）：`reply_text` 是已经拼好的
+        直接引用块，`blog_text` 是实际拼进 `pending_user` 的博客块（省略了正文的只有标题），
+        `expanded_texts` 是 R10 的 `ResolvedRefs.expanded_texts`（预算不足没取回的引用不在其中），
+        `lobby_recent` 是 S1。**不为记忆匹配额外抓取博客或剪贴板**：本方法不读博客、不读剪贴板、
+        不取图片，唯一的网络请求是纯文本命中的身份校验（§6.4），它不改变本轮外送的正文。
+
+        近期消息按原样传入：优先级 7 只扫 `content`，**不扫 `blog_title`**。公开设计 §6.1 第 8 条
+        说的是「实际选入的发言者与**正文**用户名」，标题因此落在匹配面之外 —— 少解析只是少一份
+        可选资料（欠解析的方向），而反过来去碰一段没有明确授权的文本会扩大读取面（§6.3 的口径）。
+
+        身份校验会发站点查询（纯文本命中才发，稳定来源不发，§43.4），失败一律 fail-closed：
+        一个候选都解析不出来就返回空元组，这一轮只是少一份可选资料，聊天照常、历史提交不变。
+        """
+        resolver = self._public_memory_resolver
+        service = self._memory_service
+        if resolver is None or service is None:
+            return ()
+        inputs = PublicMemoryInputs(
+            channel_kind=request.channel_kind,
+            # 当前发言者由 Router 在入队前算好（§47.2）：这里不回头去碰 `author.id`。
+            current_subject=request.public_memory_subject,
+            # 短期参与者直接取历史的 subject（§45.1）：只读、同步、无 I/O。
+            conversation_subjects=self._ctx.recent_subjects(request.session_key),
+            # 当前正文用**用户自己写的原文**（设计 §15 的 `request.user_text`）：展开过的引用
+            # 走它们自己的优先级来源，在这里再扫一遍只会把同一段文本当成两个来源。
+            current_text=request.user_text,
+            reply_text=reply_text,
+            blog_text=blog_text,
+            expanded_clipboard_texts=expanded_texts,
+            lobby_recent=lobby_recent,
+        )
+        try:
+            subjects = await resolver.resolve(inputs)
+        except Exception as exc:
+            # 解析器自己承诺不抛（§43.2）；这一层兜的是注入的替身与将来的回归。
+            log_event(
+                _logger,
+                logging.WARNING,
+                "memory.context_omitted",
+                scope="public",
+                reason="subjects",
+                error=type(exc).__name__,
+            )
+            return ()
+        if not subjects:
+            # 一个 owner 都没命中：这一轮不加载任何公开个人记忆（连目录都不看）。
+            return ()
+        try:
+            # 与 `context_for` 职责分开：公开候选只从 `public/` 来，共同/私有候选仍由
+            # `_memory_context_items` 出（§47.4 第 4 条）。
+            context = await service.public_context_for(
+                subjects=subjects, channel_kind=request.channel_kind
+            )
+            items = tuple(context.items)
+        except Exception as exc:
+            # 软故障（§47.5）：已经解析出来的 subject 一个都不落地，回答照常生成。
+            # `subject_count` 是本轮解析出的 owner 数（§51 的白名单字段），不含任何身份。
+            log_event(
+                _logger,
+                logging.WARNING,
+                "memory.context_omitted",
+                scope="public",
+                reason="internal",
+                subject_count=len(subjects),
+                error=type(exc).__name__,
+            )
+            return ()
+        return items
 
     def _auto_capture_eligible(self, request: Request) -> bool:
         """§34.4 的自动提取前置条件；**全部**同时成立才为真。
@@ -1086,7 +1217,9 @@ class BotApp:
             blog = await self._load_blog(request)
             blog_block, blog_state = blog.block, blog.state
             # 内容引用（`[@<ID>]`）也在这里展开：三种引用各一次请求，与取图/取博客并列。
-            user_text, reply_text, ref_parts = await self._resolve_refs(request)
+            user_text, reply_text, ref_parts, expanded_texts = await self._resolve_refs(
+                request
+            )
             if (
                 not request.user_text
                 and image_part is None
@@ -1156,28 +1289,68 @@ class BotApp:
             # 大区近期公开消息（§38.3）在这里渲染成逐条字符串：`ContextManager` 不认识
             # `LobbyRecentMessage`，只负责预算与拼装。DM 的 `lobby_recent` 恒为空元组，
             # 两个参数保持「同时为空」，整条路径与升级前逐字节一致。
+            recent_items = tuple(
+                render_lobby_recent(item) for item in request.lobby_recent
+            )
+            recent_messages = request.lobby_recent
+            feature_context = (
+                "kb" in request.enabled_features or blog_block is not None
+            )
+            system_addendum = "\n\n".join(system_addenda) or None
+            # 公开记忆本轮可能生效时**先**算 S1（R2、§47.3）：喂给模型的近期块必须是
+            # 「将要解析 subject 的那一串」，否则缓冲里有、但装不进这一轮的近期消息也会
+            # 贡献 subject —— 而那些正文模型根本没见过。位置在内容引用、博客、`/kb`、
+            # `pending_user` 与 `system_addenda` **全部确定之后**，因此 S1 的估算口径与
+            # `build_messages` 完全一致。路径未装配时整段跳过，`recent_items` 与升级前相同。
+            if self._public_memory_active(request) and recent_items:
+                recent_items = self._ctx.select_recent_suffix(
+                    request.session_key,
+                    self._config.system_prompt,
+                    pending_user=pending,
+                    system_addendum=system_addendum,
+                    feature_context=feature_context,
+                    transient_user_items=recent_items,
+                    transient_user_header=texts.LOBBY_RECENT_CONTEXT_HEADER,
+                )
+                # S1 必然是入参的**后缀**（§45.2），按条数切回来就是它对应的那些记录。
+                # 已知的保守面（R2 的刻意取舍）：S1 内随后被记忆块挤掉的那几条仍会贡献
+                # subject —— 精确解要在记忆与近期之间求不动点，可能振荡，宁可放宽这一点。
+                keep = len(request.lobby_recent) - len(recent_items)
+                recent_messages = recent_messages[keep:]
+            if self._public_memory_active(request):
+                # 公开个人候选由 `public_context_for` 独立取回，与既有共同/私有候选合并成
+                # **一组** `SupplementalItem`（§47.4 第 4 条）：取舍与位置仍由
+                # `build_messages` 决定，公开条目的 priority 整体晚于既有记忆（D-103）。
+                supplemental = (
+                    *supplemental,
+                    *await self._public_memory_items(
+                        request,
+                        reply_text=reply_prefix,
+                        blog_text=blog_block,
+                        expanded_texts=expanded_texts,
+                        lobby_recent=recent_messages,
+                    ),
+                )
             messages = self._ctx.build_messages(
                 request.session_key,
                 self._config.system_prompt,
                 pending_user=pending,
-                system_addendum="\n\n".join(system_addenda) or None,
+                system_addendum=system_addendum,
                 # 数据块不可丢弃，历史可以（D-38）：/kb 与引用的博客正文同理。
-                feature_context=(
-                    "kb" in request.enabled_features or blog_block is not None
-                ),
+                feature_context=feature_context,
                 # 记忆正文只走这一条口子：`build_messages` 把它放进 role="user" 的当前轮，
                 # 既不进 system，也不进历史（§33、D-56）。本方法之外不再碰 memory 文本。
                 supplemental_items=supplemental,
-                # §26.1 的两个 token 旋钮在这里生效：共同记忆与私有记忆各有一份上限，
-                # 记忆因此不能把整轮预算吃光、把历史挤掉（取舍仍由 `build_messages` 做，D-62）。
+                # §26.1 的三个 token 旋钮在这里生效：共同记忆、私有记忆与公开个人记忆各有
+                # 一份上限，记忆因此不能把整轮预算吃光、把历史挤掉（取舍仍由 `build_messages`
+                # 做，D-62）。
                 supplemental_caps=self._supplemental_caps(),
                 # 近期消息与块头要么都给、要么都不给：没有条目时不传表头，否则
-                # `build_messages` 会按契约抛 ValueError。
-                transient_user_items=tuple(
-                    render_lobby_recent(item) for item in request.lobby_recent
-                ),
+                # `build_messages` 会按契约抛 ValueError。公开路径生效时这里给的是 **S1**，
+                # 它同时就是模型真正看到的那一串（R2、§47.3）。
+                transient_user_items=recent_items,
                 transient_user_header=(
-                    texts.LOBBY_RECENT_CONTEXT_HEADER if request.lobby_recent else None
+                    texts.LOBBY_RECENT_CONTEXT_HEADER if recent_items else None
                 ),
             )
             if image_part is not None:
@@ -1284,7 +1457,16 @@ class BotApp:
                     history_user = self._pending_turn(request, image_state, blog_state)
                     if history_context:
                         history_user = f"{history_user}\n\n{history_context}"
-                    self._ctx.append_exchange(request.session_key, history_user, text)
+                    # 当前说话人的会话身份随这一轮一起提交（§45.1、§47.4 第 6 条）：**只有**
+                    # 真正送达的这一条路径会走到这里 —— 模型失败、额度拒绝、发送失败与代次
+                    # 失效都在上面就返回了，因此不会留下一个从没被回答过的参与者。
+                    # 记忆未装配时它是 None，与升级前逐字节一致。
+                    self._ctx.append_exchange(
+                        request.session_key,
+                        history_user,
+                        text,
+                        subject=request.public_memory_subject,
+                    )
             if outcome.reason == "quota":
                 await self._notify_quota(request)
             else:
@@ -1320,24 +1502,31 @@ class BotApp:
 
     async def _resolve_refs(
         self, request: Request
-    ) -> tuple[str, str | None, tuple[dict[str, Any], ...]]:
+    ) -> tuple[str, str | None, tuple[dict[str, Any], ...], tuple[str, ...]]:
         """展开本轮消息正文与**直接引用**正文里的内容引用（§25）。
+
+        返回 `(消息正文, 直接引用正文, 图片块, 展开成功的引用正文)`。
 
         - 两块正文各自套用同一个预算（`behavior.content_ref_max_chars`）：它们是
           同一条消息外送时相邻的两段，各自都不超过上限。
         - **历史拿到的仍是用户自己写的原文**（调用方不传这两份展开结果），
           与「引用的博客正文只属当前轮」同一条理由：换回来的是别人写的内容，
           留在历史里会在该会话后续每一轮被反复外送。
+        - 第四项是两块正文里**真正取回并渲染成功**的剪贴板正文与投票文本（R10、§49），
+          按展开顺序合并。公开记忆的优先级 6 只扫描这一份：预算不足、取回失败或本来就是
+          图片的引用都不在里面，因此「没提供给模型的正文不参与匹配」是结构性的（§6.3）。
         """
         budget = self._ref_resolver.max_ref_chars
         user_text, reply_text = _ref_source_texts(request)
         resolved = await self._ref_resolver.resolve(user_text, budget=budget)
         parts = list(resolved.image_parts)
+        expanded = list(resolved.expanded_texts)
         if reply_text is not None:
             reply = await self._ref_resolver.resolve(reply_text, budget=budget)
             reply_text = reply.text
             parts.extend(reply.image_parts)
-        return resolved.text, reply_text, tuple(parts)
+            expanded.extend(reply.expanded_texts)
+        return resolved.text, reply_text, tuple(parts), tuple(expanded)
 
     @staticmethod
     def _enabled_capability(request: Request) -> Capability | None:
