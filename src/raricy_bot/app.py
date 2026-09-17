@@ -810,24 +810,27 @@ class BotApp:
         service = self._memory_service
         if resolver is None or service is None:
             return ()
-        inputs = PublicMemoryInputs(
-            channel_kind=request.channel_kind,
-            # 当前发言者由 Router 在入队前算好（§47.2）：这里不回头去碰 `author.id`。
-            current_subject=request.public_memory_subject,
-            # 短期参与者直接取历史的 subject（§45.1）：只读、同步、无 I/O。
-            conversation_subjects=self._ctx.recent_subjects(request.session_key),
-            # 当前正文用**用户自己写的原文**（设计 §15 的 `request.user_text`）：展开过的引用
-            # 走它们自己的优先级来源，在这里再扫一遍只会把同一段文本当成两个来源。
-            current_text=request.user_text,
-            reply_text=reply_text,
-            blog_text=blog_text,
-            expanded_clipboard_texts=expanded_texts,
-            lobby_recent=lobby_recent,
-        )
         try:
+            # §47.5 的软故障边界必须包住**输入构造与解析两件事**：解析器自己承诺不抛（§43.2），
+            # 构造则要碰注入的 context manager —— 从这里抛出去会被 `WorkerPool._run` 记成
+            # `worker.handler_error`，整轮回复一起消失，那正是这条边界要挡住的事。
+            inputs = PublicMemoryInputs(
+                channel_kind=request.channel_kind,
+                # 当前发言者由 Router 在入队前算好（§47.2）：这里不回头去碰 `author.id`。
+                current_subject=request.public_memory_subject,
+                # 短期参与者直接取历史的 subject（§45.1）：只读、同步、无 I/O。
+                conversation_subjects=self._ctx.recent_subjects(request.session_key),
+                # 当前正文用**用户自己写的原文**（设计 §15 的 `request.user_text`）：展开过的引用
+                # 走它们自己的优先级来源，在这里再扫一遍只会把同一段文本当成两个来源。
+                current_text=request.user_text,
+                reply_text=reply_text,
+                blog_text=blog_text,
+                expanded_clipboard_texts=expanded_texts,
+                lobby_recent=lobby_recent,
+            )
             subjects = await resolver.resolve(inputs)
         except Exception as exc:
-            # 解析器自己承诺不抛（§43.2）；这一层兜的是注入的替身与将来的回归。
+            # 这一层兜的是注入的替身与将来的回归：任何意外都只该让这一轮少一份可选资料。
             log_event(
                 _logger,
                 logging.WARNING,
@@ -1090,21 +1093,23 @@ class BotApp:
         resolver = self._public_memory_resolver
         if resolver is None or self._memory_service is None:
             return ()
-        public_inputs = PublicMemoryInputs(
-            # 频道由评论服务钉死为 "comment"（§48.2）；解析器只认 lobby / comment（R4）。
-            channel_kind=inputs.channel_kind,
-            current_subject=inputs.current_subject,
-            conversation_subjects=inputs.conversation_subjects,
-            current_text=inputs.current_text,
-            reply_text=None,
-            blog_text=_comment_blog_text(inputs),
-            expanded_clipboard_texts=inputs.expanded_clipboard_texts,
-            lobby_recent=(),
-        )
         try:
+            # §47.5 的软故障边界包住输入构造与解析（见 `_public_memory_items`）：构造里
+            # 的 `_comment_blog_text` 也要读输入，任何意外都只该让评论少一份可选资料。
+            public_inputs = PublicMemoryInputs(
+                # 频道由评论服务钉死为 "comment"（§48.2）；解析器只认 lobby / comment（R4）。
+                channel_kind=inputs.channel_kind,
+                current_subject=inputs.current_subject,
+                conversation_subjects=inputs.conversation_subjects,
+                current_text=inputs.current_text,
+                reply_text=None,
+                blog_text=_comment_blog_text(inputs),
+                expanded_clipboard_texts=inputs.expanded_clipboard_texts,
+                lobby_recent=(),
+            )
             subjects = await resolver.resolve(public_inputs)
         except Exception as exc:
-            # 解析器自己承诺不抛（§43.2）；这一层兜的是注入的替身与将来的回归。
+            # 这一层兜的是注入的替身与将来的回归。
             log_event(
                 _logger,
                 logging.WARNING,

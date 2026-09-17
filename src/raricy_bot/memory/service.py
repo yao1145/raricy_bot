@@ -1335,8 +1335,9 @@ class MemoryService:
         `unpublish_all` 与 §42.6 的公开保护都要以**磁盘上这一刻**的公开文档为基线。走 TTL 缓存会
         把「TTL 窗口内落到盘上的条目」变成看不见的东西，而 `unpublish_private` 的 `not_found`
         是 R19 授权删除私人来源的前提——它必须意味着「我读了公开文件，里面没有这条」，不能退化成
-        「我碰巧没看见」。只读路径（`public_entries` / `public_context_for` / `find_operation` /
-        索引扫描）保持缓存，读者不为此付代价。
+        「我碰巧没看见」。只读路径（`public_entries` / `public_context_for` / `find_operation`）
+        保持缓存，读者不为此付代价；username 索引的整份重扫（`_refresh_public`）不走读者那一格，
+        它自己也 `force=True` —— 它是**填**这份缓存的那条路径，不是它的读者。
         """
         state = self._public.get(owner_key)
         fresh = self._inspect(
