@@ -3,6 +3,10 @@
 评论发现器只负责把完整的评论 DTO 交给本模块；本模块负责判定这条评论是否
 明确指向机器人，并把可执行的本地回复或模型请求交给上层。正文只存在于本次
 调用返回值和内存队列中，不写日志或 SQLite。
+
+本模块也是评论路径上**最后一个**持有 `CommentNode.author.id` 的地方：门禁布尔与
+会话 subject（`CommentRequest.public_memory_subject`）都在这里算好，原始 ID 不离开
+路由器（§35、§48.1、D-56）。
 """
 
 from __future__ import annotations
@@ -16,10 +20,11 @@ from typing import Any
 
 from .. import texts
 from ..config import CommentConfig
-from ..core.context import ContextManager
+from ..core.context import ContextManager, ConversationSubject, sanitize_username
 from ..logging_setup import get_logger, log_event
 from ..memory.access import MemoryAccessPolicy
-from ..site.comment_models import CommentNode
+from ..memory.models import user_storage_key
+from ..site.comment_models import CommentAuthor, CommentNode
 from ..store import CommentClaim
 from ..text_utils import (
     contains_bot_mention,
@@ -64,6 +69,11 @@ class CommentRequest:
     # 当前评论作者能否使用共同记忆（§35）。未注入策略或门禁关闭时恒 False；
     # 为真也只意味着可以读 `all_user`，lobby 与用户私有文件在评论路径上永不读取。
     memory_allowed: bool = False
+    # 当前评论作者的会话 subject（§48.1、公开设计 §14.3）：Router 在**仍持有**
+    # `CommentNode.author.id` 时用 `user_storage_key` 算好，原始 ID 不离开路由器。
+    # 只有不可逆的 owner key 与清洗后的用户名过界，供模型侧解析公开个人记忆。
+    # 作者 ID 为空、或记忆未注入时恒为 None（D-60 的回退路径）。
+    public_memory_subject: ConversationSubject | None = None
 
 
 @dataclass(frozen=True)
@@ -326,6 +336,9 @@ class CommentRouter:
             # 门禁判定必须在这里完成：`comment.author.id` 一旦离开路由器就不可得，
             # 模型侧只剩这个布尔（§35、D-56）。
             memory_allowed=self._memory_allowed(comment.author.id),
+            # 同理，subject 也只能在这一刻算（§48.1）：请求里留下的是不可逆的 owner key
+            # 与展示用用户名，原始作者 ID 到此为止，绝不随请求外流。
+            public_memory_subject=self._public_memory_subject(comment.author),
         )
 
         # 本地回复不调用模型。/reset 的新会话由 force_new claim 建立，旧会话完全不动。
@@ -551,6 +564,27 @@ class CommentRouter:
         if access is None:
             return False
         return access.permits_common(author_id)
+
+    def _public_memory_subject(self, author: CommentAuthor) -> ConversationSubject | None:
+        """把评论作者映射成不可逆的会话 subject（§48.1）；算不出来时返回 None。
+
+        `key` 用 `user_storage_key(author.id)`、`label` 用 `sanitize_username` 清洗后的
+        用户名（与聊天路径同一份规则，§45.1）。作者 ID 为空或记忆未注入时恒为 None：
+        未装配的部署连一次哈希都不发生（D-60 的回退路径）。
+
+        编码不出存储键的畸形 ID（孤立代理项会让严格 UTF-8 编码抛 `UnicodeEncodeError`）
+        按「拿不到身份」处理，与 `memory/service.py` 的 `_storage_key` 同一口径：
+        记忆是软故障，一个怪 ID 不能把一条本该回复的评论变成异常。
+        """
+        if self._memory_access is None or not author.id:
+            return None
+        try:
+            key = user_storage_key(author.id)
+        except UnicodeEncodeError:
+            return None
+        return ConversationSubject(
+            key=key, label=sanitize_username(author.username or "")
+        )
 
     def _comment_help_text(self) -> str:
         """评论区 `/help` 的文案（§35、§36）：按记忆注入与否、图片开关与文章正文上限拼装。
