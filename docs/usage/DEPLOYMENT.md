@@ -407,7 +407,8 @@ Rocky/RHEL 启用 SELinux 时，按[附录 A](#附录-arocky-linux-9-差异)的�
 
 > 这是**灰度功能**，默认关闭，而且建议按下面的顺序一步步开：每一步都能停下来、都能回退。
 > 用户能看到什么、能发哪些命令，见 [`USAGE.md`](USAGE.md) 第 5 与第 6 节；
-> 记忆的存储与日志口径见 `docs/design/INTERFACES.md` §29 … §37。
+> 记忆的存储与日志口径见 `docs/design/INTERFACES.md` §29 … §37，用户主动公开条目（公开个人
+> 记忆）的合同见同文件 §39 … §52。
 
 配置全貌（`config.example.yaml` 的 `memory:` 段就是这一份，默认值即「关闭」）：
 
@@ -419,6 +420,11 @@ memory:
   admin_user_list: []         # 第三步把自己加进去
   root_dir: "./data/memory"   # 容器里即 /app/data/memory，位于 bot-data 卷内
   auto_capture_available: false   # 自动记忆是独立开关，见本节最后一段
+  # 公开个人记忆（用户主动公开自己的条目）的三个容量/预算旋钮，没有独立开关：
+  # 它跟随 enabled 与 access_mode，用户还要自己在私聊里逐条执行 /memory public。
+  max_public_entries_per_user: 8   # 单个用户的公开条目上限，不得大于 max_private_entries_per_user
+  max_public_subjects_per_turn: 4  # 一轮最多选入几位用户的公开条目
+  public_personal_context_tokens: 600  # 公开个人记忆分组的渲染上限
 ```
 
 **开启顺序（每一步都验证过再走下一步）**
@@ -440,8 +446,26 @@ memory:
      → `/memory list lobby`，再到**大区**里 @ 机器人提问，确认共同记忆进入了回答。
 5. **小范围放行。** 把试用账号加进 `allow_user_list`，观察一段时间（条数上限、`full` 提示、
    `/memory list` 的回复都值得看一遍）。名单是**稳定用户 id**，不是可改的用户名。
-6. **稳定之后再考虑 `access_mode: "all"`。** 这只影响「谁能读共同记忆 / 谁能用记忆命令」，
+6. **核对公开个人记忆的三处说明，再观察它的两项开销。** 公开个人记忆没有独立开关：名单里的
+   用户随时可以在私聊里用 `/memory public <UM-ID>` 把自己的一条私有条目公开出去，因此放行
+   试用账号之前就要把文案看一遍：私聊里发 `/help`（应出现「大区与评论区不会使用任何未公开的
+   私有记忆……」那一段）、执行一次 `/memory public` 看重放确认、再到评论区发 `/help` 看那条
+   评论披露。上线后盯两样：站点用户查询的限频（机器人按名字核对身份会调
+   `GET /api/chat/users`，站点限 20 次/分钟，代码侧自己节流到 15 次/分钟；限频、超时或响应
+   形状认不出来时，那一批文本命中直接落空）与公开条目的预算占用（`public_personal_context_tokens`
+   是这个分组的渲染上限，装不下的条目整条跳过、不截断正文，后面的条目仍有机会）。
+   注意预算取舍**不发日志**：`scope=public` 的
+   `memory.context_omitted` 记的是「目录不可读」或「某位用户的公开文件读不出来」，不要把它
+   当成预算太紧的告警。
+7. **稳定之后再考虑 `access_mode: "all"`。** 这只影响「谁能读共同记忆 / 谁能用记忆命令」，
    不会改变私有记忆的边界（私有记忆在任何模式下都只在本人私聊里读写）。
+
+**公开个人记忆没有迁移，也没有默认公开**
+
+升级不解冻任何旧数据：`public/` 初始为空，所有既有私人条目保持私有，只有用户本人逐条执行
+`/memory public <UM-ID>` 才会出现公开投影。因此没有批量迁移、没有「历史授权推断」，也不存在
+把某人的旧条目默认为公开的路径。它的读写都在同一个 `root_dir/public/` 下，和私人条目一样是
+原子的单文件替换，规则与红线（正文不进日志、不进 SQLite）完全一致。
 
 **单副本约束（Beta 的硬限制）**
 
@@ -449,15 +473,35 @@ memory:
 也不要在两个部署之间共享同一个记忆目录：记忆是「内存快照 + 原子替换整个文件」，两个进程各自
 持有自己的快照时，后一次替换会**静默覆盖**另一边的写入。这条与第 1 节第 3 条（整台机器人本来就
 只部署一个副本）方向一致，但记忆是**独立的第二条理由**——即使两个副本用各自的数据库也不能共用
-记忆目录。多副本选主不在 Beta 范围内。
+记忆目录。公开投影在这条上不比私有记忆宽松：`public/` 与 username 索引同样按「一次引用替换」
+发布，两个进程写同一份 `root_dir/public/` 的后果与私有文件一样是静默覆盖。多副本选主不在
+Beta 范围内。
 
 **回退（两种方式，都不删数据）**
 
-- `memory.enabled: false`：整段记忆装配被跳过——不读、不写、不建目录，Markdown 原样留在磁盘上；
+- `memory.enabled: false`：整段记忆装配被跳过——不读、不写、不建目录，公开目录连扫都不扫，
+  不发站点用户查询，Markdown 原样留在磁盘上；
 - 或者保持 `enabled: true` 但把 `allow_user_list` 清空（回到 `allowlist` 模式）：谁都用不了，
   已有文件同样保留，将来把名单加回来即可继续。
 
 两种回退都不会删除任何条目，也不会影响聊天与评论。
+
+**回退不等于删除：永久撤回仍然要用户自己执行命令**
+
+`memory.enabled: false` 只让公开条目**不再进入任何模型请求**，`public/` 里的文件、`operations`
+记录与私人条目都原样留着，随时可以再打开。要真正把内容撤下来或删掉，只有三条用户侧的命令：
+
+| 想要的结果 | 命令 | 发生了什么 |
+|------------|------|------------|
+| 撤回某一条的公开副本 | `/memory unpublic <UM-ID>` | 公开投影里不再有它；私人条目不动 |
+| 删除一条私人条目（连带撤回它的公开副本） | `/memory forget <UM-ID>` | 先撤回公开副本、再删私人条目 |
+| 清空全部私人条目（连带撤回全部公开副本） | `/memory clear` | 同上，一次做完 |
+
+**不要**把关闭功能当成「已经删除」答复用户：磁盘上的文件仍在，重新打开后（只要用户没有执行过
+上面三条命令）那些公开条目会再次生效。用户要求删除时，先确认他执行过 `unpublic` / `forget` /
+`clear` 中的哪一条。代码级回退（回滚到没有公开个人记忆的版本）同样不需要数据库迁移：摘掉
+resolver 与公开 provider 的装配、保留 Markdown 文件即可；重新启用之前要确认 `/help` 与评论
+披露已经跟着版本一起回来——功能生效期间不能恢复成「公开场景绝不使用个人记忆」的旧说明。
 
 **备份、恢复与数据保护**
 
@@ -475,19 +519,26 @@ memory:
   docker compose run --rm -v "$PWD/memory-backup:/backup:ro" bot python -c "
   from pathlib import Path
   from raricy_bot.config import load_config
-  from raricy_bot.memory.codec import parse_common, parse_private
+  from raricy_bot.memory.codec import parse_common, parse_private, parse_public
   cfg = load_config('/app/config.yaml').memory
   count = 0
   for path in sorted(Path('/backup').rglob('*.md')):
       data = path.read_bytes()
-      (parse_common if path.name == 'common.md' else parse_private)(data, cfg)
+      # 三份文档三种解析器：公开投影在 public/ 下，用私人解析器读它一定失败。
+      if path.name == 'common.md':
+          parse_common(data, cfg)
+      elif 'public' in path.parts:
+          parse_public(data, cfg)
+      else:
+          parse_private(data, cfg)
       count += 1
   print('校验通过', count, '个文件')
   "
   ```
 
   解析失败会直接报错并指出文件——先修好或移走它，否则服务会带着「记忆不可用」的状态起来
-  （不影响聊天，但那份文件读不出来）。
+  （不影响聊天，但那份文件读不出来）。公开文件损坏时只有它那一位 owner 受影响：冷启动时该
+  owner 的条目被省略，其余人照常。
 
 **自动提取是独立的灰度项**
 
@@ -499,10 +550,14 @@ memory:
 
 记忆自己的日志只有 `memory.*` 这几个事件（`ready` / `load_failed` / `refresh_failed` /
 `command` / `write_failed` / `updated` / `candidate_updated` / `auto_capture` / `context_omitted`），
-字段取自 §37 为记忆**新增**的那五个（`scope`、`revision`、`entry_count`、`memory_id`、
-`candidate_id`）加上白名单里原有的通用字段（`status`、`reason`、`error`、`message_id` 等）：
-**正文、key、用户 id、存储键、路径与文件摘要都不会进日志**（白名单外的字段一律被丢弃）。
-所以「某条记忆为什么没生效」只能靠用户自己用 `/memory list` 看，不要指望日志。
+字段取自 §37 为记忆**新增**的那七个（`scope`、`revision`、`entry_count`、`memory_id`、
+`candidate_id`，以及公开个人记忆另加的 `public_entry_count`、`subject_count`）加上白名单里原有的
+通用字段（`status`、`reason`、`error`、`message_id` 等）：**正文、key、用户 id、存储键、
+用户名、站点查询词与匹配到的正文、文件路径都不会进日志**（白名单外的字段一律被丢弃）。
+所以「某条记忆为什么没生效」只能靠用户自己用 `/memory list` 看，不要指望日志；公开路径同样
+只有计数（`public_entry_count` 是某次扫描/操作涉及的公开条目数，`subject_count` 是本轮选中的
+用户数），一个名字都不会留下。公开扫描相关的行用 `scope=public` 区分：`memory.ready`、
+`memory.load_failed`、`memory.refresh_failed` 与 `memory.context_omitted` 都会带它。
 
 一条值得记住的告警：`memory.auto_capture` 带 `reason=disclosure_no_room`（WARNING）表示
 `behavior.max_output_chars` 相对 `memory.max_entry_chars` 太紧——这一轮的记忆**已经写进去了**，
@@ -1273,7 +1328,9 @@ docker compose logs --tail=200 bot | grep -E 'router\.route|sender\.send|app\.'
 - [ ] 已做过一次备份并验证能解开（第 10.5 节）
 - [ ] 若启用评论能力：已在测试文章上验证首次 @、直接回复、旁支静默、`/help` 与 `/reset`
 - [ ] 若启用长期记忆（Beta）：按 §4.2.2 走完「空跑确认不建目录 → 名单留空验证接入门 →
-      管理员自测 `/remember` 与共同候选 → 小范围放行」，并演练过一次回退
+      管理员自测 `/remember` 与共同候选 → 小范围放行」，核对过 `/help`、公开确认与评论披露，
+      并演练过一次回退（回退**不等于删除**：永久撤回仍要用户自己执行 `unpublic` / `forget` /
+      `clear`）
 - [ ] Rocky 上另见[附录 A](#附录-arocky-linux-9-差异)的补充检查项
 
 ---
@@ -1282,7 +1339,10 @@ docker compose logs --tail=200 bot | grep -E 'router\.route|sender\.send|app\.'
 
 - 不支持博客理解与通用工具调用。**长期记忆是默认关闭的 Beta 可选项**（灰度步骤、单副本约束、
   回退与备份见 §4.2.2）：开启后也只保存被模型整理成**条目**的内容，不是「记住整段对话」，
-  且不改变短上下文的规则（仍然只在内存、重启即空）。聊天区 MCP 能力是**默认关闭**的可选项，
+  且不改变短上下文的规则（仍然只在内存、重启即空）。同一开关下还有**用户主动公开的个人记忆**
+  （§4.2.2）：用户逐条公开自己的条目之后，大区与评论里出现或精确提到他时，那几条才可能随
+  当轮请求发给模型；未公开的私有条目永远不进公开请求，关掉 `memory.enabled` 则连公开目录都不读。
+  聊天区 MCP 能力是**默认关闭**的可选项，
   四条命令各只授权自己那一轮：`/search` 查 Exa、`/zhihu` 查知乎、`/map` 查高德、
   `/wolfram` 算 Wolfram；一条消息最多带一个能力命令，叠加会被本地拒绝。
   其中 `zhihu`/`map`/`wolfram` 三个在示例配置里默认关闭，启用前必须先取样校准（§4.1.2）。

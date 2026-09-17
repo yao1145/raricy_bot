@@ -47,7 +47,8 @@
 | 文件 | 是什么 | 权威性 |
 |------|--------|--------|
 | `design/INTERFACES.md` | 本项目内部契约：锁定的签名、字段名、默认值、判定谓词 | 改签名前先查全部消费者 |
-| `design/DESIGN_DECISIONS.md` | 设计未明确处的裁决记录（D-1 … D-93） | 觉得某处行为怪，先读对应条目——不少「看起来像 bug」的选择是刻意的 |
+| `design/DESIGN_DECISIONS.md` | 设计未明确处的裁决记录（D-1 … D-103） | 觉得某处行为怪，先读对应条目——不少「看起来像 bug」的选择是刻意的 |
+| `design/PUBLIC_PERSONAL_MEMORY_DESIGN.md` | 用户公开个人记忆（`/memory public <UM-ID>`）的实现设计：公开投影与私人真相源分离、只在大区与评论、按完整用户名精确匹配。合同见 `design/INTERFACES.md` §39 … §52，部署与回退见 `usage/DEPLOYMENT.md` §4.2.2，用户说明见 `usage/USAGE.md` 第 5 / 6 / 8 节与 `usage/推文-长期记忆-发布稿.md` | 产品行为与内部合同已冻结；状态段随实现进度更新 |
 | `design/SYSTEM_PROMPTS.md` | 系统提示词的正式来源 + 站点速查表 | 提示词正文的权威副本，**但它不参与运行**：改完必须手动同步到 `config.yaml` |
 | `design/SITE_DOCS_KB_DESIGN.md` | `knowledge/` 知识库**内容侧**的取材范围、删减规则、问答写法、留痕与验收口径 | 已实施（2026-09-15，15 篇 / 220 条）。只约束内容，运行行为见 `usage/EXA_POOL_AND_KB.md` |
 
