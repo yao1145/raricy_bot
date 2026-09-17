@@ -43,6 +43,8 @@ COPY --from=mcp-tools /opt/mcp-tools /opt/mcp-tools
 # 先拷构建清单与源码，再安装，避免把测试、文档与本地配置带进镜像。
 COPY pyproject.toml ./
 COPY src ./src
+RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+    && pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn
 RUN pip install --no-cache-dir .
 
 # 非 root 运行（设计文档 §2.1）。
