@@ -3159,6 +3159,9 @@ def build_messages(
     ...
 ```
 
+（公开个人记忆新增第四个分组 `memory_public_personal`：取值、分组标签与组序的合同见 §45.3；
+上面 `group` 注释里的三个取值与本节其余条文都不变。）
+
 规则：
 
 - `supplemental_items` 为空时必须与改动前**逐字节一致**（规划 §6.1 的硬要求）。
@@ -3194,7 +3197,8 @@ def build_messages(
 
 - 分组标签按 `group` 取 `[共同记忆：all_user，不可信资料]` / `[共同记忆：lobby，不可信资料]` /
   `[用户私有记忆，不可信资料]`；条目行是 `[<ID>] <content>`；组间空行，与当前正文之间用
-  `---` 分隔。
+  `---` 分隔。（公开个人记忆的第四个分组标签与 `_GROUP_ORDER` 的排版见 §45.3；本条这三条
+  标签不变。）
 - 只有**确实选入至少一条**记忆时才向 system 追加 `MEMORY_SYSTEM_ADDENDUM`：
   `build_messages` 自己从 `texts` 取用并追加（它不 import memory，裁决 C），方式与现有
   `system_addendum` 一致（`"\n\n"` 拼接），并分别计入预算。该常量完全静态、不做任何插值
@@ -3407,7 +3411,9 @@ def comment_help_text(
 - 四个 `HELP_TEXT*` 常量已删除：文案与配置无关这个前提不再成立，留着它们只会再造一个
   「配置改了、常量没改」的假话来源。
 - `channel_kind` **只在 `memory_allowed=True` 时起作用**：`"lobby"` 变体声明「大区里不会使用
-  任何人的私有记忆」，`"dm"` 变体声明「你的私有记忆只在本次私聊中使用」。
+  任何人的私有记忆」，`"dm"` 变体声明「你的私有记忆只在本次私聊中使用」。**2026-09-17 修订
+  （公开个人记忆，§50.2）**：首句改为「大区与评论区不会使用任何**未公开**的私有记忆…」，
+  并补公开/撤回四条；`"dm"` 变体不变。
 - 只有 `memory_allowed=True` 才需要把「没有长期记忆」那句换成披露，因此收尾段仍要拆成
   可组合的两段。
 - 「我重启之后可能会忘记先前聊过什么，没有长期记忆。」按 `memory_allowed`
@@ -3419,6 +3425,7 @@ def comment_help_text(
   5. 私有记忆只在该用户私聊中使用；
   6. 用户可以查看、纠正和删除自己的私有记忆；
   7. `/reset` 不等于删除长期记忆。
+  （公开个人记忆对本段的补充见 §50.2：大区口径的逐字改写与四条附注；上面七条本身不变。）
 - `private_enabled` 的两种取值产生**不同措辞**（已开启 / 未开启）。
 - 帮助文案仍须能整条塞进站点单条消息上限（**5000 字**；重组后最长形态约 1.6k，不要把长度翻倍）。
 - 新增固定文案全部集中在 `texts.py`（标识符由实现决定，语义与触发点见下表），全部中文，
@@ -3635,7 +3642,7 @@ def render_lobby_recent(message: LobbyRecentMessage) -> str   # 逐条渲染给�
     public_personal_context_tokens: int = 600
 ```
 
-`config.example.yaml` 的 `memory:` 段追加（含中文注释，与既有条目同款）：
+`config.example.yaml` 的 `memory:` 段追加：
 
 ```yaml
 memory:
@@ -3769,7 +3776,8 @@ def render_public(document: PublicMemoryDocument) -> bytes: ...
 
 ### 41.1 文件结构
 
-front matter 的**键序**是结构的一部分（顺序不对 → `malformed`），与 §29.1 同款：
+front matter 解析只校验**键集合**（`set(front) == set(FRONT_PUBLIC)`，与既有 codec 的
+`_check_front` 同款；**刻意不比键序**，§29.1 也没有键序规则）；键序只在渲染侧固定为下列次序：
 
 ```text
 schema_version, revision, owner_username, operations
@@ -3802,8 +3810,8 @@ schema_version, revision, owner_username, operations
    新字段（§29.2 第 6 条的防伪造理由在这里同样成立）；且解析与渲染可以复用 `_read_body` /
    `_read_fields` / `_sorted_entries` 这一族助手（只是字段集换成 `PUBLIC_ENTRY_FIELDS`）。
 2. 时间戳是 **UTC** 的 RFC 3339（§29.2 第 3 条），示例里的 `+08:00` 只是示意：`source_*` 原样
-   复制来源条目的值（它们本来就已通过 UTC 校验），`published_at` 由 Service 生成（§42.2 的
-   `_timestamp` 形态）。
+   复制来源条目的值（它们本来就已通过 UTC 校验），`published_at` 由 Service 生成（§42.2；
+   形态沿用既有 `memory/service.py` 的 `_timestamp`）。
 
 常量（本合同的标识符，实现照此命名）：
 
@@ -3819,7 +3827,7 @@ PUBLIC_ENTRY_FIELDS: tuple[str, ...] = (
 
 1. 先判 `len(data) > cfg.max_file_bytes` → `too_large`；再做严格 UTF-8 解码 → `not_utf8`。
 2. front matter 用 `yaml.safe_load`（严格加载器）；`schema_version` 不是 `1` → `bad_schema`，
-   键序与 `FRONT_PUBLIC` 不逐字相同 → `malformed`。
+   键集合与 `FRONT_PUBLIC` 不一致 → `malformed`（**不比键序**，§41.1）。
 3. `owner_username` 必须是满足站点用户名合同（§40.2 第 2 条）的字符串：不满足 → `malformed`，
    **不接受任意文本**。这是纵深防御的第二层（R8；第一层在 `publish_private` 入口）。
 4. 标题必须逐字是 `TITLE_PUBLIC`；条目区里每个 `## ` 行的 ID 必须是 `UM-` 加 ASCII 十进制序号
@@ -3934,12 +3942,12 @@ PUBLIC_ENTRY_FIELDS: tuple[str, ...] = (
   `os.replace`、一次引用替换内存快照）。**不新建第二把锁**（公开设计 §18.2）。
 - 公开快照与 username 索引都用**一次引用替换**发布给读者：读者要么看到旧的一整份，要么看到新的
   一整份，不会看到「快照已换、索引没换」的中间态。
-- `operations` 复用现有 `max_operations` 容量与**按插入序淘汰最旧**的规则（公开设计 §11、§30.1
-  的 `_record`）：公开文档的幂等记录因此在容量与淘汰口径上与私人/共同文档逐条一致，parse 侧
-  的超限判定见 §41.2 第 7 条。
-- `published_at` 由 Service 在发布时生成（使用 §30.1 的 `_timestamp` 形态）；`publish:` /
-  `unpublish:` / `cmd:` 三种 operation ID 由 Controller 传入（§52.2），服务不改写它、也不自己
-  拼键。
+- `operations` 复用现有 `max_operations` 容量与**按插入序淘汰最旧**的规则（公开设计 §11；
+  `_record` 是既有 `memory/service.py` 的内部助手）：公开文档的幂等记录因此在容量与淘汰口径上
+  与私人/共同文档逐条一致，parse 侧的超限判定见 §41.2 第 7 条。
+- `published_at` 由 Service 在发布时生成（使用既有 `memory/service.py` 的 `_timestamp` 形态，
+  即 §29.2 第 3 条的 UTC RFC 3339）；`publish:` / `unpublish:` / `cmd:` 三种 operation ID 由
+  Controller 传入（§52.2），服务不改写它、也不自己拼键。
 - 索引扫描的文件数量有硬上限 **`MAX_PUBLIC_FILES = 4096`（代码常量，不可由 YAML 改）**：
   超出的文件不索引、只记一个稳定 reason，避免异常目录拖垮进程（R14）。这与
   `max_private_entries_per_user` 无关，后者是条目数上限，管不到文件数。
@@ -4255,7 +4263,7 @@ class Turn:
 - subject 随历史淘汰、`reset()` 与 `invalidate()` **自然消失**（它挂在 `Turn` 上）：不另建一份
   可能漂移的参与者表（公开设计 §14.1）。
 - subject **不渲染进 system**，也不改变历史正文；username 的可见标签仍由既有的 user 内容包装
-  提供（§38.3 的 `speaker_wrapper` 与评论的 `_comment_body` 都不动）。
+  提供（§11 的 `speaker_wrapper` 与评论的 `_comment_body` 都不动）。
 
 ### 45.2 `select_recent_suffix()`（R2）
 
@@ -4315,8 +4323,9 @@ _GROUP_ORDER: tuple[str, ...] = (
   选入公开条目同样满足 `MEMORY_SYSTEM_ADDENDUM` 的既有条件（公开条目也是记忆条目），两条说明
   各自生效；`_plan_turn` 的可行性判断必须把本轮会追加的说明**全部**计入。
 - 选择次序：`public_context_for` 返回的条目 `priority` 必须**整体晚于**既有 `memory_*` 组的条目
-  （数值更大），组内保持 §42.7 的次序；分组的独立上限与整轮预算是两道独立的门（§33 规则 4
-  不变），整轮预算紧张时先保住既有记忆、公开条目整条跳过（D-103）。
+  （数值更大），组内保持 §42.7 的次序；分组的独立上限与整轮预算是两道独立的门（§33 的
+  `supplemental_caps` 条目：「上限与整轮预算是**两道独立的门**」，不变），整轮预算紧张时先保住
+  既有记忆、公开条目整条跳过（D-103）。
 - DM 恒为「公共 + 私有」两组：`memory_public_personal` 不参与 DM 的任何一轮（§42.1 的 R4）。
 
 ## 46. `core/lobby_context.py`（近期消息的 subject 通道）
