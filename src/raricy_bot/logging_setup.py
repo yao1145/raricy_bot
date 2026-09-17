@@ -63,6 +63,11 @@ LOG_FIELDS: frozenset[str] = frozenset(
         "entry_count",
         "memory_id",
         "candidate_id",
+        # 公开个人记忆（INTERFACES §51）：本功能**只**新增这两个字段，两者都只承载计数 ——
+        # 前者是某次扫描/操作涉及的公开条目数，后者是本轮选中的 subject 数。username、
+        # owner key、查询词、匹配正文、文件路径与完整 subject 对象一律不进日志。
+        "public_entry_count",
+        "subject_count",
     }
 )
 
