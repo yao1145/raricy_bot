@@ -2359,6 +2359,10 @@ class MemoryConfig:
     max_operations: int = 512
     common_context_tokens: int = 800
     private_context_tokens: int = 800
+    # 公开个人记忆（§39；设计 §9）：第三类记忆的三个旋钮。
+    max_public_entries_per_user: int = 8
+    max_public_subjects_per_turn: int = 4
+    public_personal_context_tokens: int = 600
     writer_context_tokens: int = 2000
     writer_timeout_seconds: float = 15.0
     auto_capture_available: bool = False
@@ -2428,6 +2432,10 @@ memory: MemoryConfig = field(default_factory=MemoryConfig)
 `all_user` 与 `lobby` 两个分组**合计**，后者管 `memory_user`；评论侧只用到前者（§35）。它们不改变
 整轮预算（`behavior.context_input_tokens` / `comments.context_input_tokens`）的任何账目，只是先给
 记忆自己的那一份封顶，因此调小它们只可能让记忆少占、历史多留。
+
+公开个人记忆在 §26.1 的字段表里追加了三个字段，校验规则与既有条文的**关系**单独写在 §39.2：
+本节的第 6、7、8 条原样保留，新增的三条是叠加而不是替代（第 7 条就是设计 §9 的第 3 条本身，
+不在两处各判一遍）。
 
 ### 26.3 关闭语义
 
@@ -2547,11 +2555,12 @@ def user_storage_key(user_id: str) -> str:
 
 ### 27.4 稳定状态字符串
 
-下面十个字符串是**稳定合同**（值逐字固定，不得新增、改写或按用途重命名）：
+下面**十一**个字符串是**稳定合同**（值逐字固定，不得新增、改写或按用途重命名；第十一个
+`public_conflict` 是公开个人记忆新增的，见 §40.3）：
 
 ```text
 ok | noop | duplicate | not_found | forbidden | unavailable |
-invalid_proposal | conflict | full | secret_detected
+invalid_proposal | conflict | full | secret_detected | public_conflict
 ```
 
 它们由 `memory/models.py` 以 `STATUS_*` 常量导出，**标识符名同样逐字固定**（裁决 R8）：
@@ -2567,12 +2576,13 @@ STATUS_INVALID_PROPOSAL: str = "invalid_proposal"
 STATUS_CONFLICT: str = "conflict"
 STATUS_FULL: str = "full"
 STATUS_SECRET_DETECTED: str = "secret_detected"
+STATUS_PUBLIC_CONFLICT: str = "public_conflict"
 ```
 
-- 十个常量各自标注 `: str`，与本仓库既有的状态常量写法一致（`core/blog.py:26` 的
+- 十一个常量各自标注 `: str`，与本仓库既有的状态常量写法一致（`core/blog.py:26` 的
   `BLOG_STATE_OK: str = "ok"`）。
 - 值**和**名字都只有这一处来源：`memory/` 内外的模块与测试一律从 `memory.models` 导入这些
-  常量，不得重新内联字面量、不得另起别名、不得增删第十一个。
+  常量，不得重新内联字面量、不得另起别名、不得增删任何一个（当前总数是十一）。
 
 | 状态 | 含义 |
 |------|------|
@@ -2586,6 +2596,7 @@ STATUS_SECRET_DETECTED: str = "secret_detected"
 | `conflict` | 外部编辑或候选目标已被改动，拒绝覆盖 |
 | `full` | 触发容量上限，**绝不静默删除**既有条目 |
 | `secret_detected` | 脱敏前后不一致（命中已注册密钥），整条拒绝、不保存脱敏版本 |
+| `public_conflict` | AI 撰写或自动提取试图更新一条**仍然公开**的来源条目；私人与公开文件都不写（§40.3、§42.6） |
 
 - 用户可预期的失败一律映射成状态返回，不用异常传递；异常只用于编程错误与被取消。
 - 幂等命中返回**第一次**的稳定结果，不改写成 `duplicate`（§30.2）。
@@ -3600,3 +3611,1040 @@ def render_lobby_recent(message: LobbyRecentMessage) -> str   # 逐条渲染给�
   `error` 只放 `type(exc).__name__`：异常消息、对象 `repr` 与条目正文都不许进日志
   （`log_event` 的白名单是最后一道闸，但它挡的是**字段名**，`error=` 这条口子要靠取值自律）。
 - 这条路径没有别的事件名：正文、博客标题与渲染后的近期块都不落日志、不落 SQLite。
+
+## 39. `config.py`（公开个人记忆配置）
+
+「用户公开个人记忆」功能（设计 `docs/design/PUBLIC_PERSONAL_MEMORY_DESIGN.md`，下称「公开设计」）
+的配置合同。**首版继续服从 `memory.enabled` 与既有 `access_mode` / `allow_user_list` 门禁**
+（公开设计 §5.2、§22.1）：本节没有任何新开关，只新增三个可调的容量与预算旋钮。
+
+### 39.1 字段与默认值
+
+逐字照抄公开设计 §9（`MemoryConfig` 追加，位置见 §26.1 的字段表）：
+
+```python
+    max_public_entries_per_user: int = 8
+    max_public_subjects_per_turn: int = 4
+    public_personal_context_tokens: int = 600
+```
+
+`config.example.yaml` 的 `memory:` 段追加（含中文注释，与既有条目同款）：
+
+```yaml
+memory:
+  max_public_entries_per_user: 8
+  max_public_subjects_per_turn: 4
+  public_personal_context_tokens: 600
+```
+
+- `max_public_entries_per_user`：单个 owner 的公开条目上限。命中时 `publish_private` 返回 `full`，
+  文案必须明确说的是**公开条目**上限（§42.4、§50）。
+- `max_public_subjects_per_turn`：一轮最多选入的 owner 数（§43 的 R5 规则）。
+- `public_personal_context_tokens`：`memory_public_personal` 分组的渲染上限（§45.3）。
+- 三个字段都可由 YAML 覆盖；本功能**没有**新的「代码常量」开关（身份缓存与节流是 §43.4 的常量，
+  它们是对上游限频的实现保护，不是产品语义）。
+
+### 39.2 校验规则
+
+逐条实现公开设计 §9 的六条，并写清与 §26.2 的关系：
+
+| # | 规则 | 施加条件 | 与 §26.2 的关系 |
+|---|------|----------|-----------------|
+| 1 | 三个值均为正整数（布尔不算整数，复用 `_positive_int`） | 总是 | 就是 §26.2 第 6 条覆盖的那类单字段范围校验 |
+| 2 | `max_public_entries_per_user <= max_private_entries_per_user` | 仅 `enabled=true` | 新增的交叉约束，沿用 §26.2 第 11 条的「交叉约束只在启用时施加」 |
+| 3 | `common_context_tokens + private_context_tokens <= behavior.context_input_tokens` | 仅 `enabled=true` | **就是 §26.2 第 7 条本身**，不复制第二份判断 |
+| 4 | `common_context_tokens + public_personal_context_tokens <= behavior.context_input_tokens` | 仅 `enabled=true` | 新增；只在 `enabled=true` 时施加 |
+| 5 | `common_context_tokens + public_personal_context_tokens <= comments.context_input_tokens` | 仅 `enabled=true` 且 `comments.enabled=true` | 新增；`public_personal_context_tokens` 为正整数时它蕴含 §26.2 第 8 条，但第 8 条**原样保留**（它是「评论侧共同记忆上限」的独立条文，删掉会让只读 §26 的人看不到评论侧的上限） |
+| 6 | `memory.root_dir/public` 位于 memory root **之内**，不新增任何路径配置键 | 总是（结构事实） | `public/` 是 `root_dir` 的固定子目录，§26.2 第 10 条的三条路径约束不变，判定仍只看 `root_dir` |
+
+- 关闭时（`enabled=false`）只做第 1 条与类型校验（§26.2 第 11 条的口径不变）：默认关闭的部署
+  不该因为 `behavior.context_input_tokens` / `comments.context_input_tokens` 调小而起不来。
+- 第 2 条的成立理由：每个人能公开的条目不能比他自己能拥有的私有条目还多（公开投影只可能复制
+  私人快照，超出部分的配置值是死数）。
+- 第 4、5 条成立的理由与 §26.2 第 7、8 条同源：本功能不改变整轮预算的账目，只是保证
+  「共同记忆 + 公开个人记忆」不会把其中任何一轮预算吃光。
+
+### 39.3 关闭语义
+
+- `enabled=false` 时**不创建、不扫描、不读取** `memory.root_dir/public/`，不发站点用户查询
+  （§44），不注册公开个人记忆的 system 静态说明（§50.4），帮助文案与升级前逐字节一致
+  （D-96；公开设计 §21 第 15 条）。
+- 本功能不引入任何新的环境变量：密钥红线仍是 §3 注册的那三个。
+
+## 40. `memory/models.py`（公开个人记忆模型）
+
+公开设计的纯类型底座，沿用 §27 的全部约束：无 I/O、无网络、不 import `app.py`（裁决 G）。
+字段与语义逐字对照公开设计 §10.1 / §10.2。
+
+### 40.1 公开条目与公开文档
+
+```python
+@dataclass(frozen=True)
+class PublicMemoryEntry:
+    memory_id: str              # 沿用来源 UM-ID
+    key: str
+    content: str
+    pinned: bool
+    source_created_at: str
+    source_updated_at: str
+    published_at: str
+
+
+@dataclass(frozen=True)
+class PublicMemoryDocument:
+    schema_version: int = 1
+    revision: int = 0
+    owner_username: str = ""
+    operations: Mapping[str, OperationResult] = field(default_factory=dict)
+    entries: tuple[PublicMemoryEntry, ...] = ()
+```
+
+规则：
+
+- 公开条目是私人条目在**发布那一刻**的**显式快照**，不是动态引用（公开设计 §3.2）：
+  `source_created_at` / `source_updated_at` 原样复制来源条目的 `created_at` / `updated_at`，
+  `published_at` 由 Service 在发布时生成。来源条目之后的变化**不会**反映到这里，用户要修正
+  内容必须「先撤回、再修改、最后重新公开」。
+- `memory_id` 沿用来源的 `UM-` ID：重复公开同一条目时保持原 ID 与原快照，不新建条目。
+- `owner_username` 必须满足站点用户名合同（§40.2 第 2 条）；`operations` 与 §29.1 同款，
+  键是宿主的 `operation_id`，值是 `OperationResult`。
+- `schema_version` 当前只认 `1`（解析侧 §41）。
+
+### 40.2 `PublicMemorySubject`
+
+```python
+@dataclass(frozen=True)
+class PublicMemorySubject:
+    owner_key: str
+    username: str
+    source_priority: int
+```
+
+规则：
+
+1. `source_priority` 只表达**本轮的选择顺序**，不落盘、不进日志；越小越优先，取值表见 §43.3（R5）。
+2. `owner_key` 必须是 `user_storage_key()`（§27.3）的 64 位小写十六进制形态；`username` 必须满足
+   站点用户名合同——**3–20 字符，仅 ASCII 字母、数字、`_`、`-`，首尾不得是 `-` 或 `_`**
+   （`docs/materials/chat-bot.md` §2.1 的注册校验规则，Global Constraints 第 15 条；公开设计 §6.2
+   的宽松描述按这条收窄），且已清洗控制字符（复用 `core/context.py` 的 `sanitize_username`）。
+3. 只包含不可逆 `owner_key` 与已清洗的 `username`：没有原始 user ID、没有正文、没有来源文本
+   （公开设计 §8）。
+4. 它是**宿主计算**的结果，模型不参与身份决策（公开设计 §3.3）：它只能由稳定身份、公开索引
+   与站点精确校验产生，任何正文文本都不能直接构造出它。
+
+### 40.3 第十一个稳定状态
+
+```python
+STATUS_PUBLIC_CONFLICT: str = "public_conflict"
+```
+
+- 语义：**AI 撰写或自动提取试图更新一条仍然公开的来源条目**（公开设计 §10.2、§12.5）。
+- 它与 `conflict` 不是一回事：`conflict` 是「磁盘摘要与内存快照不一致，拒绝覆盖」（§30.2）；
+  `public_conflict` 是「这条来源正被用户主动公开着，任何静默改写都会扩大用户批准过的授权范围」。
+  两者必须有**独立**的用户文案，`public_conflict` 的固定文案见 §50.3（公开设计 §10.2 的原文）。
+- 加入 §27.4 的稳定集合后，`operations` 的允许值、codec 校验（§41）、Controller 映射（§52）
+  与测试全部同步扩展；状态总数是十一。
+
+## 41. `memory/codec.py`（公开 Markdown 编解码）
+
+公开投影文件的严格解析与确定性渲染。与 §29 同款：**纯同步、无文件 I/O**、不 import `app.py`
+（裁决 G）；**render 不接受 cfg**（容量只在 parse 侧按 cfg 检查），`render_public` 内部用
+`_check_public(document, None)` 做结构校验。合同化公开设计 §11。
+
+```python
+def parse_public(data: bytes, cfg: MemoryConfig) -> PublicMemoryDocument: ...
+def render_public(document: PublicMemoryDocument) -> bytes: ...
+```
+
+- 复用同一套失败 reason（`CODEC_REASONS` 的六个值），**不新增** reason；`CodecError(reason)` 的
+  字符串与日志**绝不**带原始内容（§29.2 第 7 条、§37）。
+- 解析入口的读上限、UTF-8 判定与 §29.2 第 1 条逐条一致（调用方最多读 `max_file_bytes + 1` 字节）。
+
+### 41.1 文件结构
+
+front matter 的**键序**是结构的一部分（顺序不对 → `malformed`），与 §29.1 同款：
+
+```text
+schema_version, revision, owner_username, operations
+```
+
+正文结构：
+
+```markdown
+# 用户公开个人记忆
+
+## UM-000006
+
+- key: "preferred_python_version"
+- pinned: false
+- source_created_at: "2026-09-16T02:00:00Z"
+- source_updated_at: "2026-09-16T02:00:00Z"
+- published_at: "2026-09-17T06:00:00Z"
+
+> 偏好使用 Python 3.12。
+```
+
+**与公开设计 §11 示例的两处收口**（示例标题写的是「建议格式」，其余条文要求「与现有 codec
+一致」，此处按后者收口）：
+
+1. 条目正文是**连续的 Markdown 引用行**（`> `），与 §29.1 的条目体完全相同，不采用示例里的
+   普通行写法。理由有二：正文里可能出现 `## `、`- ` 开头的行，普通行写法会让它被解析成新条目或
+   新字段（§29.2 第 6 条的防伪造理由在这里同样成立）；且解析与渲染可以复用 `_read_body` /
+   `_read_fields` / `_sorted_entries` 这一族助手（只是字段集换成 `PUBLIC_ENTRY_FIELDS`）。
+2. 时间戳是 **UTC** 的 RFC 3339（§29.2 第 3 条），示例里的 `+08:00` 只是示意：`source_*` 原样
+   复制来源条目的值（它们本来就已通过 UTC 校验），`published_at` 由 Service 生成（§42.2 的
+   `_timestamp` 形态）。
+
+常量（本合同的标识符，Task 2 照此实现）：
+
+```python
+TITLE_PUBLIC: str = "# 用户公开个人记忆"
+FRONT_PUBLIC: tuple[str, ...] = ("schema_version", "revision", "owner_username", "operations")
+PUBLIC_ENTRY_FIELDS: tuple[str, ...] = (
+    "key", "pinned", "source_created_at", "source_updated_at", "published_at",
+)
+```
+
+### 41.2 解析
+
+1. 先判 `len(data) > cfg.max_file_bytes` → `too_large`；再做严格 UTF-8 解码 → `not_utf8`。
+2. front matter 用 `yaml.safe_load`（严格加载器）；`schema_version` 不是 `1` → `bad_schema`，
+   键序与 `FRONT_PUBLIC` 不逐字相同 → `malformed`。
+3. `owner_username` 必须是满足站点用户名合同（§40.2 第 2 条）的字符串：不满足 → `malformed`，
+   **不接受任意文本**。这是纵深防御的第二层（R8；第一层在 `publish_private` 入口）。
+4. 标题必须逐字是 `TITLE_PUBLIC`；条目区里每个 `## ` 行的 ID 必须是 `UM-` 加 ASCII 十进制序号
+   （解析接受任意 ≥1 位宽度，人工改宽过的文件仍能读回，§29.1 同款）→ 否则 `malformed`。
+5. 字段行必须是 `PUBLIC_ENTRY_FIELDS` 的集合与顺序：`key` 走 `_check_key`，`pinned` 是布尔，
+   三个时间戳走 `_check_timestamp`，正文走 `_check_content`；正文长度 > `cfg.max_entry_chars`
+   → `malformed`。正文与 key 的空白规范沿用现有条目（§29.2、§31.2 第 6 条），公开侧不新增规则。
+6. ID 重复 → `duplicate_id`（按 `_id_key` 的规范形式判重）；key 重复 → `duplicate_key`。
+7. 条目数 > `cfg.max_public_entries_per_user` → `malformed`（与 §29.2 第 5 条的容量判定同款：
+   超限的文件不整份载入）。`operations` 条数 > `cfg.max_operations` 同样 → `malformed`。
+8. 空文档（`# 用户公开个人记忆` 下零条目）是**合法**文档：它不参与 username 索引（§42.3），
+   但必须能解析回来（R9、D-100）。
+9. `operations` 允许的 `status` 包含 §40.3 的第十一个值；其余约束与 §29.2 相同。
+
+### 41.3 渲染
+
+- **先按 UM-ID 的数值序升序**（`_id_key` 的规范形式比较，`7` 与 `000007` 是同一个 ID），
+  再逐条输出：字段顺序固定为 `PUBLIC_ENTRY_FIELDS`，正文是连续的 `> ` 行。
+- 同一 document 重复渲染必须**逐字节相同**；UTF-8 编码与换行规则与 §29.3 一致。
+- `operations` 按稳定顺序输出（与 §29.3 同款，插入顺序不影响输出字节）。
+- `render_public` 与 `parse_public` 共用同一套校验，因此渲染器写出的文档必然能被解析回来。
+
+## 42. `memory/service.py`（公开投影服务）
+
+公开投影的路径、快照、索引与全部一致性操作。合同化公开设计 §10.3、§12、§13.1、§18.2、§18.3。
+本模块**不**做 AI 撰写、不做命令解析、不 import `app.py`（裁决 G）。
+
+### 42.1 接口
+
+逐字照抄公开设计 §10.3 的六个签名（顺序照抄）：
+
+```python
+    async def public_entries(self, user_id: str) -> tuple[PublicMemoryEntry, ...]: ...
+
+    async def publish_private(
+        self,
+        user_id: str,
+        username: str,
+        memory_id: str,
+        *,
+        operation_id: str,
+    ) -> OperationResult: ...
+
+    async def unpublish_private(
+        self,
+        user_id: str,
+        memory_id: str,
+        *,
+        operation_id: str,
+    ) -> OperationResult: ...
+
+    async def unpublish_all(
+        self,
+        user_id: str,
+        *,
+        operation_id: str,
+    ) -> OperationResult: ...
+
+    async def public_context_for(
+        self,
+        *,
+        subjects: tuple[PublicMemorySubject, ...],
+        channel_kind: str,
+    ) -> MemoryContext: ...
+
+    def public_path_from_owner_key(self, owner_key: str) -> str: ...
+```
+
+第七个签名是**本合同补入**的（公开设计 §13.1 只写了内存里的
+`username_index: dict[str, tuple[str, ...]]`，没给它访问入口；Resolver 需要一个
+`index_provider`，见 §43.2）：
+
+```python
+    def public_username_index(self) -> Mapping[str, tuple[str, ...]]: ...
+```
+
+规则：
+
+- `public_path_from_owner_key(owner_key)` 是**同步**的只读方法，返回
+  `<root_dir>/public/<owner_key>.md`；目录不存在时**不创建**。它是公开路径的唯一入口
+  （D-65 同款）：测试与上层都从这里拿路径，不再自己拼文件名。`owner_key` 形状非法时返回一条
+  同形、稳定、不含原始 ID 且不可能有文件的兜底路径（与 `private_path` 的 `_invalid_id_path_key`
+  兜底同款），**读路径永不抛出**。
+- `public_username_index()` 同样是**同步**只读方法：返回当前索引快照（一次引用替换发布给读者），
+  大小写敏感；调用方不得缓存它跨轮使用，也不得修改返回值。
+- `public_entries(user_id)` 是该用户自己的公开条目（`/memory list public` 与发布确认的数据源）；
+  不可用时返回空元组。
+- `public_context_for` 只接受 `channel_kind ∈ {"lobby", "comment"}`；其余（含 `"dm"` 与未知值）
+  返回 `MemoryContext(common_revision=0, private_revision=None, items=())`（R4）。它不接收原始
+  user ID，也不自行解析正文；viewer 的接入门仍由 Router/App 在调用前判定，Service 再复查频道与
+  subject 形状。
+- **公开读路径只读 `public/`，绝不打开 `users/`**：这不是「读了再过滤」，是「结构上读不到」
+  （公开设计 §3.1、Global Constraints 第 7 条）。任何新代码都不得在公开路径上引入
+  `private_path` / `_user_state` 一类的调用。
+- `find_operation`（§30.1）扩写为三处查询：`user_id` 非空时按「该用户的私有快照 → 该用户的公开
+  快照 → 共同快照」的顺序查，为空时只查共同快照。公开快照只按 owner 索引，因此没有 `user_id`
+  时**不查**（不给匿名调用者留一个按 operation_id 探测公开文档形状的口子）。
+  `publish:<message_id>` / `unpublish:<message_id>` / `cmd:<message_id>:unpublish` 这些显式命令
+  的幂等键命中公开快照，`/remember` 与自动提取的键命中私有快照 —— 顺序固定是为了让结果确定，
+  不是因为键会撞车。
+
+### 42.2 路径、快照与单写者
+
+- 目录布局照公开设计 §3.1：`<root_dir>/common.md`、`<root_dir>/users/<owner_key>.md`、
+  `<root_dir>/public/<owner_key>.md`。`public/` 只在 `enabled=true` 时由 `start()` 创建；
+  `enabled=false` 时不创建、不扫描、不读取（§39.3）。
+- 公开文件与用户私有文件走**同一套**快照机制：惰性加载 + 有界 LRU + TTL（`refresh_seconds`）
+  摘要比对，外部编辑合法则以它为新基线、非法则保留最后一份有效快照；刷新失败只记稳定 reason，
+  **不记路径、username 或正文**（§30.4、§37）。
+- **单写者**：公开与私人的全部 mutation 共用 `MemoryService` 的**同一个** `asyncio.Lock`；
+  公开文件也走 §30.3 的七步原子写（同目录临时文件、独占创建、flush/fsync、摘要比对、
+  `os.replace`、一次引用替换内存快照）。**不新建第二把锁**（公开设计 §18.2）。
+- 公开快照与 username 索引都用**一次引用替换**发布给读者：读者要么看到旧的一整份，要么看到新的
+  一整份，不会看到「快照已换、索引没换」的中间态。
+- 索引扫描的文件数量有硬上限 **`MAX_PUBLIC_FILES = 4096`（代码常量，不可由 YAML 改）**：
+  超出的文件不索引、只记一个稳定 reason，避免异常目录拖垮进程（R14）。这与
+  `max_private_entries_per_user` 无关，后者是条目数上限，管不到文件数。
+
+### 42.3 username 索引
+
+`start()` 扫描 `public/` 建立 `username_index`：`username -> tuple[owner_key, ...]`（公开设计
+§13.1）。规则：
+
+- 只有**解析成功且至少一条有效条目**的文档才入索引；空公开文档**不入索引**（R9）。
+- 重复 username 保留**全部** owner key，**不擅自挑一个**：选谁由 §43 的站点精确校验决定。
+- 坏文件只让该 owner 的公开资料不可用，记稳定 reason，不记路径、username 或正文。
+- 刷新周期复用 `memory.refresh_seconds`：文件摘要没变不重解析；合法外部修改原子替换对应快照并
+  重建该 username 的索引项；非法外部修改保留最后一份有效快照。
+- 索引项的移除只发生在三种情形：文件消失/变坏、文档变成空文档、条目全部被撤回（§42.5）。
+
+### 42.4 `/memory public <UM-ID>`：发布
+
+固定顺序逐条实现公开设计 §12.1（**不调用 `MemoryWriter`**）：
+
+1. Controller 复查 `permits_commands(user_id, "dm")`（§34.1、§52）；
+2. 用 `publish:<message_id>` 查该用户公开文档的幂等结果，命中即返回第一次的稳定结果；
+3. 读取该用户私人快照并精确定位 UM-ID；
+4. 找不到则 `not_found`；
+5. 对正文与 key 再做一次密钥筛查（§30.2 的口径），人工编辑过的私人 Markdown 也不能绕过；
+   命中 → `secret_detected`；
+6. 校验 username（站点用户名合同，§40.2 第 2 条）：缺失或非法 → `invalid_proposal`（R8）；
+7. 达到公开条目上限 → `full`（文案必须明确是**公开条目**上限）；
+8. 在单写锁内以公开文档当前版本为基线**原子添加**快照；
+9. 同 ID 已存在且 **key 与正文完全一致** → `noop`（幂等）；**不一致** → `conflict`（R3：
+   快照不是动态引用，绝不静默覆盖用户批准过的旧版本）；
+10. 成功后更新内存公开索引；
+11. 回复展示 ID、正文、公开场景、第三方模型传输范围与撤回命令（文案 §50.3）。
+
+### 42.5 `/memory unpublic <UM-ID>` 与两阶段删除
+
+- `/memory unpublic`（公开设计 §12.2）：用 `unpublish:<message_id>` 查幂等；只修改该用户公开
+  文档，**不改私人来源**；ID 不存在时 `not_found`；删除最后一条后立刻从内存 username 索引移除
+  owner；回复只确认 ID 已撤回，**不回显已经撤下的正文**。撤到零条后**保留一个合法空公开文档**
+  （R9）：它不进索引、不影响模型可见行为，但保住 `operations` 的跨重启幂等（D-59）。
+  **不做**「尽力删除」。
+- `/memory forget <UM-ID>`（公开设计 §12.3）：隐私优先的**可恢复两步**，operation ID 逐字固定：
+
+  ```text
+  步骤 A：公开文档删除该 UM-ID        operation_id = cmd:<message_id>:unpublish
+  步骤 B：私人文档删除该 UM-ID        operation_id = cmd:<message_id>
+  ```
+
+- `/memory clear`（公开设计 §12.4）：同样两步 —— 先 `unpublish_all`，再 `clear_private`，
+  operation ID 与 `forget` 逐字相同（R13）。
+- 两步都是**幂等**的：A 失败 → **不执行 B**，返回 A 的失败状态；进程在 A 成功、B 之前退出 →
+  重放时 A 幂等命中，再继续 B。最坏状态是「公开副本已经撤回、私人来源仍保留」，
+  **绝不**出现「私人来源已删、公开副本遗留」（公开设计 §3.5、§18.3）。
+- `unpublish_all` 撤回该 owner 的全部公开条目并清索引；它与 `unpublish_private` 用同一个写锁、
+  同一套原子写，因此「撤回全部」不会留下半份文档。
+
+### 42.6 AI 更新保护（`public_conflict`）
+
+`apply_private_proposal` 在应用 `update` 或「同 key add 替换」**之前**，检查目标 UM-ID 是否存在于
+公开投影（公开设计 §12.5）：
+
+| 情况 | 返回 | 写入 |
+|------|------|------|
+| 目标已公开 | `public_conflict` | 私人与公开文件**都不写** |
+| 公开状态无法确认（公开快照不可用） | `unavailable` | 保守拒绝，两个文件都不写 |
+| 目标未公开 | 沿用现有更新逻辑 | 只写私人文件 |
+
+- `add` 新增条目不受影响（新条目不可能已经在公开投影里）。
+- 检查只发生在 `update` / 「同 key add 替换」这两条会改动**已有条目**的路径上；删除由用户命令
+  触发，不经这里（§52）。
+- 自动提取遇到 `public_conflict` **静默跳过且不追加写入披露**；显式 `/remember` 返回专用说明
+  （§50.3、§52）。
+
+### 42.7 公开读取（`public_context_for`）
+
+- 只读 `public/`，按 `subjects` 的次序取每个 owner 的公开条目：**同一 owner 内 pinned 在前，
+  再按 `published_at` 或 `source_updated_at` 新到旧**（公开设计 §7.3 第 5 条）。
+- 产出 `SupplementalItem`：
+
+  ```python
+  SupplementalItem(
+      group="memory_public_personal",
+      label=f"@{subject.username} / {entry.memory_id}",
+      content=entry.content,
+      priority=...,                 # 数值是实现细节，但必须满足 §45.3 的排序要求
+  )
+  ```
+
+- 分组标签与排序见 §45.3；`label` 里的 username 必须来自已经校验或当前稳定参与者的 subject，
+  **不从记忆正文推断**（公开设计 §7.1）。
+- 预算取舍**不在这里**（裁决 B / D-62）：本方法只按 subject 次序返回，取舍由
+  `ContextManager.build_messages` 与 §45.3 的分组上限决定。
+- 任何失败返回空 items 并记 `memory.context_omitted` 的稳定字段，**不抛出**（D-60）。
+
+### 42.8 软故障
+
+| 故障 | 行为 |
+|------|------|
+| 公开目录不可读 | 本轮无公开个人记忆；聊天继续 |
+| 某个公开文件损坏 | 该 owner 使用最后一份有效快照；冷启动无快照则省略 |
+| 用户搜索失败或限频 | 只省略需要查询验证的文本命中；稳定参与者仍可使用（§43.4） |
+| 公开条目预算不足 | 整条跳过，不截断（§45.3） |
+| publish / unpublish 写失败 | 命令回稳定失败，私人来源不改 |
+| forget / clear 的撤回步骤失败 | 不执行私人删除（§42.5） |
+| forget / clear 撤回成功、私人删除失败 | 内容已不公开、私人来源保留；重放继续完成 |
+
+记忆故障不得影响 `/livez`、`/readyz`、评论 `alive`、SSE 水位或聊天事件终态（公开设计 §18.3、
+D-60）。
+
+## 43. `memory/subjects.py`（公开 subject 解析）
+
+新增模块：用户名提取、公开索引匹配、身份查询缓存与 subject 排序。合同化公开设计 §6、§13.2、
+§13.3。
+
+### 43.1 `PublicMemoryInputs`
+
+```python
+@dataclass(frozen=True)
+class PublicMemoryInputs:
+    channel_kind: str                              # "lobby" | "comment"
+    current_subject: ConversationSubject | None
+    conversation_subjects: tuple[ConversationSubject, ...]
+    current_text: str
+    reply_text: str | None
+    blog_text: str | None
+    expanded_clipboard_texts: tuple[str, ...]
+    lobby_recent: tuple[LobbyRecentMessage, ...]
+```
+
+字段名逐字照抄公开设计 §15 的构造示例（**不采用**任务计划里那两处简写 `clipboard_texts` /
+`lobby_recent_texts`：示例是设计的原文，且 `expanded_` 前缀承载着「只装实际展开成功的文本」
+这条规则）。每个字段的含义与边界：
+
+- `channel_kind`：本轮场景，取 `"lobby"` / `"comment"`。Resolver 不因它改变匹配规则；`"dm"`
+  或未知值直接返回空元组（纵深防御，与 R4 一致：DM 绝不加载第三方公开记忆）。
+- `current_text`：当前消息正文（聊天是剔除 `@机器人` 之后的 `user_text`）。
+- `reply_text`：**本轮实际拼给模型的那份直接引用块**（`[引用 @作者] 正文` / 大区的
+  `[直接引用 @作者] 正文`），调用方在拼 `pending_user` 时已经算好；没有引用时为 `None`。
+  引用块里的 token 一律按优先级 3 处理，**不再**按 `@` 前缀提升为优先级 1。
+- `blog_text`：本轮实际提供给模型的博客/评论文章正文块（**含标题**）；没有提供时为 `None`。
+  被省略的正文既不入参也不扫描（公开设计 §6.3）。
+- `expanded_clipboard_texts`：本轮**实际取回并渲染成功**的剪贴板正文与投票文本，按展开顺序
+  （R10 的 `ResolvedRefs.expanded_texts`，见 §49）；不含原文本、不含加载失败标记、不含图片。
+  预算不足而未取回的引用**不在**其中。
+- `lobby_recent`：**实际选入 S1 的**大区近期消息（R2，见 §46 / §47.3）；每条记录带自己的
+  `subject`（可能为 `None`）与正文文本。缓冲里存在、但不在 S1 里的消息**永不**贡献 subject。
+
+### 43.2 `PublicMemorySubjectResolver`
+
+```python
+class ChatUserSearch(Protocol):
+    async def search_chat_users(self, query: str) -> tuple[ChatUserSummary, ...]: ...
+
+
+class PublicMemorySubjectResolver:
+    def __init__(
+        self,
+        index_provider: Callable[[], Mapping[str, tuple[str, ...]]],
+        client: ChatUserSearch,
+        *,
+        now: Callable[[], float] = time.monotonic,
+        max_subjects: int,
+    ) -> None: ...
+
+    async def resolve(
+        self, inputs: PublicMemoryInputs
+    ) -> tuple[PublicMemorySubject, ...]: ...
+```
+
+- `index_provider` 是同步、无 I/O 的可调用对象，装配层接到
+  `MemoryService.public_username_index`（§42.1）。Resolver 只在构造时接收它，不缓存返回值。
+- `client` 只需要 `search_chat_users` 一个方法（§44）：测试传入 fake，生产传入 `SiteClient`；
+  本模块**不 import** `site/client.py`（避免把站点层的重依赖拖进记忆包）。
+- `now` 注入（TTL 用单调时钟）；`max_subjects` 由装配层传
+  `memory.max_public_subjects_per_turn`（§39.1）。
+- `resolve` 是**唯一**的公开入口：同步完成文本提取与索引查表，只对需要校验的候选 `await` 站点
+  查询；返回的 tuple 已按 §43.3 的次序排好并去重。任何失败（查询超时、限频、形状异常、坏索引）
+  都只**省略对应的候选**，不抛出。
+- `PublicMemorySubject` 构造时 `owner_key` 只能来自 `user_storage_key(...)` 或稳定 subject，
+  `username` 只能来自公开索引的键或已校验的站点结果（§40.2）。
+
+### 43.3 可以产生 subject 的来源与优先级（R5）
+
+| 优先级 | 来源 | 输入字段 | 是否需要站点精确校验（§43.4） |
+|--------|------|----------|-------------------------------|
+| 0 | 当前发言者 | `current_subject` | 否（宿主用 `user_storage_key` 算好） |
+| 1 | 当前消息里的精确 `@username` | `current_text` 里带 `@` 前缀的 token | 是 |
+| 2 | 当前消息普通文本里的 username | `current_text` 里其余 token | 是 |
+| 3 | 直接引用正文里的用户名与直接引用作者 | `reply_text` | 是 |
+| 4 | 短期会话参与者 | `conversation_subjects` | 否（历史提交时已由宿主算好） |
+| 5 | 博客正文或评论文章正文 | `blog_text` | 是 |
+| 6 | 已展开的剪贴板与投票正文 | `expanded_clipboard_texts` | 是 |
+| 7 | 大区近期消息块 | `lobby_recent`：`subject` 免查，正文 token 要查 | 混合 |
+
+规则：
+
+- 优先级数值越小越优先；同一 owner 取**最小**优先级（即最高来源）。
+- 排序键是 `(source_priority, 在来源内的出现位置)`：同一来源内按文本出现位置（`conversation_subjects`
+  按入参次序，见 §45.1）保持确定顺序。
+- owner 去重后取前 `max_subjects` 个；达到上限后**低优先级来源不再扩大集合**（公开设计 §6.1 末段）。
+- 近期消息里的**发言者**只经记录自带的 `subject` 参与（R1/R2）；它的 `author_name` **不**作为
+  文本候选再查一遍（那会让每个没被公开索引命中的发言者都触发一次站点查询）。
+- 没有任何来源命中、或全部候选都 fail-closed 时返回空元组：这一轮不加载任何公开个人记忆。
+
+### 43.4 文本匹配、身份校验与缓存
+
+提取（公开设计 §6.2、§13.2）：
+
+- 只枚举符合站点用户名形状的**完整 token**：ASCII 字母、数字、`_`、`-`，长度 3–20；token 前后
+  不能紧邻 `[A-Za-z0-9_-]`；`alice` 命中 `alice`，不命中 `alice2`、`myalice`。
+- 大小写**敏感**；`@alice` 与普通 `alice` 是同一 owner 的两个候选来源，`@alice` 优先级更高。
+- 候选集合只来自**本地公开索引**（`index_provider()`）：程序不拿正文里的每个词调用站点搜索。
+- **不做模糊匹配**：前缀、子串、拼音、昵称、语义、编辑距离一律不做（公开设计 §2、§21 第 6 条）。
+  提取器不是通用实体识别器。
+- 不扫描模型回答、搜索结果、知识库片段、MCP 输出与未实际提供的外部正文（公开设计 §6.3）。
+
+身份校验（公开设计 §6.4、R6）：
+
+1. 只在必要时查网络：由**稳定 subject** 确立的 owner（优先级 0 / 4），以及同一 owner 已经由
+   稳定来源确立的文本命中，**直接合并、不发查询**；命令路径（§52）同样不查网络。
+2. 其余**纯文本命中**（优先级 1 / 2 / 3 / 5 / 6 / 7 的文本部分）走
+   `client.search_chat_users(username)`（R6 的括注漏列了第 3 条，但它的判据是「纯文本命中」，
+   设计 §6.4 也要求全部文本命中经校验，因此这里按判据执行）。
+3. 解析结果：只接受**大小写完全一致**的**唯一**用户；计算 `user_storage_key(result.id)`；仅当它
+   等于公开档案的 `owner_key` 时采用。
+4. **fail-closed**：改名、被重新注册、索引重复、查询超时、限频、响应形状异常、无结果或出现多个
+   exact 结果时，一律**不采用**这个候选（公开设计 §6.4、§21 第 13 条）。
+
+缓存与本地节流（R7；常量是**代码常量**，不做成 YAML 配置）：
+
+```python
+IDENTITY_CACHE_POSITIVE_TTL_SECONDS: float = 600.0   # 正结果 10 分钟
+IDENTITY_CACHE_NEGATIVE_TTL_SECONDS: float = 60.0    # 负结果 1 分钟
+IDENTITY_CACHE_MAX_ENTRIES: int = 512                # 有界
+IDENTITY_QUERY_LIMIT_PER_MINUTE: int = 15            # 站点查询本地节流
+```
+
+- 缓存只保存 `username -> owner_key | negative` 与过期时间：**正文不落缓存**（公开设计 §13.2）。
+- 上界是「≤ 15 次 / 分钟」，低于上游 20 次/分钟（`chat-bot.md` §9.1）；超出时本轮直接降级为
+  省略需要查询的候选，**不等**、不排队。
+- 缓存容量满了按最旧淘汰；同一 username 重复出现时先查缓存再决定要不要发查询。
+
+## 44. `site/models.py` / `site/client.py`（站点用户精确查询）
+
+公开设计 §13.3 的最小只读查询。上游事实：`GET /api/chat/users?q=<关键词>&limit=30&offset=0`
+（`chat-bot.md` §9.1），限频 **20 次/分钟**，返回 core+ 用户并排除自己；**响应 JSON 形状上游
+未文档化**，解析必须宽容、失败必须 fail-closed。
+
+```python
+@dataclass(frozen=True)
+class ChatUserSummary:
+    id: str
+    username: str
+```
+
+```python
+class SiteClient:
+    async def search_chat_users(self, query: str) -> tuple[ChatUserSummary, ...]: ...
+```
+
+规则：
+
+- DTO 照既有站点 DTO 风格：frozen dataclass、`from_dict`、字段缺失取默认值的宽容解析
+  （`site/models.py` 的 `_as_str` 一类）；**只保留 `id` 与 `username` 两个字段**，其余字段丢弃。
+- 固定 `limit=30&offset=0`，**不接受**调用方传分页参数；查询只读，**不创建私聊频道**
+  （不调 `POST /api/chat/channels`）。
+- 复用现有登录、401 重登一次、响应字节上限与 JSON envelope 校验（走 §7 的 `_call` 路径）；
+  未知的响应形状（顶层数组 / envelope 下的数组都尝试，仍不认识）一律 fail-closed 返回空元组。
+- 429、网络错误、非法响应、缺字段全部转成**可降级失败**：`search_chat_users` 返回空元组或抛
+  `SiteError`，由 §43.2 的 resolver 统一吞掉；调用方不得让它影响聊天或评论（D-60）。
+- **提交给 `q` 的值、结果里的 username 与 id 一律不进日志**（§51；公开设计 §13.3、§18.1）。
+- 测试全部用 `httpx.MockTransport`，不打开真实连接（§18）。
+
+## 45. `core/context.py`（会话 subject 与公开记忆预算）
+
+公开设计 §14.1、§7.1、§7.3 与 R2 的合同。`core/context.py` **仍然不得 import 任何 memory
+模块**（D-61）：本节新增的一切都是通用类型，`ConversationSubject` 不是记忆专属。
+
+### 45.1 `ConversationSubject` 与历史 subject
+
+```python
+@dataclass(frozen=True)
+class ConversationSubject:
+    key: str        # user_storage_key(user_id)：64 位小写十六进制
+    label: str      # 站点用户名（已清洗控制字符）
+
+
+@dataclass(frozen=True)
+class Turn:
+    role: str
+    content: str
+    subject: ConversationSubject | None = None
+```
+
+```python
+    def append_exchange(
+        self, session_key: str, user: str, assistant: str,
+        *, subject: ConversationSubject | None = None,
+    ) -> None: ...
+
+    def recent_subjects(self, session_key: str) -> tuple[ConversationSubject, ...]: ...
+```
+
+规则：
+
+- `key` 由构造方用 `user_storage_key(author.id)` 算好（§27.3）；`label` 由构造方用
+  `sanitize_username(author.username)` 清洗（同一条规则只能有一份实现，§38.1 已为此把它单独导出）。
+- `append_exchange` 的 `subject` 默认 `None`：既有调用点逐字节不变。它只在**成功送达并提交完整
+  exchange** 时保存当前用户的 subject（公开设计 §14.1）；模型失败、额度拒绝、发送失败、代次失效
+  都不提交。
+- `recent_subjects` 只读、同步、无 I/O：按**最近一次出现从新到旧**返回去重后的参与者，按 `key`
+  去重、`label` 取最近一次的值。会话不存在时返回空元组。
+- subject 随历史淘汰、`reset()` 与 `invalidate()` **自然消失**（它挂在 `Turn` 上）：不另建一份
+  可能漂移的参与者表（公开设计 §14.1）。
+- subject **不渲染进 system**，也不改变历史正文；username 的可见标签仍由既有的 user 内容包装
+  提供（§38.3 的 `speaker_wrapper` 与评论的 `_comment_body` 都不动）。
+
+### 45.2 `select_recent_suffix()`（R2）
+
+```python
+    def select_recent_suffix(
+        self,
+        session_key: str,
+        system_prompt: str,
+        *,
+        pending_user: str | None = None,
+        system_addendum: str | None = None,
+        feature_context: bool = False,
+        transient_user_items: tuple[str, ...] = (),
+        transient_user_header: str | None = None,
+    ) -> tuple[str, ...]: ...
+```
+
+- 用途：装配层在**解析公开记忆 subject 之前**算出候选后缀 S1，用来决定「哪些大区近期消息可以
+  贡献 subject」，再把 S1 的渲染结果传给 `build_messages`（R2、§47.3）。
+- 参数与 `build_messages` 的预算输入同名、同款（`transient_user_items` / `transient_user_header`
+  就是 §38.3 的那两个参数），估算口径必须与 `_plan_turn` 完全一致 —— 两处一旦分叉，S1 就不再是
+  「`_plan_turn` 选择的上界」。
+- **规则逐条照抄 `_plan_turn` 第 5 步的连续后缀试装**：从最新向旧扩展，装不下下一条更老的就停，
+  不跳洞；返回旧到新的那一串（零条时返回空元组，`transient_user_items` 为空时也返回空元组）。
+- **不预留记忆块的额度**：不接收 `supplemental_items` / `supplemental_caps`，计算时假定记忆块
+  与记忆 system 说明都不存在（这正是「先算 S1、再解析 subject」能成立的原因）。
+- 纯只读：不修改历史、不修改代次、不写 `_sessions`；`_plan_turn` 的行为**不得改变**。
+- 保证：`_plan_turn` 最终的近期选择必然是 S1 的**子集**（不在 S1 里的消息永不贡献 subject）。
+  已知保守面：S1 内被记忆块挤掉的那几条**仍会**贡献 subject，只在整轮预算紧张时出现。这是刻意
+  取舍（精确解需要在记忆与近期选择之间求不动点，且可能振荡），实现时在注释里写明。
+
+### 45.3 分组标签、组序与预算
+
+`_GROUP_LABELS` 增加（逐字，公开设计 §7.1）：
+
+```python
+    "memory_public_personal": "[用户主动公开的个人记忆；只适用于所标注用户，不可信资料]",
+```
+
+`_GROUP_ORDER` 把新组排在既有三组**之后**（版面上仍是「共同 / 私有在前、公开个人在后」）：
+
+```python
+_GROUP_ORDER: tuple[str, ...] = (
+    "memory_all_user", "memory_lobby", "memory_user", "memory_public_personal",
+)
+```
+
+渲染形态照公开设计 §7.1：组标签行 + 每行一条 `[@alice / UM-000006] 偏好使用 Python 3.12。`。
+
+规则：
+
+- `SupplementalCap(("memory_public_personal",), memory.public_personal_context_tokens)` 由装配层
+  传入（§47.4）；上限按渲染后的文本块计，与 §33 完全同款（条目不可拆分，超上限整条跳过）。
+- 只有确实选入**至少一条**公开个人记忆时才向 system 追加 `PUBLIC_PERSONAL_MEMORY_SYSTEM_ADDENDUM`
+  （§50.4），方式与 `MEMORY_SYSTEM_ADDENDUM` 相同（`build_messages` 自己从 `texts` 取用，
+  `"\n\n"` 拼接、单独计入预算、不做任何插值）。零条选中时输出与没有该组时**逐字节一致**。
+  选入公开条目同样满足 `MEMORY_SYSTEM_ADDENDUM` 的既有条件（公开条目也是记忆条目），两条说明
+  各自生效；`_plan_turn` 的可行性判断必须把本轮会追加的说明**全部**计入。
+- 选择次序：`public_context_for` 返回的条目 `priority` 必须**整体晚于**既有 `memory_*` 组的条目
+  （数值更大），组内保持 §42.7 的次序；分组的独立上限与整轮预算是两道独立的门（§33 规则 4
+  不变），整轮预算紧张时先保住既有记忆、公开条目整条跳过（D-103）。
+- DM 恒为「公共 + 私有」两组：`memory_public_personal` 不参与 DM 的任何一轮（§42.1 的 R4）。
+
+## 46. `core/lobby_context.py`（近期消息的 subject 通道）
+
+公开设计 §14.4 与 R1 的签名修订。模块的既有约束全部不变：**纯内存、同步、无 I/O**、不 import
+`Store`、不 import `site/client.py`、不加 `asyncio` 锁、不发网络请求、不写日志正文。
+
+```python
+@dataclass(frozen=True)
+class LobbyRecentMessage:
+    sequence: int
+    message_id: int
+    author_name: str
+    content: str
+    blog_title: str | None
+    subject: ConversationSubject | None = None      # 新增（R1）
+```
+
+```python
+    def observe(
+        self, message: ChatMessage, subject: ConversationSubject | None = None
+    ) -> int
+```
+
+规则：
+
+- `subject` 是**可选**的新字段，默认 `None`：既有构造点与既有断言逐字节兼容。
+- `core/lobby_context.py` 与 `core/context.py` **不得 import 任何 memory 模块**（D-61、R1）：
+  owner key 由 `core/router.py` 用 `user_storage_key(author.id)` 算好再传进来（§47.3）。
+- memory 路径未装配（`memory_access is None`）时传 `None`，**不做任何计算**（R1）：行为与升级前
+  逐字节一致。
+- `subject` 不参与去重（`_seen_ids` 仍只看 `message_id`）、不参与 `peek_before` /
+  `discard_through` 的边界语义、不改变 `observe` 的返回值。
+- `render_lobby_recent` 的**输出不得包含 `owner_key`**（§38.1 的版面与用户名清洗不变）：给模型
+  看的永远只有清洗后的站点用户名与正文。
+
+## 47. `core/router.py` 与聊天路径装配
+
+公开设计 §14.2、§15 与 R1/R2/R12 的合同；§34 的既有判定顺序与注入语义**全部不变**。
+
+### 47.1 `MemoryCommandRequest.username`（R12）
+
+```python
+@dataclass(frozen=True)
+class MemoryCommandRequest:
+    event_id: int | None
+    message_id: int
+    channel_id: str
+    session_key: str
+    user_id: str
+    command: MemoryCommand
+    username: str = ""      # 新增（R12）；Router 用 message.author.username 填充
+```
+
+- `username` 是**命令路径**的唯一用户名来源（公开设计 §4.2）：`/memory public` 据此写
+  `owner_username`（§42.4 第 6 步）。
+- 缺省空串表示拿不到身份：`publish_private` 按 R8 返回 `invalid_proposal`，Controller 映射到
+  `MEMORY_PUBLIC_IDENTITY_TEXT`（§50.3、§52）。
+- 它不改变既有命令的行为：`user_id` 仍是门禁与寻址的唯一身份，`username` 只用于公开命令。
+
+### 47.2 `Request` 的公开记忆字段
+
+```python
+@dataclass(frozen=True)
+class Request:
+    ...
+    # 当前作者的会话 subject（公开设计 §14.2）：Router 在入队前用
+    # user_storage_key(message.author.id) 与 sanitize_username(username) 算好。
+    # 记忆未装配或拿不到作者 id 时为 None，App 不做任何公开记忆解析。
+    public_memory_subject: ConversationSubject | None = None
+```
+
+规则：
+
+- 字段名与 `CommentRequest.public_memory_subject`（§48.1）对称：设计只给了评论侧的名字，
+  聊天侧的名字由本合同钉死（D-103）。
+- `memory_access is None` 时 Router **不做任何计算**，恒为 `None`（R1 的同一条口径）。
+- 这不是「作者 ID 的替身」：`Request` 仍然持有完整的 `message`（`author.id` 本来就在），
+  这里落的是**不可逆的 owner key 与清洗后的 username**，供 App 与历史提交直接使用。
+
+### 47.3 大区观察与 S1（R1 / R2）
+
+- `_observe_lobby_message` 把 subject 传给缓冲：
+
+  ```python
+  subject = (
+      ConversationSubject(
+          key=user_storage_key(message.author.id),
+          label=sanitize_username(message.author.username),
+      )
+      if self._memory_access is not None and message.author.id
+      else None
+  )
+  self._lobby_recent.observe(message, subject)
+  ```
+
+  未注入记忆时 `subject=None`，`observe(message)` 的调用形状与升级前一致。
+- App 在**解析 subject 之前**调用 `ctx.select_recent_suffix(...)`（§45.2）算 S1，只用 S1 里的
+  `LobbyRecentMessage` 构造 `PublicMemoryInputs.lobby_recent`，并把 S1 的渲染结果传给
+  `build_messages`（`transient_user_items`）；**不在 S1 里的消息永不贡献 subject**（R2）。
+- 从 S1 里解析 subject 的是 §43 的 resolver，不是 Router；Router 只负责把 owner key 算进缓冲。
+- 已知保守面（R2）：S1 内被记忆块挤掉的那几条仍会贡献 subject；这是刻意的取舍，实现时在注释里
+  写明。
+
+### 47.4 App 装配与调用时机
+
+`BotApp` 新增装配（公开设计 §4.2、§15）：`PublicMemorySubjectResolver`（用
+`MemoryService.public_username_index` 作为 `index_provider`、`SiteClient` 作为 `client`、
+`max_subjects = memory.max_public_subjects_per_turn`）。`memory.enabled=false` 或记忆路径未装配
+（`_memory_armed` 为假，§34.2）时**不装配** resolver，也不注入 §48 的 provider。
+
+聊天侧（`_handle_request`）的固定次序（公开设计 §15）：
+
+1. 内容引用、博客、`/kb`、`pending_user`、近期块的渲染与预算判定**全部完成之后**，才构造
+   `PublicMemoryInputs`（§43.1）——`blog_text` 与实际拼进 `pending_user` 的块同一份，
+   `expanded_clipboard_texts` 取 R10 的结果，`lobby_recent` 只放 S1。**不得为记忆匹配额外抓取
+   博客或剪贴板**。
+2. 只有 `request.memory_allowed` 为真时才解析；频道不是 `"lobby"`（DM）时**不调用** resolver。
+3. `subjects = await resolver.resolve(inputs)`；解析失败或超时按空元组继续（软故障，D-60）。
+4. `public_items = await service.public_context_for(subjects=subjects, channel_kind=...)`，
+   与 `_memory_context_items(request)` 的结果**合并成一组** `SupplementalItem` 交给
+   `build_messages`（职责分开：共同/私有候选仍由 `context_for` 出，公开候选由
+   `public_context_for` 出）。
+5. `_supplemental_caps()` 增加
+   `SupplementalCap(("memory_public_personal",), memory.public_personal_context_tokens)`。
+6. 历史提交：`append_exchange(..., subject=request.public_memory_subject)` 只在发送成功后执行
+   （§45.1）。
+
+### 47.5 软故障
+
+解析、查询、读取的**任何**失败都只让本轮少一份可选资料：聊天照常、历史提交不变、能力工具不受
+影响；不改变 `/livez` / `/readyz`，不抛异常（D-60、公开设计 §18.3）。日志只用 §51 的白名单字段。
+
+## 48. `comments/router.py` 与 `comments/service.py`（评论路径）
+
+公开设计 §14.3、§16 的合同。§35 的既有边界全部不变：**绝不**请求 `lobby` 或任何用户私有文件。
+
+### 48.1 `CommentRequest.public_memory_subject`
+
+```python
+@dataclass(frozen=True)
+class CommentRequest:
+    ...
+    # 当前评论作者的会话 subject（公开设计 §14.3）：Router 在仍持有
+    # CommentNode.author.id 时算好，原始 ID 不离开 Router。
+    public_memory_subject: ConversationSubject | None = None
+```
+
+- **不得**添加 `author_id` / `user_id` 或任何等价字段（§35、D-56 的既有条文不变）。
+- 必须有默认值：`comments/sender.py` 的 `_coerce_request` 用固定 kwargs 构造它，缺省时行为与
+  升级前逐字节一致。
+- 作者 ID 为空、或记忆未注入时恒为 `None`；`memory_allowed` 的判定位置与口径不变（§35）。
+
+### 48.2 `CommentMemoryInputs` 与请求感知 provider
+
+```python
+@dataclass(frozen=True)
+class CommentMemoryInputs:
+    channel_kind: str                              # 恒为 "comment"
+    current_subject: ConversationSubject | None
+    conversation_subjects: tuple[ConversationSubject, ...]
+    current_text: str                              # 当前评论原文
+    expanded_clipboard_texts: tuple[str, ...]      # 已展开并外送的剪贴板/投票正文（R10）
+    article_title: str                             # 文章标题
+    article_text: str | None                       # 实际提供给模型的文章正文；超限时为 None
+    memory_allowed: bool
+```
+
+```python
+    memory_context: Callable[
+        [CommentMemoryInputs], Awaitable[Iterable[SupplementalItem]]
+    ] | None = None
+```
+
+规则：
+
+- provider 从**无参**改为**请求感知**（公开设计 §14.3），输入的字段集合就是上面这些：**不含私人
+  正文、不含作者 ID、不含文章以外未被提供的正文**（§14.3「输入只含当前 subject、session
+  subjects、已允许扫描的文本段和 `memory_allowed`」的逐条落地）。
+- **调用时机**：在字符上限与引用预算判定**之后**（§16）——文章正文只有
+  `len(body) <= comments.article_max_chars` 时才提供，超限时只给标题、**不扫描被省略的正文**；
+  剪贴板只用成功展开的那部分；当前评论原文取 `request.user_text`。
+- `CommentService._build_model_messages` 构造 `CommentMemoryInputs` 并只在
+  `request.memory_allowed` 为真时调用 provider；返回的 items 与共同记忆的 items 合并后交给
+  `build_messages`，公开分组的上限用
+  `SupplementalCap(("memory_public_personal",), memory.public_personal_context_tokens)`。
+- `CommentService` 把 `CommentMemoryInputs` 转成 §43.1 的 `PublicMemoryInputs` 时：`blog_text`
+  = 标题 + **实际提供**的正文（超限时只有标题），`lobby_recent=()`，`reply_text=None`
+  （评论侧没有「直接引用」这个文本段：设计 §16 的可扫描清单里没有父块），
+  `expanded_clipboard_texts` = 当前评论正文与文章正文两处成功展开的文本。
+- 评论 busy / 失败 / 配额用尽仍然静默；公开记忆解析失败**不得**改变评论事件状态、重试时间或
+  `alive`（公开设计 §16、§18.3）。
+- `_CommentMemoryAccess`（D-76）**保留**：仍然只服务 `all_user` 共同记忆那一路，不因本功能被
+  换成真策略、也不被删除（D-76 的 2026-09-17 补充）。
+
+## 49. `core/content_refs.py`（`ResolvedRefs.expanded_texts`）
+
+R10 的合同。§25 的既有条文不变，只在结果类型上增加一个字段：
+
+```python
+@dataclass(frozen=True)
+class ResolvedRefs:
+    text: str
+    image_parts: tuple[dict[str, Any], ...] = ()
+    expanded: int = 0
+    image_attempts: int = 0
+    expanded_texts: tuple[str, ...] = ()   # 新增（R10），默认值使既有构造点不变
+```
+
+- 内容：本次**真正取回并渲染成功**的剪贴板正文与投票文本，按展开顺序排列。
+- **不含**原文本、**不含**加载失败标记（`failure_marker` 的占位）、**不含**图片。
+- 预算不足或额度用尽而**未取回**的引用不在其中（公开设计 §6.3）。
+- 既有字段与默认值不变；聊天与评论两条路径都用它取「已展开的引用正文」，不再各自解析
+  （§43.1 的 `expanded_clipboard_texts`）。
+
+## 50. `texts.py`（公开个人记忆文案与静态说明）
+
+公开设计 §17 的逐条落地。§36 的全部既有纪律不变：所有用户可见文本都在本模块、Controller 不得
+内联中文、静态说明不做任何插值、`texts.py` 不 import 任何 memory 模块。
+
+### 50.1 新增固定文案
+
+| 文案（标识符由实现决定，除本节点名的三个） | 触发点 |
+|------|--------|
+| `MEMORY_PUBLIC_USAGE_TEXT` | `/memory public`、`/memory unpublic` 缺参数或非法 ID（§52） |
+| `MEMORY_PUBLIC_CONFLICT_TEXT` | `public_conflict`（§40.3、§42.6）；文案逐字取自公开设计 §10.2 的原文：「该条目当前已公开，请先撤回公开，再修改并重新发布。」 |
+| `MEMORY_PUBLIC_IDENTITY_TEXT` | `public` 命令拿到 `invalid_proposal`（R8：拿不到或非法的 username），**不沿用**「撰写失败」那句 |
+| 重复公开不一致 | `public` 命令拿到 `conflict`（R3：同 ID 的公开副本与当前私人条目不一致）：说明「先撤回、再重新公开」，与 `MEMORY_PUBLIC_CONFLICT_TEXT` 分开 |
+| 发布成功 | `/memory public <UM-ID>`：回显 UM-ID 与正文、说明公开使用范围（大区与评论、第三方模型传输）与 `/memory unpublic` 撤回入口 |
+| 撤回成功 | `/memory unpublic <UM-ID>`：只确认 ID 已不再用于公开请求，**不回显已经撤下的正文** |
+| 公开列表表头、空态与上限 | `/memory list public`；上限文案必须明确是**公开条目**上限 |
+| 私有列表的标记 | `/memory list`（私有）每条加 `[私有]` / `[已公开]` |
+| 状态计数 | `/memory status` 增加**公开条目数** |
+| `/memory off` 的补充句 | 确认文案必须说明**已公开条目仍然公开**（公开设计 §5.1） |
+| `/memory clear` 的条数 | 确认文案报出本次「撤回并删除」的条数（重放时如实报 0） |
+
+- 新增文案全部中文、不回显宿主路径、原始 user ID 或模型错误正文；长度仍受站点单条消息上限
+  约束（§36）。
+- 公开命令的**确认必须回显实际公开的 ID 与正文**（公开设计 §3.2），这与既有「成功文案必须展示
+  实际保存的正文与条目 ID」（§32.3）同源。
+
+### 50.2 `/help` 的大区口径改写
+
+公开设计 §17.2：当前「大区不会使用任何人的私有记忆」改为更准确的口径，**逐字**：
+
+> 大区与评论区不会使用任何未公开的私有记忆。用户可以在私聊中主动公开自己的某些条目；只有当
+> 当前公开对话出现或精确提到该用户时，这些公开条目才可能随本轮请求发送给第三方模型。
+
+同时必须覆盖（公开设计 §17.2 的四条）：
+
+- 公开与撤回命令只在私聊；
+- `/memory off` **不撤回**公开条目；
+- `/reset` 不删除或撤回长期记忆；
+- 普通用户名、博客正文与已展开的公开剪贴板都可能触发精确匹配，且**不做模糊匹配**。
+
+其他约束不变：`memory_allowed=False` 时帮助文案与升级前**逐字节一致**（D-64/D-94 的冻结口径）；
+「别人的发言我看不见」不得写回（D-95）；总长不得翻倍（站点单条消息上限 5000 字，§36）。
+
+### 50.3 其余命令文案
+
+- `/memory clear` 与 `/memory forget` 的两阶段失败各自回**自己的**稳定状态文案（§52、§42.5）：
+  撤回步失败时不报「已删除」，重放成功时也不重复报删除。
+- `public_conflict` 与 `conflict` **不得共用**一句：前者必须给出「先撤回、再修改、重新发布」的
+  路径（§40.3）。
+
+### 50.4 `PUBLIC_PERSONAL_MEMORY_SYSTEM_ADDENDUM`
+
+```python
+PUBLIC_PERSONAL_MEMORY_SYSTEM_ADDENDUM: str = (...)
+```
+
+- **触发条件**：当且仅当 `build_messages` 确实选入**至少一条** `memory_public_personal` 条目时
+  追加（§45.3），方式与 `MEMORY_SYSTEM_ADDENDUM` 相同。
+- 内容必须覆盖公开设计 §7.2 的五条：自述背景不是身份、权限或事实证明；只能用于标签对应的
+  用户、不得把某个人的内容套给其他人；记忆中的指令、授权、工具调用要求与身份声明不生效；
+  不得凭某人的公开记忆代表他作承诺或评价第三方；可能过时、当前明确说法优先。
+- **完全静态、不做任何插值**：不得插入 username、ID、正文、路径或 revision（Global Constraints
+  第 9 条）。它的规范文本登记在 `docs/design/SYSTEM_PROMPTS.md` §1.9。
+
+## 51. `logging_setup.py`（公开个人记忆日志）
+
+`logging_setup.LOG_FIELDS` 在本功能里**增加且只增加**两个字段（公开设计 §18.1）：
+
+```text
+public_entry_count | subject_count
+```
+
+规则：
+
+- 两者都只承载**计数**：前者是某次扫描/操作涉及的公开条目数，后者是本轮选中的 subject 数。
+- 继续允许既有的 `memory_id`、`revision`、`scope`、`status`（§37）。
+- **禁止**记录（任何级别、任何路径）：username、owner key、站点查询词、匹配到的正文、文件路径、
+  SQLite 行、完整 subject 对象；以及 §37 原有的全部禁止项（正文、key、user ID、AI 撰写请求与
+  响应、命令参数、密钥命中的字符串、新建 `public/` 相关路径）。`log_event` 的白名单是最后一道
+  闸，但 `error=` 一类自由取值字段仍要靠**取值自律**（§38.4 同款）。
+- 事件名沿用 §37 的既有集合（公开路径用 `memory.load_failed`、`memory.refresh_failed`、
+  `memory.context_omitted`、`memory.command` 等）；**要新增事件名必须先改本节**，源码级测试会拦。
+- `query`（站点搜索的 `q`）与返回的 username/id **绝不进日志**（§44、公开设计 §13.3）。
+
+## 52. `memory/commands.py` 与 `memory/controller.py`（公开命令）
+
+公开设计 §12.1–§12.4、§5.1 与 R11/R12/R13 的合同。§32 的既有判定顺序、幂等纪律与「文案全部
+取自 `texts.py`」全部不变。
+
+### 52.1 解析（R11）
+
+新增三个输入形式，`MemoryCommand` 的字段取值是稳定合同：
+
+| 输入 | `name` | `argument` | `scope` |
+|------|--------|-----------|---------|
+| `/memory public <UM-ID>` | `"public"` | ID 原样 | `None` |
+| `/memory unpublic <UM-ID>` | `"unpublic"` | ID 原样 | `None` |
+| `/memory list public` | `"list"` | `"public"` | `None` |
+
+- `/memory list public` 的解析结果是 `MemoryCommand(name="list", argument="public", scope=None)`；
+  `scope` 字段的语义**不变**（`None` = 自己的私有条目；`ALL_USER` / `LOBBY` = 已生效共同记忆）。
+- `public` / `unpublic` 的 ID 参数做 `UM-` 前缀校验；缺参数或非法 ID 一律走既有的
+  `_missing` / `_usage` 口径（解析成功但视为用法错误），**不返回 `None`**（§32.2 同款）。
+- 大小写不敏感与「只在消息开头生效」的既有规则不变；未知子命令仍返回 `None`。
+
+### 52.2 Controller
+
+- `_HANDLERS` 增加 `public` / `unpublic` 两项；`_list` 支持 `argument == "public"`；无参命令集合
+  与 admin 集合按需同步（§32.3 的判定顺序不变：门禁 → 未知命令 → admin → 缺参数 → 多余参数 →
+  handler）。
+- `/memory public` 的固定顺序：门禁（`permits_commands(user_id, "dm")`）→ 幂等查询
+  （`publish:<message_id>`）→ `service.publish_private(user_id, username, memory_id,
+  operation_id=...)`（§42.4）。**全程不调用 `MemoryWriter`**（公开设计 §2、§12.1）。
+- `/memory unpublic`：幂等查询用 `unpublish:<message_id>` → `service.unpublish_private(...)`。
+- 状态到文案的映射照 §50.1：`public_conflict` → `MEMORY_PUBLIC_CONFLICT_TEXT`；`public` 命令的
+  `invalid_proposal` → `MEMORY_PUBLIC_IDENTITY_TEXT`（R8）；`full` → 公开条目上限文案；
+  `conflict`（R3：同 ID 的公开副本与当前私人条目不一致）→ 一条能让用户看懂「已公开的副本和
+  现在这条不一样，请先撤回再重新公开」的文案，**不得**与 `public_conflict` 那句共用（两句说的
+  不是同一件事：一句是 AI 更新受阻，一句是用户自己重复公开）。
+- `/memory forget <UM-ID>` 与 `/memory clear` 改成两阶段（R13），operation ID 逐字固定：
+
+  | 步骤 | `/memory forget` | `/memory clear` |
+  |------|------------------|-----------------|
+  | A：撤回 | `cmd:<message_id>:unpublish` | `cmd:<message_id>:unpublish` |
+  | B：删除 | `cmd:<message_id>` | `cmd:<message_id>` |
+
+  - 撤回步失败 → **不执行**删除步，返回撤回步的稳定失败状态与它的文案；
+  - 重放时**先命中撤回步**（幂等）再继续删除步；
+  - 两步都命中时如实回报（删除条数为 0，§50.1）。
+- `/memory off` 的成功回复必须说明已公开条目仍然公开（§50.1）；自动提取遇到 `public_conflict`
+  静默跳过且不追加披露，显式 `/remember` 返回专用说明（§42.6）。
+- 记忆日志仍只用 §37 的事件名与 §51 的字段；命令参数、username 与正文不进日志（§37）。
