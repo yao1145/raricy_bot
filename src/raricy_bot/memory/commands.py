@@ -17,6 +17,11 @@
 
 `/memory forget <非法 ID>` 按 §32.2 在**解析阶段**就落成用法（`argument is None`），
 非法 ID 因此不进 AI、不落任何文件。ID 前缀逐字用 `codec` 的四个常量，本模块不重新定义。
+
+公开动作（§52.1、R11）同样只做形状判定：`/memory public <UM-ID>` / `/memory unpublic <UM-ID>`
+一律 `name="public"` / `"unpublic"` + `argument` 原样，`/memory list public` 落成
+`MemoryCommand(name="list", argument="public", scope=None)`；它们是否真的执行由 Controller 的门禁、
+幂等与 Service 的存储状态决定，解析器不猜、也不替它们判断。
 """
 
 from __future__ import annotations
@@ -50,12 +55,19 @@ _SCOPES: dict[str, MemoryScope] = {
 }
 
 # 需要 ID 实参的命令 → 该命令接受的 ID 前缀（§29.1 / §32.2）。
+# `public` / `unpublic` 的作用对象是私有条目（公开副本沿用来源的 UM-ID），因此只接受 `UM-`。
 _ID_PREFIXES: dict[str, tuple[str, ...]] = {
     "forget": (PREFIX_USER,),
+    "public": (PREFIX_USER,),
+    "unpublic": (PREFIX_USER,),
     "approve": (PREFIX_CANDIDATE,),
     "reject": (PREFIX_CANDIDATE,),
     "delete": (PREFIX_ALL_USER, PREFIX_LOBBY),
 }
+
+# `/memory list` 的公开实参（R11、§52.1）：解析结果是 `argument == "public"`，`scope` 仍为 None
+# （`scope` 的语义不变：None 表示「自己的条目」，只是条目从私有换成公开的那一份）。
+_PUBLIC_SCOPE_ARGUMENT: str = "public"
 
 # 不接收任何实参的命令（`argument` 与 `scope` 都必须为空）。
 _BARE_COMMANDS: frozenset[str] = frozenset({"status", "on", "off", "clear", "candidates"})
@@ -84,6 +96,10 @@ class MemoryCommandRequest:
     session_key: str
     user_id: str
     command: MemoryCommand
+    # 站点用户名（R12、§47.1）：命令路径的**唯一**用户名来源，公开命令据此写 `owner_username`。
+    # 缺省空串表示拿不到身份：`publish_private` 按 R8 回 `invalid_proposal`，Controller 映射到
+    # `MEMORY_PUBLIC_IDENTITY_TEXT`。默认值让既有构造点（与测试）逐字不变。
+    username: str = ""
 
 
 @dataclass(frozen=True)
@@ -153,11 +169,17 @@ def _missing(name: str) -> MemoryCommand:
 
 
 def _parse_list(tail: list[str]) -> MemoryCommand:
-    """`/memory list` 的两种形式（§32.3）：无参数看自己的私有条目，带作用域看已生效共同记忆。"""
+    """`/memory list` 的三种形式（§32.3、§52.1）：无参数看自己的私有条目，`public` 看自己的公开
+    条目，带作用域看已生效共同记忆。"""
     if not tail:
         return MemoryCommand(name="list")
-    if len(tail) == 1 and tail[0].lower() in _SCOPES:
-        return MemoryCommand(name="list", scope=_SCOPES[tail[0].lower()])
+    if len(tail) == 1:
+        value = tail[0].lower()
+        if value in _SCOPES:
+            return MemoryCommand(name="list", scope=_SCOPES[value])
+        if value == _PUBLIC_SCOPE_ARGUMENT:
+            # `scope` 仍为 None：它表示「自己的条目」，公开与私有的区别落在 `argument` 上（R11）。
+            return MemoryCommand(name="list", argument=_PUBLIC_SCOPE_ARGUMENT)
     # 未知作用域不猜：`/memory list foo` 并不是「列出我的私有条目」的请求。
     return _usage()
 
