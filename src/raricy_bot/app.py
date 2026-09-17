@@ -45,7 +45,7 @@ from .capabilities import CAPABILITIES, Capability
 from .comments.quota import CommentQuotaGuard
 from .comments.router import CommentRouter
 from .comments.sender import CommentSender
-from .comments.service import CommentService
+from .comments.service import CommentMemoryInputs, CommentService
 from .config import Config
 from .core.blog import BlogLoad, BlogLoader, blog_marker, blog_readable
 from .core.content_refs import ContentRefResolver, find_refs
@@ -79,7 +79,7 @@ from .mcp.runtime import McpManager
 from .memory.access import MemoryAccessPolicy
 from .memory.commands import MemoryCommandRequest
 from .memory.controller import MemoryController
-from .memory.models import STATUS_OK, ProposalAction
+from .memory.models import STATUS_OK, ProposalAction, PublicMemorySubject
 from .memory.service import MemoryService
 from .memory.subjects import PublicMemoryInputs, PublicMemorySubjectResolver
 from .memory.writer import MemoryWriter
@@ -141,6 +141,19 @@ class CapabilityUnavailable(Exception):
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(reason)
+
+
+def _comment_blog_text(inputs: CommentMemoryInputs) -> str | None:
+    """评论侧的 `PublicMemoryInputs.blog_text`（§48.2）：标题 + **实际提供**的正文。
+
+    超限被省略的正文不在 `article_text` 里（`None`），因此这里只剩标题；两种情况都没
+    内容时返回 `None`，解析器于是也看不到任何文章文本（公开设计 §6.3、§15）。
+    """
+    title = inputs.article_title
+    body = inputs.article_text
+    if body:
+        return f"{title}\n{body}" if title else body
+    return title or None
 
 
 class _CommentMemoryAccess:
@@ -514,8 +527,9 @@ class BotApp:
                     image_loader=(
                         self._image_loader if self._comment_vision else None
                     ),
-                    # §34.2 第 5 步的只读 context provider：无参数、只读、只可能返回
-                    # `all_user`；关闭时同样不注入，评论侧连一个方法都拿不到。
+                    # §34.2 第 5 步的只读 context provider：请求感知（§48.2）、只读，
+                    # 共同记忆只可能返回 `all_user`、公开条目只来自 `public/`；关闭时
+                    # 同样不注入，评论侧连一个方法都拿不到。
                     memory_context=(
                         self._comment_memory_items if memory_on else None
                     ),
@@ -524,6 +538,13 @@ class BotApp:
                     # 关闭时与 provider 一起缺席：那时评论侧一次都不碰记忆。
                     memory_common_tokens=(
                         self._config.memory.common_context_tokens if memory_on else None
+                    ),
+                    # 公开个人记忆的分组上限（§45.3、§48.2）：与共同记忆那份互相独立，
+                    # 公开条目装不下时整条跳过，先保住既有记忆（D-103 第 5 条）。
+                    memory_public_tokens=(
+                        self._config.memory.public_personal_context_tokens
+                        if memory_on
+                        else None
                     ),
                 )
                 await self._comment_service.start()
@@ -816,16 +837,27 @@ class BotApp:
                 error=type(exc).__name__,
             )
             return ()
-        if not subjects:
-            # 一个 owner 都没命中：这一轮不加载任何公开个人记忆（连目录都不看）。
+        # 取回与软故障由 `_public_context_items` 统一处理：评论路径问的是同一件事，
+        # 只有输入的构造方式不同。
+        return await self._public_context_items(subjects, request.channel_kind)
+
+    async def _public_context_items(
+        self, subjects: tuple[PublicMemorySubject, ...], channel_kind: str
+    ) -> tuple[SupplementalItem, ...]:
+        """按已经解析出的 subject 取回公开个人条目（§42.7）；任何失败返回空元组（§47.5）。
+
+        一个 owner 都没命中时不看目录、不问服务，直接空手返回（§43.3 末段）。
+        与 `context_for` 职责分开：公开候选只从 `public/` 来，共同/私有候选仍由
+        `_memory_context_items` / `_comment_memory_items` 出（§47.4 第 4 条、§48.2）。
+        """
+        service = self._memory_service
+        if service is None or not subjects:
             return ()
         try:
-            # 与 `context_for` 职责分开：公开候选只从 `public/` 来，共同/私有候选仍由
-            # `_memory_context_items` 出（§47.4 第 4 条）。
             context = await service.public_context_for(
-                subjects=subjects, channel_kind=request.channel_kind
+                subjects=subjects, channel_kind=channel_kind
             )
-            items = tuple(context.items)
+            return tuple(context.items)
         except Exception as exc:
             # 软故障（§47.5）：已经解析出来的 subject 一个都不落地，回答照常生成。
             # `subject_count` 是本轮解析出的 owner 数（§51 的白名单字段），不含任何身份。
@@ -839,7 +871,6 @@ class BotApp:
                 error=type(exc).__name__,
             )
             return ()
-        return items
 
     def _auto_capture_eligible(self, request: Request) -> bool:
         """§34.4 的自动提取前置条件；**全部**同时成立才为真。
@@ -988,39 +1019,97 @@ class BotApp:
             )
             return answer
 
-    async def _comment_memory_items(self) -> tuple[SupplementalItem, ...]:
-        """评论区的只读 context provider（§34.2 第 5 步、§35）；失败返回空元组（D-60）。
+    async def _comment_memory_items(
+        self, inputs: CommentMemoryInputs
+    ) -> tuple[SupplementalItem, ...]:
+        """评论区的只读 context provider（§34.2 第 5 步、§35、§48.2）；失败返回空元组（D-60）。
 
-        与聊天侧 `_memory_context_items` 的关键差别是**没有参数**：评论请求刻意不带作者 ID，
-        模型侧只剩 `memory_allowed` 这个布尔，因此这里不接受任何调用方输入 —— 它拿不到
-        「谁」，也就无法按作者改写作用域。频道在这里钉死为 `comment`，于是 `context_for`
-        按 §30.2 的表只会读 `all_user`：`lobby` 与任何用户私有文件都不打开。
+        **请求感知**（§48.2、公开设计 §14.3）：参数是评论服务在本轮资料都定下来之后构造的
+        `CommentMemoryInputs` —— 当前 subject、会话 subjects、已允许扫描的文本段与门禁布尔，
+        没有任何私人正文。它拿不到原始作者 ID，「谁」只能以不可逆的 owner key 出现。
 
-        门禁由 `CommentRouter` 用真实作者 ID 判过，`_CommentMemoryAccess` 只把那个结论
-        带过作者 ID 不可得的那一段（§35、D-56）。
+        两路各自独立取用、各自软失败，都只读 `public/` 或 `all_user`：
+
+        1. **共同记忆**：`user_id=None` + `channel_kind="comment"` + `_CommentMemoryAccess`
+           载体，按 §30.2 的表只可能解析出 `all_user`（§35、D-76）。作者 ID 不可得，门禁
+           结论由 `CommentRouter` 用真实 ID 判过、由载体带过这一段。
+        2. **公开个人记忆**：由 `public_context_for` 从公开投影里取（§42.7、§48.2）；
+           它不经过载体，因此载体的 fail-open 构造扩大不了任何范围（D-76 的 2026-09-17 补充）。
         """
+        items: tuple[SupplementalItem, ...] = ()
         service = self._memory_service
-        if service is None:
+        if service is not None:
+            try:
+                context = await service.context_for(
+                    user_id=None,
+                    channel_kind="comment",
+                    access=self._comment_memory_access,
+                )
+                items = tuple(context.items)
+            except Exception as exc:
+                # `context_for` 自己就把失败吞成空结果（D-60）；这一层只兜注入的替身与将来的
+                # 回归：共同记忆取不到绝不能把这一轮评论一起拖掉，`alive` 与 `/livez` 也不受影响。
+                log_event(
+                    _logger,
+                    logging.WARNING,
+                    "memory.context_omitted",
+                    scope="comment",
+                    reason="internal",
+                    error=type(exc).__name__,
+                )
+        # 两路互不牵连：共同记忆读失败不影响公开投影的取用，反之亦然（都是软故障）。
+        return (*items, *await self._comment_public_memory_items(inputs))
+
+    async def _comment_public_memory_items(
+        self, inputs: CommentMemoryInputs
+    ) -> tuple[SupplementalItem, ...]:
+        """评论这一轮的公开个人条目（§48.2、公开设计 §16）；任何失败都返回空元组。
+
+        与聊天侧 `_public_memory_items` 是同一条路径（同一个解析器、同一个
+        `public_context_for`），差别只在输入的构造：评论侧把本轮**实际提供**的文本按
+        §48.2 映射成 §43.1 的 `PublicMemoryInputs` ——
+
+        - `blog_text` = 标题 + 实际提供的正文（超限时只有标题，被省略的正文不扫描）；
+        - `reply_text=None`：评论侧没有「直接引用」这个文本段（设计 §16 的可扫描清单里
+          没有父块），父评论块既不匹配也不扫描；
+        - `lobby_recent=()`：评论没有大区近期块；
+        - `expanded_clipboard_texts` = 评论正文与文章正文两处成功展开的文本（R10）。
+
+        §48.2 把这条映射写在 `CommentService` 名下；解析器由装配层持有（§47.4），装配层
+        又是唯一能拿到它的地方，所以映射规则在这一层落地（规则本身逐字照抄该条）。
+
+        **不为记忆匹配额外抓取任何东西**：本方法不读博客、不读剪贴板、不取图片，唯一的
+        网络请求是纯文本命中的身份校验（§6.4）。门禁由评论服务在调用前判过（§48.2）：
+        `memory_allowed` 为假时这个方法一次都不会被叫到。
+        """
+        resolver = self._public_memory_resolver
+        if resolver is None or self._memory_service is None:
             return ()
+        public_inputs = PublicMemoryInputs(
+            # 频道由评论服务钉死为 "comment"（§48.2）；解析器只认 lobby / comment（R4）。
+            channel_kind=inputs.channel_kind,
+            current_subject=inputs.current_subject,
+            conversation_subjects=inputs.conversation_subjects,
+            current_text=inputs.current_text,
+            reply_text=None,
+            blog_text=_comment_blog_text(inputs),
+            expanded_clipboard_texts=inputs.expanded_clipboard_texts,
+            lobby_recent=(),
+        )
         try:
-            context = await service.context_for(
-                user_id=None,
-                channel_kind="comment",
-                access=self._comment_memory_access,
-            )
+            subjects = await resolver.resolve(public_inputs)
         except Exception as exc:
-            # `context_for` 自己就把失败吞成空结果（D-60）；这一层只兜注入的替身与将来的回归：
-            # 共同记忆取不到绝不能把这一轮评论一起拖掉，`alive` 与 `/livez` 也不受影响。
+            # 解析器自己承诺不抛（§43.2）；这一层兜的是注入的替身与将来的回归。
             log_event(
                 _logger,
                 logging.WARNING,
                 "memory.context_omitted",
-                scope="comment",
-                reason="internal",
+                scope="public",
+                reason="subjects",
                 error=type(exc).__name__,
             )
             return ()
-        return tuple(context.items)
+        return await self._public_context_items(subjects, inputs.channel_kind)
 
     async def _handle_memory_command(self, request: MemoryCommandRequest) -> None:
         """记忆 worker 的处理：执行命令 → 回一条本地文案 → 无论成败都标记终态（§34.3）。

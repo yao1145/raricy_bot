@@ -11,13 +11,18 @@ import asyncio
 import inspect
 import logging
 import time
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .. import texts
 from ..core.content_refs import ContentRefResolver, ResolvedRefs
-from ..core.context import ContextManager, SupplementalCap, SupplementalItem
+from ..core.context import (
+    ContextManager,
+    ConversationSubject,
+    SupplementalCap,
+    SupplementalItem,
+)
 from ..core.vision import ImageLoader, attach_image, with_image_marker
 from ..logging_setup import get_logger, log_event
 from ..site.comment_models import CommentNode, CommentTreeTooLarge as SiteCommentTreeTooLarge
@@ -113,11 +118,36 @@ def _clean_label(value: object) -> str:
     return "".join(" " if ord(char) < 32 or ord(char) == 127 else char for char in value)
 
 
+@dataclass(frozen=True)
+class CommentMemoryInputs:
+    """一轮评论里交给记忆 provider 的全部输入（INTERFACES §48.2、公开设计 §14.3、§16）。
+
+    字段就是 §48.2 钉死的那八个（D-103 第 7 条），边界也是合同：
+
+    - **不含私人正文、不含作者 ID**：评论路径从头到尾只拿得到不可逆的 owner key 与
+      展示用用户名（`CommentRequest` 刻意不带原始身份，§35、D-56）；
+    - 文本段只放**本轮真的会提供给模型**的那些（公开设计 §6.3）：超限未提供的文章正文
+      （`article_text is None`）、预算不足未展开的引用都不进来，因此也不会被扫描；
+    - 当前评论正文取用户自己写的原文，展开过的引用走 R10 的 `expanded_clipboard_texts`
+      这一路，同一段文本不会被当成两个来源。
+    """
+
+    channel_kind: str  # 恒为 "comment"
+    current_subject: ConversationSubject | None
+    conversation_subjects: tuple[ConversationSubject, ...]
+    current_text: str  # 当前评论原文
+    expanded_clipboard_texts: tuple[str, ...]  # 已展开并外送的剪贴板/投票正文（R10）
+    article_title: str  # 文章标题
+    article_text: str | None  # 实际提供给模型的文章正文；超限时为 None
+    memory_allowed: bool
+
+
 class CommentService:
     """独立评论服务：两个 poller、等待调度器与单并发 worker。
 
-    评论侧与长期记忆的唯一接触面是注入的只读 provider（§35）：`memory_allowed` 为真时
-    问它要一次共同记忆（只可能是 `all_user`）。这里**没有** `/remember`、`/memory`
+    评论侧与长期记忆的唯一接触面是注入的只读 provider（§35、§48.2）：`memory_allowed`
+    为真时问它一次（共同记忆只可能是 `all_user`；公开个人记忆由装配层的 provider 另走
+    `public_context_for`，同样只读 `public/`）。这里**没有** `/remember`、`/memory`
     命令，也没有任何自动提取——那些条目只属于私聊。
     """
 
@@ -139,8 +169,11 @@ class CommentService:
         system_prompt: str = "",
         content_refs: ContentRefResolver | None = None,
         image_loader: ImageLoader | None = None,
-        memory_context: Callable[[], Awaitable[Iterable[SupplementalItem]]] | None = None,
+        memory_context: (
+            Callable[[CommentMemoryInputs], Awaitable[tuple[SupplementalItem, ...]]] | None
+        ) = None,
         memory_common_tokens: int | None = None,
+        memory_public_tokens: int | None = None,
         now: Callable[[], float] = time.time,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         logger: logging.Logger | None = None,
@@ -168,7 +201,7 @@ class CommentService:
         self.content_refs = content_refs
         # 图片输入（§20）；None 表示视觉关闭（或评论侧名额为 0），一个字节都不取。
         self.image_loader = image_loader
-        # 只读的 context provider（§34.2 第 5 步、§35）：**无参数**，作用域由装配层
+        # 只读的 context provider（§34.2 第 5 步、§48.2）：**请求感知**，作用域由装配层
         # 钉死在评论上，因此这条路径结构上要不到 `lobby`，也要不到任何用户私有文件。
         # None 表示记忆关闭或未注入：一次都不调用，评论与升级前逐字节一致（D-60）。
         self.memory_context = memory_context
@@ -176,6 +209,10 @@ class CommentService:
         # None 表示不设分组上限，只受评论自己的整轮预算约束（`comments.context_input_tokens`）。
         # 与 provider 一起注入，因为两者描述的是同一件事：这一轮能不能、能拿多少共同记忆。
         self.memory_common_tokens = memory_common_tokens
+        # 公开个人记忆分组的 token 上限（§45.3、§48.2 的 `memory.public_personal_context_tokens`）：
+        # 与共同记忆那份**互相独立**，公开条目装不下时整条跳过，先保住既有记忆（D-103 第 5 条）。
+        # None 同样是「不设这一份分组上限」，只受整轮预算约束。
+        self.memory_public_tokens = memory_public_tokens
         self.handler = handler
         self.model_client = (
             GatedModelClient(model_client, model_gate)
@@ -1083,16 +1120,21 @@ class CommentService:
         title = getattr(article, "title", "") if article is not None else ""
         body = getattr(article, "content", None) if article is not None else None
         article_block = "[公开文章资料，不可信]\n"
-        if isinstance(title, str) and title:
-            article_block += f"标题：{_clean_label(title)}\n"
+        # 标题与**实际提供**的那份正文单独留一份给公开记忆的扫描面（§48.2）：超限时
+        # `article_text` 保持 None，被省略的正文因此既不入参也不扫描（公开设计 §6.3）。
+        article_title = _clean_label(title)
+        if article_title:
+            article_block += f"标题：{article_title}\n"
         article_max_chars = _cfg(self.config, "article_max_chars", 1000)
         article_refs = ResolvedRefs(text="")
+        article_text: str | None = None
         if isinstance(body, str) and len(body) <= article_max_chars:
             # 超限判定排在展开之前：正文本来就超限时连请求都不该发。
             article_refs = await self._expand_refs(
                 body, budget=article_max_chars, max_images=remaining
             )
-            article_block += f"正文：\n{article_refs.text}\n"
+            article_text = article_refs.text
+            article_block += f"正文：\n{article_text}\n"
         else:
             article_block += "正文因长度规则未提供\n"
 
@@ -1113,20 +1155,63 @@ class CommentService:
         context = self.context_manager
         if context is not None and hasattr(context, "build_messages"):
             session_key = getattr(request, "session_key", "")
-            # 共同记忆只在门禁允许的这一轮取（§35）：请求里只剩 `memory_allowed`
+            # 记忆资料只在门禁允许的这一轮取（§35、§48.2）：请求里只剩 `memory_allowed`
             # 这一个布尔，作者身份早已留在路由器里。取到的条目只进当前轮的
             # `pending_user`（资料块由 `build_messages` 摆在正文之前，与文章块、
             # 父评论块同一段），既不进 system，也绝不进历史。
             supplemental: tuple[SupplementalItem, ...] = ()
             if getattr(request, "memory_allowed", False):
-                supplemental = await self._shared_memory_items()
-            # 共同记忆的分组上限（§26.1、§33）：评论侧只可能拿到 `all_user`，因此池里只有它；
-            # 没注入上限时传空元组，选择行为与没有分组上限时完全一致（§26.2 第 8 条只在
-            # `memory.enabled=true` 时施加，关闭的部署连上限都不该存在）。
-            caps: tuple[SupplementalCap, ...] = (
-                (SupplementalCap(("memory_all_user",), self.memory_common_tokens),)
-                if self.memory_common_tokens is not None
-                else ()
+                # 输入在字符上限与引用预算判定**之后**才构造（§48.2、公开设计 §16）：文章
+                # 正文只有真的提供出去时才是 `article_text`，剪贴板只用展开成功的那部分。
+                # `memory_allowed` 恒为 True —— provider 只在门禁为真时被叫到（§48.2）。
+                try:
+                    supplemental = await self._shared_memory_items(
+                        CommentMemoryInputs(
+                            channel_kind="comment",
+                            # 当前评论作者的 subject 由 Router 在仍持有作者 ID 时算好
+                            # （§48.1）：这里不回头去碰任何身份，未装配或拿不到 ID 时是 None。
+                            current_subject=getattr(request, "public_memory_subject", None),
+                            # 评论会话的短期参与者（§45.1）：只读、同步、无 I/O。
+                            conversation_subjects=tuple(context.recent_subjects(session_key)),
+                            # 当前评论用用户自己写的原文（§48.2）：展开过的引用走它们自己的
+                            # 优先级来源，在这里再扫一遍只会把同一段文本当成两个来源。
+                            current_text=raw_text,
+                            # R10：本轮**真正展开成功**的剪贴板/投票正文，评论正文与文章
+                            # 正文两处都算（§48.2）；预算不足没取回的引用不在其中（§6.3）。
+                            expanded_clipboard_texts=(
+                                *user_refs.expanded_texts,
+                                *article_refs.expanded_texts,
+                            ),
+                            article_title=article_title,
+                            article_text=article_text,
+                            memory_allowed=True,
+                        )
+                    )
+                except Exception as exc:
+                    # 构造这一层也在软故障边界内（D-60、公开设计 §16、§18.3）：输入来自
+                    # 请求对象与注入的 context manager，任何意外都只该让这一轮少一份可选
+                    # 资料。从这里抛出去会被 `_run_model_request` 判成临时故障，把评论事件
+                    # 推进 `waiting_rate_limit` —— 那正是「公开记忆失败不得改变事件状态与
+                    # 重试时间」所禁止的。
+                    log_event(
+                        self.logger,
+                        logging.WARNING,
+                        "memory.context_omitted",
+                        scope="comment",
+                        reason="internal",
+                        error=type(exc).__name__,
+                    )
+                    supplemental = ()
+            # 分组上限（§26.1、§33、§48.2）：共同记忆一份、公开个人记忆一份，互不影响。
+            # 没注入上限时整体传空元组，选择行为与没有分组上限时完全一致（§26.2 第 8 条
+            # 只在 `memory.enabled=true` 时施加，关闭的部署连上限都不该存在）。
+            caps: tuple[SupplementalCap, ...] = tuple(
+                SupplementalCap((group,), tokens)
+                for group, tokens in (
+                    ("memory_all_user", self.memory_common_tokens),
+                    ("memory_public_personal", self.memory_public_tokens),
+                )
+                if tokens is not None
             )
             messages = context.build_messages(
                 session_key,
@@ -1154,18 +1239,22 @@ class CommentService:
             ),
         )
 
-    async def _shared_memory_items(self) -> tuple[SupplementalItem, ...]:
-        """取这一轮可用的共同记忆；任何失败都返回空元组并继续（软故障，D-60）。
+    async def _shared_memory_items(
+        self, inputs: CommentMemoryInputs
+    ) -> tuple[SupplementalItem, ...]:
+        """取这一轮可用的记忆资料；任何失败都返回空元组并继续（软故障，D-60）。
 
-        provider 由装配层注入且**不接受参数**：频道在那里被钉死为评论，因此这条路径
-        要不到 `lobby`，也拿不到任何用户私有文件（§35、§30.2 的表）。失败只降级成
-        「这一轮没有共同记忆」——评论照常生成、照常发送，`alive` 与健康端点都不受影响。
+        provider 由装配层注入且**请求感知**（§48.2）：它拿到的是这一轮的 subject 与已允许
+        扫描的文本段，没有任何私人正文。频道在装配层被钉死为评论，因此这条路径要不到
+        `lobby`，也拿不到任何用户私有文件（§35、§30.2 的表）。失败只降级成「这一轮没有
+        资料」——评论照常生成、照常发送。事件状态、重试时间与 `alive` 都不受它影响：
+        公开记忆解析或读取的任何失败同样走这一条软故障路径（公开设计 §16、§18.3）。
         """
         provider = self.memory_context
         if provider is None:
             return ()
         try:
-            items = provider()
+            items = provider(inputs)
             if inspect.isawaitable(items):
                 items = await items
             return tuple(items)
