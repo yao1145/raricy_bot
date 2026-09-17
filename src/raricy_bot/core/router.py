@@ -16,6 +16,13 @@
 （包括机器人自己的公开回复与未 `@` 的普通消息）在进入任何过滤之前先交给缓冲器观察，
 但只有真正构造出 `Request` 且成功入队时才消费那一批。本地回复、被忽略的消息与队列满
 都不消费，因此不需要为它们各写一次清理。缓冲器不注入时这条路径整体不存在。
+
+**会话 subject（INTERFACES.md §47.2/§47.3、R1）是这一层的第三件事，也是唯一一处把
+「原始作者」变成「不可逆 owner key」的地方**：当前作者的 subject 落在
+`Request.public_memory_subject`，旁观消息的 subject 随 `observe` 进缓冲器。两处都只在
+记忆路径装配（`memory_access` 注入）时才计算，未装配时恒为 `None`、不做任何哈希；
+`core/context.py` 与 `core/lobby_context.py` 则完全不认识 memory（D-61），
+它们只是搬运这段元数据。
 """
 
 from __future__ import annotations
@@ -36,7 +43,8 @@ from ..memory.commands import (
     MemoryCommandRequest,
     parse_memory_command,
 )
-from ..site.models import LOBBY, ChatMessage, StreamEvent
+from ..memory.models import user_storage_key
+from ..site.models import LOBBY, Author, ChatMessage, StreamEvent
 from ..store import Store
 from ..text_utils import (
     contains_bot_mention,
@@ -49,7 +57,13 @@ from ..text_utils import (
     is_secret_probe,
     strip_bot_mention,
 )
-from .context import ContextManager, dm_session_key, lobby_thread_session_key
+from .context import (
+    ContextManager,
+    ConversationSubject,
+    dm_session_key,
+    lobby_thread_session_key,
+    sanitize_username,
+)
 from .lobby_context import LobbyRecentContextBuffer, LobbyRecentMessage
 
 _logger = get_logger("core.router")
@@ -91,6 +105,25 @@ _ACTIONABLE_REASONS: frozenset[str] = frozenset(
 )
 
 
+def _conversation_subject(author: Author) -> ConversationSubject | None:
+    """把站点作者映射成不可逆的会话 subject（§45.1、§47.2）；算不出来时返回 None。
+
+    `key` 是 `user_storage_key(author.id)`（§27.3），`label` 用 `sanitize_username` 清洗过
+    控制字符 —— 清洗规则只有 `core/context.py` 那一份实现。
+
+    编码不出存储键的畸形 `id`（孤立代理项会让严格 UTF-8 编码抛 `UnicodeEncodeError`）
+    按「拿不到身份」处理：`memory/service.py` 的 `_storage_key` 是同一口径，那里也认
+    「这个 ID 没有可用的存储键」。记忆是软故障，一个怪 id 不能把一条本来能回的消息变成异常。
+    """
+    if not author.id:
+        return None
+    try:
+        key = user_storage_key(author.id)
+    except UnicodeEncodeError:
+        return None
+    return ConversationSubject(key=key, label=sanitize_username(author.username))
+
+
 @dataclass(frozen=True)
 class Request:
     """一条待模型处理的任务；由 worker 消费。"""
@@ -108,6 +141,12 @@ class Request:
     # 当前作者是否可用共同记忆（§34.1 第 2 条）：由 Router 用 `message.author.id` 算出。
     # 记忆未注入或门禁关闭时恒为 `False`，worker 据此决定要不要取记忆上下文（§34.3）。
     memory_allowed: bool = False
+    # 当前作者的会话 subject（§47.2、公开设计 §14.2）：Router 在入队前用
+    # `user_storage_key(message.author.id)` 与 `sanitize_username(username)` 算好。
+    # 它**不是**作者 ID 的替身（原始 id 本来就在 `message` 里），而是一个不可逆的 owner key
+    # 加一个展示标签，供 App 解析公开记忆、以及发送成功后提交历史时使用。
+    # 记忆未装配或拿不到作者 id 时恒为 `None`，App 因此不做任何公开记忆解析（R1）。
+    public_memory_subject: ConversationSubject | None = None
     # 这条消息被唤起之前积累的大区公开消息（§38.2），入队那一刻固化；**私聊恒为空元组**。
     # 用不可变 tuple 而不是引用：请求进了队列之后，缓冲器还可以继续被 SSE 改动。
     lobby_recent: tuple[LobbyRecentMessage, ...] = ()
@@ -545,6 +584,9 @@ class MessageRouter:
             thread_root_id=thread_root_id,
             enabled_features=enabled_features,
             memory_allowed=self._memory_allowed(message.author.id),
+            # 当前作者的 subject 在**入队前**算好（§47.2）：worker 与 App 都不再回头去碰
+            # `message.author.id`，公开记忆路径拿到的只有这个不可逆的 key（R1）。
+            public_memory_subject=self._public_memory_subject(message.author),
             lobby_recent=lobby_recent,
         )
         try:
@@ -593,7 +635,14 @@ class MessageRouter:
         if buffer is None:
             return None
         try:
-            return buffer.observe(message)
+            # subject 与条目一起进缓冲（R1、§46）：记忆路径未装配时传 None，**不做任何计算**，
+            # 行为与升级前逐字节一致。`owner key` 只在这里算一次，缓冲器不认识 memory。
+            subject = (
+                _conversation_subject(message.author)
+                if self._memory_access is not None
+                else None
+            )
+            return buffer.observe(message, subject)
         except Exception as exc:
             log_event(
                 self._logger,
@@ -673,6 +722,16 @@ class MessageRouter:
         if access is None:
             return False
         return access.permits_common(user_id)
+
+    def _public_memory_subject(self, author: Author) -> ConversationSubject | None:
+        """当前作者的会话 subject（§47.2）；记忆未装配时**不做任何计算**（R1）。
+
+        与 `_memory_allowed` 一样，注入与否就是这条路径的总开关：关掉记忆的部署里
+        连一次哈希都不发生，`Request.public_memory_subject` 恒为 `None`。
+        """
+        if self._memory_access is None:
+            return None
+        return _conversation_subject(author)
 
     def _private_enabled_for(self, user_id: str | None) -> bool:
         """当前作者的私有记忆开关（§34.1 第 3 条）；未注入或取不到时按 False。
@@ -760,6 +819,10 @@ class MessageRouter:
             session_key=session_key,
             user_id=user_id,
             command=command,
+            # R12：站点用户名原样落进请求，它是命令路径**唯一**的用户名来源。
+            # 不在这里清洗、也不额外查询：`/memory public` 据此写 `owner_username`，
+            # 合法性由 `publish_private`（R8）与 codec 的 `_check_public` 两道校验把关。
+            username=message.author.username,
         )
         try:
             queue.put_nowait(request)

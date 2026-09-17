@@ -23,7 +23,7 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass
 
 from ..site.models import ChatMessage
-from .context import sanitize_username
+from .context import ConversationSubject, sanitize_username
 
 # 三组容量都是**固定合同**（设计 §1、§5.1）：本期不新增 YAML 开关。
 MAX_RECENT_MESSAGES: int = 50
@@ -49,6 +49,10 @@ class LobbyRecentMessage:
     `content` 与 `blog_title` 都是截断后的结果，`author_name` 是原始用户名
     （渲染时才清洗控制字符）。除此之外的一切 —— 作者 id、图片 URL、博客描述与正文、
     拍一拍目标、`created_at` —— 都不保存：它们对这层上下文没有用处，留下只会扩大泄露面。
+
+    `subject` 是**唯一**的例外（R1、§46）：它由调用方（`core/router.py`）算好，里面只有
+    不可逆的 owner key 与清洗前的站点用户名，**没有原始作者 id**。本模块不 import 任何
+    memory 模块（D-61），也不解释这个 key —— 它只是替调用方随条目搬运这段元数据。
     """
 
     sequence: int
@@ -56,6 +60,7 @@ class LobbyRecentMessage:
     author_name: str
     content: str
     blog_title: str | None
+    subject: ConversationSubject | None = None
 
 
 class LobbyRecentContextBuffer:
@@ -77,7 +82,9 @@ class LobbyRecentContextBuffer:
         self._seen_capacity = seen_capacity
         self._next_sequence = 0
 
-    def observe(self, message: ChatMessage) -> int:
+    def observe(
+        self, message: ChatMessage, subject: ConversationSubject | None = None
+    ) -> int:
         """观察一条大区消息，返回本次到达序号（同步、无 I/O）。
 
         **每条**消息都会推进序号，包括那些没有可保存文本的（图片、拍一拍、已删除、
@@ -86,6 +93,11 @@ class LobbyRecentContextBuffer:
 
         重复 `message.id` 只推进边界、不重复入队：SSE 与 resync 会看见同一条消息两次，
         而已经消费掉的 id 也留在去重表里，避免刚消费完就被一次 resync 原样塞回来。
+
+        `subject` 由调用方算好后随条目一起保存（R1、§46）：它**不参与去重**（去重只看
+        `message_id`）、不参与 `peek_before` / `discard_through` 的边界语义，也不改变本方法
+        的返回值。默认 None 时与升级前逐字节一致；记忆路径未装配时调用方传 None，
+        这里不做任何计算（本模块不 import memory，D-61）。
         """
         self._next_sequence += 1
         sequence = self._next_sequence
@@ -97,7 +109,7 @@ class LobbyRecentContextBuffer:
         while len(self._seen_ids) > self._seen_capacity:
             self._seen_ids.popitem(last=False)
 
-        stored = _to_recent_message(message, sequence)
+        stored = _to_recent_message(message, sequence, subject)
         if stored is not None:
             self._messages.append(stored)
         return sequence
@@ -132,6 +144,9 @@ def render_lobby_recent(message: LobbyRecentMessage) -> str:
 
     渲染是**逐条**做的，返回值由调用方拼成元组交给 `ContextManager`：
     通用上下文模块不认识 `LobbyRecentMessage`，也不该认识（§38.3）。
+
+    `message.subject` **不参与渲染**（§46）：给模型看的永远只有清洗后的站点用户名与正文，
+    owner key 一个字都不出现在这里。
     """
     body = message.content
     if message.blog_title:
@@ -141,11 +156,17 @@ def render_lobby_recent(message: LobbyRecentMessage) -> str:
     return f"{label}\n{body}"
 
 
-def _to_recent_message(message: ChatMessage, sequence: int) -> LobbyRecentMessage | None:
+def _to_recent_message(
+    message: ChatMessage,
+    sequence: int,
+    subject: ConversationSubject | None = None,
+) -> LobbyRecentMessage | None:
     """按设计 §5.1 的规则表决定一条消息存不存、存什么；没有可存文本时返回 None。
 
     只有图片、拍一拍、已删除这几类**完全不看正文**；其余情况正文照存，
     图片部分直接忽略（文字带图的消息仍然是有信息量的）。
+
+    `subject` 原样带给记录：它不影响「存不存」的判定，也不参与任何文本准入。
     """
     if message.is_deleted or message.pat is not None:
         return None
@@ -159,6 +180,7 @@ def _to_recent_message(message: ChatMessage, sequence: int) -> LobbyRecentMessag
         author_name=message.author.username,
         content=content,
         blog_title=blog_title,
+        subject=subject,
     )
 
 

@@ -332,7 +332,12 @@ class LobbyRecentMessage:
 - `content` 在构造时已经是 `message.content[:500]`；后续代码不得再次从 DTO 读取完整正文；
 - `blog_title` 取 `message.blog.title`，没有博客或标题为空时为 `None`；防御性截断上限 200；
 - 不保存作者 id、图片 URL、博客描述、博客正文、拍一拍目标、`reply.content` 或 `created_at`；
-- 记录的默认 `repr` 不应出现在任何日志。生产代码不记录该对象本身。
+- 记录的默认 `repr` 不应出现在任何日志。生产代码不记录该对象本身；
+- 「用户公开个人记忆」功能为它增加一个**可选**字段 `subject: ConversationSubject | None`，由调用方
+  用 `user_storage_key(author.id)` 与 `sanitize_username(username)` 算好后经
+  `observe(message, subject=None)` 传入（只有不可逆的 owner key 与用户名标签，没有原始作者 id）：
+  它不参与去重、边界语义与渲染，且只有**实际选入**当轮近期块的消息才贡献 subject —— 见
+  `INTERFACES.md` §46 / §47.3 与 `PUBLIC_PERSONAL_MEMORY_DESIGN.md` §14.4。
 
 缓冲器接口建议锁定为：
 
