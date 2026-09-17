@@ -368,7 +368,12 @@ class MemoryController:
             texts.memory_entry_line(
                 memory_id=entry.memory_id,
                 content=entry.content,
-                published=entry.memory_id in published,
+                # 比对用 `_same_memory_id` 的归一化口径（§41.2、§41.3）：公开文件里的 ID 可以
+                # 被人手改窄（`UM-6`），逐字相等会把**仍然公开着**的这条渲染成 `[私有]` ——
+                # 那等于告诉用户他没暴露，而暴露是真的。
+                published=any(
+                    _same_memory_id(entry.memory_id, one) for one in published
+                ),
             )
             for entry in entries
         )
