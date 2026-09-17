@@ -314,5 +314,12 @@ memory:
   writer_context_tokens: 2000
   writer_timeout_seconds: 15
 
+  # 公开个人记忆（用户把自己的一条私有记忆发布到大区与评论可见的公开投影）：
+  # 单个 owner 的公开条目上限、一轮最多选入的 owner 数、公开个人记忆分组的渲染上限。
+  # `max_public_entries_per_user` 不能大于 `max_private_entries_per_user`。
+  max_public_entries_per_user: 8
+  max_public_subjects_per_turn: 4
+  public_personal_context_tokens: 600
+
   # 部署允许后，用户仍需在私聊中主动开启自动记忆。
   auto_capture_available: false

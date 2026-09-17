@@ -279,6 +279,11 @@ class MemoryConfig:
     # 不会截断，也不会改变整轮预算（behavior/comments 的 context_input_tokens）的账目。
     common_context_tokens: int = 800
     private_context_tokens: int = 800
+    # 公开个人记忆（§39；公开设计 §9）：第三类记忆的三个旋钮 —— 单个 owner 的公开条目上限、
+    # 一轮最多选入的 owner 数、`memory_public_personal` 分组的渲染上限。
+    max_public_entries_per_user: int = 8
+    max_public_subjects_per_turn: int = 4
+    public_personal_context_tokens: int = 600
     writer_context_tokens: int = 2000
     writer_timeout_seconds: float = 15.0
     auto_capture_available: bool = False
@@ -1086,6 +1091,15 @@ def _memory(
     max_operations = _positive_int(container, "max_operations", where, 512)
     common_context_tokens = _positive_int(container, "common_context_tokens", where, 800)
     private_context_tokens = _positive_int(container, "private_context_tokens", where, 800)
+    max_public_entries_per_user = _positive_int(
+        container, "max_public_entries_per_user", where, 8
+    )
+    max_public_subjects_per_turn = _positive_int(
+        container, "max_public_subjects_per_turn", where, 4
+    )
+    public_personal_context_tokens = _positive_int(
+        container, "public_personal_context_tokens", where, 600
+    )
     writer_context_tokens = _positive_int(container, "writer_context_tokens", where, 2000)
     writer_timeout_seconds = _positive_number(
         container, "writer_timeout_seconds", where, 15.0
@@ -1107,6 +1121,30 @@ def _memory(
             raise ConfigError(
                 f"配置 {where}.common_context_tokens 不能大于"
                 " comments.context_input_tokens"
+            )
+        if max_public_entries_per_user > max_private_entries_per_user:
+            # 公开条目只可能是私人条目的快照：比私人上限还大的公开上限是死数（§39.2 第 2 条）。
+            raise ConfigError(
+                f"配置 {where}.max_public_entries_per_user 不能大于"
+                " max_private_entries_per_user"
+            )
+        # 公开个人记忆与共同记忆并排在同一个分组预算里，两两之和都不得吃光整轮预算
+        # （§39.2 第 4、5 条；第 3 条就是上面 common + private 那条，不重复判）。
+        if (
+            common_context_tokens + public_personal_context_tokens
+            > behavior.context_input_tokens
+        ):
+            raise ConfigError(
+                f"配置 {where}.common_context_tokens 与 public_personal_context_tokens 之和"
+                " 不能大于 behavior.context_input_tokens"
+            )
+        if comments.enabled and (
+            common_context_tokens + public_personal_context_tokens
+            > comments.context_input_tokens
+        ):
+            raise ConfigError(
+                f"配置 {where}.common_context_tokens 与 public_personal_context_tokens 之和"
+                " 不能大于 comments.context_input_tokens"
             )
         if max_entry_chars > behavior.max_input_chars:
             raise ConfigError(
@@ -1150,6 +1188,9 @@ def _memory(
         max_operations=max_operations,
         common_context_tokens=common_context_tokens,
         private_context_tokens=private_context_tokens,
+        max_public_entries_per_user=max_public_entries_per_user,
+        max_public_subjects_per_turn=max_public_subjects_per_turn,
+        public_personal_context_tokens=public_personal_context_tokens,
         writer_context_tokens=writer_context_tokens,
         writer_timeout_seconds=writer_timeout_seconds,
         auto_capture_available=auto_capture_available,
