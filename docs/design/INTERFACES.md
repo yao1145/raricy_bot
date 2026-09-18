@@ -2336,8 +2336,8 @@ class ContentRefResolver:
 ## 26. `config.py`（长期记忆 `MemoryConfig`）
 
 全局记忆 Beta 的配置合同。**默认关闭**，关闭时行为与升级前逐字节一致（§26.3、D-60）。
-产品语义见 `docs/design/GLOBAL_MEMORY_DESIGN.md`（下称「设计」），技术规划见
-`docs/design/GLOBAL_MEMORY_IMPLEMENTATION_PLAN.md`（下称「规划」）§3。
+产品语义见 `docs/archive/GLOBAL_MEMORY_DESIGN.md`（下称「设计」，已归档、不在版本控制里），
+技术规划见 `docs/archive/GLOBAL_MEMORY_IMPLEMENTATION_PLAN.md`（下称「规划」）§3。
 
 ### 26.1 字段与默认值
 
@@ -3628,7 +3628,8 @@ def render_lobby_recent(message: LobbyRecentMessage) -> str   # 逐条渲染给�
 
 ## 39. `config.py`（公开个人记忆配置）
 
-「用户公开个人记忆」功能（设计 `docs/design/PUBLIC_PERSONAL_MEMORY_DESIGN.md`，下称「公开设计」）
+「用户公开个人记忆」功能（设计 `docs/archive/PUBLIC_PERSONAL_MEMORY_DESIGN.md`，下称「公开设计」，
+已归档、不在版本控制里）
 的配置合同。**首版继续服从 `memory.enabled` 与既有 `access_mode` / `allow_user_list` 门禁**
 （公开设计 §5.2、§22.1）：本节没有任何新开关，只新增三个可调的容量与预算旋钮。
 

@@ -222,7 +222,7 @@ print(blocks == [A.strip(), P.strip(), C.strip()])
 
 ### 1.9 公开个人记忆的静态附加说明（第三类记忆）
 
-「用户公开个人记忆」（`docs/design/PUBLIC_PERSONAL_MEMORY_DESIGN.md`）另有一段静态 system 说明，
+「用户公开个人记忆」（`docs/archive/PUBLIC_PERSONAL_MEMORY_DESIGN.md`，已归档）另有一段静态 system 说明，
 与 §1.8 的三段同源：`texts.py` 的模块级常量、**无占位符**、拼接不做任何格式化。与它们不同的
 是触发条件——**当且仅当**本轮确实选入至少一条 `memory_public_personal` 条目时，由
 `core/context.py` 的 `build_messages` 追加（INTERFACES §45.3、§50.4；没有选中时一个 token

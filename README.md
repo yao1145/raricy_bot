@@ -264,25 +264,74 @@ Cookie、密码与 API Key 在任何级别都不会落进日志或数据库。
 ```
 raricy_bot/
 ├── src/raricy_bot/
-│   ├── config.py            # YAML + 环境变量配置加载与校验
-│   ├── logging_setup.py     # 结构化日志与脱敏过滤器
-│   ├── redact.py            # 密钥脱敏
-│   ├── text_utils.py        # @ 解析、token 估算、截断、本地规则
-│   ├── texts.py             # 全部对外文案
-│   ├── store.py             # SQLite 运行状态（正文/密钥不落库）
-│   ├── quota.py             # 聊天：每分钟窗口 + 24 小时额度 + 通知冷却
-│   ├── site/                # 站点 HTTP 客户端、SSE 接收器、聊天与评论 DTO
-│   ├── core/                # 聊天：上下文、路由器、工作器池、发送器
-│   ├── capabilities.py      # 能力表：命令字面量、上游工具白名单、各能力文案
-│   ├── mcp/                 # MCP 传输（stdio/SSE）、工具注册、四个适配器与多 Key 池
-│   ├── kb/                  # 本地 Markdown 知识库：扫描、分块、词法索引与检索
-│   ├── comments/            # 评论：发现轮询、匹配、配额、发送器、后台服务
-│   ├── memory/              # 长期记忆（Beta）：Markdown 存储、AI 撰写、命令与接入策略
-│   ├── ops.py               # /livez 与 /readyz
-│   ├── app.py               # 组件装配与生命周期
-│   └── __main__.py          # python -m raricy_bot 入口
-├── tests/                   # pytest + pytest-asyncio 测试
-├── config.example.yaml      # 配置示例
+│   ├── __main__.py               # 命令行入口：`python -m raricy_bot`
+│   ├── app.py                    # 应用装配：配置、站点客户端、SSE、路由、工作器、发送器与运维端点
+│   ├── config.py                 # YAML + 环境变量配置加载与校验
+│   ├── logging_setup.py          # 结构化日志与脱敏过滤器
+│   ├── redact.py                 # 密钥脱敏：日志与出站错误写出前统一替换
+│   ├── text_utils.py             # 用户名字符、@ 提及、token 估算、段落截断与命令判定
+│   ├── texts.py                  # 全部对外文案
+│   ├── capabilities.py           # 能力表：命令字面量、上游工具白名单、各能力文案
+│   ├── store.py                  # SQLite 运行状态（正文与密钥不落库）
+│   ├── quota.py                  # 聊天配额：每分钟窗口 + 24 小时额度 + 通知冷却
+│   ├── ops.py                    # 内建运维端点 `/livez` 与 `/readyz`
+│   ├── site/                     # 站点 HTTP 客户端与 SSE 长连接
+│   │   ├── client.py             # 登录、探活、读消息、发消息、开流
+│   │   ├── models.py             # 站点 DTO 与 SSE 事件模型
+│   │   ├── comment_models.py     # 博客评论接口 DTO 与受限解析
+│   │   └── sse.py                # SSE 帧解析、自愈重连、断线补齐
+│   ├── core/                     # 聊天主链路：路由、上下文、工作器与发送
+│   │   ├── router.py             # 判定「入队 / 本地回复 / 忽略」
+│   │   ├── context.py            # 按会话的内存历史（INTERFACES §11、§33）
+│   │   ├── lobby_context.py      # 大区近期消息缓冲（§38）
+│   │   ├── worker.py             # 模型客户端与工作器池
+│   │   ├── sender.py             # 脱敏、截断、配额预留、发送与对账
+│   │   ├── blog.py               # 被引用博客：状态判定、取正文与拼块
+│   │   ├── content_refs.py       # 内容引用 `[@<内容ID>]` 的识别与替换（§25）
+│   │   └── vision.py             # 图片输入：取回、格式判定与编码（§20）
+│   ├── mcp/                      # MCP 能力：两种传输、工具注册与四个上游适配
+│   │   ├── session.py            # 单个 ClientSession 的 Provider 骨架
+│   │   ├── stdio.py              # stdio 传输 Provider
+│   │   ├── sse.py                # 远程 MCP-over-SSE Provider
+│   │   ├── runtime.py            # Provider 生命周期、软故障隔离与后台重连
+│   │   ├── registry.py           # 工具发现、命名空间与 feature 白名单
+│   │   ├── contracts.py          # 与模型工具循环共享的领域合同
+│   │   ├── adapters.py           # 按 feature 装配适配器
+│   │   ├── adapter_kit.py        # 适配器公共件：限流、文本块读取、URL 校验
+│   │   ├── exa.py                # Exa 搜索结果适配
+│   │   ├── pool.py               # Exa 授权密钥池：多个 stdio Provider 合成一个
+│   │   ├── zhihu.py              # 知乎检索适配：白名单 + 结构化 XML 的保守提取
+│   │   ├── amap.py               # 高德地图适配：参数白名单与结果清洗
+│   │   └── wolfram.py            # Wolfram 适配：宿主钉死 `mode`，只放行 query
+│   ├── kb/                       # 本地 Markdown 知识库：载入、索引与检索
+│   │   ├── loader.py             # 扫描、读取与分块（§23.3 / §23.4）
+│   │   ├── index.py              # 纯标准库的 BM25 风格词法索引（§23.5）
+│   │   ├── service.py            # 生命周期、原子快照、周期刷新与查询（§23.6 / §23.7）
+│   │   └── models.py             # 不可变数据类型
+│   ├── comments/                 # 博客评论机器人：发现、匹配、队列与发送
+│   │   ├── service.py            # 生命周期、独立队列与后台轮询
+│   │   ├── discovery.py          # 评论区两个轮询发现器
+│   │   ├── matcher.py            # 评论树索引与触发匹配
+│   │   ├── router.py             # 博客评论候选路由
+│   │   ├── quota.py              # 独立配额与节流
+│   │   ├── sender.py             # 博客评论发送链
+│   │   └── models.py             # 评论子系统的内存请求类型
+│   └── memory/                   # 长期记忆（Beta）：Markdown 存储、AI 撰写与接入策略
+│       ├── service.py            # 存储服务：快照、原子写、幂等与刷新（§30）
+│       ├── codec.py              # 记忆文件与公开投影的解析与渲染（§29、§41）
+│       ├── models.py             # 长期记忆的数据模型（§27）
+│       ├── access.py             # Beta 接入策略与共同记忆管理权（§28）
+│       ├── writer.py             # AI 撰写器：来源内容整理成一条候选记忆（§31）
+│       ├── commands.py           # 命令类型与解析（§32.1 / §32.2）
+│       ├── controller.py         # 命令编排：门禁、幂等、撰写、写入与文案（§32.3）
+│       └── subjects.py           # 公开个人记忆的 subject 解析（§43）
+├── tests/                        # pytest + pytest-asyncio 测试
+├── docs/                         # 文档：materials（上游契约）/ usage（操作手册）/ design（内部契约）/ archive（历史）
+├── tools/                        # 仅开发用的脚本：上游取样 `capture_mcp_fixture.py`
+├── knowledge/                    # 本地知识库的 Markdown 源文件
+├── config.example.yaml           # 配置示例，字段旁都有中文注释
+├── mcp-tools.package.json        # 构建期安装的三个 stdio MCP 服务器及版本
+├── pyproject.toml                # 依赖、打包与 pytest 配置
 ├── Dockerfile
 └── docker-compose.yml
 ```

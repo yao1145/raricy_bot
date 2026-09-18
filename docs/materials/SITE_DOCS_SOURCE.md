@@ -6,7 +6,7 @@
 
 > 运行行为（怎么启用、访问策略、日志、验收）见 [`../usage/EXA_POOL_AND_KB.md`](../usage/EXA_POOL_AND_KB.md)
 > 与 [`../design/INTERFACES.md`](../design/INTERFACES.md) §23；内容侧的设计见
-> [`../design/SITE_DOCS_KB_DESIGN.md`](../design/SITE_DOCS_KB_DESIGN.md)。
+> [`../archive/SITE_DOCS_KB_DESIGN.md`](../archive/SITE_DOCS_KB_DESIGN.md)（已归档，不在版本控制里）。
 
 ## 锁定的上游版本
 
@@ -70,7 +70,7 @@ git log -1 --format="%H %cI %s"
    ```
 
 4. 只对**动过的上游文件**重跑对应的问答条目（对照表里有映射），逐项核对数字、字数上限、频率、
-   路径、按钮名。改动大时按 `../design/SITE_DOCS_KB_DESIGN.md` §6 的写法重写该文件。
+   路径、按钮名。改动大时按 `../archive/SITE_DOCS_KB_DESIGN.md` §6 的写法重写该文件。
 5. 更新本文件的提交号与提交时间。
 
    版本标注只维护在本文件里，`knowledge/` 下的问答条目不写版本、不写 front matter ——

@@ -5,11 +5,20 @@
 > 注意：`archive/` 被仓库根的 `.gitignore` 忽略，**归档文件不在版本控制里**，
 > 重命名或删除都没有 git 兜底。`materials/`、`usage/`、`design/` 与本文正常入库。
 >
-> 其中六份例外：`CHAT_IMAGE_INPUT_DESIGN.md` 与 `CHAT_IMAGE_INPUT_PLAN.md`（最后提交
-> `e834035`）、`MCP_CHAT_SEARCH_DESIGN.md` 与 `EXA_ACCOUNT_POOL_AND_KB_DESIGN_PLAN.md`
-> （`f47ce1d`）、`CHAT_BLOG_QUOTE_DESIGN.md` 与 `CHAT_BLOG_QUOTE_PLAN.md`（`d3c9599`）
-> 都是 2026-09-15 从 `design/` 移进来的，它们**进过版本控制**，需要时用
-> `git show <上面的提交号>:docs/design/<文件名>` 取回全文。归档目录里其余五份从未提交过。
+> 其中十一份例外，它们**进过版本控制**，需要时用 `git show <提交号>:docs/design/<文件名>`
+> 取回全文（括号里是移出时的最后一次提交）：
+>
+> - 2026-09-15 从 `design/` 移入：`CHAT_IMAGE_INPUT_DESIGN.md` 与 `CHAT_IMAGE_INPUT_PLAN.md`
+>   （`e834035`）、`MCP_CHAT_SEARCH_DESIGN.md` 与 `EXA_ACCOUNT_POOL_AND_KB_DESIGN_PLAN.md`
+>   （`f47ce1d`）、`CHAT_BLOG_QUOTE_DESIGN.md` 与 `CHAT_BLOG_QUOTE_PLAN.md`（`d3c9599`）。
+> - 2026-09-18 从 `design/` 移入：`GLOBAL_MEMORY_DESIGN.md` 与
+>   `GLOBAL_MEMORY_IMPLEMENTATION_PLAN.md`、`PUBLIC_PERSONAL_MEMORY_DESIGN.md`（`980b858`）、
+>   `LOBBY_RECENT_CONTEXT_DESIGN.md`（`5aa2cc1`）、`SITE_DOCS_KB_DESIGN.md`（`e834035`）。
+>   其中 `LOBBY_RECENT_CONTEXT_DESIGN.md` 移出时工作区另有一处未提交的节号修正，上面这个
+>   提交号取回的是提交版。
+> 归档目录里其余七份从未提交过，其中 `PUBLIC_PERSONAL_MEMORY_PLAN.md` 与
+> `PUBLIC_PERSONAL_MEMORY_PLAN-constraints.md` 是 2026-09-18 从实现期工作目录
+> `.superpowers/sdd/` 移进来的（该目录已删除，这两份是仅存的副本）。
 > 移动之后它们不再被 git 跟踪——归档就是「退出仓库」，本目录里剩下的永远是最新一份。
 
 ## 现行口径在哪里
@@ -49,9 +58,7 @@
 |------|--------|--------|
 | `design/INTERFACES.md` | 本项目内部契约：锁定的签名、字段名、默认值、判定谓词 | 改签名前先查全部消费者 |
 | `design/DESIGN_DECISIONS.md` | 设计未明确处的裁决记录（D-1 … D-103） | 觉得某处行为怪，先读对应条目——不少「看起来像 bug」的选择是刻意的 |
-| `design/PUBLIC_PERSONAL_MEMORY_DESIGN.md` | 用户公开个人记忆（`/memory public <UM-ID>`）的实现设计：公开投影与私人真相源分离、只在大区与评论、按完整用户名精确匹配。合同见 `design/INTERFACES.md` §39 … §52，部署与回退见 `usage/DEPLOYMENT.md` §4.2.2，用户说明见 `usage/USAGE.md` 第 5 / 6 / 8 节与 `usage/推文-长期记忆-发布稿.md` | 产品行为与内部合同已冻结；状态段随实现进度更新 |
 | `design/SYSTEM_PROMPTS.md` | 系统提示词的正式来源 + 站点速查表 | 提示词正文的权威副本，**但它不参与运行**：改完必须手动同步到 `config.yaml` |
-| `design/SITE_DOCS_KB_DESIGN.md` | `knowledge/` 知识库**内容侧**的取材范围、删减规则、问答写法、留痕与验收口径 | 已实施（2026-09-15，15 篇 / 220 条）。只约束内容，运行行为见 `usage/EXA_POOL_AND_KB.md` |
 
 ## archive/ —— 归档（历史，不是现行口径）
 
@@ -70,6 +77,13 @@
 | `archive/EXA_ACCOUNT_POOL_AND_KB_DESIGN_PLAN.md` | Exa 授权密钥池与 `/kb` 本地知识库的设计及实施计划（含 P0 处置记录）。已实施：合同见 `design/INTERFACES.md` §22/§23，裁决见 D-36 … D-46（2026-09-15 从 `design/` 归档） |
 | `archive/CHAT_BLOG_QUOTE_DESIGN.md` | 聊天区引用内容的实现前设计稿：被引用博客的正文进模型、引用边角的标记。已上线：裁决见 D-47 / D-48 / D-54，合同见 `design/INTERFACES.md` §24（2026-09-15 从 `design/` 归档） |
 | `archive/CHAT_BLOG_QUOTE_PLAN.md` | 上一条的实现计划与任务清单（同上，已上线；行为以 `design/` 与代码为准） |
+| `archive/GLOBAL_MEMORY_DESIGN.md` | 长期记忆（Beta）的实现设计：共同记忆与私有记忆的真相源、AI 撰写器与跨轮预算。已上线：合同见 `design/INTERFACES.md` §26 … §37，裁决见 D-55 … D-65（2026-09-18 从 `design/` 归档） |
+| `archive/GLOBAL_MEMORY_IMPLEMENTATION_PLAN.md` | 上一条的实施计划与任务清单（同上，已上线；行为以 `design/` 与代码为准） |
+| `archive/LOBBY_RECENT_CONTEXT_DESIGN.md` | 大区近期消息上下文的实现设计：保留现有公开回复链，同时把机器人被唤起前的近期大区消息作为一次性上下文交给模型。已实施（2026-09-17）：合同见 `design/INTERFACES.md` §38，裁决见 D-95（2026-09-18 从 `design/` 归档） |
+| `archive/SITE_DOCS_KB_DESIGN.md` | `knowledge/` 知识库**内容侧**的取材范围、删减规则、问答写法、留痕与验收口径。已实施（2026-09-15，15 篇 / 220 条）：只约束内容，运行行为见 `usage/EXA_POOL_AND_KB.md`，来源留痕见 `materials/SITE_DOCS_SOURCE.md`（2026-09-18 从 `design/` 归档） |
+| `archive/PUBLIC_PERSONAL_MEMORY_DESIGN.md` | 用户公开个人记忆（`/memory public <UM-ID>`）的实现设计：公开投影与私人真相源分离、只在大区与评论、按完整用户名精确匹配。已上线：合同见 `design/INTERFACES.md` §39 … §52，裁决见 D-96 … D-103，部署与回退见 `usage/DEPLOYMENT.md` §4.2.2（2026-09-18 从 `design/` 归档） |
+| `archive/PUBLIC_PERSONAL_MEMORY_PLAN.md` | 上一条的实施计划与任务拆分（含控制者裁决 R1–R14）。D-96 … D-103 的引文以它为来源；R 编号的实质记录处见 `design/DESIGN_DECISIONS.md` 文末附录（实现期产物，从未入库） |
+| `archive/PUBLIC_PERSONAL_MEMORY_PLAN-constraints.md` | 上一条的「Global Constraints」开工约束清单。`src/raricy_bot/memory/` 的注释与 `design/INTERFACES.md` §39 … §52 引用的「Global Constraints 第 N 条」即出自这里（实现期产物，从未入库） |
 
 ## 仓库根（不在本目录）
 

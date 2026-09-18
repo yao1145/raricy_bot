@@ -807,8 +807,9 @@ D-48 给被引用消息的三种边角各留了一行标记，并明确**不下�
 
 ## D-55 Beta 门禁同时约束全部记忆能力，管理权与接入门分离
 
-D-55 … D-65 记录「全局记忆 Beta」的裁决；引文里的「设计」指 `docs/design/GLOBAL_MEMORY_DESIGN.md`，
-「规划」指 `docs/design/GLOBAL_MEMORY_IMPLEMENTATION_PLAN.md`，接口小节号（§N）指
+D-55 … D-65 记录「全局记忆 Beta」的裁决；引文里的「设计」指
+`docs/archive/GLOBAL_MEMORY_DESIGN.md`，「规划」指
+`docs/archive/GLOBAL_MEMORY_IMPLEMENTATION_PLAN.md`（均已归档，不在版本控制里），接口小节号（§N）指
 `docs/design/INTERFACES.md` 的 §26 … §37。
 
 原文（规划 §1.3、§1.4）：
@@ -1736,11 +1737,11 @@ reason=missing_env`，而**容器里那个变量是有的**（`docker compose ex
 ## D-96 公开个人记忆是第三类记忆：公开投影与私人真相源分离，且不是 `MemoryScope.ALL_USER`
 
 D-96 … D-103 记录「用户公开个人记忆」（功能名 `public_personal_memory`）的裁决。引文里的
-「设计」指 `docs/design/PUBLIC_PERSONAL_MEMORY_DESIGN.md`，「实施计划」指
-`.superpowers/sdd/PUBLIC_PERSONAL_MEMORY_PLAN.md`（它的控制者裁决 R1–R14 与 D-55 … D-95
+「设计」指 `docs/archive/PUBLIC_PERSONAL_MEMORY_DESIGN.md`，「实施计划」指
+`docs/archive/PUBLIC_PERSONAL_MEMORY_PLAN.md`（它的控制者裁决 R1–R14 与 D-55 … D-95
 引用的 R1–R16 是**两套编号**，映射见文末附录；本组裁决里引用的「Global Constraints 第 N 条」
-是该实施计划的开工约束清单，归档在同一个目录），接口小节号（§N）指
-`docs/design/INTERFACES.md` 的 §39 … §52。
+见 `docs/archive/PUBLIC_PERSONAL_MEMORY_PLAN-constraints.md`。以上三份均已归档，不在版本控制里），
+接口小节号（§N）指 `docs/design/INTERFACES.md` 的 §39 … §52。
 
 原文（设计 §1、§3.1、§23）：
 
@@ -2006,10 +2007,10 @@ A 的公开偏好当成 B 的——那是本功能唯一可能真正伤到人的
 
 ## 附录：运行期裁决编号索引（补充裁决 A–H、控制器裁决 R1–R16、公开个人记忆 R1–R14）
 
-实现期在规划产物里另立了两套编号——`.superpowers/sdd/TASKS.md` 的「补充裁决 A–H」与
-`.superpowers/sdd/TASKS/progress.md` 的「Controller rulings R1–R16」；两者都不入库，而 `src/`
-的注释与本文件的正文直接引用这些编号（例如 `memory/codec.py` 只写「裁决 G」）。下表给出
-每个**被引用**编号的实质记录处：
+实现期在规划产物里另立了两套编号——`TASKS.md` 的「补充裁决 A–H」与 `progress.md` 的
+「Controller rulings R1–R16」；两者都不入库（实现期用的 `.superpowers/sdd/` 工作目录已于
+2026-09-18 删除，从未提交过），而 `src/` 的注释与本文件的正文直接引用这些编号
+（例如 `memory/codec.py` 只写「裁决 G」）。下表给出每个**被引用**编号的实质记录处：
 
 | 运行期裁决 | 实质记录处 |
 |---|---|
@@ -2037,7 +2038,7 @@ D-67 与 INTERFACES §26–§37）。`memory/service.py` 另有一处**未编号
 
 ### 用户公开个人记忆的 R1–R14（2026-09-17）
 
-「用户公开个人记忆」的实施计划（`.superpowers/sdd/PUBLIC_PERSONAL_MEMORY_PLAN.md`）另立了一套
+「用户公开个人记忆」的实施计划（`docs/archive/PUBLIC_PERSONAL_MEMORY_PLAN.md`）另立了一套
 **从 R1 重新开始**的控制器裁决（R1–R14）。它与上面那张表里的 R1–R16 **不是同一套编号**：
 本文件 D-96 … D-103 引用 R 编号时一律指这一套，实质记录处如下：
 
