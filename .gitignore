@@ -6,6 +6,9 @@ AGENTS.md
 # 知识库（按要求不入库）
 knowledge/
 
+# 博客草稿（按要求不入库）
+drafts/
+
 # 测试（按要求不入库）
 tests/
 
