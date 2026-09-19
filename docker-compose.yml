@@ -49,6 +49,13 @@ services:
       # 不要把它复制进镜像：镜像层里的旧资料会一直留在那里。
       # 不用知识库时保留这一行也无害（目录不存在只会让 KB 标为不可用）。
       - ./knowledge:/app/knowledge:ro
+      # 稿库：`blog` 任务的 drafts_dir 相对路径按**配置文件所在目录**解析，配置在
+      # /app/config.yaml，所以 ./drafts 指的是 /app/drafts，正是这里挂的挂载点。
+      # 漏掉这一行的表现不是报错，而是稿库型任务每次都记 `blog.empty_queue`
+      # （目录不存在等同队列空，见 drafts.py）：日志看着正常，文章永远发不出去。
+      # 同样只读：稿件由人维护，机器人只读不写；目录不存在时 Docker 会建成 root 属主的空目录，
+      # 所以先在宿主建好并让 uid 10001 可读，再 up。
+      - ./drafts:/app/drafts:ro
       # 数据目录不变量：容器 WORKDIR 为 /app，配置默认 storage.db_path=./data/bot.db
       # 解析为 /app/data/bot.db，所以卷必须挂在 /app/data，默认配置才能开箱持久化。
       # 若改成别的路径（或改这里的挂载点），必须同步修改另一处。
