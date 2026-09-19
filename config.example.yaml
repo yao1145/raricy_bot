@@ -165,6 +165,33 @@ mcp:
       max_tool_calls_per_turn: 1
       max_concurrency: 1
       min_interval_seconds: 2
+    # 定时发文的取材工具（设计 §8.1、D-110）。它与上面四个聊天能力**互不影响**：
+    # 同一个上游服务器被两边同时绑定时，各用各的参数上限、结果数与限流，谁也覆盖不了谁。
+    # 首版白名单只有这六个**只读**工具；不绑任何工具也能发文，只是模型没有素材可查。
+    # `result_count` 被能力表钉死为 1（一次生成只带一条工具结果），配成别的值会在加载期报错。
+    # 六个绑定同样是「全有或全无」：任一服务器不可达就整轮退回「无工具生成」（只有 DEBUG 日志）。
+    blog_write:
+      enabled: false
+      bindings:
+        - server: exa
+          tool: web_search_exa
+        - server: zhihu
+          tool: zhihu_search
+        - server: amap
+          tool: maps_geo
+        - server: amap
+          tool: maps_text_search
+        - server: amap
+          tool: maps_weather
+        - server: wolfram
+          tool: wolfram_query
+      result_count: 1
+      result_item_token_limit: 3000
+      history_item_token_limit: 500
+      max_query_chars: 500
+      max_tool_calls_per_turn: 1
+      max_concurrency: 1
+      min_interval_seconds: 2
 
 behavior:
   context_turns: 10
