@@ -14,10 +14,10 @@
 |---|---|
 | 仓库 | `https://github.com/raricycms/raricy.com` |
 | 许可 | MIT |
-| 提交 | `9bd397f492ade75d36030a4aafe9a0f11d876d86` |
-| 提交时间 | `2026-09-13T16:27:55Z`（本地 +08:00 为 2026-09-14 00:27） |
-| 提交标题 | `docs(rate-limit): 对外文档同步每日配额 2000` |
-| 取材范围 | `docs/guide/` 全部 13 篇 + `docs/architecture.md`、`README.md`（后两者只用于站点概览） |
+| 提交 | `5eace1299751176e5a612036751c0de78bb8f7a9` |
+| 提交时间 | `2026-09-18T22:36:20+08:00`（UTC 14:36:20） |
+| 提交标题 | `feat(security): 免认证读口收紧为 core+ —— spider 四条 + 评论树 GET` |
+| 取材范围 | `docs/guide/` 全部 9 篇 + `docs/architecture.md`、`README.md`（后两者只用于站点概览） |
 
 上游的 `docs/README.md` 把 `docs/` 分成两层：`guide/` 给玩家和内容创作者，根下给开发与运维。
 本知识库取前者；根下的开发运维文档不入库，只在写「站点概览」时从中取材（功能清单与栏目定义）。
@@ -36,10 +36,19 @@ cd src && git sparse-checkout set docs README.md
 git log -1 --format="%H %cI %s"
 ```
 
+> 这条路的 `git fetch` 会间歇性地连不上（2026-09-19 复核时反复 `Connection was reset`）。
+> 两条替代路径同样够用，且都只要 HTTP：
+>
+> - **逐文件取**：`https://raw.githubusercontent.com/raricycms/raricy.com/<提交>/<路径>`
+>   （路径里的中文要先百分号编码）；
+> - **一次拿到全部改动**：`https://api.github.com/repos/raricycms/raricy.com/compare/<旧提交>...<新提交>`
+>   返回改动文件清单与补丁（响应是 UTF-8，本机控制台若按 GBK 打印会看到乱码，落盘再读即可）。
+>   用它可比 `git log -- <路径>` 更快地看出「哪些上游文件动过、动在哪」。
+
 ## 对照表
 
 每个 `knowledge/` 文件对应的上游来源、覆盖范围，以及本篇内容是基于哪个提交写的。
-下表所有条目的上游版本都等于上表的 `9bd397f`。
+下表所有条目的上游版本都等于上表的 `5eace12`。
 
 | `knowledge/` 文件 | 上游来源 | 覆盖范围 |
 |---|---|---|
@@ -47,17 +56,35 @@ git log -1 --format="%H %cI %s"
 | `内容创作/云剪贴板.md` | `docs/guide/云剪贴板使用指南.md` | 前置条件、一–九（含限制一览与常见问题） |
 | `内容创作/图床.md` | `docs/guide/图床使用指南.md` | 前置条件、一–七（含限制一览与常见问题） |
 | `内容创作/投票箱.md` | `docs/guide/投票箱使用指南.md` | 前置条件、一–七（含限制一览与常见问题） |
-| `内容创作/内容引用语法.md` | `docs/guide/内容引用语法指南.md` | 前置条件、零–四、六；§五「技术实现简述」按删减规则**蒸馏**为可观察行为（三种类型共用的 50 处上限、同 ID 只请求一次、评论与聊天里只出现站内图床图片） |
+| `内容创作/内容引用语法.md` | `docs/guide/内容引用语法指南.md` | 前置条件、零–四、六；§五「技术实现简述」按删减规则**蒸馏**为可观察行为（各类型共用的 50 处上限、同 ID 只请求一次、评论与讨论里只出现站内图床图片与表情） |
+| `内容创作/收藏夹.md` | `docs/guide/收藏夹使用指南.md` | 一–七（含上限与次数、常见问题）。§四第 3 点里的站外接口路径按删减规则删除，只保留「被机器人 / 爬虫读取需要 core+ 账号」这一可观察事实 |
+| `内容创作/表情包.md` | `docs/guide/表情包使用指南.md` | 一–五（怎么发、哪儿能用、斜杠分隔的理由、写错了会怎样、限制）。**§六「给站长」整节不收录**：素材目录、`info.json` 字段、缓存与生效时机属运维与实现细节 |
 | `互动叙事/Cattca入门.md` | `docs/guide/cattca-guide.md` | 全部，含常见问题与完整故事模板 |
 | `互动叙事/Cattca脚本语法.md` | `docs/guide/cattca-syntax.md` | 全部，含命令参考（11/11 条命令）、表达式、完整示例与语法速查 |
 | `互动叙事/故事模块.md` | `docs/guide/story-module.md` | 全部 |
-| `互动叙事/ATÅMAS.md` | `docs/guide/atamas-game.md` | 简介、核心玩法、界面功能、注意事项。「技术架构」与「路由」中的源码级实现已删除，可观察事实（免登录可玩、状态只存浏览器内存、刷新即丢）保留 |
-| `联机对战/联机对战通用.md` | `docs/guide/{gomoku,tictactoe,xiangqi,chess,draughts}-online.md` 的公共章节 | 开一局、房号、开始之前、对局轮次、掉线与判胜、观战、再来一局、房间有效期、连接数上限 |
-| `联机对战/五子棋.md` | `docs/guide/gomoku-online.md` | 棋盘与胜负、先手、黑棋禁手（三三 / 四四 / 长连）、四三不是禁手、白棋无禁手、单机版 |
-| `联机对战/井字棋.md` | `docs/guide/tictactoe-online.md` | 棋盘与胜负、平局、记号、只有联机一种玩法 |
-| `联机对战/中国象棋.md` | `docs/guide/xiangqi-online.md` | 棋盘、走法表、飞将、将死 / 困毙 / 和棋 / 长将判负、单机入口 |
-| `联机对战/国际象棋.md` | `docs/guide/chess-online.md` | 棋盘、走法表、王车易位 / 吃过路兵 / 兵升变、非法走法、将死 / 逼和 / 和棋、无 AI 对手 |
-| `联机对战/国际跳棋.md` | `docs/guide/draughts-online.md` | 棋盘、兵与王的走法、强制吃子与最大吃子、连吃途中不升王、胜负判定、点不动格子的原因 |
+
+### 已下线功能的条目（2026-09-19）
+
+上游在 `9bd397f` 之后**删除了整个游戏子系统**：`docs/guide/` 下的 `atamas-game.md` 与
+五份 `*-online.md` 指南被删除，代码侧的 `api/game/*`、棋盘房间、规则文件等一并移除，
+`README.md` 的站点自述也去掉了「游戏」。站点实测确认：`/api/game/game_token` 返回 404，
+首页导航里已无 `/game`。
+
+相应的 7 个条目**没有删除**，而是加了 `.` 前缀（`互动叙事/.ATÅMAS.md`、`.联机对战/` 整目录）
+——`kb/loader.py` 会静默跳过隐藏文件与隐藏目录，因此它们退出检索但仍在磁盘上，功能若回归可原地改回：
+
+| 原条目 | 原上游来源 | 处置 |
+|---|---|---|
+| `互动叙事/ATÅMAS.md` | `docs/guide/atamas-game.md` | 隐藏为 `.ATÅMAS.md` |
+| `联机对战/联机对战通用.md` | 五份 `*-online.md` 的公共章节 | 整目录隐藏为 `.联机对战/` |
+| `联机对战/五子棋.md` | `docs/guide/gomoku-online.md` | 同上 |
+| `联机对战/井字棋.md` | `docs/guide/tictactoe-online.md` | 同上 |
+| `联机对战/中国象棋.md` | `docs/guide/xiangqi-online.md` | 同上 |
+| `联机对战/国际象棋.md` | `docs/guide/chess-online.md` | 同上 |
+| `联机对战/国际跳棋.md` | `docs/guide/draughts-online.md` | 同上 |
+
+> ⚠️ `knowledge/` 在 `.gitignore` 里，**删除没有 git 兜底**。上游删掉一篇 guide 时，
+> 对应条目一律**隐藏而不是删除**，处置写在本表里。
 
 ## 上游更新时怎么复核
 
@@ -66,11 +93,16 @@ git log -1 --format="%H %cI %s"
 3. 不一样时，看新提交动了哪些文件：
 
    ```bash
-   git log --oneline 9bd397f..HEAD -- docs/guide docs/architecture.md README.md
+   git log --oneline <旧提交>..HEAD -- docs/guide docs/architecture.md README.md
    ```
 
 4. 只对**动过的上游文件**重跑对应的问答条目（对照表里有映射），逐项核对数字、字数上限、频率、
    路径、按钮名。改动大时按 `../archive/SITE_DOCS_KB_DESIGN.md` §6 的写法重写该文件。
+   - **新增**一篇 guide：按同样的写法新写一条，并补进对照表。
+   - **删除**一篇 guide（功能下线）：对应条目加 `.` 前缀隐藏，**不要删除**（`knowledge/`
+     无 git 兜底），并在「已下线功能的条目」那一节登记。
+   - 站点上的功能是否真的下线，以**站点实测**为准（页面上还有没有入口、接口返回什么），
+     不要只看文档删没删。
 5. 更新本文件的提交号与提交时间。
 
    版本标注只维护在本文件里，`knowledge/` 下的问答条目不写版本、不写 front matter ——
