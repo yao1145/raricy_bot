@@ -266,14 +266,14 @@
 | `/help` 不调模型 | `core/router.py` 的 `reply_now` 分支，kind=`notice_local` |
 | 超时 45 秒、超时不重试 | `model.timeout_seconds` 默认 45；`worker._map_error` 把 timeout 映射为不可重试（D-19） |
 | 提示每人每 5 分钟一条 | `behavior.notice_cooldown_seconds`（默认 300），键为 `(频道, 触发者)`（D-18） |
-| 额度是滚动 24 小时窗口 | `quota.py` 的 `count_sends_since(now - 86400)`；1950 条模型回复、2000 条总量 |
+| 额度是滚动 24 小时窗口 | `quota.py` 的 `count_sends_since(now - 86400)`；7950 条模型回复、8000 条总量 |
 | 正文长度 | 输入超过 `max_input_chars`（8000）本地拦停；输出超过 `max_output_chars`（5000）按自然段截断并追加 `TRUNCATION_SUFFIX` |
 | 博客区首次要精确 @，之后直接回复即可继续 | `comments/router.py`：`contains_bot_mention` 判定首次；父机器人评论映射判定后续，普通评论/旁支返回 `ignored`（`not_addressed`） |
 | 评论每 30 秒轮询全站最近 100 条 | `comments/discovery.py` 的 `RecentCommentPoller`（`comments.recent_poll_seconds` 默认 30；上游最多 100 条，窗口溢出不可恢复） |
 | 每轮读取文章标题，正文 ≤1000 字才提供 | `CommentService._build_model_messages`（`comments.article_max_chars` 默认 1000，按 Unicode 字符数） |
 | 博客会话保留 30 天、去重 90 天 | `comments.conversation_retention_seconds`（2592000）/ `dedupe_retention_seconds`（7776000） |
 | 博客区记忆最近约 10 轮、按 token 再裁 | `comments.context_turns` / `comments.context_input_tokens` |
-| 评论配额独立：20/分钟、1950/2000 日限、同文章 5 秒 | `comments/quota.py`（`minute_attempt_limit`、`daily_reply_limit`、`daily_absolute_limit`、`article_cooldown_seconds`） |
+| 评论配额独立：20/分钟、7950/8000 日限、同文章 5 秒 | `comments/quota.py`（`minute_attempt_limit`、`daily_reply_limit`、`daily_absolute_limit`、`article_cooldown_seconds`） |
 | 评论区忙碌/失败/额度用尽静默，不发提示 | 设计 §11.2：评论发送只有 `reply` 与 `notice_local`，无主动 `notice` |
 | 每条成功评论都真实通知被回复者 | 站点评论接口写入即通知，无机器人豁免（设计 §3.2 / §20.2） |
 | `/help` `/reset` 在评论区两种写法都有效 | `comments/router.py`：`is_help_command` / `is_reset_command`，整条评论匹配 |

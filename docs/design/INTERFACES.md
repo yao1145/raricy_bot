@@ -47,9 +47,9 @@ class BehaviorConfig:
     max_output_chars: int = 5000
     concurrency: int = 3
     queue_size: int = 50
-    minute_attempt_limit: int = 25
-    daily_normal_limit: int = 1950
-    daily_absolute_limit: int = 2000
+    minute_attempt_limit: int = 100
+    daily_normal_limit: int = 7950
+    daily_absolute_limit: int = 8000
     notice_cooldown_seconds: int = 300
     reconnect_base_seconds: float = 3.0
     reconnect_max_seconds: float = 60.0
@@ -88,8 +88,8 @@ class CommentConfig:
     max_tree_nodes: int = 10000             # 显式栈硬上限 10000
     unmatched_attempt_limit: int = 5
     minute_attempt_limit: int = 20
-    daily_reply_limit: int = 1950
-    daily_absolute_limit: int = 2000
+    daily_reply_limit: int = 7950
+    daily_absolute_limit: int = 8000
     article_cooldown_seconds: int = 5
     conversation_retention_seconds: int = 2592000
     dedupe_retention_seconds: int = 7776000

@@ -351,8 +351,8 @@ class SiteClient:
     # --- 博客评论接口 ------------------------------------------------------
 
     async def fetch_recent_comments(self) -> list[CommentNode]:
-        """读取全站最近评论；该 spider 接口是裸数组且不带 Cookie。"""
-        payload = await self._request_public_json(_SPIDER_COMMENTS_PATH)
+        """读取全站最近评论；该 spider 接口是裸数组，需 core+ 会话 Cookie。"""
+        payload = await self._request_spider_json(_SPIDER_COMMENTS_PATH)
         if not isinstance(payload, list):
             raise self._error(200, "malformed comments response")
         result: list[CommentNode] = []
@@ -376,7 +376,7 @@ class SiteClient:
         if normalized is None:
             raise ValueError("文章 id 不是 UUID")
         response, payload = await self._request_comment_envelope(
-            "GET", f"{_COMMENTS_PREFIX}/{normalized}/comments", authenticated=False
+            "GET", f"{_COMMENTS_PREFIX}/{normalized}/comments"
         )
         if payload.get("code") != 200:
             raise self._error_from_payload(response, payload)
@@ -404,11 +404,11 @@ class SiteClient:
         return result
 
     async def fetch_blog_context(self, blog_id: str) -> BlogContext:
-        """读取本轮文章资料；spider 博客接口是裸对象且不带 Cookie。"""
+        """读取本轮文章资料；spider 博客接口是裸对象，需 core+ 会话 Cookie。"""
         normalized = normalize_uuid(blog_id)
         if normalized is None:
             raise ValueError("文章 id 不是 UUID")
-        payload = await self._request_public_json(f"{_SPIDER_BLOGS_PREFIX}/{normalized}")
+        payload = await self._request_spider_json(f"{_SPIDER_BLOGS_PREFIX}/{normalized}")
         if not isinstance(payload, Mapping):
             raise self._error(200, "malformed blog response")
         meta = payload.get("meta")
@@ -505,12 +505,12 @@ class SiteClient:
         await self.ensure_session()
         params = {"page": page, "unread_only": str(bool(unread_only)).lower()}
         response, payload = await self._request_comment_envelope(
-            "GET", _NOTIFICATIONS_PATH, params=params, authenticated=True
+            "GET", _NOTIFICATIONS_PATH, params=params
         )
         if payload.get("code") == 401:
             await self._relogin()
             response, payload = await self._request_comment_envelope(
-                "GET", _NOTIFICATIONS_PATH, params=params, authenticated=True
+                "GET", _NOTIFICATIONS_PATH, params=params
             )
         if payload.get("code") != 200:
             raise self._error_from_payload(response, payload)
@@ -546,12 +546,12 @@ class SiteClient:
         await self.ensure_session()
         path = f"{_NOTIFICATIONS_PATH}/{notification_id}/read"
         response, payload = await self._request_comment_envelope(
-            "POST", path, authenticated=True
+            "POST", path
         )
         if payload.get("code") == 401:
             await self._relogin()
             response, payload = await self._request_comment_envelope(
-                "POST", path, authenticated=True
+                "POST", path
             )
         if payload.get("code") != 200:
             raise self._error_from_payload(response, payload)
@@ -568,12 +568,12 @@ class SiteClient:
         body = {"content": content, "parent_id": normalized_parent}
         path = f"{_COMMENTS_PREFIX}/{normalized_blog}/comments"
         response, payload = await self._request_comment_envelope(
-            "POST", path, json_body=body, authenticated=True
+            "POST", path, json_body=body
         )
         if payload.get("code") == 401:
             await self._relogin()
             response, payload = await self._request_comment_envelope(
-                "POST", path, json_body=body, authenticated=True
+                "POST", path, json_body=body
             )
         if payload.get("code") != 200:
             raise self._error_from_payload(response, payload)
@@ -587,11 +587,16 @@ class SiteClient:
         except ValueError:
             return None
 
-    async def _request_public_json(self, path: str) -> object:
-        """读取公开 spider 响应，严格施加原始字节上限。"""
+    async def _request_spider_json(self, path: str) -> object:
+        """读取 spider 响应（裸 JSON），严格施加原始字节上限；一律带会话 Cookie。
+
+        spider 系列已不是匿名读口：需 core+ 登录（`comment-bot.md` §6.2 / §6.3）。
+        """
+        headers = {"Accept": "application/json"}
+        headers.update(self._cookie_headers())
         try:
             async with self._require_client().stream(
-                "GET", path, headers={"Accept": "application/json"}
+                "GET", path, headers=headers
             ) as response:
                 status = response.status_code
                 raw = await self._bounded_response_bytes(response)
@@ -611,8 +616,8 @@ class SiteClient:
     ) -> tuple[int, object, float | None]:
         """带 Cookie 拉一次 JSON 并原样交回载荷（**不要求**信封），供形状未文档化的接口用。
 
-        与 `_request_public_json` 的两处差别：带上会话 Cookie；把 HTTP 状态与响应头里的
-        `Retry-After` 一并带回来，让调用方能按**信封 code**（而不是 HTTP 状态）判成败。
+        与 `_request_spider_json` 的差别：把 HTTP 状态与响应头里的 `Retry-After`
+        一并带回来，让调用方能按**信封 code**（而不是 HTTP 状态）判成败。
         字节上限与网络错误映射都复用既有机制。
         """
         headers: dict[str, str] = {"Accept": "application/json"}
@@ -639,12 +644,13 @@ class SiteClient:
         *,
         params: Any = None,
         json_body: Any = None,
-        authenticated: bool = False,
     ) -> tuple[httpx.Response, Mapping[str, Any]]:
-        """评论站内接口的有界信封请求。"""
+        """评论站内接口的有界信封请求；一律带会话 Cookie。
+
+        评论侧没有匿名读口：读与写都要求 core+ 登录（`comment-bot.md` §6）。
+        """
         headers = {"Accept": "application/json"}
-        if authenticated:
-            headers.update(self._cookie_headers())
+        headers.update(self._cookie_headers())
         try:
             async with self._require_client().stream(
                 method, path, headers=headers, params=params, json=json_body

@@ -181,9 +181,9 @@ behavior:
   max_output_chars: 5000
   concurrency: 3
   queue_size: 50
-  minute_attempt_limit: 25
-  daily_normal_limit: 1950
-  daily_absolute_limit: 2000
+  minute_attempt_limit: 100
+  daily_normal_limit: 7950
+  daily_absolute_limit: 8000
   notice_cooldown_seconds: 300
   reconnect_base_seconds: 3.0
   reconnect_max_seconds: 60.0
@@ -262,8 +262,8 @@ comments:
   max_tree_nodes: 10000
   unmatched_attempt_limit: 5
   minute_attempt_limit: 20
-  daily_reply_limit: 1950
-  daily_absolute_limit: 2000
+  daily_reply_limit: 7950
+  daily_absolute_limit: 8000
   article_cooldown_seconds: 5
   conversation_retention_seconds: 2592000
   dedupe_retention_seconds: 7776000

@@ -201,8 +201,8 @@ system_prompt: |
 ```
 
 其余键保持默认即可。默认值是照设计文档定的：`concurrency: 3`、`queue_size: 50`、
-`minute_attempt_limit: 25`（低于站点 30 次/分的硬限）、`daily_normal_limit: 1950`、
-`daily_absolute_limit: 2000`。
+`minute_attempt_limit: 100`（低于站点 120 次/分的硬限）、`daily_normal_limit: 7950`、
+`daily_absolute_limit: 8000`。
 
 ### 4.1 聊天区 MCP 能力（可选）
 
@@ -845,7 +845,7 @@ storage:
 ### 9.5 两条校验会拦住你
 
 - `daily_normal_limit` 必须**小于** `daily_absolute_limit`
-- `minute_attempt_limit` 默认 25 是照站点 30 次/分硬限留的余量，**不要往上调**
+- `minute_attempt_limit` 默认 100 是照站点 120 次/分硬限留的余量（约 1/6），**不要往上调**
 
 ### 9.6 编辑 config.yaml 之后（Rocky / SELinux）
 
@@ -1177,7 +1177,7 @@ journalctl -u raricy-bot -f          # 跟日志
 | 大区里 @ 机器人没反应                                  | 确认是**区分大小写的精确** @ `机器人用户名`，且用户名两侧不是字母/数字/`_`/`-`。`@机器人名x` 不算命中                                                                          |
 | 大区里普通消息（没 @）没反应                           | 触发上这是设计如此：大区只回应精确 @，避免烧光每日额度。但这些消息**会**进内存里的近期上下文（最近 50 条、每条前 500 字），并在下一次有人 @ 机器人时随该轮外送                                                                                                 |
 | 私聊不回                                               | 检查是不是空消息或纯博客（这些只回一次「读不了」提示）；纯图在开了图片输入时会进模型                                                                                                         |
-| 一段时间后完全不回                                     | 可能当日额度用尽（1950 条后停止模型回复，2000 条后完全静默），或账号被禁言                                                                                                                   |
+| 一段时间后完全不回                                     | 可能当日额度用尽（7950 条后停止模型回复，8000 条后完全静默），或账号被禁言                                                                                                                   |
 | 机器人在线但对所有人不回，且 `/livez` 持续 503         | 未定案的线上现象，见 `usage/INCIDENTS.md` 事件一。特征：每 30 秒一条健康检查 503、日志再无 `sender.send`/`httpx2`/`app.*` 行、健康检查节拍没有中断（没重启过）。**先按事件一的取证清单抓现场，再重启**——重启会销毁现场 |
 | 回复里出现`[redacted]`                               | 输出命中已加载的机密被替换了。若被替换的是**机器人自己的名字**，说明有人把用户名注册成了机密——用户名不是机密，不该被注册                                                             |
 | 某个能力（`/search`、`/map`、`/wolfram`、`/zhihu`）恒回「暂不可用」 | 先 `docker compose logs bot \| grep 'event=mcp\.'` 看那台服务器那一行，一行就够定位：`provider_disabled reason=missing_env` = 密钥没给上（改 `.env` 后必须 `docker compose up -d`，`restart` 不会重新读值）；`provider_start_failed` 后面的 `error=` 与 `stderr=` 是子进程给出的退出原因——`ERR_MODULE_NOT_FOUND` 之类说明镜像里的依赖树不对（见 §2.2），不是账号问题 |
@@ -1249,7 +1249,7 @@ docker compose logs --tail=200 bot | grep -E 'router\.route|sender\.send|app\.'
 | "我没有看到要处理的内容…"             | 空白 / 只 @ 了机器人                             | `reason=empty`                                             |
 | "当前排队较多…"                       | 队列满（默认 50）                                | `reason=queue_full`                                        |
 | "抱歉，这次的回复没有生成成功。"       | 模型调用最终失败（超时不重试，D-19）             | `app.model_failed`                                         |
-| "今天的回复额度已经用完…"             | 触及 1950 条                                     | 无独立事件，随 quota 通知                                    |
+| "今天的回复额度已经用完…"             | 触及 7950 条                                     | 无独立事件，随 quota 通知                                    |
 
 **`SECRET_PROBE_PATTERNS` 有误伤**（`text_utils.py`）：里面是 `token`、`config`、
 `env`、`密钥`、`口令`、`配置文件` 这类词，且是**子串匹配 + 大小写不敏感**。

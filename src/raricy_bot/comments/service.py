@@ -390,12 +390,16 @@ class CommentService:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    # `status` 是 `SiteError` 的站点 code（0 表示网络层）：没有它，
+                    # 「会话失效 401」「不是 core+ 403」「路由没了 404」在日志里
+                    # 长得一模一样，只能靠外部复现才知道是哪一种。
                     log_event(
                         self.logger,
                         logging.WARNING,
                         "comment.poll_failed",
                         error=type(exc).__name__,
                         reason=name,
+                        status=getattr(exc, "status", None),
                     )
                     await self.sleep(failure_delay)
                     failure_delay = min(retry_max, failure_delay * 2)
