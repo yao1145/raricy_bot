@@ -67,7 +67,7 @@ class McpManager:
         redactor: Redactor | None = None,
         provider_factory: Callable[..., McpProvider] = StdioMcpProvider,
         pooled_provider_factory: Callable[..., McpProvider] = ExaPooledProvider,
-        adapters: Mapping[str, Callable[[Any, str], Any]] | None = None,
+        adapters: Mapping[tuple[str, str], Callable[[Any, str], Any]] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.config = config
@@ -102,9 +102,10 @@ class McpManager:
                     sleep=sleep,
                     **common,
                 )
-        # Adapter 按模型侧工具名注入，避免 Runtime 层把 Exa 绑死；App 可将
-        # ``exa__web_search_exa`` 映射到 ExaSearchAdapter.adapt，未来服务器只需
-        # 增加对应适配器而不改 Provider/Registry 合同。
+        # Adapter 按 `(feature 名, 模型侧工具名)` **双键**注入（§21.2），避免 Runtime 层把
+        # Exa 绑死；App 把每个 feature 的绑定映射到对应适配器的 adapt 方法，未来服务器只需
+        # 增加对应适配器而不改 Provider/Registry 合同。同一个上游工具被两个 feature 绑定时
+        # 两条记录并存、各自生效 —— 单键会让后写的覆盖先写的（D-110）。
         self.registry = InMemoryToolRegistry(
             self.providers,
             config.features,

@@ -68,6 +68,14 @@ LOG_FIELDS: frozenset[str] = frozenset(
         # owner key、查询词、匹配正文、文件路径与完整 subject 对象一律不进日志。
         "public_entry_count",
         "subject_count",
+        # 定时发文（INTERFACES §53.13）：只承载配置事实与本地序号 —— 任务名来自 YAML，
+        # post_id/run_id 是本地自增主键，day 是 UTC+8 的 YYYY-MM-DD。
+        # `chars` 只表示**出站标题**的 UTF-16 长度：文章正文的长度、片段与指纹一律不进日志。
+        "task_name",
+        "post_id",
+        "run_id",
+        "day",
+        "chars",
     }
 )
 

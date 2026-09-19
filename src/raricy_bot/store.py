@@ -1,7 +1,11 @@
 """SQLite 运行状态持久化。
 
-只保存运行元数据：事件与水位、私聊频道、已发回复、发送尝试时间、冷却状态。
+只保存运行元数据：事件与水位、私聊频道、已发回复、发送尝试时间、冷却状态、
+定时发文的调度与投递元数据。
 **不保存**消息正文、模型输入输出、Cookie、密码或 API Key（§19.1 红线）。
+
+定时发文是本条红线唯一的例外，且例外边界写死在 D-107：只允许落**脱敏后的待发布标题**
+与内容指纹，正文与描述（以及模型请求/响应体）仍然一个字都不落。
 
 实现方式：单条 `sqlite3` 连接（`check_same_thread=False`），具体语句在
 `asyncio.to_thread` 里执行，避免阻塞事件循环；串行化用一把**线程锁**，由真正在用
@@ -22,6 +26,37 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
 
+from .blog.models import (
+    MAX_POST_ATTEMPTS,
+    MAX_RECONCILE_ATTEMPTS,
+    POST_HOLDING_STATUSES,
+    POST_STATUSES,
+    REASON_ALREADY_PUBLISHED,
+    REASON_AWAITING_CONFIRMATION,
+    REASON_BUDGET_EXHAUSTED,
+    REASON_INTERRUPTED,
+    REASON_MISFIRE,
+    REASON_NOT_RETRYABLE,
+    REASON_RESERVED,
+    RUN_INTERRUPTED,
+    RUN_QUEUED,
+    RUN_RUNNING,
+    RUN_SKIPPED,
+    RUN_TERMINAL_STATUSES,
+    STATUS_ABANDONED,
+    STATUS_INFLIGHT,
+    STATUS_PUBLISHED,
+    STATUS_REJECTED,
+    STATUS_RETRY_WAIT,
+    STATUS_UNCONFIRMED,
+    BlogPost,
+    BlogRecoverySummary,
+    BlogReservation,
+    BlogRun,
+    BlogScope,
+    RunCandidate,
+)
+from .blog.planner import SCAN_WINDOW_SECONDS, utc8_day, utc8_next_day
 from .config import StorageConfig
 
 _T = TypeVar("_T")
@@ -463,7 +498,166 @@ _SCHEMA: tuple[str, ...] = (
     """,
     "CREATE INDEX IF NOT EXISTS idx_comment_send_attempts_time ON comment_send_attempts(attempted_at)",
     "CREATE INDEX IF NOT EXISTS idx_comment_send_attempts_blog_time ON comment_send_attempts(blog_id, attempted_at)",
+    # 定时发文（设计 §11）：投递行与调度执行行职责分离 —— blog_posts 去重内容与计费，
+    # blog_runs 去重调度点。两张表都是追加式建表，旧库打开后自动补上，旧数据不动。
+    # 这两张表**不挂进** `_prune()`：首版不自动清理。删掉投递行会让同一篇文重新发布，
+    # 不确定行更是只能人工核实（设计 §11 最后一段）。
+    """
+    CREATE TABLE IF NOT EXISTS blog_posts (
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        site_base_url        TEXT NOT NULL,
+        self_user_id         TEXT NOT NULL,
+        task_name            TEXT NOT NULL,
+        source_kind          TEXT NOT NULL CHECK (source_kind IN ('file', 'generated')),
+        category_id          INTEGER,
+        content_hash         TEXT NOT NULL,
+        hash_version         INTEGER NOT NULL DEFAULT 1 CHECK (hash_version = 1),
+        title                TEXT NOT NULL,
+        status               TEXT NOT NULL CHECK (status IN
+                             ('inflight', 'published', 'unconfirmed', 'retry_wait', 'rejected', 'abandoned')),
+        site_blog_id         TEXT,
+        attempts             INTEGER NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 3),
+        retry_after_day      TEXT,
+        budget_from_day      TEXT,
+        charged_through_day  TEXT,
+        reconcile_attempts   INTEGER NOT NULL DEFAULT 0,
+        last_reconciled_at   REAL,
+        created_at           REAL NOT NULL,
+        updated_at           REAL NOT NULL,
+        confirmed_at         REAL,
+        reason               TEXT,
+        UNIQUE (site_base_url, self_user_id, content_hash)
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_blog_posts_site_id"
+    " ON blog_posts (site_base_url, self_user_id, site_blog_id) WHERE site_blog_id IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_blog_posts_status"
+    " ON blog_posts (site_base_url, self_user_id, status, last_reconciled_at)",
+    """
+    CREATE TABLE IF NOT EXISTS blog_runs (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        site_base_url     TEXT NOT NULL,
+        self_user_id      TEXT NOT NULL,
+        task_name         TEXT NOT NULL,
+        scheduled_at      REAL NOT NULL,
+        task_order        INTEGER NOT NULL,
+        selected          INTEGER NOT NULL CHECK (selected IN (0, 1)),
+        status            TEXT NOT NULL CHECK (status IN
+                          ('queued', 'running', 'skipped', 'finished', 'failed', 'interrupted')),
+        post_id           INTEGER REFERENCES blog_posts(id),
+        created_at        REAL NOT NULL,
+        updated_at        REAL NOT NULL,
+        reason            TEXT,
+        UNIQUE (site_base_url, self_user_id, task_name, scheduled_at)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_blog_runs_pending"
+    " ON blog_runs (site_base_url, self_user_id, status, scheduled_at, task_order)",
 )
+
+# --- 定时发文的状态语义与行转换（INTERFACES §53.4）--------------------------
+#
+# SELECT 列顺序与 `BlogPost` / `BlogRun` 的字段顺序逐字对应，行可以直接解包成 DTO。
+_BLOG_POST_COLUMNS: str = (
+    "id, site_base_url, self_user_id, task_name, source_kind, category_id, content_hash,"
+    " hash_version, title, status, created_at, updated_at, site_blog_id, attempts,"
+    " retry_after_day, budget_from_day, charged_through_day, reconcile_attempts,"
+    " last_reconciled_at, confirmed_at, reason"
+)
+_BLOG_RUN_COLUMNS: str = (
+    "id, site_base_url, self_user_id, task_name, scheduled_at, task_order, selected,"
+    " status, post_id, created_at, updated_at, reason"
+)
+
+# 占额但不允许同指纹重投的两种状态（`POST_HOLDING_STATUSES` 去掉 published）。
+# 从常量派生而不是另抄一份字面量：两处一旦不同步，预算口径就会悄悄错。
+_BLOG_PENDING_STATUSES: tuple[str, ...] = tuple(
+    sorted(POST_HOLDING_STATUSES - {STATUS_PUBLISHED})
+)
+
+# 投递状态迁移表（设计 §7.2）。表里没有的迁移一律拒绝 —— `finalize_blog_post`
+# 不得成为任意改状态的后门。三行的理由：
+#   inflight   —— POST 在途，四种结果都由这里落定；
+#   unconfirmed—— 只读对账找到唯一精确匹配才转 published；同状态调用只刷新查询元数据，
+#                 绝不释放额度（unconfirmed 到 rejected/retry_wait/abandoned 是明令禁止的）；
+#   published  —— 重复确认必须幂等，因此只允许「还是 published」这一种。
+_BLOG_POST_TRANSITIONS: dict[str, frozenset[str]] = {
+    STATUS_INFLIGHT: frozenset(
+        {STATUS_PUBLISHED, STATUS_UNCONFIRMED, STATUS_REJECTED, STATUS_RETRY_WAIT, STATUS_ABANDONED}
+    ),
+    STATUS_UNCONFIRMED: frozenset({STATUS_PUBLISHED, STATUS_UNCONFIRMED}),
+    STATUS_PUBLISHED: frozenset({STATUS_PUBLISHED}),
+}
+
+
+def _row_to_blog_post(row: tuple[object, ...]) -> BlogPost:
+    """把 `_BLOG_POST_COLUMNS` 的一行解包成 DTO。"""
+    return BlogPost(*row)  # type: ignore[arg-type]
+
+
+def _row_to_blog_run(row: tuple[object, ...]) -> BlogRun:
+    """把 `_BLOG_RUN_COLUMNS` 的一行解包成 DTO。"""
+    return BlogRun(*row)  # type: ignore[arg-type]
+
+
+def _blog_budget_used(conn: sqlite3.Connection, scope: BlogScope, day: str) -> int:
+    """当天已占用的发文额度（设计 §9、D-108）。
+
+    当天占用 = **当天计费闭区间**覆盖的 published 行数 + **全部** inflight/unconfirmed 行数，
+    一行只计一次（两种状态互斥，所以两个子查询不会重复计同一行）。
+    `charged_through_day` 为 NULL 的 published 行没有已确认区间，不计入 —— 本实现里
+    只有 `finalize_blog_post(published)` 会写这两个字段，它一定一起写。
+
+    调用方必须处在同一事务里：预检（省模型调用）不能代替预留时的复查。
+    """
+    holding = ", ".join("?" for _ in _BLOG_PENDING_STATUSES)
+    row = conn.execute(
+        "SELECT ("
+        " SELECT COUNT(*) FROM blog_posts"
+        " WHERE site_base_url = ? AND self_user_id = ?"
+        f" AND status IN ({holding})"
+        ") + ("
+        " SELECT COUNT(*) FROM blog_posts"
+        " WHERE site_base_url = ? AND self_user_id = ? AND status = ?"
+        " AND budget_from_day IS NOT NULL AND charged_through_day IS NOT NULL"
+        " AND budget_from_day <= ? AND ? <= charged_through_day"
+        ")",
+        (
+            scope.site_base_url,
+            scope.self_user_id,
+            *_BLOG_PENDING_STATUSES,
+            scope.site_base_url,
+            scope.self_user_id,
+            STATUS_PUBLISHED,
+            day,
+            day,
+        ),
+    ).fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+def _blog_refusal_reason(
+    post: BlogPost, *, run: BlogRun, category_id: int | None, day: str
+) -> str | None:
+    """设计 §7.4 的六种指纹状态：返回 None 表示这一行可以被复用/新建，否则是拒绝原因。"""
+    if post.status == STATUS_PUBLISHED:
+        return REASON_ALREADY_PUBLISHED
+    if post.status in _BLOG_PENDING_STATUSES:
+        # 结果未定的行绝不重投：额度还占着，去重靠这一条，而不是靠运气。
+        return REASON_AWAITING_CONFIRMATION
+    if post.status == STATUS_RETRY_WAIT:
+        # 429 之后的有界重试：同原任务、栏目未变、已到重试日、尝试次数未到上限，缺一不可。
+        if post.task_name != run.task_name:
+            return REASON_NOT_RETRYABLE
+        if post.category_id != category_id:
+            return REASON_NOT_RETRYABLE
+        if post.retry_after_day is None or day < post.retry_after_day:
+            return REASON_NOT_RETRYABLE
+        if post.attempts >= MAX_POST_ATTEMPTS:
+            return REASON_NOT_RETRYABLE
+        return None
+    # rejected / abandoned（以及任何未知取值）：同指纹不自动再投，只保留诊断记录。
+    return REASON_NOT_RETRYABLE
 
 
 class Store:
@@ -1870,3 +2064,492 @@ class Store:
             conn.commit()
 
         await self._execute(operation)
+
+    # --- 定时发文：调度执行与投递（INTERFACES §53.4）------------------------
+    #
+    # 这一组的 `now` 一律由调用方传入，SQL 里不读真实时钟；UTC+8 日期只从
+    # `blog.planner` 取，不在这里另写一份日历。所有多步骤写操作都是显式事务，
+    # 整体在一次 `_execute()` 里跑完，因此天然串行、天然原子（D-90）。
+
+    async def get_blog_run(
+        self, scope: BlogScope, task_name: str, scheduled_at: float
+    ) -> BlogRun | None:
+        """按执行键 `(site_base_url, self_user_id, task_name, scheduled_at)` 读一次调度执行。
+
+        扫描时先查这里：**命中就跳过，绝不重新掷骰**（设计 §6.1）。本方法不插入、不改状态。
+        """
+
+        def operation(conn: sqlite3.Connection) -> BlogRun | None:
+            row = conn.execute(
+                f"SELECT {_BLOG_RUN_COLUMNS} FROM blog_runs"
+                " WHERE site_base_url = ? AND self_user_id = ?"
+                " AND task_name = ? AND scheduled_at = ?",
+                (scope.site_base_url, scope.self_user_id, task_name, scheduled_at),
+            ).fetchone()
+            return None if row is None else _row_to_blog_run(row)
+
+        return await self._execute(operation)
+
+    async def claim_blog_run(
+        self,
+        scope: BlogScope,
+        candidate: RunCandidate,
+        selected: int,
+        now: float,
+    ) -> BlogRun | None:
+        """原子领取一个调度点；同键已存在时返回 None。
+
+        `selected` 是本次掷骰的结果（must 恒为 1），由调用方在**确认执行键不存在之后**
+        取一次随机值得到。唯一约束是最后一道防线：重复扫描、时钟回拨、两个进程同时启动
+        都只能有一个调用方插入成功，且**不覆盖**已经落库的随机决策（设计 §6.1）。
+        冲突时返回 None，而不是抛异常 —— 这不是错误，是正常的防重命中。
+        """
+        if selected not in (0, 1):
+            raise ValueError("selected 必须是 0 或 1")
+
+        key = (
+            scope.site_base_url,
+            scope.self_user_id,
+            candidate.task_name,
+            candidate.scheduled_at,
+        )
+
+        def operation(conn: sqlite3.Connection) -> BlogRun | None:
+            try:
+                conn.execute(
+                    "INSERT INTO blog_runs (site_base_url, self_user_id, task_name,"
+                    " scheduled_at, task_order, selected, status, post_id,"
+                    " created_at, updated_at, reason)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL)",
+                    (*key, candidate.task_order, selected, RUN_QUEUED, now, now),
+                )
+            except sqlite3.IntegrityError:
+                # 只有唯一键冲突才是「已领取」；别的完整性错误必须原样抛出，
+                # 否则一个写坏的字段会被伪装成正常的防重命中。
+                conn.rollback()
+                existing = conn.execute(
+                    f"SELECT {_BLOG_RUN_COLUMNS} FROM blog_runs"
+                    " WHERE site_base_url = ? AND self_user_id = ?"
+                    " AND task_name = ? AND scheduled_at = ?",
+                    key,
+                ).fetchone()
+                if existing is None:
+                    raise
+                return None
+            row = conn.execute(
+                f"SELECT {_BLOG_RUN_COLUMNS} FROM blog_runs"
+                " WHERE site_base_url = ? AND self_user_id = ?"
+                " AND task_name = ? AND scheduled_at = ?",
+                key,
+            ).fetchone()
+            conn.commit()
+            if row is None:
+                raise RuntimeError("blog_runs 插入成功却读不回这一行")
+            return _row_to_blog_run(row)
+
+        return await self._execute(operation)
+
+    async def take_blog_run(self, scope: BlogScope, now: float) -> BlogRun | None:
+        """领取本账号最早的一条 `queued` 执行，原子转 `running`；没有可执行的返回 None。
+
+        积压超过 5 分钟（`SCAN_WINDOW_SECONDS`）还没开始的点在**同一事务**里转成
+        `skipped` + reason=`misfire` 后继续看下一行：停机一整天后一次性补发几十篇文章，
+        比漏发危险得多（设计 §6.1）。已经开始的任务允许跨分钟完成。
+        没有可执行的行时提交这些 misfire 记账再返回 None。
+        """
+
+        def operation(conn: sqlite3.Connection) -> BlogRun | None:
+            while True:
+                row = conn.execute(
+                    f"SELECT {_BLOG_RUN_COLUMNS} FROM blog_runs"
+                    " WHERE site_base_url = ? AND self_user_id = ? AND status = ?"
+                    " ORDER BY scheduled_at, task_order, id LIMIT 1",
+                    (scope.site_base_url, scope.self_user_id, RUN_QUEUED),
+                ).fetchone()
+                if row is None:
+                    conn.commit()
+                    return None
+                run = _row_to_blog_run(row)
+                if now - run.scheduled_at > SCAN_WINDOW_SECONDS:
+                    conn.execute(
+                        "UPDATE blog_runs SET status = ?, reason = ?, updated_at = ?"
+                        " WHERE id = ? AND status = ?",
+                        (RUN_SKIPPED, REASON_MISFIRE, now, run.id, RUN_QUEUED),
+                    )
+                    continue
+                cursor = conn.execute(
+                    "UPDATE blog_runs SET status = ?, updated_at = ?"
+                    " WHERE id = ? AND status = ?",
+                    (RUN_RUNNING, now, run.id, RUN_QUEUED),
+                )
+                if cursor.rowcount != 1:
+                    # 连接由 Store 串行持有，这只可能是有人绕过 Store 直接改库；
+                    # 重新选一次即可，不必把整个服务拖停。
+                    conn.rollback()
+                    continue
+                updated = conn.execute(
+                    f"SELECT {_BLOG_RUN_COLUMNS} FROM blog_runs WHERE id = ?",
+                    (run.id,),
+                ).fetchone()
+                conn.commit()
+                if updated is None:
+                    raise RuntimeError("blog_runs 更新成功却读不回这一行")
+                return _row_to_blog_run(updated)
+
+        return await self._execute(operation)
+
+    async def finish_blog_run(
+        self,
+        scope: BlogScope,
+        run_id: int,
+        status: str,
+        reason: str | None,
+        now: float,
+    ) -> None:
+        """给一次执行落终态；只接受 `RUN_TERMINAL_STATUSES` 里的取值。
+
+        **不得**碰投递状态与额度：POST 之后运行记录的终态不能替代投递状态（§53.11）。
+        已经终结的行不再改写，因此重复调用（或账号/作用域不符）会抛 `KeyError` ——
+        把调用方的状态机错误暴露出来，而不是静默吞掉。
+        """
+        if status not in RUN_TERMINAL_STATUSES:
+            raise ValueError(f"不是合法的执行终态：{status}")
+        placeholders = ", ".join("?" for _ in RUN_TERMINAL_STATUSES)
+
+        def operation(conn: sqlite3.Connection) -> None:
+            cursor = conn.execute(
+                "UPDATE blog_runs SET status = ?, reason = ?, updated_at = ?"
+                " WHERE id = ? AND site_base_url = ? AND self_user_id = ?"
+                f" AND status NOT IN ({placeholders})",
+                (status, reason, now, run_id, scope.site_base_url, scope.self_user_id,
+                 *RUN_TERMINAL_STATUSES),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                raise KeyError(f"blog_run {run_id} 不存在、不属于当前账号或已是终态")
+            conn.commit()
+
+        await self._execute(operation)
+
+    async def find_blog_post(self, scope: BlogScope, content_hash: str) -> BlogPost | None:
+        """按账号 + 内容指纹查投递行；没有记录返回 None。
+
+        没有记录只表示「这个指纹还没投过」，**不是**「已发布」（设计 §7.4）：
+        记录可能是 inflight/unconfirmed/retry_wait/rejected/abandoned。
+        """
+
+        def operation(conn: sqlite3.Connection) -> BlogPost | None:
+            row = conn.execute(
+                f"SELECT {_BLOG_POST_COLUMNS} FROM blog_posts"
+                " WHERE site_base_url = ? AND self_user_id = ? AND content_hash = ?",
+                (scope.site_base_url, scope.self_user_id, content_hash),
+            ).fetchone()
+            return None if row is None else _row_to_blog_post(row)
+
+        return await self._execute(operation)
+
+    async def blog_budget_used(self, scope: BlogScope, day: str) -> int:
+        """`day`（UTC+8 `YYYY-MM-DD`）当天已占用的发文额度（设计 §9、D-108）。
+
+        当天占用 = 当天计费闭区间覆盖的 published 行数 + **全部** inflight/unconfirmed
+        行数。不确定行跨日**持续占 1**，不能零点释放：零点一放额度，「结果未知」就变成了
+        「从未发生」，而那正是重复发布的入口。429 等确定未发布的行已清空计费区间，不占。
+        """
+        return await self._execute(lambda conn: _blog_budget_used(conn, scope, day))
+
+    async def reserve_blog_post(
+        self,
+        scope: BlogScope,
+        run_id: int,
+        title: str,
+        content_hash: str,
+        hash_version: int,
+        source_kind: str,
+        category_id: int | None,
+        max_posts_per_day: int,
+        now: float,
+    ) -> BlogReservation:
+        """在**一个事务里**复查并预留一篇的额度；成功才返回 allowed 与投递行。
+
+        复查顺序（设计 §6.2 第 5 步、§7.4）：执行行仍属于本账号且处于 `running` → 指纹行的
+        六种状态 → 429 重试的四项条件 → 当天预算。通过后创建或复用投递行、`attempts += 1`、
+        并把 `blog_runs.post_id` 关联到它。**只有 `take_blog_run` 领过的执行**才允许走到这里：
+        一次执行必须先被领取才产生投递副作用，`queued` 行能预留就等于绕开了「一次只有一篇在跑」
+        的那道闸（§53.4）。
+
+        拒绝时 `post` 必须是 None（不持有额度就不能顺手带出行快照）。**写库失败一律抛异常**，
+        绝不伪装成 `budget_exhausted` —— 那会让服务以为「今天额度用完了」继续跑，
+        而实际上一条记录都没落下。
+        """
+        day = utc8_day(now)
+
+        def operation(conn: sqlite3.Connection) -> BlogReservation:
+            row = conn.execute(
+                f"SELECT {_BLOG_RUN_COLUMNS} FROM blog_runs"
+                " WHERE id = ? AND site_base_url = ? AND self_user_id = ?",
+                (run_id, scope.site_base_url, scope.self_user_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"blog_run {run_id} 不存在或不属于当前账号")
+            run = _row_to_blog_run(row)
+            if run.status != RUN_RUNNING:
+                # 只有 take 过的 run 才能产生投递副作用：终态的执行不许补发，
+                # queued 的执行不许绕过「一次只有一篇在跑」的那道闸（§53.4）。
+                raise KeyError(
+                    f"blog_run {run_id} 不是 running，不能预留：{run.status}"
+                )
+
+            existing = conn.execute(
+                f"SELECT {_BLOG_POST_COLUMNS} FROM blog_posts"
+                " WHERE site_base_url = ? AND self_user_id = ? AND content_hash = ?",
+                (scope.site_base_url, scope.self_user_id, content_hash),
+            ).fetchone()
+            post = None if existing is None else _row_to_blog_post(existing)
+
+            if post is not None:
+                refused = _blog_refusal_reason(
+                    post, run=run, category_id=category_id, day=day
+                )
+                if refused is not None:
+                    return BlogReservation(allowed=False, post=None, reason=refused)
+
+            if _blog_budget_used(conn, scope, day) >= max_posts_per_day:
+                return BlogReservation(
+                    allowed=False, post=None, reason=REASON_BUDGET_EXHAUSTED
+                )
+
+            if post is None:
+                cursor = conn.execute(
+                    "INSERT INTO blog_posts (site_base_url, self_user_id, task_name,"
+                    " source_kind, category_id, content_hash, hash_version, title, status,"
+                    " site_blog_id, attempts, retry_after_day, budget_from_day,"
+                    " charged_through_day, reconcile_attempts, last_reconciled_at,"
+                    " created_at, updated_at, confirmed_at, reason)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, NULL, ?, NULL, 0, NULL,"
+                    " ?, ?, NULL, NULL)",
+                    (
+                        scope.site_base_url,
+                        scope.self_user_id,
+                        run.task_name,
+                        source_kind,
+                        category_id,
+                        content_hash,
+                        hash_version,
+                        title,
+                        STATUS_INFLIGHT,
+                        day,
+                        now,
+                        now,
+                    ),
+                )
+                post_id = int(cursor.lastrowid)
+            else:
+                # 复用 429 后的原行：以新尝试日期为计费起点，清空旧的计费区间与重试日
+                # （D-108）。标题不重写：指纹相同意味着它必然与落库时一致。
+                cursor = conn.execute(
+                    "UPDATE blog_posts SET status = ?, attempts = attempts + 1,"
+                    " budget_from_day = ?, charged_through_day = NULL,"
+                    " retry_after_day = NULL, reason = NULL, updated_at = ?"
+                    " WHERE id = ? AND status = ?",
+                    (STATUS_INFLIGHT, day, now, post.id, STATUS_RETRY_WAIT),
+                )
+                if cursor.rowcount != 1:
+                    conn.rollback()
+                    raise RuntimeError(f"blog_post {post.id} 的 retry_wait 复用失败")
+                post_id = post.id
+
+            conn.execute(
+                "UPDATE blog_runs SET post_id = ?, updated_at = ? WHERE id = ?",
+                (post_id, now, run.id),
+            )
+            reserved = conn.execute(
+                f"SELECT {_BLOG_POST_COLUMNS} FROM blog_posts WHERE id = ?", (post_id,)
+            ).fetchone()
+            conn.commit()
+            if reserved is None:
+                raise RuntimeError("blog_posts 写入成功却读不回这一行")
+            # 成功与拒绝都不留空串：`REASON_RESERVED` 是「拿到了额度」的稳定 token（§53.4）。
+            return BlogReservation(
+                allowed=True, post=_row_to_blog_post(reserved), reason=REASON_RESERVED
+            )
+
+        return await self._execute(operation)
+
+    async def finalize_blog_post(
+        self,
+        scope: BlogScope,
+        post_id: int,
+        status: str,
+        site_blog_id: str | None,
+        reason: str | None,
+        now: float,
+    ) -> BlogPost:
+        """按设计 §7.2 的迁移终结一次投递；状态与额度在**同一事务**里变更。
+
+        `retry_after_day` 与两个计费日期由本方法按 `now` 自己推导，**不接受调用方填值**：
+        时钟口径只能有一处，否则「跨日多占」这条保守设计会被调用方悄悄绕过。
+
+        - `published`：`charged_through_day` 取本地确认日（时钟回退时至少为起始日），
+          计费区间是 `[budget_from_day, charged_through_day]` 的闭区间（D-108）；
+          重复确认幂等，**不重新计费、不延长区间**。
+        - `unconfirmed`：维持占额与计费区间不动。
+        - `rejected` / `retry_wait` / `abandoned`：确定未发布，清空本次计费区间；
+          `retry_wait` 额外把 `retry_after_day` 记为下一个 UTC+8 日期。
+        """
+        if status not in POST_STATUSES:
+            raise ValueError(f"不是合法的投递状态：{status}")
+        if status == STATUS_PUBLISHED:
+            if not isinstance(site_blog_id, str) or not site_blog_id:
+                raise ValueError("published 必须带非空 site_blog_id")
+        elif site_blog_id is not None:
+            raise ValueError("只有 published 可以带 site_blog_id")
+
+        def operation(conn: sqlite3.Connection) -> BlogPost:
+            row = conn.execute(
+                f"SELECT {_BLOG_POST_COLUMNS} FROM blog_posts"
+                " WHERE id = ? AND site_base_url = ? AND self_user_id = ?",
+                (post_id, scope.site_base_url, scope.self_user_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"blog_post {post_id} 不存在或不属于当前账号")
+            post = _row_to_blog_post(row)
+            allowed = _BLOG_POST_TRANSITIONS.get(post.status, frozenset())
+            if status not in allowed:
+                raise ValueError(
+                    f"blog_post {post_id}：{post.status} -> {status} 不是合法迁移"
+                )
+
+            if status == STATUS_PUBLISHED and post.status == STATUS_PUBLISHED:
+                if site_blog_id != post.site_blog_id:
+                    raise ValueError(
+                        f"blog_post {post_id} 重复确认的 site_blog_id 与已存记录不一致"
+                    )
+                # 幂等：连 updated_at 都不动，重复确认不产生任何计费副作用。
+                return post
+
+            day = utc8_day(now)
+            if status == STATUS_PUBLISHED:
+                charged_through = day
+                if post.budget_from_day is not None and post.budget_from_day > day:
+                    # 时钟回退：确认日不得早于起始日，否则区间会变成倒置的空集。
+                    charged_through = post.budget_from_day
+                conn.execute(
+                    "UPDATE blog_posts SET status = ?, site_blog_id = ?,"
+                    " charged_through_day = ?, confirmed_at = ?, reason = ?, updated_at = ?"
+                    " WHERE id = ?",
+                    (STATUS_PUBLISHED, site_blog_id, charged_through, now, reason, now, post_id),
+                )
+            elif status == STATUS_UNCONFIRMED:
+                # 结果不确定：保留占额与计费区间，只更新诊断字段。
+                conn.execute(
+                    "UPDATE blog_posts SET status = ?, reason = ?, updated_at = ?"
+                    " WHERE id = ?",
+                    (STATUS_UNCONFIRMED, reason, now, post_id),
+                )
+            else:
+                # 确定未发布：释放预留，清空本次计费区间；稿库下次尝试重新预留。
+                retry_after = utc8_next_day(day) if status == STATUS_RETRY_WAIT else None
+                conn.execute(
+                    "UPDATE blog_posts SET status = ?, reason = ?, retry_after_day = ?,"
+                    " budget_from_day = NULL, charged_through_day = NULL, updated_at = ?"
+                    " WHERE id = ?",
+                    (status, reason, retry_after, now, post_id),
+                )
+
+            updated = conn.execute(
+                f"SELECT {_BLOG_POST_COLUMNS} FROM blog_posts WHERE id = ?", (post_id,)
+            ).fetchone()
+            conn.commit()
+            if updated is None:
+                raise RuntimeError("blog_posts 更新成功却读不回这一行")
+            return _row_to_blog_post(updated)
+
+        return await self._execute(operation)
+
+    async def recover_blog_state(
+        self, scope: BlogScope, now: float
+    ) -> BlogRecoverySummary:
+        """启动恢复：`inflight` → `unconfirmed`，`queued`/`running` → `interrupted`。
+
+        **保留额度**：不确定行照旧占 1（D-109）。这里不调用模型、不访问站点、不重新生成
+        任何东西 —— 上一进程 POST 到一半的窗口无法在本地消除，只能对账（D-107）。
+        运行记录与投递行各自恢复，不在这里重建两者的关联。
+        """
+
+        def operation(conn: sqlite3.Connection) -> BlogRecoverySummary:
+            unconfirmed = conn.execute(
+                "UPDATE blog_posts SET status = ?, updated_at = ?"
+                " WHERE site_base_url = ? AND self_user_id = ? AND status = ?",
+                (STATUS_UNCONFIRMED, now, scope.site_base_url, scope.self_user_id, STATUS_INFLIGHT),
+            ).rowcount
+            interrupted = conn.execute(
+                "UPDATE blog_runs SET status = ?, reason = ?, updated_at = ?"
+                " WHERE site_base_url = ? AND self_user_id = ? AND status IN (?, ?)",
+                (RUN_INTERRUPTED, REASON_INTERRUPTED, now, scope.site_base_url,
+                 scope.self_user_id, RUN_QUEUED, RUN_RUNNING),
+            ).rowcount
+            conn.commit()
+            return BlogRecoverySummary(
+                unconfirmed=int(unconfirmed), interrupted=int(interrupted)
+            )
+
+        return await self._execute(operation)
+
+    async def blog_posts_to_reconcile(
+        self, scope: BlogScope, now: float, limit: int = 10
+    ) -> tuple[BlogPost, ...]:
+        """本轮只读对账要处理的行：本账号的 `unconfirmed`，按公平轮转取最多 `limit` 条。
+
+        排除已查满 `MAX_RECONCILE_ATTEMPTS` 次的行 —— 它们**仍然占额**，只是不再自动查询
+        （设计 §7.3）。排序是 `last_reconciled_at` NULL 优先、然后最久没查的、然后 id：
+        每次查询会把 `last_reconciled_at` 推到现在，于是下一轮自然轮到后面的记录，
+        不会饿死。`now` 只为与其余方法保持同一签名口径，筛选本身不读时钟。
+        """
+
+        def operation(conn: sqlite3.Connection) -> tuple[BlogPost, ...]:
+            rows = conn.execute(
+                f"SELECT {_BLOG_POST_COLUMNS} FROM blog_posts"
+                " WHERE site_base_url = ? AND self_user_id = ? AND status = ?"
+                " AND reconcile_attempts < ?"
+                " ORDER BY (last_reconciled_at IS NOT NULL), last_reconciled_at, id"
+                " LIMIT ?",
+                (
+                    scope.site_base_url,
+                    scope.self_user_id,
+                    STATUS_UNCONFIRMED,
+                    MAX_RECONCILE_ATTEMPTS,
+                    limit,
+                ),
+            ).fetchall()
+            return tuple(_row_to_blog_post(row) for row in rows)
+
+        return await self._execute(operation)
+
+    async def note_blog_reconcile(
+        self, scope: BlogScope, post_id: int, reason: str | None, now: float
+    ) -> BlogPost:
+        """记一次只读查询尝试：次数 +1、查询时间与原因更新；**不改额度**。
+
+        查询失败、无匹配、不完整**都要**记 —— 否则一行可以无限次被查询，12 次上限永远到不了。
+        次数不由重启重置（唯一会让它变小的路径是人工维护）。
+        """
+
+        def operation(conn: sqlite3.Connection) -> BlogPost:
+            cursor = conn.execute(
+                "UPDATE blog_posts SET reconcile_attempts = reconcile_attempts + 1,"
+                " last_reconciled_at = ?, reason = ?, updated_at = ?"
+                " WHERE id = ? AND site_base_url = ? AND self_user_id = ?",
+                (now, reason, now, post_id, scope.site_base_url, scope.self_user_id),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                raise KeyError(f"blog_post {post_id} 不存在或不属于当前账号")
+            row = conn.execute(
+                f"SELECT {_BLOG_POST_COLUMNS} FROM blog_posts WHERE id = ?", (post_id,)
+            ).fetchone()
+            conn.commit()
+            if row is None:
+                raise RuntimeError("blog_posts 更新成功却读不回这一行")
+            return _row_to_blog_post(row)
+
+        return await self._execute(operation)

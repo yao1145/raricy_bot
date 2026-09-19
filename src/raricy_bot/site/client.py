@@ -25,6 +25,15 @@ import httpx
 
 from ..logging_setup import get_logger, log_event, register_secret
 from ..redact import Redactor
+from .blog_models import (
+    OUTCOME_PUBLISHED,
+    OUTCOME_RATE_LIMITED,
+    OUTCOME_REJECTED,
+    OUTCOME_UNCONFIRMED,
+    BlogPublishResult,
+    BlogSearchItem,
+    BlogSearchPage,
+)
 from .comment_models import (
     BlogContext,
     CommentNode,
@@ -51,6 +60,10 @@ _ME_PATH: str = "/api/auth/me"
 _STREAM_PATH: str = "/api/chat/stream"
 _CHANNELS_PREFIX: str = "/api/chat/channels"
 _COMMENTS_PREFIX: str = "/api/blogs"
+# 发文（POST）与文章列表（GET）都挂在 `/api/blogs` 本身，评论是它的子路径。
+# 与 `_COMMENTS_PREFIX` 同值是这个接口形状的事实，另起名字是为了让发文与对账
+# 不再借评论的常量名（`blog_write` 是显式记录的接口例外，D-106）。
+_BLOGS_PATH: str = "/api/blogs"
 _SPIDER_COMMENTS_PATH: str = "/api/spider/comments"
 _SPIDER_BLOGS_PREFIX: str = "/api/spider/blogs"
 _NOTIFICATIONS_PATH: str = "/api/notifications"
@@ -418,6 +431,148 @@ class SiteClient:
             title=title if isinstance(title, str) else "",
             content=payload.get("content") if isinstance(payload.get("content"), str) else None,
         )
+
+    # --- 定时发文（INTERFACES §53.5）---------------------------------------
+
+    async def publish_blog(
+        self,
+        *,
+        title: str,
+        description: str,
+        content: str,
+        category_id: int | None,
+    ) -> BlogPublishResult:
+        """发布一篇文章：普通用户网页表单的同一个接口（D-106；INTERFACES §53.5）。
+
+        **只发一次**：不做传输层自动重试，也**不模仿** `post_message` / `post_comment`
+        的 401 自动重登重投 —— 站方没有幂等键，重复投递的代价高于「这次没发出去」。
+        `Origin` / `Referer` 照旧两个都不设（`_cookie_headers()`）：站方 CSRF 对同时缺失
+        这两头的写请求保守放行，带一个**错误**的值反而会 403。
+
+        分类只看**解析成功的业务信封**：`_decode()` 会把非法信封变成带 HTTP 状态的
+        `SiteError`，所以传输错误、超时、非法/超大响应、5xx 一律 `unconfirmed`，
+        绝不冒充「确定没发出去」。`CancelledError` 不在这里捕获，继续向上传播。
+        """
+        body = {
+            "title": title,
+            "description": description,
+            "content": content,
+            # 未分类就是 null：站方把可空当「未分类」，这里不替人猜一个默认栏目。
+            "category_id": category_id,
+        }
+        try:
+            _response, payload = await self._request_comment_envelope(
+                "POST", _BLOGS_PATH, json_body=body
+            )
+        except SiteError:
+            # 传输错误、超时、非法信封、响应过大都在这里：这次发布的结果不确定。
+            # 不记 `error=`：站点/网络异常的文案可能带出一段上传正文，而这里无从判断。
+            return BlogPublishResult(OUTCOME_UNCONFIRMED, OUTCOME_UNCONFIRMED)
+        return self._classify_publish(payload)
+
+    async def search_blog_titles(
+        self, title: str, *, page: int = 1, per_page: int = 50
+    ) -> BlogSearchPage:
+        """按标题搜索文章列表（只读；§53.5，对账入口见 §7.3）。
+
+        `title` 交给 `params=` 编码，不手拼 URL；走 `_request_comment_envelope` 那一档
+        **有界**读取 —— `_request_envelope` 不保证响应字节有界，换它等于丢掉这道闸门。
+
+        坏结构**必须失败**，不能过滤坏条目后伪装成空结果：空结果在本子域里是
+        「没有正向凭证」，不是「未发布」（§2.3、§7.3）。
+        """
+        params = {
+            "search": title,
+            "search_fields": "title",
+            "page": page,
+            "per_page": per_page,
+        }
+        response, payload = await self._request_comment_envelope(
+            "GET", _BLOGS_PATH, params=params
+        )
+        code = payload["code"]
+        if code != 200:
+            # 刻意不复用信封里的 `message`（同 `search_chat_users`）：错误文案可能把
+            # 查询词原样回显，而对账查询串不进日志、也不该出现在异常文案里（§53.13）。
+            raise self._error(
+                code,
+                f"code={code} http={int(response.status_code)}",
+                _parse_retry_after(response) if code == 429 else None,
+            )
+        raw_items = payload.get("blogs")
+        if not isinstance(raw_items, list):
+            raise self._error(200, "malformed blog list")
+        return BlogSearchPage(
+            items=tuple(self._parse_search_item(item) for item in raw_items),
+            has_next=self._blog_list_has_next(payload),
+        )
+
+    def _classify_publish(self, payload: Mapping[str, Any]) -> BlogPublishResult:
+        """按业务信封给一次发布分类（§53.5 的判定边界）。
+
+        - `code == 200` 且 `blog_id` 是合法 UUID → `published`；缺 id 或 id 非法 →
+          `unconfirmed`：文章**可能**已经建出来了，没有凭证就不能说它没发出去。
+        - `message` 不是字符串 → 这不是本站认识的 `apiErr` 形状（chat-bot.md §7.2 记过
+          同一个键位可以放对象），认不出就不敢说是确定拒绝。
+        - 429 → `rate_limited`；其余 4xx → `rejected`：站方的发布顺序把登录、禁言、
+          权限、校验、日限额全放在**建文之前**，所以 4xx 一定是「没建文就拒绝」。
+        - 5xx 与其余码 → `unconfirmed`：服务端可能建了文才回错。
+        """
+        code = payload["code"]
+        if code == 200:
+            normalized = normalize_uuid(payload.get("blog_id"))
+            if normalized is None:
+                return BlogPublishResult(OUTCOME_UNCONFIRMED, OUTCOME_UNCONFIRMED, code=code)
+            return BlogPublishResult(
+                OUTCOME_PUBLISHED, OUTCOME_PUBLISHED, blog_id=normalized, code=code
+            )
+        message = payload.get("message")
+        if not isinstance(message, str):
+            return BlogPublishResult(OUTCOME_UNCONFIRMED, OUTCOME_UNCONFIRMED, code=code)
+        if code == 429:
+            return BlogPublishResult(OUTCOME_RATE_LIMITED, OUTCOME_RATE_LIMITED, code=code)
+        if 400 <= code < 500:
+            return BlogPublishResult(OUTCOME_REJECTED, OUTCOME_REJECTED, code=code)
+        return BlogPublishResult(OUTCOME_UNCONFIRMED, OUTCOME_UNCONFIRMED, code=code)
+
+    def _parse_search_item(self, item: object) -> BlogSearchItem:
+        """解析列表里的一项；任何一处不完整都抛 SiteError，不跳过、不补默认值。
+
+        对账要靠 `author_id` 与标题做精确判定，所以缺字段、类型不对、id 不是 UUID
+        都必须让**整页失败**（调用方会把它当作「查询不完整」并保持 `unconfirmed`）。
+        """
+        if not isinstance(item, Mapping):
+            raise self._error(200, "malformed blog item")
+        blog_id = normalize_uuid(item.get("id"))
+        title = item.get("title")
+        author_id = item.get("author_id")
+        if (
+            blog_id is None
+            or not isinstance(title, str)
+            or not isinstance(author_id, str)
+            or not author_id
+        ):
+            raise self._error(200, "malformed blog item")
+        return BlogSearchItem(blog_id=blog_id, title=title, author_id=author_id)
+
+    @staticmethod
+    def _blog_list_has_next(payload: Mapping[str, Any]) -> bool:
+        """列表还有没有下一页；认不出的形状一律当作「没有下一页」。
+
+        上游把分页放在 `pagination.has_next`；顶层 `has_next` / `hasNext` 也接受，
+        因为这两处在站内其他接口里出现过。都认不出时停在这一页 —— 对账方另有
+        「页数上限」和「候选超限即不确认」两道保守闸门，猜错方向只会少查、不会误认。
+        """
+        pagination = payload.get("pagination")
+        if isinstance(pagination, Mapping):
+            value = pagination.get("has_next")
+            if isinstance(value, bool):
+                return value
+        for key in ("has_next", "hasNext"):
+            value = payload.get(key)
+            if isinstance(value, bool):
+                return value
+        return False
 
     async def fetch_clipboard(self, clip_id: str) -> Clipboard:
         """读取一篇云剪贴板的正文（内容引用语法 §三）。

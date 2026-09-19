@@ -23,7 +23,11 @@
   DM 不解析、`memory_allowed=false` 不解析，任何失败都只让本轮少一份可选资料（§47.5）；
 - 模型失败的 `failure` 通知同样用 `notice` + 触发者冷却；额度用尽补发一次 `quota` 通知；
 - 403 进入不可用状态，按 `ready_probe_seconds` 探测恢复（D-4）；
-- 优雅关闭总超时 10 秒，`stop()` 可重复调用；记忆 worker 必须早于模型客户端关闭（§34.2）。
+- 定时发文的装配位置（§53.12）：在所有账号、Store、模型、MCP 都就绪**之后**，
+  共享 `_model_gate` 与 Registry；`blog.enabled=false` 时整段跳过，不构造也不起后台任务，
+  因此既有部署升级后行为逐字节不变。它的失败只停自己，不影响聊天/评论与健康判定；
+- 优雅关闭总超时 10 秒，`stop()` 可重复调用；记忆 worker 必须早于模型客户端关闭（§34.2），
+  而**发文子域最先停** —— 它同时用 MCP 与模型，晚停就会在已经关掉的客户端上发起投递。
 
 日志只写白名单字段，绝不写正文、Cookie、密码或 API Key（§19 红线）；
 记忆日志只允许 §37 的九个事件名与白名单字段。
@@ -34,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import random
 import time
 from collections.abc import Iterable
 from typing import Any
@@ -41,6 +46,10 @@ from typing import Any
 import httpx
 
 from . import texts
+from .blog.models import BlogScope
+from .blog.publisher import BlogPublisher
+from .blog.service import BlogService
+from .blog.writer import BlogWriter
 from .capabilities import CAPABILITIES, Capability
 from .comments.quota import CommentQuotaGuard
 from .comments.router import CommentRouter
@@ -351,6 +360,8 @@ class BotApp:
         self._resync_task: asyncio.Task[None] | None = None
         self._probe_task: asyncio.Task[None] | None = None
         self._cleanup_task: asyncio.Task[None] | None = None
+        # 定时发文同样默认关闭；启用时由独立服务托管扫描/消费/对账三个后台任务（§53.12）。
+        self._blog_service: BlogService | None = None
         # 评论功能默认关闭；启用时由独立服务托管自己的队列与轮询任务。
         self._comment_service: CommentService | None = None
         self._comment_router: CommentRouter | None = None
@@ -553,10 +564,66 @@ class BotApp:
                 log_event(_logger, logging.ERROR, "app.comment_start_failed")
                 self._comment_service = None
 
+        # 定时发文（§53.12）：与评论一样是与聊天共享客户端/Store/模型的可选子域。
+        # `blog.enabled=false` 时**整段跳过**：不构造、不建后台任务、不调模型、
+        # 不访问发布接口 —— 旧部署升级后行为逐字节不变。
+        # 装配位置在账号、Store、模型与 MCP 都就绪之后，共享 `_model_gate` 与 Registry。
+        if self._config.blog.enabled:
+            try:
+                self._blog_service = self._build_blog_service(user)
+                await self._blog_service.start()
+            except Exception as exc:
+                # 只用 `Exception`（不用 `BaseException`）：启动途中被取消时取消必须继续传播，
+                # 吞掉它会让关闭流程以为一切正常。子域失败不停聊天/评论，也不改变健康判定。
+                log_event(
+                    _logger,
+                    logging.ERROR,
+                    "app.blog_start_failed",
+                    error=type(exc).__name__,
+                )
+                self._blog_service = None
+
         self._sse_task = asyncio.create_task(self._sse.run(), name="bot-sse")
         self._cleanup_task = asyncio.create_task(self._cleanup_loop(), name="bot-cleanup")
         self._started = True
         log_event(_logger, logging.INFO, "app.started")
+
+    def _build_blog_service(self, user) -> BlogService:
+        """构造发文子域（§53.11 / §53.12）：共享客户端、Store、模型 gate 与 MCP Registry。
+
+        **不在这里创建或持有** SiteClient、模型客户端的关闭权限 —— 它们属于 App，
+        子域只是借用。工具预算不新增配置项：`BlogWriter` 从
+        `mcp.features.blog_write` 取 `max_tool_calls_per_turn`（§8.1、D-110）。
+        """
+        scope = BlogScope(
+            site_base_url=self._config.site.base_url, self_user_id=user.id
+        )
+        writer = BlogWriter(
+            model=self._model,
+            registry=self._mcp_manager.registry,
+            feature=self._config.mcp.features.get("blog_write"),
+            mcp_enabled=self._config.mcp.enabled,
+            max_input_tokens=self._config.behavior.context_input_tokens,
+            model_gate=self._model_gate,
+        )
+        publisher = BlogPublisher(
+            config=self._config,
+            scope=scope,
+            store=self._store,
+            client=self._client,
+            clock=time.time,
+        )
+        return BlogService(
+            config=self._config,
+            scope=scope,
+            store=self._store,
+            writer=writer,
+            publisher=publisher,
+            redactor=self._redactor,
+            clock=time.time,
+            sleep=asyncio.sleep,
+            random=random.random,
+        )
 
     async def run_forever(self) -> None:
         """启动并阻塞，直到 `stop()` 被调用（或信号处理方调用 stop）。"""
@@ -2104,6 +2171,12 @@ class BotApp:
         模型客户端 / SiteClient / Store。
         **记忆 worker 必须早于模型客户端关闭**：在途的 AI 撰写会访问那个已关闭的客户端。
         """
+        # 发文子域**最先**停（§53.12）：它同时用 MCP 与模型客户端，而这两者都在后面几步关闭；
+        # 晚停就会在已经关掉的客户端上发起投递。`stop()` 只取消、不等 writer 自然结束 ——
+        # 本函数的 10 秒总预算装不下一个 180 秒的生成。
+        blog_service, self._blog_service = self._blog_service, None
+        if blog_service is not None:
+            await blog_service.stop()
         # 评论 poller 先停，禁止在聊天组件关闭期间再产生新的候选任务。
         comment_service, self._comment_service = self._comment_service, None
         if comment_service is not None:

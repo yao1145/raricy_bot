@@ -308,3 +308,56 @@ memory:
 
   # 部署允许后，用户仍需在私聊中主动开启自动记忆。
   auto_capture_available: false
+
+# 定时发文（设计 BLOG_PUBLISH_DESIGN.md §4，内部合同 INTERFACES.md §53）。
+# 机器人以自己的账号、按固定 UTC+8 的调度点自动发布博客文章，默认整段关闭。
+# 两条来源产出的都是同一种草稿（YAML front matter + Markdown 正文）：
+#   - 现写型：写 prompt，到点让模型写一篇；
+#   - 稿库型：写 drafts_dir，到点从目录里按文件名顺序取一篇。
+# tier=must 到点必发起；tier=maybe 到点按 probability 掷一次骰。
+# 注意：这里没有 Web 界面，任务的增删改一律走本文件（也就是走版本控制）。
+blog:
+  enabled: false
+
+  # 本地日预算，1..5，默认 2。只约束「本机器人记录的投递」；同账号在网页上手工发文
+  # 一样占站方的 20 篇/日额度，所以远端 429 仍必须处理。
+  # 结果不确定的行跨 UTC+8 午夜**持续占用额度**，不会在零点释放 —— 详见 USAGE.md。
+  max_posts_per_day: 2
+
+  # 任务表。enabled 为 true 时必须至少有一个任务；关闭时留空是合法的。
+  #
+  # 字段（`prompt` 与 `drafts_dir` 必须**恰好给一个**）：
+  #   name         任务名，非空、全局唯一；它是持久标识，**改名等同新建一个任务**
+  #   tier         must | maybe
+  #   schedule     "HH:MM" 列表，按 UTC+8 解释，同任务内不得重复
+  #   prompt       现写型的任务提示词（多行用 YAML 的 `|`）
+  #   drafts_dir   稿库型：稿件目录，相对路径以**本配置文件所在目录**为基准
+  #   category_id  公开栏目 id；留空即「未分类」。站点没有公开的栏目列表接口，
+  #                叶子栏目的 id 拿不到，只能人工填父栏目的 id（见设计 §2.2）
+  #   probability  仅 maybe 使用且必填，(0, 1]
+  tasks: []
+
+  # 用法示例（整段取消注释后按需修改）：
+  #
+  # tasks:
+  #   - name: "晨间随笔"
+  #     tier: must
+  #     schedule: ["09:00"]
+  #     category_id: 12
+  #     prompt: |
+  #       写一篇晨间随笔，语气平和，400 字左右。
+  #       可以先用一次搜索工具取一点当天的素材。
+  #
+  #   - name: "偶发感想"
+  #     tier: maybe
+  #     probability: 0.3
+  #     schedule: ["21:30"]
+  #     category_id: 7
+  #     prompt: |
+  #       写一段随想。
+  #
+  #   - name: "连载"
+  #     tier: must
+  #     schedule: ["20:00"]
+  #     category_id: 5
+  #     drafts_dir: ./drafts/serial

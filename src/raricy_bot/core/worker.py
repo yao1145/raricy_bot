@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -30,8 +31,57 @@ from ..mcp.contracts import (
     ToolExecutor,
 )
 from ..redact import Redactor
+from ..text_utils import estimate_tokens
 
 logger = get_logger("worker")
+
+# --- 稳定失败 kind（定时发文用，§53.9）---------------------------------------
+# 与既有的 `timeout` / `http` / `bad_request` 一样是稳定 token：只进日志与运行记录，
+# 不带任何正文。定义在这里而不是 `blog/models.py`，是因为它们描述的是**模型调用**的
+# 失败形状，模型的三个调用方（聊天、评论、发文）都可能看到它们。
+KIND_TRUNCATED = "truncated"
+"""最终回复被 `max_tokens` 截断（`finish_reason == "length"`）：半篇正文不得发布。"""
+
+KIND_INVALID_COMPLETION = "invalid_completion"
+"""最终回复的完成原因不可接受：拒答或未知/缺失的 `finish_reason`。"""
+
+KIND_INPUT_TOO_LARGE = "input_too_large"
+"""整份请求超出 `max_input_tokens`：在发出网络调用之前就被本地拦下，写作要求不裁剪。"""
+
+KIND_STRICT_UNSUPPORTED = "strict_unsupported"
+"""客户端不接受 `require_complete` / `max_input_tokens`：发文**明确失败**，不静默降级。"""
+
+KIND_TIMEOUT = "timeout"
+"""整次调用超出上限；与 `_map_error` 的既有 `timeout` 是同一个取值。"""
+
+# 严格完成检查接受的完成原因。首轮合法的 `tool_calls` 由调用方另行加进来：
+# 它意味着「继续工具协议」，而不是一条可以发布的成稿。
+_FINISH_STOP_ONLY: frozenset[str] = frozenset({"stop"})
+_FINISH_STOP_OR_TOOL_CALLS: frozenset[str] = frozenset({"stop", "tool_calls"})
+
+# JSON 序列化文本之外的请求框架开销（角色、分隔、工具定义外层包装）的粗估。
+# 与项目其它 token 预算一样是**估算**：不声称等同模型商的 tokenizer。
+_REQUEST_OVERHEAD_TOKENS: int = 16
+
+
+def _completion_kind(finish_reason: str | None) -> str:
+    """把不可接受的完成原因映射成稳定 kind：截断单独一档，其余归入 invalid_completion。"""
+    return KIND_TRUNCATED if finish_reason == "length" else KIND_INVALID_COMPLETION
+
+
+def _estimate_request_tokens(messages: Any, tools: Any) -> int:
+    """估算整份请求的输入量。
+
+    对**最终的** `messages` 与 `tools` 的 JSON 文本（`ensure_ascii=False`）套现有
+    `estimate_tokens`，再加一档框架开销：工具定义、assistant 工具调用参数与 tool 消息
+    都在序列化结果里，第二轮因此不可能绕过检查。
+    """
+    payload = json.dumps(
+        {"messages": messages, "tools": list(tools)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return estimate_tokens(payload) + _REQUEST_OVERHEAD_TOKENS
 
 
 class SessionRequest(Protocol):
@@ -67,6 +117,7 @@ class _ToolRound:
     text: str
     tool_calls: tuple[ToolCall, ...]
     raw_message: dict[str, Any]
+    finish_reason: str | None = None
 
 
 class ModelClient(Protocol):
@@ -76,7 +127,11 @@ class ModelClient(Protocol):
 
 
 class ToolCapableModelClient(ModelClient, Protocol):
-    """支持 Chat Completions function tools 的可选模型协议。"""
+    """支持 Chat Completions function tools 的可选模型协议。
+
+    `require_complete` / `max_input_tokens` 是 §53.9 的两个严格参数：定时发文显式传值，
+    它会先探测客户端是否接受它们，不接受就稳定失败 —— 绝不静默吞掉严格检查继续发布。
+    """
 
     async def complete_with_tools(
         self,
@@ -87,6 +142,8 @@ class ToolCapableModelClient(ModelClient, Protocol):
         max_tool_calls: int,
         generation_is_current: Callable[[], bool],
         model_gate: Any | None = None,
+        require_complete: bool = False,
+        max_input_tokens: int | None = None,
     ) -> ToolCompletion: ...
 
 
@@ -125,10 +182,22 @@ class OpenAIModelClient:
             kwargs["http_client"] = httpx.AsyncClient(transport=transport)
         self._client = openai.AsyncOpenAI(**kwargs)
 
-    async def complete(self, messages: list[dict[str, Any]]) -> str:
-        """调用 chat.completions；可重试错误只重试一次，最终失败抛 `ModelError`。"""
+    async def complete(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        require_complete: bool = False,
+        max_input_tokens: int | None = None,
+    ) -> str:
+        """调用 chat.completions；可重试错误只重试一次，最终失败抛 `ModelError`。
+
+        两个可选参数只服务于定时发文（§53.9），默认值让聊天路径逐字节不变：
+        `require_complete=True` 时只有正常 `stop` 的回复可接受；`max_input_tokens`
+        非 None 时在每次网络调用之前检查整份请求。
+        """
         attempt = 0
         while True:
+            self._check_input_budget(messages, (), max_input_tokens)
             try:
                 response = await self._client.chat.completions.create(
                     model=self._cfg.model,
@@ -136,7 +205,6 @@ class OpenAIModelClient:
                     temperature=self._cfg.temperature,
                     max_tokens=self._cfg.max_output_tokens,
                 )
-                text = self._extract_text(response)
             except Exception as exc:  # 任何异常都必须映射为 ModelError
                 error = self._map_error(exc)
                 if not error.retryable or attempt + 1 >= _MAX_ATTEMPTS:
@@ -150,6 +218,11 @@ class OpenAIModelClient:
                     attempt=attempt,
                 )
                 continue
+
+            # 严格完成检查刻意放在异常映射**之外**：它产生的是稳定失败，既不参与重试，
+            # 也不会被 `_map_error` 改写成可重试的未知错误。
+            self._ensure_complete(response, _FINISH_STOP_ONLY if require_complete else None)
+            text = self._extract_text(response)
 
             if not text:
                 error = ModelError("empty", True)
@@ -177,12 +250,18 @@ class OpenAIModelClient:
         max_tool_calls: int,
         generation_is_current: Callable[[], bool],
         model_gate: Any | None = None,
+        require_complete: bool = False,
+        max_input_tokens: int | None = None,
     ) -> ToolCompletion:
         """执行至多一次工具的两轮 Chat Completions 工具循环。
 
         第一轮让模型自动决定是否调用工具并关闭并行调用；工具结果随后以
         ``role=tool`` 回传，第二轮明确设置 ``tool_choice=none``。MCP 内容由
         executor 负责清洗，本方法只把不可信字符串作为工具消息传递。
+
+        `require_complete` / `max_input_tokens` 与 `complete` 同义（§53.9），默认关闭：
+        发文显式传 True / 预算值，聊天路径的行为逐字节不变。首轮合法的 `tool_calls`
+        可以继续协议；只有**最终**一轮必须正常 `stop`。
         """
         if not tools:
             raise ModelError("tools_unavailable", False)
@@ -199,9 +278,19 @@ class OpenAIModelClient:
             parallel_tool_calls=False,
             model_gate=model_gate,
             detect_tools_unsupported=True,
+            # 首轮允许的另一个完成原因是「模型要求工具」：它是协议内的中间态，
+            # 只有最终成稿才必须正常收尾。
+            accepted_finish_reasons=(
+                _FINISH_STOP_OR_TOOL_CALLS if require_complete else None
+            ),
+            max_input_tokens=max_input_tokens,
         )
         self._check_generation(generation_is_current)
         if not first.tool_calls:
+            if require_complete and first.finish_reason != "stop":
+                # `tool_calls` 的宽限只对**真的带回了合法调用**的那一轮成立；没有调用时，
+                # 完成原因不是正常收尾就与截断、拒答同类：稳定失败，不产出半篇正文。
+                raise ModelError(_completion_kind(first.finish_reason), False)
             if not first.text:
                 raise ModelError("empty", True)
             return ToolCompletion(first.text, (), None)
@@ -273,6 +362,10 @@ class OpenAIModelClient:
             parallel_tool_calls=False,
             model_gate=model_gate,
             detect_tools_unsupported=False,
+            accepted_finish_reasons=(
+                _FINISH_STOP_ONLY if require_complete else None
+            ),
+            max_input_tokens=max_input_tokens,
         )
         self._check_generation(generation_is_current)
         if not final.text:
@@ -304,11 +397,16 @@ class OpenAIModelClient:
         parallel_tool_calls: bool,
         model_gate: Any | None,
         detect_tools_unsupported: bool,
+        accepted_finish_reasons: frozenset[str] | None = None,
+        max_input_tokens: int | None = None,
     ) -> "_ToolRound":
         """发起一轮带工具请求并复用现有错误重试映射。"""
         payload = tuple(self._tool_payload(tool) for tool in tools)
         attempt = 0
         while True:
+            # 检查发生在请求序列化完成之后、网络调用之前，且对**每一轮**都生效：
+            # 第二轮带着 assistant 工具调用参数与 tool 消息，体积通常比第一轮大得多。
+            self._check_input_budget(messages, payload, max_input_tokens)
             try:
                 request_kwargs: dict[str, Any] = {
                     "model": self._cfg.model,
@@ -351,6 +449,8 @@ class OpenAIModelClient:
                     attempt=attempt,
                 )
                 continue
+            # 与 `complete` 同一条理由：严格完成检查在异常映射之外，稳定且不重试。
+            self._ensure_complete(response, accepted_finish_reasons)
             if not result.text and not result.tool_calls:
                 error = ModelError("empty", True)
                 if attempt + 1 >= _MAX_ATTEMPTS:
@@ -373,6 +473,52 @@ class OpenAIModelClient:
             raise ToolGenerationCancelled()
 
     @staticmethod
+    def _check_input_budget(
+        messages: list[dict[str, Any]],
+        tools: Any,
+        max_input_tokens: int | None,
+    ) -> None:
+        """输入预算检查：超限是稳定失败，**不裁剪**写作要求（§53.9）。"""
+        if max_input_tokens is None:
+            return
+        if _estimate_request_tokens(messages, tools) > max_input_tokens:
+            raise ModelError(KIND_INPUT_TOO_LARGE, False)
+
+    @classmethod
+    def _ensure_complete(
+        cls, response: Any, accepted_finish_reasons: frozenset[str] | None
+    ) -> None:
+        """严格完成检查（§53.9）；`accepted` 为 None 时不做任何检查（聊天路径）。
+
+        只有正常 `stop`（首轮合法的 `tool_calls` 由调用方加进来）且没有明确拒答的回复
+        才算成稿：`length` 是半篇正文，拒答与未知完成原因同样不可发布。
+        """
+        if accepted_finish_reasons is None:
+            return
+        reason = cls._finish_reason(response)
+        if reason in accepted_finish_reasons and not cls._has_refusal(response):
+            return
+        raise ModelError(_completion_kind(reason), False)
+
+    @classmethod
+    def _finish_reason(cls, response: Any) -> str | None:
+        """取第一条 choice 的完成原因；结构异常一律返回 None（= 未知）。"""
+        choices = cls._field(response, "choices") or []
+        if not choices:
+            return None
+        reason = cls._field(choices[0], "finish_reason")
+        return reason if isinstance(reason, str) and reason else None
+
+    @classmethod
+    def _has_refusal(cls, response: Any) -> bool:
+        """模型是否明确拒答（`message.refusal` 被填上，部分兼容端点会这么返回）。"""
+        choices = cls._field(response, "choices") or []
+        if not choices:
+            return False
+        refusal = cls._field(cls._field(choices[0], "message"), "refusal")
+        return isinstance(refusal, str) and bool(refusal.strip())
+
+    @staticmethod
     def _tool_payload(tool: ToolDefinition) -> dict[str, Any]:
         """把领域工具转换为 OpenAI function tool 定义。"""
         return {
@@ -389,7 +535,10 @@ class OpenAIModelClient:
         """从 SDK 对象或兼容的 dict 中提取正文、调用和原始 assistant 消息。"""
         choices = cls._field(response, "choices") or []
         if not choices:
-            return _ToolRound("", (), {"role": "assistant", "content": None})
+            return _ToolRound("", (), {"role": "assistant", "content": None}, None)
+        finish_reason = cls._field(choices[0], "finish_reason")
+        if not isinstance(finish_reason, str) or not finish_reason:
+            finish_reason = None
         message = cls._field(choices[0], "message")
         text = cls._field(message, "content")
         text = text.strip() if isinstance(text, str) else ""
@@ -418,7 +567,7 @@ class OpenAIModelClient:
         assistant: dict[str, Any] = {"role": "assistant", "content": text or None}
         if serial_calls:
             assistant["tool_calls"] = serial_calls
-        return _ToolRound(text, tuple(calls), assistant)
+        return _ToolRound(text, tuple(calls), assistant, finish_reason)
 
     @staticmethod
     def _field(value: Any, name: str) -> Any:
@@ -450,7 +599,7 @@ class OpenAIModelClient:
             # APITimeoutError 是 APIConnectionError 的子类，必须先判。
             # 超时不重试（D-19）：这次调用已经等满整个超时预算，立即重试几乎必然再等满一次，
             # 只把用户看到的静默从 1 个超时周期拖成 2 个。
-            return ModelError("timeout", False)
+            return ModelError(KIND_TIMEOUT, False)
         if isinstance(exc, openai.APIConnectionError):
             return ModelError("network", True)
         if isinstance(exc, (openai.RateLimitError, openai.InternalServerError)):
@@ -462,7 +611,7 @@ class OpenAIModelClient:
             # SDK 没有 408 分支，会把它归入通用 APIStatusError；必须在兜底之前显式判出，
             # 否则它会被下面的「其余 4xx」吃成 bad_request，日志里就看不出是超时了。
             # 归类为 timeout，因此同样不重试（D-19）。
-            return ModelError("timeout", False)
+            return ModelError(KIND_TIMEOUT, False)
         if isinstance(exc, openai.APIStatusError):
             # BadRequestError / NotFoundError 及其余确定性的 4xx 状态。
             return ModelError("bad_request", False)

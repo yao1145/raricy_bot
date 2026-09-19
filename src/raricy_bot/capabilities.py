@@ -3,6 +3,10 @@
 这里集中三件以前散落各处的事：Router 认哪些命令、配置允许某个 feature 绑定哪些工具、
 以及一个能力的本轮文案。下一个能力只加一行。
 
+**并非每个能力都有命令**：`blog_write` 是定时发文子域自己发起的一轮生成，
+用户敲不出它，所以 `command` 可为 None，`CAPABILITY_COMMANDS` 会把它过滤掉 ——
+否则路由器的命令表与 `/help` 文案里会多出一条谁也敲不出来的命令。
+
 **本模块不能放进 `mcp/`**：`config.py` 要用这张表做加载期校验，而 `mcp/__init__.py` 会
 拉起 `registry`，`registry` 又依赖 `config`，放进去就成环。依赖方向固定为
 `texts ← capabilities ← {text_utils, config, core/router, app}`。
@@ -32,8 +36,12 @@ class Capability:
     feature: str
     """写入 ``Request.enabled_features`` 的通用能力名，也是 ``mcp.features`` 的键。"""
 
-    command: str
-    """消息开头触发的命令字面量，统一小写；大小写不敏感由解析器负责。"""
+    command: str | None
+    """消息开头触发的命令字面量，统一小写；大小写不敏感由解析器负责。
+
+    ``None`` = 这条能力没有用户命令（如定时发文的 ``blog_write``）：它由子域自己发起，
+    不出现在命令解析、帮助文案或任何用户可见路径上。无命令的能力必须不带给用户的文案。
+    """
 
     source: str
     """``mcp`` = 需要上游 MCP 服务器；``local`` = 机器人本地实现，不经过 MCP。"""
@@ -58,6 +66,18 @@ class Capability:
 
     max_query_chars: int
     """宿主对模型给出的查询串长度上限，同时是该 feature 配置项的上限；本地能力不适用。"""
+
+    fixed_result_count: int | None = None
+    """非 None 时，该能力的 ``result_count`` 默认值与唯一合法值都是它。
+
+    定时发文要求「一次生成最多带一条工具结果」，若沿用通用默认值 5，
+    ``result_count × result_item_token_limit`` 这一个整体预算就会变成 5 倍。
+    """
+
+    @property
+    def has_command(self) -> bool:
+        """是否有用户可见的命令字面量。"""
+        return self.command is not None
 
 
 # 声明顺序即 Router 的判定顺序与帮助文案的出现顺序。当前没有任何一条命令是另一条的前缀，
@@ -129,6 +149,34 @@ CAPABILITIES: tuple[Capability, ...] = (
         # 本地能力不经过 MCP，没有上游查询串上限。
         max_query_chars=0,
     ),
+    Capability(
+        # 定时发文子域的一轮生成（设计 §8）。它**没有命令字面量**：用户敲不出来，
+        # 由 BlogService 到点自己发起，因此 command=None，也就没有占用文案与 system 追加。
+        # 它仍然是一条 MCP 能力，因为要复用 Registry 的白名单、限流、超时与故障转移。
+        feature="blog_write",
+        command=None,
+        source=SOURCE_MCP,
+        usage_text="",
+        unavailable_text=None,
+        system_addendum=None,
+        # 首版白名单是现有已审核的 6 个只读工具，不引入通用透传（设计 §8.2 第 3 条）。
+        allowed_tools=frozenset(
+            {
+                "web_search_exa",
+                "zhihu_search",
+                "maps_geo",
+                "maps_text_search",
+                "maps_weather",
+                "wolfram_query",
+            }
+        ),
+        max_bindings=6,
+        result_shape=SHAPE_LIST,
+        # 整篇文章只是这条路上的一「轮」，没有多步研究循环，查询串上限与通用值同档。
+        max_query_chars=500,
+        # 一篇文只需要一条工具结果；写死成 1 是为了让整体 token 预算不被暗中放大 5 倍。
+        fixed_result_count=1,
+    ),
 )
 
 # 已经接了适配器的 MCP 能力。声明在这里而不是 `mcp/adapters.py`，是因为 `config.py`
@@ -138,7 +186,7 @@ CAPABILITIES: tuple[Capability, ...] = (
 # 那既不是我们评审过的清洗，也不是我们想给用户的形态，所以宁可在启动时报错。
 # `mcp/adapters.py` 的工厂表必须与本集合逐项一致，由 tests/test_mcp_adapters.py 钉住。
 IMPLEMENTED_FEATURES: frozenset[str] = frozenset(
-    {"search", "zhihu", "map", "wolfram"}
+    {"search", "zhihu", "map", "wolfram", "blog_write"}
 )
 
 
@@ -147,6 +195,9 @@ CAPABILITY_BY_FEATURE: Mapping[str, Capability] = MappingProxyType(
 )
 
 # 命令字面量 -> 能力名。_parse_capability_command 按此顺序判定，顺序即声明顺序。
+# 无命令的能力在这里被过滤掉：它们不从消息里解析，也不该出现在帮助文案里。
 CAPABILITY_COMMANDS: tuple[tuple[str, str], ...] = tuple(
-    (capability.command, capability.feature) for capability in CAPABILITIES
+    (capability.command, capability.feature)
+    for capability in CAPABILITIES
+    if capability.command is not None
 )

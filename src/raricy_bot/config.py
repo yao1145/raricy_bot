@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import re
 import urllib.parse
@@ -73,6 +74,19 @@ KB_MAX_REFRESH_SECONDS: int = 86400
 # 首版锁死的两处：密钥注入的目标变量名与选择策略。
 POOL_CHILD_ENV: str = "EXA_API_KEY"
 POOL_STRATEGY: str = "round_robin"
+
+# 定时发文的任务档位（设计 §4.1）。`must` 到点必发起，`maybe` 按 probability 掷骰。
+TIER_MUST: str = "must"
+TIER_MAYBE: str = "maybe"
+
+# 本地日预算的硬边界（设计 §9）。站方自己是 20 篇/账号，本地这个数只约束本机器人
+# 记录的投递，配得再大也绕不过站方日限，只会让「发到一半被 429 拦住」更容易发生。
+BLOG_MAX_POSTS_PER_DAY_MIN: int = 1
+BLOG_MAX_POSTS_PER_DAY_MAX: int = 5
+
+# 调度点字面量：严格的 00:00 .. 23:59。`24:00`、`9:00`、`09:00:00` 都不是合法写法 ——
+# 宽松解析会让「09:00」与「9:00」两个写法指向同一分钟而彼此看不出重复。
+_SCHEDULE_RE = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
 
 
 @dataclass(frozen=True)
@@ -290,6 +304,33 @@ class MemoryConfig:
 
 
 @dataclass(frozen=True)
+class BlogTaskConfig:
+    """一个定时发文任务的静态事实（设计 §4.1）。
+
+    `prompt` 与 `drafts_dir` 恰好有一个非 None —— 两个都给或都不给在加载期就是错误。
+    `drafts_dir` 已按配置文件所在目录解析成绝对路径，运行期不再依赖当前工作目录。
+    栏目归任务，不归稿件：`Draft` 里没有栏目字段。
+    """
+
+    name: str
+    tier: str
+    schedule: tuple[str, ...]
+    category_id: int | None = None
+    probability: float | None = None
+    prompt: str | None = None
+    drafts_dir: str | None = None
+
+
+@dataclass(frozen=True)
+class BlogConfig:
+    """定时发文配置（设计 §4）；默认关闭以保持现有部署行为。"""
+
+    enabled: bool = False
+    max_posts_per_day: int = 2
+    tasks: tuple[BlogTaskConfig, ...] = ()
+
+
+@dataclass(frozen=True)
 class Secrets:
     """密钥集合；repr 必须脱敏。"""
 
@@ -334,6 +375,7 @@ class Config:
     mcp: McpConfig = field(default_factory=McpConfig)
     knowledge_base: KnowledgeBaseConfig = field(default_factory=KnowledgeBaseConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    blog: BlogConfig = field(default_factory=BlogConfig)
 
     @property
     def db_path(self) -> str:
@@ -383,6 +425,9 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
     memory = _memory(
         _section(raw, "memory"), behavior, comments, knowledge_base, storage
     )
+    # 稿库的相对路径以**配置文件所在目录**为基准：它与 `--config` 指的是同一处，
+    # 也因此在容器里换了工作目录、或在别处启动进程时都不会指到另一个目录去。
+    blog = _blog(_section(raw, "blog"), os.path.dirname(os.path.abspath(resolved)))
     ops = OpsConfig(
         host=_ops_host(ops_raw),
         port=_ops_port(ops_raw),
@@ -407,6 +452,7 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
         mcp=mcp,
         knowledge_base=knowledge_base,
         memory=memory,
+        blog=blog,
     )
 
 
@@ -1197,6 +1243,152 @@ def _memory(
     )
 
 
+def _blog(container: Mapping[str, Any], config_dir: str) -> BlogConfig:
+    """构造定时发文配置（设计 §4.2）。
+
+    与知识库/记忆不同，这里**没有「只在启用时才查」的交叉约束**：任务表本身就是配置事实，
+    写错一个字段（比如把 probability 放在 must 任务上）在关闭态下同样是错的，
+    留着它只会等到某天启用时才在启动日志里炸出来。
+    `drafts_dir` 不存在**不是**配置错误：目录可以先空着，运行期按「队列空」处理。
+    """
+    where = "blog"
+    enabled = _bool_flag(container, "enabled", where, False)
+
+    max_posts_per_day = container.get("max_posts_per_day", 2)
+    if isinstance(max_posts_per_day, bool) or not isinstance(max_posts_per_day, int):
+        raise ConfigError(f"配置 {where}.max_posts_per_day 必须是整数")
+    if not (
+        BLOG_MAX_POSTS_PER_DAY_MIN <= max_posts_per_day <= BLOG_MAX_POSTS_PER_DAY_MAX
+    ):
+        raise ConfigError(
+            f"配置 {where}.max_posts_per_day 必须在 {BLOG_MAX_POSTS_PER_DAY_MIN}"
+            f" 到 {BLOG_MAX_POSTS_PER_DAY_MAX} 之间"
+        )
+
+    raw_tasks = container.get("tasks")
+    if raw_tasks is None:
+        raw_tasks = []
+    if not isinstance(raw_tasks, list):
+        raise ConfigError(f"配置 {where}.tasks 必须是列表")
+
+    tasks: list[BlogTaskConfig] = []
+    seen_names: set[str] = set()
+    for index, raw_task in enumerate(raw_tasks):
+        if not isinstance(raw_task, dict):
+            raise ConfigError(f"配置 {where}.tasks 的第 {index + 1} 项必须是映射")
+        task = _blog_task(raw_task, index, where, config_dir)
+        if task.name in seen_names:
+            raise ConfigError(f"配置 {where}.tasks 的任务名不能重复：{task.name}")
+        seen_names.add(task.name)
+        tasks.append(task)
+
+    if enabled and not tasks:
+        raise ConfigError(f"配置 {where}.enabled 为 true 时 tasks 不能为空")
+
+    return BlogConfig(
+        enabled=enabled,
+        max_posts_per_day=max_posts_per_day,
+        tasks=tuple(tasks),
+    )
+
+
+def _blog_task(
+    raw: Mapping[str, Any], index: int, where: str, config_dir: str
+) -> BlogTaskConfig:
+    """解析并校验一个发文任务；所有报错都带上它在 tasks 里的位置。"""
+    path = f"{where}.tasks[{index + 1}]"
+
+    raw_name = raw.get("name")
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        raise ConfigError(f"配置 {path}.name 必须是非空字符串")
+    name = raw_name.strip()
+
+    tier = raw.get("tier")
+    if tier not in (TIER_MUST, TIER_MAYBE):
+        raise ConfigError(f"配置 {path}.tier 只能是 {TIER_MUST} 或 {TIER_MAYBE}")
+
+    schedule = _blog_schedule(raw.get("schedule"), path)
+
+    category_id = raw.get("category_id")
+    if category_id is not None:
+        # bool 是 int 的子类：`category_id: true` 必须被挡住，否则会当成栏目 1。
+        if isinstance(category_id, bool) or not isinstance(category_id, int):
+            raise ConfigError(f"配置 {path}.category_id 必须是正整数")
+        if category_id < 1:
+            raise ConfigError(f"配置 {path}.category_id 必须是正整数")
+
+    probability = _blog_probability(raw.get("probability"), path)
+    if tier == TIER_MAYBE and probability is None:
+        raise ConfigError(f"配置 {path}.probability 在 {TIER_MAYBE} 任务上是必填的")
+    if tier == TIER_MUST and probability is not None:
+        # `must` 恒发起，写一个概率在这里只会让人以为它有用。
+        raise ConfigError(f"配置 {path}.probability 只能出现在 {TIER_MAYBE} 任务上")
+
+    raw_prompt = raw.get("prompt")
+    raw_drafts_dir = raw.get("drafts_dir")
+    if (raw_prompt is None) == (raw_drafts_dir is None):
+        raise ConfigError(f"配置 {path} 必须恰好给出 prompt 与 drafts_dir 中的一个")
+
+    prompt: str | None = None
+    drafts_dir: str | None = None
+    if raw_prompt is not None:
+        if not isinstance(raw_prompt, str) or not raw_prompt.strip():
+            raise ConfigError(f"配置 {path}.prompt 必须是非空字符串")
+        prompt = raw_prompt
+    else:
+        if not isinstance(raw_drafts_dir, str) or not raw_drafts_dir.strip():
+            raise ConfigError(f"配置 {path}.drafts_dir 必须是非空路径字符串")
+        drafts_dir = _blog_drafts_dir(raw_drafts_dir.strip(), config_dir)
+
+    return BlogTaskConfig(
+        name=name,
+        tier=tier,
+        schedule=schedule,
+        category_id=category_id,
+        probability=probability,
+        prompt=prompt,
+        drafts_dir=drafts_dir,
+    )
+
+
+def _blog_probability(value: Any, path: str) -> float | None:
+    """校验 maybe 任务的概率；未给出返回 None。"""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"配置 {path}.probability 必须是数字")
+    probability = float(value)
+    if not math.isfinite(probability):
+        # NaN 会让每一次比较都为假，也就是「永远不发起」——静默失效，必须挡住。
+        raise ConfigError(f"配置 {path}.probability 必须是有限数字")
+    if not 0 < probability <= 1:
+        raise ConfigError(f"配置 {path}.probability 必须大于 0 且不大于 1")
+    return probability
+
+
+def _blog_schedule(value: Any, path: str) -> tuple[str, ...]:
+    """校验调度点列表：非空、每项严格 HH:MM、同任务内不重复。"""
+    if not isinstance(value, list) or not value:
+        raise ConfigError(f"配置 {path}.schedule 必须是非空的 HH:MM 列表")
+    schedule: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not _SCHEDULE_RE.match(item.strip()):
+            raise ConfigError(
+                f"配置 {path}.schedule 的每一项必须是 00:00 到 23:59 之间的 HH:MM"
+            )
+        schedule.append(item.strip())
+    if len(set(schedule)) != len(schedule):
+        raise ConfigError(f"配置 {path}.schedule 不能出现重复的调度点")
+    return tuple(schedule)
+
+
+def _blog_drafts_dir(value: str, config_dir: str) -> str:
+    """把稿库路径解析成绝对路径；相对路径以配置文件所在目录为基准。"""
+    if os.path.isabs(value):
+        return os.path.normpath(value)
+    return os.path.normpath(os.path.join(config_dir, value))
+
+
 def _mcp_args(value: Any, server: str) -> tuple[str, ...]:
     """校验 stdio 命令参数。"""
     if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
@@ -1279,9 +1471,21 @@ def _mcp_feature(
             f"配置 mcp.features.{name} 的绑定数量不能超过 {spec.max_bindings}"
         )
 
-    result_count = _positive_int(container, "result_count", f"mcp.features.{name}", 5)
-    if result_count > 5:
-        raise ConfigError(f"配置 mcp.features.{name}.result_count 不能大于 5")
+    if spec.fixed_result_count is None:
+        result_count = _positive_int(container, "result_count", f"mcp.features.{name}", 5)
+        if result_count > 5:
+            raise ConfigError(f"配置 mcp.features.{name}.result_count 不能大于 5")
+    else:
+        # 能力表把整条路的预算钉死成一档时，默认值与唯一合法值都是它 ——
+        # 配成别的值不是「调参」，而是暗中把 result_count × result_item_token_limit
+        # 这一个整体预算放大若干倍。
+        result_count = _positive_int(
+            container, "result_count", f"mcp.features.{name}", spec.fixed_result_count
+        )
+        if result_count != spec.fixed_result_count:
+            raise ConfigError(
+                f"配置 mcp.features.{name}.result_count 必须为 {spec.fixed_result_count}"
+            )
     if spec.result_shape == SHAPE_SINGLE and result_count != 1:
         # `single` 的能力本轮只产出一条答案，`result_count` 参与的是
         # `result_count × result_item_token_limit` 这个整体上限，配成 5 就是 5 倍预算。

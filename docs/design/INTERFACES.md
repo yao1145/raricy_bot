@@ -143,7 +143,8 @@ class Secrets:
     llm_api_key: str
 
 # McpConfig、McpServerConfig、McpFeatureConfig 和 McpBindingConfig 的完整定义见 §21；
-# McpAccountPoolConfig 见 §22.1，KnowledgeBaseConfig 见 §23.1，MemoryConfig 见 §26.1。
+# McpAccountPoolConfig 见 §22.1，KnowledgeBaseConfig 见 §23.1，MemoryConfig 见 §26.1，
+# BlogConfig 与 BlogTaskConfig 见 §53.2。
 
 @dataclass(frozen=True)
 class Config:
@@ -160,6 +161,7 @@ class Config:
     mcp: McpConfig = field(default_factory=McpConfig)
     knowledge_base: KnowledgeBaseConfig = field(default_factory=KnowledgeBaseConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)   # 长期记忆 Beta，见 §26
+    blog: BlogConfig = field(default_factory=BlogConfig)         # 定时发文，见 §53.2
 
     @property
     def db_path(self) -> str           # 兼容别名，保留一个版本；新代码用 config.storage.db_path
@@ -187,7 +189,7 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
   Exa 的 `EXA_API_KEY` 通过 `mcp.servers.exa.env_from` 映射给 stdio 子进程；缺失时只停用 Exa，
   不阻止普通聊天、评论或健康检查。
 - YAML 顶层键：`site` / `model` / `behavior` / `ops` / `storage`（`db_path`）/ `logging`（`level`）/
-  `comments` / `mcp` / `system_prompt`。`comments.enabled` 默认 `false`；关闭时不创建评论队列、
+  `comments` / `mcp` / `blog` / `system_prompt`。`comments.enabled` 默认 `false`；关闭时不创建评论队列、
   poller 或 quota，但 SiteClient 仍接收 `comments.max_response_bytes` 与 `max_tree_nodes`
   默认上限（旧窄客户端替身可省略这两个关键字）。
   未知键**忽略**；缺失键用上表默认值（`site.base_url`、`model.base_url`、`model.model`、`system_prompt` 必填）。
@@ -223,7 +225,8 @@ def log_event(logger, level: int, event: str, **fields) -> None
 `LOG_FIELDS` 至少包含：`event`, `component`, `status`, `error`, `kind`, `reason`,
 `event_id`, `message_id`, `channel_id`, `channel_kind`, `count`, `attempt`, `delay`,
 `thread_root_id`, `size_bytes`, `limit_bytes`；Exa 池与知识库另加 §22 / §23 用到的
-`slot`（进程内槽位序号）、`snapshot_version`、`chunk_count`、`available_count`。
+`slot`（进程内槽位序号）、`snapshot_version`、`chunk_count`、`available_count`；
+定时发文另加 §53.13 的 `task_name`、`post_id`、`run_id`、`day`、`chars`。
 这些字段都只承载数字或配置来源的稳定短标识，绝不放 Key、环境变量名、查询、路径或正文。
 
 清理相关日志的级别：新建链/加入链用 DEBUG；周期清理摘要用 INFO；
@@ -1745,6 +1748,14 @@ MCP 是可选的运行时扩展。`Request.enabled_features: frozenset[str]` 是
 | `map` | `/map` | mcp | `maps_geo`、`maps_text_search`、`maps_weather` | 3 | list | 100 |
 | `wolfram` | `/wolfram` | mcp | `wolfram_query` | 1 | single | 300 |
 | `kb` | `/kb` | local | — | 0 | list | — |
+| `blog_write` | **无** | mcp | `web_search_exa`、`zhihu_search`、`maps_geo`、`maps_text_search`、`maps_weather`、`wolfram_query` | 6 | list | 500 |
+
+`command` 的类型是 **`str | None`**：`None` 表示这条能力没有用户命令（定时发文的
+`blog_write` 由子域自己发起，用户敲不出来）。`CAPABILITY_COMMANDS` 会过滤掉这类能力，
+因此路由器的命令表与 `/help` 文案不会多出一条谁也敲不出来的命令。无命令的能力必须
+不带给用户的文案（`usage_text == ""`、`unavailable_text is None`、`system_addendum is None`）。
+`Capability` 另有 `fixed_result_count: int | None`，非 None 时 `result_count` 的默认值与
+唯一合法值都是它（`blog_write` 是 1，见 §53.2）。
 
 `capabilities.IMPLEMENTED_FEATURES` 是「已经接了适配器的能力」的独立声明，必须与
 `mcp/adapters.py` 的工厂表逐项一致（由测试钉住）。**配置启用一个没有适配器的能力会在
@@ -1769,12 +1780,20 @@ def prepare_arguments(self, arguments, feature) -> dict[str, Any]   # 宿主裁�
 def adapt(self, raw: Any, call_id: str) -> ToolExecution            # 结果清洗
 ```
 
-`InMemoryToolRegistry` 按**模型侧工具名**查适配器，并且只把适配器对象交给
-`prepare_arguments(arguments, feature)`（**不传工具名**），所以「一个 binding 一个适配器
-对象」是必须的 —— `/map` 的三个工具参数白名单各不相同。反过来说 Registry 零改动。
+适配器的键是 **`(feature_name, model_tool_name)`** 这一对，不是单独的工具名：
+`mcp/adapters.py` 的工厂表、`InMemoryToolRegistry` 的查表、`tools_for` 给出的模型 schema、
+`execute` 的参数预处理、limiter 与结果清洗**全部**用这个双键。模型看到的工具名仍为
+`<server>__<tool>`，Provider 与 pool 不复制、不特化。
+
+双键是**必须**的：同一个上游工具可以同时被两个 feature 绑定（`search` 与 `blog_write`
+都用 `web_search_exa`），而两边的参数上限、结果数、schema 与限流策略各不相同。
+**不得保留跨 feature 的回退查询** —— 一旦回退，`blog_write` 的一轮会按 `search` 的策略
+去调用与清洗，配置里写的绑定次序就不再决定行为（D-110）。
 
 每个 feature 只造**一个** `CapabilityLimiter`（`mcp/adapter_kit.py`）注入它的全部绑定：
-限流是 feature 级全局串行，否则 `/map` 可以用三个工具绕过最小间隔（§22）。
+限流是 feature 级全局串行，否则 `/map` 可以用三个工具绕过最小间隔（§22），
+`blog_write` 的六个工具同理。**同一个上游工具被两个 feature 绑定时各用各自的 limiter**，
+共享的是 Provider 与连接池，不是策略。
 
 各适配器对模型的参数面，以及宿主强制/丢弃的部分：
 
@@ -4674,3 +4693,500 @@ public_entry_count | subject_count
 - `/memory off` 的成功回复必须说明已公开条目仍然公开（§50.1）；自动提取遇到 `public_conflict`
   静默跳过且不追加披露，显式 `/remember` 返回专用说明（§42.6）。
 - 记忆日志仍只用 §37 的事件名与 §51 的字段；命令参数、username 与正文不进日志（§37）。
+
+## 53. 定时发文（`blog/`）
+
+设计依据 [`BLOG_PUBLISH_DESIGN.md`](BLOG_PUBLISH_DESIGN.md)，分工与测试预算依据
+[`BLOG_PUBLISH_IMPLEMENTATION_PLAN.md`](BLOG_PUBLISH_IMPLEMENTATION_PLAN.md)。本节是该子域
+**实现前冻结的合同**：签名、字段名、默认值与判定谓词。改任何一条签名都要先查全部消费者。
+
+本子域的边界，写在最前面：
+
+- 它**不在**站方 `docs/materials/chat-bot.md` 的机器人契约里：发文走的是普通用户网页表单
+  同一个 `POST /api/blogs`。这是一处**显式记录的例外**，不是默默越界（D-106）。
+- 它是 core+ 功能，账号掉出核心用户即整体失效；站方改前端即可能失效。
+- **正文永不落盘**：SQLite、日志、临时文件、异常 repr 都不出现正文（§53.13、D-107）。
+  唯一允许落库的文本类字段是**脱敏后的待发布标题**。
+
+### 53.1 `blog/models.py`（基础类型与常量，无 I/O）
+
+```python
+HASH_VERSION: int = 1          # 内容指纹版本；唯一范围 (site_base_url, self_user_id, content_hash)
+MAX_POST_ATTEMPTS: int = 3     # 稿库同指纹累计 POST 上限（含首次）
+MAX_RECONCILE_ATTEMPTS: int = 12   # 单行只读查询次数上限，到达后停止自动查询但保持占额
+
+# 调度执行状态（blog_runs.status）与投递状态（blog_posts.status）：取值与 §53.4 的
+# CHECK 约束逐字一致，两处必须一起改。
+RUN_QUEUED / RUN_RUNNING / RUN_SKIPPED / RUN_FINISHED / RUN_FAILED / RUN_INTERRUPTED
+RUN_STATUSES / RUN_TERMINAL_STATUSES
+STATUS_INFLIGHT / STATUS_PUBLISHED / STATUS_UNCONFIRMED / STATUS_RETRY_WAIT
+STATUS_REJECTED / STATUS_ABANDONED
+POST_STATUSES / POST_HOLDING_STATUSES / POST_SETTLED_STATUSES   # 后两者见 §53.4
+
+SOURCE_FILE = "file" / SOURCE_GENERATED = "generated"           # source_kind
+
+# 稳定原因（全部是小写 ASCII token，不含任何正文或自由文本）
+REASON_PROBABILITY_MISS / REASON_BUDGET_EXHAUSTED / REASON_EMPTY_QUEUE / REASON_MISFIRE
+REASON_GENERATION_FAILED / REASON_INTERRUPTED
+REASON_MODEL_ERROR / REASON_TRUNCATED / REASON_INPUT_TOO_LARGE / REASON_TIMEOUT
+REASON_DRAFT_INVALID / REASON_DRAFT_EMPTY / REASON_FILE_INVALID
+REASON_RESERVED / REASON_ALREADY_PUBLISHED / REASON_AWAITING_CONFIRMATION / REASON_NOT_RETRYABLE
+REASON_PUBLISHED / REASON_REJECTED / REASON_RATE_LIMITED / REASON_UNCONFIRMED / REASON_ABANDONED
+REASON_RECONCILE_MATCH / REASON_RECONCILE_NO_MATCH / REASON_RECONCILE_INCOMPLETE
+REASON_RECONCILE_AMBIGUOUS / REASON_RECONCILE_EXHAUSTED
+```
+
+| DTO | 字段（frozen dataclass） |
+|---|---|
+| `BlogScope` | `site_base_url: str`、`self_user_id: str` |
+| `Draft` | `title: str`、`description: str`、`content: str`；后两者 `repr=False` |
+| `PreparedDraft` | `title/description/content: str`、`content_hash: str`、`hash_version: int = HASH_VERSION`；后两者 `repr=False` |
+| `RunCandidate` | `task_name: str`、`scheduled_at: float`、`task_order: int` |
+| `BlogRun` | id、site_base_url、self_user_id、task_name、scheduled_at、task_order、selected、status、post_id、created_at、updated_at、reason=None |
+| `BlogPost` | §53.4 的 blog_posts 列逐一对应，另加 `id: int` 在前 |
+| `BlogReservation` | `allowed: bool`、`post: BlogPost \| None`、`reason: str` |
+| `PublishOutcome` | `post_id: int \| None`、`status: str`、`reason: str` |
+| `BlogRecoverySummary` | `unconfirmed: int = 0`、`interrupted: int = 0` |
+
+规则：
+
+- `Draft` 与 `PreparedDraft` **必须是两个类型**：指纹算完之后再脱敏或再截断，落库的指纹
+  就不再对应真正发出去的字节，对账会认错文章。`PreparedDraft` 只在内存在流转。
+- `BlogReservation.allowed is False` 时 `post` 必须为 None：不持有额度就不能顺手带出一行快照。
+- `PublishOutcome` 只带元数据，**绝不回传正文**。
+- 本模块**不得** import config、Store、SiteClient、MCP 或 App；`blog/__init__.py` 保持为空，
+  `config.py` 才能安全地 import 它而不成环（同 §21.1 顶上那段理由）。
+- 模块之间的稳定原因常量只此一处。**只在单个模块内使用的原因**可以用该模块自己的字面量，
+  凡是跨模块传递的（`BlogRun.reason`、`BlogReservation.reason`、`PublishOutcome.reason`）
+  一律取这里的取值。
+
+### 53.2 `config.py`（`blog` 段）
+
+`BlogTaskConfig` 与 `BlogConfig` 定义在 **`config.py`**（不是 `blog/models.py`），与
+`CommentConfig`/`MemoryConfig` 同处：任务表是配置事实，解析与校验都归 §1 那一层。
+
+```python
+TIER_MUST: str = "must"; TIER_MAYBE: str = "maybe"     # 代码常量
+BLOG_MAX_POSTS_PER_DAY_MIN: int = 1
+BLOG_MAX_POSTS_PER_DAY_MAX: int = 5
+
+@dataclass(frozen=True)
+class BlogTaskConfig:
+    name: str                       # 非空、全局唯一；同时是持久任务标识与日志字段
+    tier: str                       # "must" | "maybe"
+    schedule: tuple[str, ...]       # 非空；每项严格 "HH:MM"，同任务内不重复
+    category_id: int | None = None  # 正整数；None = 未分类
+    probability: float | None = None
+    prompt: str | None = None       # 与 drafts_dir 恰好一个非 None
+    drafts_dir: str | None = None   # 已按配置文件所在目录解析成绝对路径
+
+@dataclass(frozen=True)
+class BlogConfig:
+    enabled: bool = False
+    max_posts_per_day: int = 2      # 1..5，非 bool 整数
+    tasks: tuple[BlogTaskConfig, ...] = ()
+
+# Config 新增字段，位置在所有既有字段之后
+blog: BlogConfig = field(default_factory=BlogConfig)
+```
+
+加载期校验（全部在 `config.py` 的 `_blog()` / `_blog_task()`，任一条不满足 → `ConfigError`）：
+设计 §4.2 的十条。与知识库/记忆不同，**这里没有「只在启用时才查」的交叉约束** ——
+任务表本身就是配置事实，`probability` 放在 `must` 上在关闭态下同样是错的。
+`drafts_dir` 不存在**不是**配置错误，运行期按「队列空」处理。
+
+`mcp.features.blog_write` 的 `result_count` **只能为 1**：能力表用
+`Capability.fixed_result_count = 1` 把这条路的整体预算
+（`result_count × result_item_token_limit`）钉死成一档，默认值与唯一合法值都是它。
+
+### 53.3 `capabilities.py`（无命令能力 `blog_write`）
+
+`Capability.command` 放宽为 **`str | None`**：`None` 表示这条能力没有用户命令。
+`CAPABILITY_COMMANDS` 过滤掉无命令的能力，因此路由器的命令表与 `/help` 文案都不会多出
+一条谁也敲不出来的命令。新增只读属性 `Capability.has_command`。
+
+新增 `Capability.fixed_result_count: int | None = None`（见 §53.2）。
+
+| feature | 命令 | source | allowed_tools | max_bindings | result_shape | max_query_chars | fixed_result_count |
+|---|---|---|---|---|---|---|---|
+| `blog_write` | — | mcp | `web_search_exa`、`zhihu_search`、`maps_geo`、`maps_text_search`、`maps_weather`、`wolfram_query` | 6 | list | 500 | 1 |
+
+无命令能力的**不变量**：`usage_text == ""`、`unavailable_text is None`、
+`system_addendum is None` —— 它没有任何用户可见路径，因此不许带用户文案。
+`IMPLEMENTED_FEATURES` 增加 `blog_write`。
+
+### 53.4 `store.py`（持久状态、原子占额与恢复）
+
+两张新表按设计 §11 的 schema 追加进 `_SCHEMA`（`_connect()` 保持幂等，旧表与旧数据不动）。
+时间戳沿用 Store 的 REAL epoch 秒；`*_day` 字段是 UTC+8 的 `YYYY-MM-DD`。
+`site_base_url` 用 Config 已规范化的站点地址，与稳定用户 id 一起隔离账号。
+
+以下几类状态关系是**语义**而不是实现细节：
+
+| 分组 | 取值 | 含义 |
+|---|---|---|
+| `POST_HOLDING_STATUSES` | inflight、published、unconfirmed | 仍占着当天额度 |
+| `POST_SETTLED_STATUSES` | published、rejected、abandoned | 同指纹不再自动重投 |
+
+当天占用（`blog_budget_used`）= **当天计费区间覆盖的 published 行数 + 全部
+inflight/unconfirmed 行数**，一行只计一次。不确定行跨日持续占 1，**不能零点释放**。
+`budget_from_day` 取 POST 前预留的 UTC+8 日期，`charged_through_day` 取本地确认日
+（时钟回退时至少为起始日），该投递在两者**闭区间**内每天各计 1（D-108）。
+
+全部为 async 方法，`now` 一律显式传入（SQL 内不读真实时钟）；多步骤写操作显式事务，
+遵守既有 `_execute()` / `_run_locked()` 线程锁方式（D-90）。
+
+```python
+async def get_blog_run(scope, task_name, scheduled_at) -> BlogRun | None
+async def claim_blog_run(scope, candidate, selected, now) -> BlogRun | None
+async def take_blog_run(scope, now) -> BlogRun | None
+async def finish_blog_run(scope, run_id, status, reason, now) -> None
+async def find_blog_post(scope, content_hash) -> BlogPost | None
+async def blog_budget_used(scope, day) -> int
+async def reserve_blog_post(scope, run_id, title, content_hash, hash_version,
+                            source_kind, category_id, max_posts_per_day, now) -> BlogReservation
+async def finalize_blog_post(scope, post_id, status, site_blog_id, reason, now) -> BlogPost
+async def recover_blog_state(scope, now) -> BlogRecoverySummary
+async def blog_posts_to_reconcile(scope, now, limit=10) -> tuple[BlogPost, ...]
+async def note_blog_reconcile(scope, post_id, reason, now) -> BlogPost
+```
+
+必须保证：
+
+- `claim_blog_run` 靠唯一键 `(site_base_url, self_user_id, task_name, scheduled_at)` **原子插入**，
+  冲突返回 None 且**不覆盖**已有随机决策 —— 重复扫描、时钟回拨都靠它防重。
+- `take_blog_run` 按 `scheduled_at, task_order` 取最早的一条 `queued`；超过 5 分钟尚未开始的
+  行在同一事务里转 `skipped`/`misfire` 并继续取下一行；合法行原子转 `running`。
+- `finish_blog_run` 只接受 §53.1 的终态，**不得**改投递状态或额度。
+  行不存在、跨账号、或已经是终态时**抛 `KeyError`**，不做静默兜底：重复终结一次执行是
+  状态机错误，应当炸出来而不是被吞掉（每一次执行只能有一个终态）。
+- `reserve_blog_post` 在**一个事务内**复查：run 仍是自己的、指纹行的状态（§7.4 六种）、
+  429 的次数/日期/原任务/栏目、当天预算；然后创建或复用行、`attempts += 1`、
+  关联 `blog_runs.post_id`。**只能给 `status == "running"` 的 run 预留** ——
+  一次执行必须先被 `take_blog_run` 领取，才允许产生投递副作用；允许 `queued` 就等于
+  绕开了「一次只有一篇在跑」的那道闸。
+  成功时 `reason = REASON_RESERVED`，任何一支都不留空串；拒绝时 `reason` 至少区分
+  `budget_exhausted`、`already_published`、`awaiting_confirmation`、`not_retryable`。
+  **写库失败抛异常让服务停发，不伪装成额度用尽。**
+- `finalize_blog_post` 只接受 §7.2 的迁移。`retry_after_day` 与计费日期由 **Store 自己推导**，
+  不接受调用方填值。`published` 重复确认必须幂等，**不能再次计费**；
+  `unconfirmed` 不能自动迁移到 `rejected`/`retry_wait`/`abandoned`。
+- `recover_blog_state`：`inflight` → `unconfirmed`，`queued`/`running` → `interrupted`；
+  **保留额度**，不调用模型或站点。它不处理运行记录与投递行的关联，两者各自恢复。
+- `blog_posts_to_reconcile` 排除已查满 12 次的行，按 `last_reconciled_at`（NULL 优先）与 id
+  轮转，不饿死后面的记录。
+- `note_blog_reconcile` 在**查询失败或无匹配时也**增加次数并更新查询时间；不改额度。
+
+### 53.5 `site/blog_models.py` 与 `site/client.py`（发布与有界搜索）
+
+`site/blog_models.py` 只含站点 DTO 与常量：
+
+```python
+OUTCOME_PUBLISHED = "published"; OUTCOME_REJECTED = "rejected"
+OUTCOME_RATE_LIMITED = "rate_limited"; OUTCOME_UNCONFIRMED = "unconfirmed"
+
+@dataclass(frozen=True)
+class BlogPublishResult:
+    outcome: str                 # 上面四个之一
+    reason: str                  # 稳定原因；**不带响应正文**
+    blog_id: str | None = None   # 仅 published 时给出，且必须是合法 UUID
+    code: int | None = None      # 业务信封的 code，仅用于日志与分类
+
+@dataclass(frozen=True)
+class BlogSearchItem:  blog_id: str; title: str; author_id: str
+@dataclass(frozen=True)
+class BlogSearchPage:  items: tuple[BlogSearchItem, ...]; has_next: bool
+```
+
+```python
+async def publish_blog(self, *, title, description, content, category_id) -> BlogPublishResult
+async def search_blog_titles(self, title, *, page=1, per_page=50) -> BlogSearchPage
+async def fetch_blog_context(self, blog_id) -> BlogContext     # 既有方法，不改签名与消费者
+```
+
+判定边界（**这是本子域最容易写错的一处**）：
+
+- 只有**解析成功的业务信封**才能给出 `rejected` / `rate_limited`：信封里 `code` 是整数、
+  `message` 是预期形状时才算识别。`_decode()` 会把非法信封变成带 HTTP 状态的 `SiteError`，
+  因此**不能**把所有 `SiteError(400/403)` 都当成确定拒绝。
+- 传输错误、无效响应、成功信封里缺合法 `blog_id`、超时、5xx、客户端已取消 → `unconfirmed`。
+- `publish_blog` **不做传输层自动重试**，也**不模仿**聊天/评论 POST 的 401 自动重登重投：
+  真正发布只发一次（§7.1）。
+- `CancelledError` 继续传播，绝不吞成普通错误。
+- 请求一律走 `_request_comment_envelope` 那一档**有界**读取；`_request_envelope` 本身不保证
+  响应字节有界，不能为了「复用」丢掉这个机制。搜索的 `title` 用 `params=` 编码，不手拼 URL。
+- `search_blog_titles` 的坏结构或无法完整解析必须**失败**，不能过滤后伪装成空结果 ——
+  空结果在 §7.3 里是「没有正向凭证」，不是「未发布」。
+
+### 53.6 `blog/codec.py`（解析与预校验，无 I/O）
+
+```python
+class DraftError(Exception):
+    """草稿不可用；`reason` 是 §53.1 的稳定原因，异常文本与 repr 都不含原文。"""
+    reason: str
+
+def parse_draft(text: str) -> Draft                       # 可能抛 DraftError
+def prepare_draft(draft: Draft, *, redactor: Redactor) -> PreparedDraft   # 可能抛 DraftError
+```
+
+- 稿库文件与模型输出是**同一种格式**：YAML front matter + Markdown 正文。解析器只有这一份。
+- `parse_draft` 用 `yaml.safe_load`，front matter 必须是映射，`title`/`description` 都必须是
+  **字符串**；禁止把数字、列表或对象隐式转成标题。正文保留原始 Markdown，不做空白归一化。
+- `prepare_draft` 的顺序固定为：类型校验 → 共享 `Redactor` 脱敏 → 规范化（标题与描述去首尾
+  空白）→ UTF-16 长度校验 → 计算指纹。**最终发送、落库标题、搜索标题与指纹必须用同一份
+  结果**，计算指纹之后不得再变换正文。
+- 长度按 JavaScript 的 UTF-16 code unit 计算，与上游 `.length` 一致，**不能直接用
+  Python `len()`**。标题 ≤ 30、描述 ≤ 100，超长**截断**且不得切开代理对、不得留下孤立代理；
+  正文上限 250000，超长**视为失败**（截断会毁文）。
+- 空值或纯空白一律失败。脱敏后的扩张也计入长度。
+- 指纹：`SHA256(UTF8(JSON([title, content], ensure_ascii=False, separators=(",", ":"))))`，
+  带版本号。**不能直接拼接两串**，否则字段边界会碰撞。描述与栏目不属于内容身份。
+
+### 53.7 `blog/drafts.py`（稿库选稿）
+
+```python
+async def next_file_draft(task, *, scope, store, redactor, day) -> PreparedDraft | None
+```
+
+- 只读取 `task.drafts_dir` 里的**普通 Markdown 文件**（后缀 `.md` / `.markdown`，大小写
+  不敏感），**按文件名升序**；不复制、不重命名、不写回输入。目录不存在（或还没建）等同队列空，
+  不是错误。单个文件的读取上限是代码常量 `MAX_DRAFT_FILE_BYTES = 1 MiB`：
+  正文上限 250000 个 UTF-16 code unit 最坏约 750 KiB，再大的一定不是正文，而是放错了文件。
+- 遍历顺序即选稿顺序：读不出、不是 UTF-8 的文件记 `REASON_FILE_INVALID`；
+  能读但解析或预校验失败的记**更具体的那一个**稳定原因（`REASON_DRAFT_INVALID` /
+  `REASON_DRAFT_EMPTY`）——两者都**继续下一个**，不让队首坏稿堵住整个队列。
+  日志只出任务名与原因，**文件路径不进日志**。
+- 候选按设计 §7.4 的六种投递状态决定可选性（全部通过 `store.find_blog_post(scope, hash)`）：
+  无记录可选；`published`/`inflight`/`unconfirmed` 跳过；`rejected`/`abandoned` 跳过；
+  `retry_wait` 仅在**同原任务、栏目未变、到达 `retry_after_day`、attempts < 3** 时可选。
+- 「到达 `retry_after_day`」用传入的 `day` 比较，不在本模块读时钟。
+- 文件 I/O 不长期阻塞事件循环（放进 `asyncio.to_thread`）。
+- 返回的是**已准备**的 `PreparedDraft`，Publisher 不重做文本变换。
+
+### 53.8 `blog/planner.py`（纯调度决策，无 I/O）
+
+```python
+UTC8: timezone                                       # 固定 +08:00，不跟系统时区
+
+def utc8_day(now: float) -> str                      # "YYYY-MM-DD"
+def utc8_next_day(day: str) -> str
+def due_runs(tasks, *, scan_start: float, now: float, startup: bool) -> tuple[RunCandidate, ...]
+def select_run(task, *, random_value: float) -> bool
+```
+
+- 调度点按固定 UTC+8 解释，`scheduled_at` 是 epoch 秒。枚举下界为
+  `max(scan_start, now - 300)`：进程启动只处理**当前分钟**的点，不追补停机期间更早的点；
+  遗漏不逐个插入历史行，只在**确实跳过了窗口内的点**时记一条聚合 `misfire` 日志。
+  判据（`BlogService._missed_a_schedule_point`）：运行期是 `now - scan_start > 300`；
+  启动期是把窗口 `(当前分钟开头 - 300, 当前分钟开头 - 1]` 交给 `due_runs(startup=False)` 问一句
+  —— 上界必须是 `当前分钟开头 - 1`，因为「正好排在当前分钟开头」的那个点会被**这次**启动扫描
+  领取，算进遗漏就会每次「开机即到点」都误报一条（那条日志正是本项要消除的假信号）。
+  **已知的窄**：停机后晚于 5 分钟才启动时，被跳过的点落在窗口之外，**不会**记这条日志 ——
+  区分「被跳过」与「上一轮已发过」需要持久化的扫描时刻，首版没有。
+  排查请以 `blog_runs` 的行为准，不要以这条日志为准。
+- 输出按 `(scheduled_at, task_order)` 排列，`task_order` 是任务在配置里的声明顺序 ——
+  同一分钟的任务按声明顺序领取和消费。
+- `select_run` 是**纯函数**：`must` 恒真，`maybe` 比较 `random_value < probability`。
+  掷骰由 Service 在**确认执行键不存在之后**用一个注入的随机源取一次，不由 DTO 构造触发。
+- 上界闭区间 `(scan_start, now]`，永不产生无界补发队列。
+- `utc8_day`/`utc8_next_day` 是本子域**唯一**的 UTC+8 日历实现：
+  `store.py` 推导 `retry_after_day`/计费日期时 import 它，不另写一份。
+
+### 53.9 `blog/writer.py`（生成）
+
+```python
+class BlogWriter:
+    def __init__(
+        self,
+        *,
+        model: Any,
+        registry: Any | None = None,
+        feature: Any | None = None,          # config.mcp.features["blog_write"]
+        mcp_enabled: bool = False,
+        max_input_tokens: int | None = None, # 传 behavior.context_input_tokens
+        model_gate: Any | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        timeout_seconds: float = WRITE_TIMEOUT_SECONDS,   # 180.0
+    ) -> None
+    async def write(self, task) -> Draft        # 可能抛 DraftError / ModelError / ValueError
+```
+
+**这里没有 `clock`**：整次 `write()` 的唯一计时需求就是那条 180 秒上限，
+它由 `sleep`（注入的计时器）加 `timeout_seconds`（可直接注入的数值）表达，
+再挂一个时钟参数只会是一个没有使用点的死参数（YAGNI）。
+`task` 没有 `prompt`（把稿库任务误交给 writer）是**调用合同被破坏**，抛 `ValueError` ——
+配置层已保证现写任务必有 `prompt`，所以这是一个 bug 而不是运行期故障。
+
+- 复用 `OpenAIModelClient.complete_with_tools()` 的**两轮协议**：首轮允许模型请求工具，
+  宿主至多执行一次合法调用，第二轮 `tool_choice="none"` 输出 front matter + 正文。
+  首轮直接返回文章也合法。**不实现多步研究循环**。
+- 工具预算**不新增配置项**：直接用 `mcp.features.blog_write.max_tool_calls_per_turn`
+  （能力层已经是工具白名单与预算的唯一真值源；再开一个旋钮就有两个真相）。
+- 消息分工固定：静态写作规则（`texts.BLOG_WRITE_SYSTEM_PROMPT`）放 system；
+  任务提示词放 user；工具结果放 tool，并以 `texts.BLOG_WRITE_TOOL_UNTRUSTED_PREFIX` 标明
+  不可信。**不得**把任务提示词或工具正文拼进 system。
+- 只在每次模型 HTTP 请求期间持有 App 共享的 `_model_gate`；MCP 等待不占 gate。
+- 整次 `write()`（含等待 gate、工具与模型）上限 **180 秒**。
+- 模型侧新增两个**可选**参数，默认值保持旧行为，发文显式传入：
+  - `require_complete=False` → 发文传 True：只有正常 `stop` 的最终文章可接受；
+    `length`（截断）、拒答、未知完成原因都产生稳定失败；首轮合法的 `tool_calls` 可继续协议。
+  - `max_input_tokens=None` → 发文传 `behavior.context_input_tokens`：在每次请求**序列化完成、
+    网络调用之前**检查，覆盖 system/user、工具定义、assistant 工具调用参数与 tool 消息；
+    第二轮不能绕过检查。检查同时作用于最终 `messages` 与 `tools`。
+- 降级：调用前已知 MCP 未启用、未配置 `blog_write`、工具不可用，或客户端已缓存不支持 tools
+  → 直接以**无工具**方式生成一次；首次调用才发现模型不支持 tools → 结束本次生成，
+  后续调度点再走无工具路径。工具执行中失败则把稳定错误回传供第二轮写作，
+  **不追加**一次独立生成。
+- 每调度点最多一次 `write()` 调用；`writer` 不在模型客户端的既有有界重试之外增加重试
+  （SDK `max_retries=0` 不变）。
+- `write()` 只返回 `Draft`：不截断、不落稿、不选栏目、不调用 Publisher。脱敏与预校验由
+  Service 在拿到 `Draft` 之后调一次 `prepare_draft`。
+
+**失败到稳定原因的映射是 Service 的责任**，取值来自 `core/worker.py` 的 `ModelError.kind`
+与 `blog/models.py` 的原因常量（模型层只给中立的 `kind`，不 import 发文子域）：
+
+| `ModelError.kind` | `blog_runs.reason` |
+|---|---|
+| `truncated`（`finish_reason="length"`） | `REASON_TRUNCATED` |
+| `input_too_large` | `REASON_INPUT_TOO_LARGE` |
+| `timeout` | `REASON_TIMEOUT` |
+| `invalid_completion` / `strict_unsupported` / 其余 | `REASON_MODEL_ERROR` |
+| `DraftError`（`.reason` 已有具体取值） | 原样用它 |
+| 其它任何异常 | `REASON_GENERATION_FAILED` |
+
+**截断必须是单独一档**：它并进 `invalid_completion` 的话，`REASON_TRUNCATED` 在 Service 侧
+就成了一个不可达的常量，而「这次是被 token 上限截断的」恰恰是运维最需要一眼看出来的信息。
+
+Service 对 `write()` 抛出的**任何**异常都按「本次生成失败」处理（记 `failed` + 上表原因），
+**不得**因此停止整个发文子域 —— 一次生成失败是运行期常态，只有账号变更（§53.10）才是停发条件。
+
+### 53.10 `blog/publisher.py`（投递与只读对账）
+
+```python
+class BlogPublisher:
+    def __init__(self, *, config, scope, store, client, clock) -> None
+    async def publish(self, run, task, prepared) -> PublishOutcome
+    async def reconcile_once(self) -> None          # 只读，永不 POST
+```
+
+`publish` 的顺序是**固定**的（§7.1）：`ensure_session()` → 确认仍是领取时账号 →
+一个事务里提交 `inflight` + `attempts += 1` + 额度预留 + 关联 `run.post_id` → 调用**一次**
+`publish_blog` → 按 outcome 调 `finalize_blog_post`。
+
+- 构造参数 `config` 收**整个 `Config`**（读 `config.blog.max_posts_per_day`），与 §53.11 的
+  Service 同口径，不要中途改成只传 `BlogConfig`。
+- 模型请求、SQLite 提交失败都**不能**触发 POST。取消（`CancelledError`）时预留行保持 `inflight`，
+  由下次启动的 `recover_blog_state` 降为 `unconfirmed`。
+- 收到成功后写 SQLite 失败：**不在内存中当作未发送**，停发并告警，保留持久 `inflight`。
+- 账号变更（`self_user_id` 与领取时不一致）→ 抛 `blog.publisher.AccountChangedError`；
+  旧记录只能用原账号恢复。
+- 429 的处置分流：稿库来源且未达尝试上限 → `retry_wait`，旧执行结束为 `finished`，
+  以后由**新调度点**关联原投递行；现写来源或已达上限 → `abandoned`。
+  现写稿不缓存到次日。
+
+**`PublishOutcome` 的两套取值域，`post_id` 是唯一判据**（消费方必须照此分支，不要靠猜）：
+
+| 情形 | `post_id` | `status` 取自 | 调用方（Service）应落的运行终态 |
+|---|---|---|---|
+| 预留被拒（额度/已发布/待确认/不可重试） | `None` | **运行状态**（`skipped`） | `outcome.status` 原样，`reason=outcome.reason` |
+| 会话或账号检查失败，未产生投递行 | `None` | **运行状态**（`failed`） | `outcome.status` 原样 |
+| 已预留并发出过一次 POST | 非 `None` | **投递状态**（§53.1 的 `STATUS_*`） | `finished` |
+
+也就是说：`post_id is None` ⟺ `status` 是运行状态且**没有**碰过投递表；
+`post_id is not None` ⟺ `status` 是投递状态，且这次执行的终态固定是 `finished`。
+两套取值域**不混用**，`post_id` 之外的字段（如 `reason`）在两种情形下都是稳定原因常量。
+
+`reconcile_once`（§7.3）：
+
+- 只取当前账号的 `unconfirmed`，每轮最多 10 条（`blog_posts_to_reconcile`），
+  按 `last_reconciled_at` NULL 优先与 id 轮转；单条最多 5 页、每页 50 条、最多读取 10 篇候选正文。
+- 搜索标题用 `prepared` 阶段落库的**脱敏标题**，逐页筛 `author_id` 与领取账号完全一致、
+  标题完全一致、id 合法的候选，再临时取回正文按同一 JSON 算法算指纹。
+- 对账的正文指纹使用**原始远端标题和正文**，**不再经过会变化的 Redactor**；
+  远端返回不是待发布草稿，不需要再次截断。重新读取详情后也核对标题，防止两次 GET 之间被编辑。
+- 候选按**去重后的 blog id** 计数，分页重复项不能假造多个匹配。
+- **只有完整走完本轮搜索且恰有一个精确匹配**才补记 `published`；同标题不同正文、他人文章、
+  多个精确匹配、查询不完整、详情读取失败、空结果 —— 一律保持 `unconfirmed` 与占额。
+- 空结果**不构成未发布证明**（搜索受栏目过滤、分页随并发移动），因此本路径永远不能授权
+  再次 POST。
+- 一次 `reconcile_once` 对每条记录只记**一次**查询尝试（`note_blog_reconcile`），
+  不能每页算一次，也不能靠重启重置 12 次上限。
+- 预算耗尽只阻止生成与 POST，**不阻止只读对账**。
+- 「只读」的精确边界是：**永不发出文章发布请求**（`POST /api/blogs`）。
+  会话探活（`ensure_session()`，必要时会重新登录）是会话维护，不属于禁止之列；
+  它是本轮开始前的一次前置动作，失败就整轮不做且**不记查询尝试** ——
+  一次登录或网络故障不该消耗 12 次查询预算，那等于凭外部故障把行推向永久待确认。
+- **探活之后必须比对账号**：`ensure_session()` 返回的用户 id 与 `scope.self_user_id`
+  不一致时同样抛 `AccountChangedError`，与 `publish` 一致。对账本身是只读的、也不会误确认
+  （候选仍按 `author_id == scope.self_user_id` 过滤），但**账号一旦换人，整个子域就该停** ——
+  继续用另一个账号跑只读查询，等于让一个已经不该运行的功能继续对外发声。
+- `author_id` 是**上游未在仓库内取样验证过**的字段名（设计 §2.3 记的是对固定提交源码的读法）。
+  解析必须**严格**：缺字段或类型不对即整页失败，**不得**退回用 `author` 用户名做匹配 ——
+  用户名可变，用它匹配可能把别人的文章认成自己发的。字段名真的变了的话，
+  表现是每一轮都记一次 `reconcile_incomplete`，累计 12 次后按 `reconcile_exhausted` 告警，
+  也就是**故障可见**但不会误确认、不会重投。
+
+### 53.11 `blog/service.py`（调度领取、串行消费与生命周期）
+
+```python
+class BlogService:
+    def __init__(self, *, config, scope, store, writer, publisher, redactor, clock, sleep, random) -> None
+    async def start(self) -> None     # 幂等
+    async def stop(self) -> None      # 幂等
+```
+
+- Service **不创建** SiteClient、模型或 Registry，也**不持有**它们的关闭权限。
+- `start` 先 `recover_blog_state`，再创建扫描 / 串行消费 / 只读对账三个后台任务。
+  独立扫描任务每秒检查一次，**不等待**文章生成。
+- 单进程只有一个发布消费者：扫描与消费可并行，但两篇文章的生成/投递不并行。
+- 一次执行的顺序（§6.2）：概率 → 预算预检 → 取稿/生成 → `prepare_draft` → Publisher。
+  每个 run 无论跳过、失败还是结束都写一个终态元数据；**POST 后运行记录终态不能替代投递状态**。
+  这句话的**边界**是：它约束的是正常执行流（跳过的、失败的、走完的都要落地）。
+  `stop()` 取消、或账号变更导致停机时，**故意不写终态** —— 取消可能正发生在 POST 中间，
+  此时代码并不知道结果，硬写一个终态就是把「不确定」伪装成「已结束」。
+  这些行留给下次启动的 `recover_blog_state` 统一转 `interrupted`（`inflight` 降 `unconfirmed`），
+  这正是 §7.4 那条恢复路径存在的理由。
+- `must` 遇到空稿库记 WARNING 后 `skipped`；现写生成失败立即告警并结束本次执行，
+  没有同点重试旋钮。
+- 任务失败后后台异常记录稳定原因并停止本子域，**不结束**聊天/评论服务，也不改变既有健康判定。
+  具体地：`publish` / `reconcile_once` 抛出的 `blog.publisher.AccountChangedError`（账号与领取时
+  不一致）必须让整个发文子域停下 —— 此时继续投递会把文章发到另一个账号名下。捕获后记稳定原因、
+  停止扫描与消费、保留全部持久记录（含 `inflight`，由下次启动的恢复流程降级），
+  但**不**影响聊天/评论与既有健康判定。
+- `stop` 先停止领取，再取消并等待后台任务；取消不吞成普通错误，也不清空 `inflight`。
+  **App 总关闭预算现为 10 秒**，不能在 `stop` 里等一个 180 秒的 writer 自然结束。
+
+### 53.12 `app.py` 装配与关闭顺序
+
+- `blog.enabled=false` 时**不构造、不启动** BlogService：不创建后台任务、不调用模型、
+  不访问博客发布接口。既有 Store 初始化新增空表可以接受。
+- enabled 时在账号、Store、模型、MCP 启动完成后装配，共享 `_model_gate` 与 Registry。
+- 博客子域异常不影响聊天/评论与既有健康判定；失败信息保留稳定原因供运维处理。
+- shutdown 顺序：**先停 BlogService**，再关 MCP / 模型 / SiteClient / Store；启动中失败也能清理。
+
+### 53.13 日志与隐私
+
+`logging_setup.LOG_FIELDS` 新增且只新增五个字段：
+
+```text
+task_name | post_id | run_id | day | chars
+```
+
+- `task_name` 来自 YAML；`post_id`/`run_id` 是本地自增主键；`day` 是 UTC+8 的 `YYYY-MM-DD`。
+- `chars` **只表示出站标题的 UTF-16 长度**。文章正文的长度与片段一律不进日志。
+- 继续允许既有的 `status`、`reason`、`attempt`、`count`、`blog_id`（站方文章 UUID）。
+- **禁止**（任何级别、任何路径）：正文、描述、任务提示词的正文、模型请求体与响应体、
+  指纹、稿库文件路径、搜索结果标题、对账查询串。`error=` 一类自由取值字段靠**取值自律**。
+- 落库：脱敏后的待发布标题、指纹、调度/账号/栏目元数据、状态、计费区间、站方 id。
+  **不落**：正文本身、描述、模型请求体、模型响应体（D-107）。标题是在 POST 前保存，
+  不能以「已经公开」为理由。
+- 人维护的稿库文件是输入来源，机器人**不复制**为持久生成缓存；不保存现写稿正文，
+  也**不承诺**进程崩溃后恢复原稿。
+
+### 53.14 测试约定与文件所有权
+
+- 测试**不得**开真连接；时钟、`sleep`、随机全部注入；站点层用 `httpx.MockTransport` 注入
+  `transport=`。真实发布只在部署者明确启用后执行，不是测试套件的一部分。
+- 每个文件在任一时刻只有一个写入者（见实施计划 §2）。新测试按 K1..K10 的预算分配，
+  不搭通用测试框架，不写全组合矩阵、快照文案测试或性能基准。
+- `blog/` 的新模块只按本节签名调用彼此；接口不够用时**先改本节**，再改实现。

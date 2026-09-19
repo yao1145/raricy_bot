@@ -1,4 +1,10 @@
-"""MCP 工具发现、命名空间和 feature 白名单。"""
+"""MCP 工具发现、命名空间和 feature 白名单。
+
+适配器的键是 **(feature 名, 模型侧工具名)** 这一对（INTERFACES §21.2）：同一个上游工具
+可以被两个 feature 绑定（`search` 与 `blog_write` 都用 `web_search_exa`），而两边的参数
+上限、结果数、schema 与限流策略各不相同。按单独的模型侧工具名查表时，后装配的适配器会
+覆盖前一个 —— 配置里写在哪一边就不再决定行为（D-110）。**不保留跨 feature 的回退查询。**
+"""
 
 from __future__ import annotations
 
@@ -28,6 +34,10 @@ from .contracts import McpNoResultsError
 
 _MODEL_NAME_RE = re.compile(r"[^A-Za-z0-9_-]")
 
+# 适配器表的键：feature 名 + 模型侧工具名。写在类型别名里，让注入点与查表点
+# 不可能各自漂移成一个字符串键。
+AdapterKey = tuple[str, str]
+
 _logger = get_logger("mcp.registry")
 
 
@@ -43,7 +53,7 @@ class InMemoryToolRegistry:
         self,
         providers: Mapping[str, McpProvider],
         features: Mapping[str, McpFeatureConfig],
-        adapters: Mapping[str, Callable[[Any, str], ToolExecution]] | None = None,
+        adapters: Mapping[AdapterKey, Callable[[Any, str], ToolExecution]] | None = None,
         on_provider_failure: Callable[[str], None] | None = None,
     ) -> None:
         self._providers = dict(providers)
@@ -140,7 +150,8 @@ class InMemoryToolRegistry:
             if definition is None or name in self._conflicts:
                 continue
             if definition.server_name == binding.server and definition.tool_name == binding.tool:
-                adapter = self._adapters.get(name)
+                # 双键查表：同一模型侧工具名在不同 feature 下是两份策略，绝不互相回退。
+                adapter = self._adapters.get((feature_name, name))
                 schema_provider = getattr(_adapter_target(adapter), "model_input_schema", None)
                 if callable(schema_provider):
                     try:
@@ -193,7 +204,7 @@ class InMemoryToolRegistry:
                 call, "invalid_arguments", "invalid_arguments", definition=definition,
                 feature=feature_name, level=logging.INFO,
             )
-        adapter = self._adapters.get(definition.model_name)
+        adapter = self._adapters.get((feature_name, definition.model_name))
         # 适配器可以在 Provider 边界实现产品级参数策略。绑定 Exa 时，
         # 这里只接受 query，并由适配器强制写入配置中的 numResults；未来工具
         # 没有该钩子时仍保持通用 MCP 参数透传。
