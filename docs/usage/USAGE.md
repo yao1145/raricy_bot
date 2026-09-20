@@ -243,16 +243,16 @@
 | 长期记忆默认没有、按名单开通、命令只在私聊 | `memory.enabled`（默认 `false`）、`memory.access_mode`（默认 `allowlist`）与 `memory.allow_user_list`；`memory/access.py` 的 `MemoryAccessPolicy`；`core/router.py` 的记忆命令分支（未通过门禁回 `MEMORY_BETA_DENIED_TEXT`，大区里回 `MEMORY_DM_ONLY_TEXT`） |
 | 私有记忆只在本人的私聊里被参考 | `MemoryService.context_for` 的作用域表（D-56）：`lobby` 与 `comment` 两种频道**连私有文件都不打开**；`permits_private` 两种接入模式下都要求频道是 `dm` |
 | 共同记忆要管理员审核后才对所有人生效 | 两阶段写入（D-58）：`/memory suggest <scope> <内容>` 只生成候选，`/memory approve <MC-ID>` 才移入生效区；候选不出现在任何普通模型请求里 |
-| 博客评论区只用 `all_user` 共同记忆与参与者公开的条目 | `comments/service.py` 只在 `memory_allowed` 时取 `all_user`；`app.py` 的评论 provider 把频道钉死为 `comment`（§35、D-76），公开条目另经 `public_context_for(channel_kind="comment")` 取回（§48.2） |
-| 公开命令只在私聊、ID 必须带 `UM-` 前缀 | `memory/commands.py` 的 `/memory public`、`/memory unpublic` 解析（§52.1）；私聊门禁与「大区里回 `MEMORY_DM_ONLY_TEXT`」沿用既有 `core/router.py` 分支 |
+| 博客评论区只用 `all_user` 共同记忆与参与者公开的条目 | `comments/service.py` 只在 `memory_allowed` 时取 `all_user`；`app.py` 的评论 provider 把频道钉死为 `comment`（§35、D-76），公开条目另经 `public_context_for(channel_kind="comment")` 取回（§48） |
+| 公开命令只在私聊、ID 必须带 `UM-` 前缀 | `memory/commands.py` 的 `/memory public`、`/memory unpublic` 解析（§52）；私聊门禁与「大区里回 `MEMORY_DM_ONLY_TEXT`」沿用既有 `core/router.py` 分支 |
 | 公开条目的使用范围是「大区与评论、出现或精确提到该用户」 | `memory/subjects.py` 的 `PublicMemorySubjectResolver`（R5 优先级表）与 `MemoryService.public_context_for`：只接受 `lobby` / `comment` 两种频道（R4），DM 永远取不到公开条目 |
 | 触发来源：普通用户名、博客与文章正文、已展开的公开剪贴板 | 优先级 2 / 5 / 6；文本命中还要过一次站点精确校验 `GET /api/chat/users`（R6、R22），缓存 600 秒 / 负缓存 60 秒、查询节流 15 次/分钟（`memory/subjects.py` 的代码常量） |
 | 不做模糊匹配 | 同上：只按完整合法用户名 token 精确比对，`alice` 不会命中 `alice2` |
 | 未公开的私有条目绝不进入公开请求 | 公开路径只读 `root_dir/public/`，不是「读了私人文件再过滤」（D-96、Global Constraints 第 7 条）；`users/<存储键>.md` 在 `lobby` / `comment` 两种频道下一次都不打开 |
 | `/memory off` 不撤回公开条目 | D-102：`off` 只改私聊里的读取与自动提取开关；回复里逐字说明「你此前公开过的条目仍然公开」（`MEMORY_OFF_DONE_TEXT`） |
-| 撤回入口是 `/memory unpublic <UM-ID>` | 公开与撤回走 `MemoryService.publish_private` / `unpublish_private`，成功文案由 `texts.memory_published_text` / `memory_unpublished_text` 给出（§50.1） |
+| 撤回入口是 `/memory unpublic <UM-ID>` | 公开与撤回走 `MemoryService.publish_private` / `unpublish_private`，成功文案由 `texts.memory_published_text` / `memory_unpublished_text` 给出（§50） |
 | `/memory clear` 先撤回公开副本、再删除私人条目 | D-100 的两阶段删除；确认文案报出本次「撤回 N 条、删除 M 条」，重放时如实报 0（`texts.memory_cleared_text`） |
-| `/reset` 不删除长期记忆 | `core/router.py` 的 reset 分支只作废短上下文；记忆条目只由 `/memory forget` / `/memory clear` 删除，公开副本只由 `/memory unpublic` 撤回（§32.3、D-100） |
+| `/reset` 不删除长期记忆 | `core/router.py` 的 reset 分支只作废短上下文；记忆条目只由 `/memory forget` / `/memory clear` 删除，公开副本只由 `/memory unpublic` 撤回（§32、D-100） |
 | 记忆读写失败不影响聊天与评论 | D-60：任何记忆失败都映射成稳定状态，`/livez`、`/readyz` 与回复质量不受影响 |
 | 记忆正文不落日志、不落库 | §37 的红线与 `logging_setup.LOG_FIELDS`（只加 `scope` / `revision` / `entry_count` / `memory_id` / `candidate_id` 五个字段） |
 | 带图有文字时的处理 | 图片输入关闭时只处理文字；开启且图可读时图片随本轮交给模型（`core/vision.py`）。只有图没有正文时才回 `IMAGE_UNAVAILABLE_TEXT` |
@@ -266,7 +266,7 @@
 | `/help` 不调模型 | `core/router.py` 的 `reply_now` 分支，kind=`notice_local` |
 | 超时 45 秒、超时不重试 | `model.timeout_seconds` 默认 45；`worker._map_error` 把 timeout 映射为不可重试（D-19） |
 | 提示每人每 5 分钟一条 | `behavior.notice_cooldown_seconds`（默认 300），键为 `(频道, 触发者)`（D-18） |
-| 额度是滚动 24 小时窗口 | `quota.py` 的 `count_sends_since(now - 86400)`；7950 条模型回复、8000 条总量 |
+| 额度是滚动 24 小时窗口 | `quota.py` 的 `count_sends_since(now - 86400)`；总发送数达到 7950 停模型回复、达到 8000 全部停止（D-1） |
 | 正文长度 | 输入超过 `max_input_chars`（8000）本地拦停；输出超过 `max_output_chars`（5000）按自然段截断并追加 `TRUNCATION_SUFFIX` |
 | 博客区首次要精确 @，之后直接回复即可继续 | `comments/router.py`：`contains_bot_mention` 判定首次；父机器人评论映射判定后续，普通评论/旁支返回 `ignored`（`not_addressed`） |
 | 评论每 30 秒轮询全站最近 100 条 | `comments/discovery.py` 的 `RecentCommentPoller`（`comments.recent_poll_seconds` 默认 30；上游最多 100 条，窗口溢出不可恢复） |
@@ -274,8 +274,8 @@
 | 博客会话保留 30 天、去重 90 天 | `comments.conversation_retention_seconds`（2592000）/ `dedupe_retention_seconds`（7776000） |
 | 博客区记忆最近约 10 轮、按 token 再裁 | `comments.context_turns` / `comments.context_input_tokens` |
 | 评论配额独立：20/分钟、7950/8000 日限、同文章 5 秒 | `comments/quota.py`（`minute_attempt_limit`、`daily_reply_limit`、`daily_absolute_limit`、`article_cooldown_seconds`） |
-| 评论区忙碌/失败/额度用尽静默，不发提示 | 设计 §11.2：评论发送只有 `reply` 与 `notice_local`，无主动 `notice` |
-| 每条成功评论都真实通知被回复者 | 站点评论接口写入即通知，无机器人豁免（设计 §3.2 / §20.2） |
+| 评论区忙碌/失败/额度用尽静默，不发提示 | INTERFACES §16.1：评论发送只有 `reply` 与 `notice_local`，无主动 `notice` |
+| 每条成功评论都真实通知被回复者 | 站点评论接口写入即通知，无机器人豁免（站方 comment-bot.md） |
 | `/help` `/reset` 在评论区两种写法都有效 | `comments/router.py`：`is_help_command` / `is_reset_command`，整条评论匹配 |
 | `/kb` 只授权当前轮、从本地资料检索 | `core/router.py` 第 9.1 步写入 `enabled_features`；`app.py` 的 `_prepare_kb` 走 `KnowledgeService.search`（D-41、D-43） |
 | 五条能力命令任意两条都不能叠加 | `text_utils.leading_capability_command` + 路由器的能力冲突分支；命令集合来自 `capabilities.py`（D-39、D-81） |
@@ -285,14 +285,14 @@
 | `/zhihu`/`/map`/`/wolfram` 默认关闭、启用前要取样 | `config.example.yaml` 里三个 feature 一律 `enabled: false`；取样用 `tools/capture_mcp_fixture.py`（D-88） |
 | 知识库默认只对私聊白名单开放 | `config.knowledge_base`：`enabled=false`、`access_mode=allowlist`、`allowed_channel_kinds=["dm"]`（D-44） |
 | 知识库有刷新周期 | `knowledge_base.refresh_seconds`（默认 60）；构建成功后一次性替换快照（D-45） |
-| 定时发文默认关闭、没有 Web 界面 | `config.blog.enabled`（默认 `false`）与 `config.example.yaml` 的 `blog` 段；任务表在 YAML 里（设计 §4） |
-| 发文走的是普通用户接口，不是站方机器人契约 | 设计 §3 与 D-106；上游依据是 `raricycms/raricy.com@5eace12` 的 `src/app/api/blogs/route.ts` |
-| 调度点、本地日预算都按 UTC+8 切 | `blog/planner.py` 的 `UTC8` / `utc8_day`；站方 `dayStart` 同口径（设计 §9） |
+| 定时发文默认关闭、没有 Web 界面 | `config.blog.enabled`（默认 `false`）与 `config.example.yaml` 的 `blog` 段；任务表在 YAML 里（INTERFACES §53.2） |
+| 发文走的是普通用户接口，不是站方机器人契约 | INTERFACES §53 与 D-106；上游依据是 `raricycms/raricy.com@5eace12` 的 `src/app/api/blogs/route.ts` |
+| 调度点、本地日预算都按 UTC+8 切 | `blog/planner.py` 的 `UTC8` / `utc8_day`；站方 `dayStart` 同口径（D-108） |
 | 停机期间不补发、只处理 5 分钟窗口内的点 | `blog/planner.py` 的 `SCAN_WINDOW_SECONDS`（300）与 `due_runs(startup=...)`；超过 5 分钟未开始的 `queued` 行由 `store.take_blog_run` 转 `skipped`/`misfire` |
 | 结果不确定的行持续占额、不自动重投 | `blog/models.py` 的 `POST_HOLDING_STATUSES` 与 `blog/publisher.py`；D-108、D-109 |
-| 只有完整搜索且唯一匹配才补记已发布 | `blog/publisher.py` 的 `reconcile_once`；`blog/codec.py` 的 `content_hash` 重算指纹（设计 §7.3） |
+| 只有完整搜索且唯一匹配才补记已发布 | `blog/publisher.py` 的 `reconcile_once`；`blog/codec.py` 的 `content_hash` 重算指纹（INTERFACES §53.10） |
 | 单条对账查 12 次后停止自动查询但保持占额 | `blog/models.py` 的 `MAX_RECONCILE_ATTEMPTS`；`store.blog_posts_to_reconcile` 排除已查满的行 |
-| 稿库同指纹累计投递上限 3 次、只允许确定的 429 重试 | `blog/models.py` 的 `MAX_POST_ATTEMPTS` 与 `blog/drafts.py` 的 `_retry_ready`（设计 §7.2、§7.4） |
+| 稿库同指纹累计投递上限 3 次、只允许确定的 429 重试 | `blog/models.py` 的 `MAX_POST_ATTEMPTS` 与 `blog/drafts.py` 的 `_retry_ready`（D-109） |
 | 发文不落正文、不落模型请求与响应 | `blog/models.py` 的 `Draft`/`PreparedDraft` 把 `description`/`content` 排除出 `repr`；D-107 与 §53.13 |
 | 发文日志只多五个字段 | `logging_setup.LOG_FIELDS` 新增 `task_name`/`post_id`/`run_id`/`day`/`chars`，其中 `chars` 只是**标题**的 UTF-16 长度 |
 | 发文工具预算不新增配置项 | 直接用 `mcp.features.blog_write.max_tool_calls_per_turn`；能力表用 `fixed_result_count=1` 钉死 `result_count`（D-110） |
@@ -349,7 +349,7 @@
 
 站点没有公开的栏目列表接口，有子栏目的父栏目 id 会出现在公开的 `/blog` 页面 HTML 里，
 叶子栏目不会。因此 `category_id` 只能人工填，或留空发为「未分类」；机器人**不做**
-启动时抓页面解析栏目（设计 §2.2）—— 那条路只覆盖父栏目、站方改版即静默失效，
+启动时抓页面解析栏目（栏目由维护者配置）—— 那条路只覆盖父栏目、站方改版即静默失效，
 而失效的表现是发错栏目。
 
 #### 调度行为
@@ -435,7 +435,7 @@
 
 `unconfirmed` 之外还有一类会**永久**拦住一篇稿子：站方明确拒绝（401/403/400）记 `rejected`，
 429 用尽次数或现写稿被限流记 `abandoned`。这两种是**确定没发出去**，额度已经释放，
-但**同一个指纹不会再自动投递**（设计 §7.4 / D-109）。最可能的真实触发是一场账号事故
+但**同一个指纹不会再自动投递**（D-109）。最可能的真实触发是一场账号事故
 （被禁言、core+ 短暂失效）把当时到点的稿子全部烧掉 —— 而且是永久的。
 
 恢复办法与 `unconfirmed` 同一条纪律，但判据相反：这两种状态**本身就是「没发出去」的正向证据**。
@@ -454,7 +454,7 @@
 
 #### 改稿子女件会绕过指纹去重
 
-去重的身份是 **`(标题, 正文)`**（设计 §7.1 的指纹）。所以**编辑队列里的一篇稿件，
+去重的身份是 **`(标题, 正文)`**（blog/codec.py 的指纹）。所以**编辑队列里的一篇稿件，
 等于换了一篇新稿**：即使它前一版可能已经发出去过、或者正停在 `unconfirmed` 等确认，
 改过的那一版也会拿到一个新指纹、作为新文章发出去。
 
@@ -464,7 +464,7 @@
 
 #### 启用前请做一次真实核对（`author_id`）
 
-只读对账靠 `GET /api/blogs` 列表里的 **`author_id`** 字段做精确匹配（设计 §2.3）。
+只读对账靠 `GET /api/blogs` 列表里的 **`author_id`** 字段做精确匹配（INTERFACES §53.10）。
 这个字段名是照着固定提交的上游源码读出来的，**没有在本仓库的自动化测试里对着真实响应取过样**
 （测试一律用替身）。如果上游实际给的是别的字段名，对账会**每一轮都失败**：
 
@@ -493,6 +493,20 @@
    这是**唯一**会进入有界重试的确定结果，也是整个设计里唯一一条可能重复发布的路径
    （前提是站方在 429 之前其实已经建了文，见 D-106/D-109）。
 
+#### 上线验收清单（尚未完成真实站点验收）
+
+实现已完成，但替身测试与设计稿归档都不代表真实站点验证通过。先完成上面的字段与信封核对，
+再由部署者在明确启用的测试环境验收；自动化测试仍禁止真实网络。
+
+- [ ] must 现写任务到点生成并发布，投递记录为 published 且具有合法 site_blog_id。
+- [ ] 用替身模拟提交后断线：进入 unconfirmed；唯一精确凭证才能补记，空结果/隐藏栏目不触发第二次 POST。
+- [ ] 稿库按文件名处理，空队列的 must 告警；用替身验证明确 429 次日按原行有界重试。
+- [ ] 日上限为 1 时，不确定首篇挡住第二篇；跨 UTC+8 午夜仍占额，只读对账继续。
+- [ ] 同一分钟重启不重新生成；maybe 概率未中不重新掷骰。
+- [ ] 聊天与发文共用 Exa 时，结果数、参数限制和 feature 限流各自生效。
+- [ ] 用替身验证生成/投递取消后重启恢复，持久介质没有新增生成正文或模型请求副本。
+- [ ] `python -m pytest tests -q` 通过且无 warning；记录真实验证的上游版本和结果。
+
 #### 已知的取舍（发布前请留意）
 
 - **不补发**停机期间错过的调度点；**不保存**现写稿正文，因此进程崩溃后无法恢复原稿 ——
@@ -501,8 +515,8 @@
 - **不承诺 exactly-once**：宁可漏发或等人工核实，也不用重复发布换成功率。
 - 发布后**不再改文**：编辑文章的 `PUT /api/blogs/:id` 本功能不使用。
 - 只允许**单实例**运行：两个机器人进程共享同一账号发文不受支持。
-- **「预算耗尽」日志的去重只在本进程内**：设计 §9 要求「每个账号每个 UTC+8 日最多一条」，
-  而实现只在内存里记住今天是否已经记过（设计 §11 没有为它提供持久位置）。因此**同一天里
+- **「预算耗尽」日志的去重只在本进程内**：日志目标为「每个账号每个 UTC+8 日最多一条」，
+  而实现只在内存里记住今天是否已经记过（Store 没有为该日志去重提供持久位置）。因此**同一天里
   每重启一次，就可能多一条** `budget_exhausted` 日志。这是已知偏差，不是遗漏：
   它只影响日志条数，不影响任何预算判定。为它单开一张表属于扩大范围，首版不做。
 - **任务改名或从配置里删掉**时，那条遗留的排队执行会以 `failed` 收尾、原因写成
@@ -512,15 +526,9 @@
 
 ### 2.5 改这份文档时注意
 
-- 第一部分的用词要与 `texts.py` 的固定文案对得上（`/help`、用法提示、不支持媒体、超长、
-  忙碌、失败、额度用尽、记忆命令那一组），否则用户在聊天里看到的话和公告对不上。博客区的对应
-  文案由 `texts.comment_help_text()` 拼装（首次 @、直接回复、文章正文上限、图片开关、真实
-  通知、重启丢短期上下文、读不到被引用的博客）；站长开启长期记忆后才多出那一句披露 ——
-  它必须同时点出 `all_user` 共同记忆与参与者**主动公开的个人条目**，只说前者在公开投影上线后
-  就是假话（§36、§50.2）。聊天侧的 `/help` 里，公开个人记忆那一段按公开设计 §17.2 **逐字**
-  出现（`texts._HELP_MEMORY_PUBLIC` 的第一句是合同的原文），改写它等于改合同；关闭记忆时
-  这一版文案与上线前逐字节相同，所以本文件里「默认没有」的措辞也要与那一份对得上。
-  **文案里的每个数字都来自配置**（`article_max_chars`、
-  `quoted_blog_max_chars`），本文件写死数字的地方要与配置默认值一致。
-- 任何一条行为改了，先回 `docs/design/INTERFACES.md` 与 `docs/design/DESIGN_DECISIONS.md` 确认是不是有意为之，
-  再改这里。裁决记录里的 D-1、D-18、D-19 都与本文件的「为什么有时不回」一节直接相关。
+- 用户说明与 `texts.py` 的帮助、失败提示和记忆回执保持一致；聊天与评论的触发方式、能力范围分别核对。
+- 记忆披露同时区分共同记忆、所属用户私有记忆和主动公开的个人条目；公开帮助文案以
+  `texts._HELP_MEMORY_PUBLIC` 为准，改写时同步本手册与文案测试（INTERFACES §36、§50）。
+- 长度、额度等可配置数字按默认值说明，不当作每个部署的实际值；实际帮助文案应注入配置。
+- 行为变更先核对 INTERFACES 和相关 D 条目，再更新用户说明。关闭功能、软故障和已知例外也须如实披露。
+- 设计稿归档后，未完成验收仍保留在本手册；不能因文档整理勾选尚未执行的验收项。

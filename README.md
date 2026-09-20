@@ -4,7 +4,7 @@
 `@机器人用户名` 的消息，在私聊里有问必答，回复始终引用触发它的那条消息。它不修改站点，
 也不需要站点的任何特殊接口。**它不是真人，也不代表站方立场。**
 
-- 大区是**公开多人对话**：一条回复链上的所有人共享最近十来轮上下文，回复链内的消息就能加入。
+- 大区是**公开多人对话**：一条回复链上的所有人共享最近十来轮上下文，精确 @ 后按回复链加入。
 - 聊天默认**不联网、也不读本地资料**：要联网就发 `/search <问题>`，要查本地资料就发
   `/kb <问题>` —— 每条命令只授权它自己那一轮，下一条普通消息不会被这层授权牵连。
   另有 `/zhihu`、`/map`、`/wolfram` 三条同类命令，默认关闭。
@@ -70,8 +70,9 @@ python -m pytest tests -q
 
 配置是只读 YAML，`config.example.yaml` 是一份可直接复制的样例（字段旁都有中文注释）。
 顶层小节为 `site` / `model` / `behavior` / `mcp` / `knowledge_base` / `ops` / `storage` /
-`logging` / `comments`，外加必填的 `system_prompt`。完整字段、默认值与校验规则见
-[`docs/design/INTERFACES.md`](docs/design/INTERFACES.md) 第 1 节。
+`logging` / `comments` / `memory` / `blog`，外加必填的 `system_prompt`。
+完整字段、默认值与校验规则见 [config.py](src/raricy_bot/config.py)，跨模块约束见
+[内部契约 §1](docs/design/INTERFACES.md)。
 
 **密钥永远只从环境变量读取**，不写进 YAML、镜像或日志：
 
@@ -261,85 +262,30 @@ Cookie、密码与 API Key 在任何级别都不会落进日志或数据库。
 
 ## 项目结构
 
-```
-raricy_bot/
-├── src/raricy_bot/
-│   ├── __main__.py               # 命令行入口：`python -m raricy_bot`
-│   ├── app.py                    # 应用装配：配置、站点客户端、SSE、路由、工作器、发送器与运维端点
-│   ├── config.py                 # YAML + 环境变量配置加载与校验
-│   ├── logging_setup.py          # 结构化日志与脱敏过滤器
-│   ├── redact.py                 # 密钥脱敏：日志与出站错误写出前统一替换
-│   ├── text_utils.py             # 用户名字符、@ 提及、token 估算、段落截断与命令判定
-│   ├── texts.py                  # 全部对外文案
-│   ├── capabilities.py           # 能力表：命令字面量、上游工具白名单、各能力文案
-│   ├── store.py                  # SQLite 运行状态（正文与密钥不落库）
-│   ├── quota.py                  # 聊天配额：每分钟窗口 + 24 小时额度 + 通知冷却
-│   ├── ops.py                    # 内建运维端点 `/livez` 与 `/readyz`
-│   ├── site/                     # 站点 HTTP 客户端与 SSE 长连接
-│   │   ├── client.py             # 登录、探活、读消息、发消息、开流
-│   │   ├── models.py             # 站点 DTO 与 SSE 事件模型
-│   │   ├── comment_models.py     # 博客评论接口 DTO 与受限解析
-│   │   └── sse.py                # SSE 帧解析、自愈重连、断线补齐
-│   ├── core/                     # 聊天主链路：路由、上下文、工作器与发送
-│   │   ├── router.py             # 判定「入队 / 本地回复 / 忽略」
-│   │   ├── context.py            # 按会话的内存历史（INTERFACES §11、§33）
-│   │   ├── lobby_context.py      # 大区近期消息缓冲（§38）
-│   │   ├── worker.py             # 模型客户端与工作器池
-│   │   ├── sender.py             # 脱敏、截断、配额预留、发送与对账
-│   │   ├── blog.py               # 被引用博客：状态判定、取正文与拼块
-│   │   ├── content_refs.py       # 内容引用 `[@<内容ID>]` 的识别与替换（§25）
-│   │   └── vision.py             # 图片输入：取回、格式判定与编码（§20）
-│   ├── mcp/                      # MCP 能力：两种传输、工具注册与四个上游适配
-│   │   ├── session.py            # 单个 ClientSession 的 Provider 骨架
-│   │   ├── stdio.py              # stdio 传输 Provider
-│   │   ├── sse.py                # 远程 MCP-over-SSE Provider
-│   │   ├── runtime.py            # Provider 生命周期、软故障隔离与后台重连
-│   │   ├── registry.py           # 工具发现、命名空间与 feature 白名单
-│   │   ├── contracts.py          # 与模型工具循环共享的领域合同
-│   │   ├── adapters.py           # 按 feature 装配适配器
-│   │   ├── adapter_kit.py        # 适配器公共件：限流、文本块读取、URL 校验
-│   │   ├── exa.py                # Exa 搜索结果适配
-│   │   ├── pool.py               # Exa 授权密钥池：多个 stdio Provider 合成一个
-│   │   ├── zhihu.py              # 知乎检索适配：白名单 + 结构化 XML 的保守提取
-│   │   ├── amap.py               # 高德地图适配：参数白名单与结果清洗
-│   │   └── wolfram.py            # Wolfram 适配：宿主钉死 `mode`，只放行 query
-│   ├── kb/                       # 本地 Markdown 知识库：载入、索引与检索
-│   │   ├── loader.py             # 扫描、读取与分块（§23.3 / §23.4）
-│   │   ├── index.py              # 纯标准库的 BM25 风格词法索引（§23.5）
-│   │   ├── service.py            # 生命周期、原子快照、周期刷新与查询（§23.6 / §23.7）
-│   │   └── models.py             # 不可变数据类型
-│   ├── comments/                 # 博客评论机器人：发现、匹配、队列与发送
-│   │   ├── service.py            # 生命周期、独立队列与后台轮询
-│   │   ├── discovery.py          # 评论区两个轮询发现器
-│   │   ├── matcher.py            # 评论树索引与触发匹配
-│   │   ├── router.py             # 博客评论候选路由
-│   │   ├── quota.py              # 独立配额与节流
-│   │   ├── sender.py             # 博客评论发送链
-│   │   └── models.py             # 评论子系统的内存请求类型
-│   └── memory/                   # 长期记忆（Beta）：Markdown 存储、AI 撰写与接入策略
-│       ├── service.py            # 存储服务：快照、原子写、幂等与刷新（§30）
-│       ├── codec.py              # 记忆文件与公开投影的解析与渲染（§29、§41）
-│       ├── models.py             # 长期记忆的数据模型（§27）
-│       ├── access.py             # Beta 接入策略与共同记忆管理权（§28）
-│       ├── writer.py             # AI 撰写器：来源内容整理成一条候选记忆（§31）
-│       ├── commands.py           # 命令类型与解析（§32.1 / §32.2）
-│       ├── controller.py         # 命令编排：门禁、幂等、撰写、写入与文案（§32.3）
-│       └── subjects.py           # 公开个人记忆的 subject 解析（§43）
-├── tests/                        # pytest + pytest-asyncio 测试
-├── docs/                         # 文档：materials（上游契约）/ usage（操作手册）/ design（内部契约）/ archive（历史）
-├── tools/                        # 仅开发用的脚本：上游取样 `capture_mcp_fixture.py`
-├── knowledge/                    # 本地知识库的 Markdown 源文件
-├── config.example.yaml           # 配置示例，字段旁都有中文注释
-├── mcp-tools.package.json        # 构建期安装的三个 stdio MCP 服务器及版本
-├── pyproject.toml                # 依赖、打包与 pytest 配置
-├── Dockerfile
-└── docker-compose.yml
-```
+源码位于 `src/raricy_bot/`；[内部契约](docs/design/INTERFACES.md) 按模块链接具体实现。
+
+| 入口 | 职责 |
+|---|---|
+| `app.py`、`__main__.py` | 生命周期、装配、模型路径与恢复 |
+| `config.py`、`texts.py`、`text_utils.py` | 配置、固定文案、文本判定 |
+| `site/` | 登录、HTTP API、DTO 与单条 SSE |
+| `core/` | 聊天路由、上下文、模型 worker、发送、图片与内容引用 |
+| `store.py`、`quota.py`、`ops.py` | SQLite 状态、聊天额度、健康探针 |
+| `comments/` | 评论发现、独立队列、配额与发送 |
+| `capabilities.py`、`mcp/` | 能力声明、工具白名单、传输与适配 |
+| `kb/` | 本地只读 Markdown 检索 |
+| `memory/` | 共同/私有记忆、公开投影、命令与原子写入 |
+| `blog/` | 定时发文的稿库/生成、调度、投递与只读对账 |
+| `logging_setup.py`、`redact.py` | 白名单日志与出站脱敏 |
+
+`tests/` 为隔离网络的测试，`tools/` 为开发工具；`knowledge/` 和 `drafts/` 是可选输入目录。
+完整文档导航见 [docs/README.md](docs/README.md)。
 
 ## 容量与清理
 
 运行期每 `storage.cleanup_interval_seconds`（默认 1 小时）清理一次，启动时也清理一次。
-聊天与评论共用同一个 SQLite 库；**正文一律不落库**，表里只有 id、状态、归属与计数。
+聊天、评论和定时发文共用 SQLite；**正文一律不落库**。发文允许保存脱敏后的待发布标题、
+指纹和必要元数据，详见 D-107。
 
 | 数据 | 保留 |
 | --- | --- |
@@ -369,9 +315,10 @@ raricy_bot/
 | 怎么部署、升级、排障 | [`docs/usage/DEPLOYMENT.md`](docs/usage/DEPLOYMENT.md) |
 | 站内用户会看到什么、怎么跟他们解释 | [`docs/usage/USAGE.md`](docs/usage/USAGE.md) |
 | Exa 多 Key 池与本地知识库怎么配、怎么看日志、怎么排障 | [`docs/usage/EXA_POOL_AND_KB.md`](docs/usage/EXA_POOL_AND_KB.md) |
-| 模块之间锁定的接口与判定顺序 | [`docs/design/INTERFACES.md`](docs/design/INTERFACES.md) |
+| 模块边界、判定顺序与代码入口 | [`docs/design/INTERFACES.md`](docs/design/INTERFACES.md) |
 | 某处行为为什么是这样 | [`docs/design/DESIGN_DECISIONS.md`](docs/design/DESIGN_DECISIONS.md) |
 | 上游站点 API 的原始契约 | [`docs/materials/chat-bot.md`](docs/materials/chat-bot.md) |
 | 推荐的系统提示词 | [`docs/design/SYSTEM_PROMPTS.md`](docs/design/SYSTEM_PROMPTS.md) |
 
-改代码前请先读 `INTERFACES.md`：它是本仓库唯一锁定的内部合同，改签名要同时检查所有消费者。
+改代码前按 [INTERFACES.md](docs/design/INTERFACES.md) 定位相关模块与决策；
+签名、字段和默认值查源码，改接口时同时检查所有消费者。已完成设计与旧稿见 [归档索引](docs/ARCHIVE.md)。

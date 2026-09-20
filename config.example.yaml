@@ -1,390 +1,261 @@
-# Raricy 站内聊天机器人配置示例。
-# 复制为 config.yaml 后按需修改；也可以用 BOT_CONFIG_PATH 指定其他路径。
-#
-# 密钥不写在本文件里，一律通过环境变量提供：
-#   RARICY_USERNAME   站点登录用户名
-#   RARICY_PASSWORD   站点登录密码
-#   LLM_API_KEY       模型服务的 API Key
-#   EXA_API_KEY       Exa MCP API Key（仅启用 mcp.enabled 时需要）
-#   EXA_API_KEY_1..N  多 Key 池模式下的各槽位 Key（可选；见下面的 account_pool）
-#   AMAP_MAPS_API_KEY    高德地图 Web 服务 Key（仅启用 map 能力时需要）
-#   WOLFRAM_APP_ID       Wolfram AppID（仅启用 wolfram 能力时需要）
-#   ZHIHU_ACCESS_SECRET  知乎开放平台访问密钥（仅启用 zhihu 能力时需要）
-# RARICY_USERNAME、RARICY_PASSWORD、LLM_API_KEY 缺失或为空时程序会直接以配置错误退出；
-# 其余四个 MCP 密钥缺失时只停用对应的那一个服务器，普通聊天与其它能力不受影响。
+site:  # 站点连接；账号与密码从 RARICY_USERNAME、RARICY_PASSWORD 环境变量读取
+  base_url: "https://raricy.com"  # 机器人访问网站地址
+  request_timeout_seconds: 20  # 普通 HTTP 请求超时秒数；SSE 长连接单独设置读超时
 
-site:
-  base_url: "https://example.com"
-  request_timeout_seconds: 20
+model:  # 模型服务配置；API Key 从 LLM_API_KEY 环境变量读取
+  base_url: "https://example.com/v1"  # 兼容 OpenAI API 的模型服务地址
+  model: "model_name"  # 模型名称
+  temperature: 0.4  # 生成随机性；值越低回答通常越稳定
+  timeout_seconds: 45  # 单次模型请求超时秒数；超时不自动重试
+  max_output_tokens: 60000  # 模型单次输出 token 上限，触顶可能截断回答
+  vision_enabled: false  # 是否启用图片理解；模型须支持视觉，聊天和评论共用
+  max_image_bytes: 5242880  # 单图下载字节上限，不得超过站点 10 MiB 限制
 
-model:
-  base_url: "https://provider.example/v1"
-  model: "configured-model-name"
-  temperature: 0.4
-  timeout_seconds: 45
-  max_output_tokens: 600
-  # 图片输入默认关闭。仅当本模型确实支持视觉时才打开：否则每一条带图的消息
-  # 都会以 400 失败并回一条失败提示。开启后聊天区与博客区都获得识图能力，
-  # 评论侧另有自己的名额（comments.max_images_per_reply）。
-  vision_enabled: false
-  # 单张图的下载期硬上限（字节），不得超过站点图床的 10 MiB 上限。
-  max_image_bytes: 5242880
+mcp:  # 外部工具总配置；查询可能发往对应上游，所有凭据只引用环境变量
+  enabled: false  # 是否启用本模块；上级总开关也须开启
+  connect_timeout_seconds: 10  # MCP 连接及工具发现超时秒数
+  call_timeout_seconds: 20  # 单次 MCP 工具调用超时秒数
+  reconnect_base_seconds: 3  # 断线重连的基础退避秒数
+  reconnect_max_seconds: 60  # 断线重连的指数退避封顶秒数
+  servers:  # MCP 上游服务定义；连接成功不等于开放全部工具
+    exa:  # Exa 搜索服务；单 Key 与 account_pool 二选一，池配置见使用手册
+      enabled: false  # 是否启用本模块；上级总开关也须开启
+      transport: stdio  # stdio 为子进程，sse 为远程连接；两套字段互斥
+      command: exa-mcp-server  # 已安装的 MCP 服务器启动命令，运行期不临时安装依赖
+      args: []  # 子进程启动参数列表
+      env_from:  # 子进程变量名到宿主变量名的映射，只写变量名，与 account_pool 互斥
+        EXA_API_KEY: EXA_API_KEY  # 提供 Exa Key 的宿主环境变量名，不是密钥值
+      env:  # 子进程非敏感环境变量；凭据只能通过 env_from 注入
+        ENABLED_TOOLS: web_search_exa  # Exa 服务开放的工具；宿主仍会再次检查白名单
+        DEBUG: "false"  # 上游子进程调试开关，独立于宿主日志级别
+    amap:  # 高德地图服务；依赖版本统一由 mcp-tools.package.json 管理
+      enabled: false  # 是否启用本模块；上级总开关也须开启
+      transport: stdio  # stdio 为子进程，sse 为远程连接；两套字段互斥
+      command: mcp-amap  # 已安装的 MCP 服务器启动命令，运行期不临时安装依赖
+      args: []  # 子进程启动参数列表
+      env_from:  # 子进程变量名到宿主变量名的映射，只写变量名，与 account_pool 互斥
+        AMAP_MAPS_API_KEY: AMAP_MAPS_API_KEY  # 提供高德 Key 的宿主环境变量名，不是密钥值
+    wolfram:  # Wolfram 计算服务；依赖版本统一由 mcp-tools.package.json 管理
+      enabled: false  # 是否启用本模块；上级总开关也须开启
+      transport: stdio  # stdio 为子进程，sse 为远程连接；两套字段互斥
+      command: wolfram-mcp  # 已安装的 MCP 服务器启动命令，运行期不临时安装依赖
+      args: []  # 子进程启动参数列表
+      env_from:  # 子进程变量名到宿主变量名的映射，只写变量名，与 account_pool 互斥
+        WOLFRAM_APP_ID: WOLFRAM_APP_ID  # 提供 Wolfram AppID 的宿主环境变量名，不是凭据值
+    zhihu:  # 知乎远程 SSE 服务；缺凭据时只停用本服务
+      enabled: false  # 是否启用本模块；上级总开关也须开启
+      transport: sse  # stdio 为子进程，sse 为远程连接；两套字段互斥
+      url: https://developer.zhihu.com/api/mcp/zhihu_search/v1/sse  # 远程 MCP SSE 地址，必须使用 HTTPS
+      bearer_env: ZHIHU_ACCESS_SECRET  # 提供 Bearer 令牌的宿主环境变量名，不是令牌值
+      stream_read_timeout_seconds: 300  # MCP SSE 读超时秒数，独立于单次调用超时
+  features:  # 产品能力及工具白名单；聊天命令只授权本轮，评论不调用 MCP
+    search:  # 聊天 /search 能力，仅允许 Exa 搜索
+      enabled: false  # 是否启用本模块；上级总开关也须开启
+      bindings:  # 本能力允许调用的工具绑定；全部绑定就绪才可用
+        - server: exa  # 引用 servers 中定义的服务器名称
+          tool: web_search_exa  # 允许调用的精确上游工具名
+      result_count: 5  # 单次工具调用最多返回的结果条目数
+      result_item_token_limit: 3000  # 当前轮每条工具结果的估算 token 上限
+      history_item_token_limit: 500  # 成功回答后每条结果保留在历史中的摘要 token 上限
+      max_query_chars: 500  # 查询参数的字符上限，还须满足能力表的硬上界
+      max_tool_calls_per_turn: 1  # 单轮工具调用预算，不代表支持多步研究循环
+      max_concurrency: 1  # 此能力全部绑定共享的工具调用并发上限
+      min_interval_seconds: 2  # 此能力全部绑定共享的最小调用间隔秒数
+    zhihu:  # 聊天 /zhihu 能力；部署前须核对真实返回样本
+      enabled: false  # 是否启用本模块；上级总开关也须开启
+      bindings:  # 本能力允许调用的工具绑定；全部绑定就绪才可用
+        - server: zhihu  # 引用 servers 中定义的服务器名称
+          tool: zhihu_search  # 允许调用的精确上游工具名
+      result_count: 5  # 单次工具调用最多返回的结果条目数
+      result_item_token_limit: 3000  # 当前轮每条工具结果的估算 token 上限
+      history_item_token_limit: 500  # 成功回答后每条结果保留在历史中的摘要 token 上限
+      max_query_chars: 100  # 查询参数的字符上限，还须满足能力表的硬上界
+      max_tool_calls_per_turn: 1  # 单轮工具调用预算，不代表支持多步研究循环
+      max_concurrency: 1  # 此能力全部绑定共享的工具调用并发上限
+      min_interval_seconds: 2  # 此能力全部绑定共享的最小调用间隔秒数
+    map:  # 聊天 /map 能力；全部绑定均就绪才可用
+      enabled: false  # 是否启用本模块；上级总开关也须开启
+      bindings:  # 本能力允许调用的工具绑定；全部绑定就绪才可用
+        - server: amap  # 引用 servers 中定义的服务器名称
+          tool: maps_geo  # 允许调用的精确上游工具名
+        - server: amap  # 引用 servers 中定义的服务器名称
+          tool: maps_text_search  # 允许调用的精确上游工具名
+        - server: amap  # 引用 servers 中定义的服务器名称
+          tool: maps_weather  # 允许调用的精确上游工具名
+      result_count: 1  # 单次工具调用最多返回的结果条目数
+      result_item_token_limit: 3000  # 当前轮每条工具结果的估算 token 上限
+      history_item_token_limit: 500  # 成功回答后每条结果保留在历史中的摘要 token 上限
+      max_query_chars: 100  # 查询参数的字符上限，还须满足能力表的硬上界
+      max_tool_calls_per_turn: 1  # 单轮工具调用预算，不代表支持多步研究循环
+      max_concurrency: 1  # 此能力全部绑定共享的工具调用并发上限
+      min_interval_seconds: 2  # 此能力全部绑定共享的最小调用间隔秒数
+    wolfram:  # 聊天 /wolfram 能力；返回一条完整答案
+      enabled: false  # 是否启用本模块；上级总开关也须开启
+      bindings:  # 本能力允许调用的工具绑定；全部绑定就绪才可用
+        - server: wolfram  # 引用 servers 中定义的服务器名称
+          tool: wolfram_query  # 允许调用的精确上游工具名
+      result_count: 1  # 完整答案型结果，必须为 1
+      result_item_token_limit: 3000  # 当前轮每条工具结果的估算 token 上限
+      history_item_token_limit: 500  # 成功回答后每条结果保留在历史中的摘要 token 上限
+      max_query_chars: 300  # 查询参数的字符上限，还须满足能力表的硬上界
+      max_tool_calls_per_turn: 1  # 单轮工具调用预算，不代表支持多步研究循环
+      max_concurrency: 1  # 此能力全部绑定共享的工具调用并发上限
+      min_interval_seconds: 2  # 此能力全部绑定共享的最小调用间隔秒数
+    blog_write:  # 发文取材，无聊天命令；绑定未全部就绪时退回无工具生成
+      enabled: false  # 是否启用本模块；上级总开关也须开启
+      bindings:  # 本能力允许调用的工具绑定；全部绑定就绪才可用
+        - server: exa  # 引用 servers 中定义的服务器名称
+          tool: web_search_exa  # 允许调用的精确上游工具名
+        - server: zhihu  # 引用 servers 中定义的服务器名称
+          tool: zhihu_search  # 允许调用的精确上游工具名
+        - server: amap  # 引用 servers 中定义的服务器名称
+          tool: maps_geo  # 允许调用的精确上游工具名
+        - server: amap  # 引用 servers 中定义的服务器名称
+          tool: maps_text_search  # 允许调用的精确上游工具名
+        - server: amap  # 引用 servers 中定义的服务器名称
+          tool: maps_weather  # 允许调用的精确上游工具名
+        - server: wolfram  # 引用 servers 中定义的服务器名称
+          tool: wolfram_query  # 允许调用的精确上游工具名
+      result_count: 1  # 发文取材固定为 1 条结果
+      result_item_token_limit: 3000  # 当前轮每条工具结果的估算 token 上限
+      history_item_token_limit: 500  # 兼容工具结果的历史摘要上限；发文不提交聊天历史
+      max_query_chars: 500  # 查询参数的字符上限，还须满足能力表的硬上界
+      max_tool_calls_per_turn: 1  # 整篇生成的工具预算；当前写作流程至多执行一次工具
+      max_concurrency: 1  # 此能力全部绑定共享的工具调用并发上限
+      min_interval_seconds: 2  # 此能力全部绑定共享的最小调用间隔秒数
 
-# MCP 能力默认关闭。启用后，聊天区的 `/search`、`/zhihu`、`/map`、`/wolfram` 四条命令
-# 各自把当前轮交给模型判断是否调用对应的上游工具；评论区永远不会获得 MCP 工具。
-# 一条消息最多只能带一个能力命令，叠加会被本地拒绝。
-# 密钥不写在 YAML 中：env_from 与 bearer_env 的值都只是宿主环境变量名，实际值由环境注入。
-mcp:
-  enabled: false
-  connect_timeout_seconds: 10
-  call_timeout_seconds: 20
-  reconnect_base_seconds: 3
-  reconnect_max_seconds: 60
-  servers:
-    exa:
-      enabled: true
-      transport: stdio
-      # Docker 镜像在构建期固定安装 exa-mcp-server@3.4.1，运行期不执行 npx/npm。
-      command: exa-mcp-server
-      args: []
-      # 单 Key 形态：把宿主环境变量映射进子进程。它与下面的 account_pool 互斥，
-      # 二者只能留一个。
-      env_from:
-        EXA_API_KEY: EXA_API_KEY
-      # 多 Key 池形态（可选）。把上面两行 env_from 注释掉，再打开这一段即可：
-      # 每个槽位一个独立子进程，一次逻辑搜索按轮询在槽位间做有界故障转移。
-      # host_envs 里写的是**环境变量名**，不是 Key 值；真实值只在运行时从宿主环境读取，
-      # 从不写进 YAML、日志或数据库。
-      #
-      # 上线前必须确认这些 Key 都已获得 Exa 授权（见 docs/usage/DEPLOYMENT.md
-      # 的「Exa 授权合规门禁」）。池不会绕过平台额度政策。
-      #
-      # account_pool:
-      #   child_env: EXA_API_KEY
-      #   host_envs:
-      #     - EXA_API_KEY_1
-      #     - EXA_API_KEY_2
-      #     - EXA_API_KEY_3
-      #   strategy: round_robin
-      #   rate_limit_cooldown_seconds: 60
-      #   transient_cooldown_seconds: 30
-      #   quota_cooldown_seconds: 21600
-      env:
-        ENABLED_TOOLS: web_search_exa
-        DEBUG: "false"
-    # 高德地图（stdio 子进程，Docker 镜像在构建期固定安装
-    # @amap/amap-maps-mcp-server@0.0.8）。
-    # 密钥走 env_from 映射，值只在运行时从宿主环境读取。缺密钥时子进程不会启动，
-    # 只有 /map 报不可用，其它能力不受影响。
-    amap:
-      enabled: true
-      transport: stdio
-      command: mcp-amap
-      args: []
-      env_from:
-        AMAP_MAPS_API_KEY: AMAP_MAPS_API_KEY
-    # Wolfram（stdio 子进程，构建期固定安装 wolfram-mcp@1.1.2）。
-    # WOLFRAM_APP_ID 同样是映射，不是取值，不允许明文写在 env: 里。
-    wolfram:
-      enabled: true
-      transport: stdio
-      command: wolfram-mcp
-      args: []
-      env_from:
-        WOLFRAM_APP_ID: WOLFRAM_APP_ID
-    # 知乎这条走 SSE 传输：没有子进程，因此 command/args/env/env_from/account_pool
-    # 一律不允许出现。
-    # bearer_env 是宿主环境变量名，值是 Bearer 令牌，只在建连时读取并立即登记脱敏。
-    zhihu:
-      enabled: true
-      transport: sse
-      url: https://developer.zhihu.com/api/mcp/zhihu_search/v1/sse
-      bearer_env: ZHIHU_ACCESS_SECRET
-      # 长连接的读侧超时，不能沿用 call_timeout_seconds：安静期比它长就会被判成
-      # 超时并重连。
-      stream_read_timeout_seconds: 300
-  features:
-    search:
-      enabled: true
-      bindings:
-        - server: exa
-          tool: web_search_exa
-      result_count: 5
-      result_item_token_limit: 3000
-      history_item_token_limit: 500
-      max_query_chars: 500
-      max_tool_calls_per_turn: 1
-      max_concurrency: 1
-      min_interval_seconds: 2
-    # 以下三个能力默认关闭，启用前必须先取真实样本校准：按 docs/usage/DEPLOYMENT.md
-    # 的「上游取样」一节跑一次 tools/capture_mcp_fixture.py。
-    #
-    # 三个能力的 max_query_chars 上限由能力表钉死：zhihu 100（上游只收 2..100 字符）、
-    # map 100、wolfram 300。写超了会在加载期直接报配置错误。
-    zhihu:
-      enabled: false
-      bindings:
-        - server: zhihu
-          tool: zhihu_search
-      result_count: 5
-      result_item_token_limit: 3000
-      history_item_token_limit: 500
-      max_query_chars: 100
-      max_tool_calls_per_turn: 1
-      max_concurrency: 1
-      min_interval_seconds: 2
-    # 三个绑定是「全有或全无」：任一工具在发现阶段缺失，整个 /map 判为不可用。
-    map:
-      enabled: false
-      bindings:
-        - server: amap
-          tool: maps_geo
-        - server: amap
-          tool: maps_text_search
-        - server: amap
-          tool: maps_weather
-      result_count: 5
-      result_item_token_limit: 3000
-      history_item_token_limit: 500
-      max_query_chars: 100
-      max_tool_calls_per_turn: 1
-      max_concurrency: 1
-      min_interval_seconds: 2
-    # wolfram 是「整条答案」型（single）：result_count 必须为 1，配成别的值会在
-    # 加载期报错。这里的 result_item_token_limit 是**整条答案**的上限，
-    # history_item_token_limit 是它跨轮摘要的上限。
-    wolfram:
-      enabled: false
-      bindings:
-        - server: wolfram
-          tool: wolfram_query
-      result_count: 1
-      result_item_token_limit: 3000
-      history_item_token_limit: 500
-      max_query_chars: 300
-      max_tool_calls_per_turn: 1
-      max_concurrency: 1
-      min_interval_seconds: 2
-    # 定时发文的取材工具（设计 §8.1、D-110）。它与上面四个聊天能力**互不影响**：
-    # 同一个上游服务器被两边同时绑定时，各用各的参数上限、结果数与限流，谁也覆盖不了谁。
-    # 首版白名单只有这六个**只读**工具；不绑任何工具也能发文，只是模型没有素材可查。
-    # `result_count` 被能力表钉死为 1（一次生成只带一条工具结果），配成别的值会在加载期报错。
-    # 六个绑定同样是「全有或全无」：任一服务器不可达就整轮退回「无工具生成」（只有 DEBUG 日志）。
-    blog_write:
-      enabled: false
-      bindings:
-        - server: exa
-          tool: web_search_exa
-        - server: zhihu
-          tool: zhihu_search
-        - server: amap
-          tool: maps_geo
-        - server: amap
-          tool: maps_text_search
-        - server: amap
-          tool: maps_weather
-        - server: wolfram
-          tool: wolfram_query
-      result_count: 1
-      result_item_token_limit: 3000
-      history_item_token_limit: 500
-      max_query_chars: 500
-      max_tool_calls_per_turn: 1
-      max_concurrency: 1
-      min_interval_seconds: 2
+behavior:  # 聊天上下文、输入输出、并发与配额
+  context_turns: 10  # 每个会话保留的完整对话轮数
+  context_input_tokens: 8000  # 文字上下文的估算 token 预算；图片成本另行限制
+  max_input_chars: 8000  # 剥离提及和命令后的输入字符上限
+  quoted_blog_max_chars: 1000  # 引用博客正文的字符上限，超长时只提供标题和说明
+  content_ref_max_chars: 2000  # 单条引用展开字符上限，同时约束消息和评论正文的展开总预算
+  max_output_chars: 5000  # 出站字符上限，超出时按自然段截断并添加后缀
+  concurrency: 3  # 聊天 worker 数，也是共享模型并发闸门容量
+  queue_size: 50  # 待处理请求队列的最大长度
+  minute_attempt_limit: 100  # 每分钟滑动窗口的本地发送限额，含在途预留
+  daily_normal_limit: 7950  # 聊天总发送数达到此滚动 24 小时阈值后停止模型回复
+  daily_absolute_limit: 8000  # 滚动 24 小时总发送上限，包含模型回复和本地回复
+  notice_cooldown_seconds: 300  # 主动通知按频道与触发者冷却的秒数，本地命令回复不受此限
+  reconnect_base_seconds: 3.0  # 断线重连的基础退避秒数
+  reconnect_max_seconds: 60.0  # 站点 SSE 指数退避封顶秒数，随后还会叠加随机抖动
+  ready_probe_seconds: 300.0  # 站点权限或禁言恢复探测的间隔秒数
+  rate_limit_wait_seconds: 60.0  # 429 未给出明确等待时间时的默认退避秒数
 
-behavior:
-  context_turns: 10
-  context_input_tokens: 8000
-  max_input_chars: 8000
-  # 消息里引用的博客正文，交给模型的最多字符数（按 Unicode 字符数）。
-  # 超限时只给标题并写明原因，与 comments.article_max_chars 的规则一致。
-  quoted_blog_max_chars: 1000
-  # 正文里的内容引用 `[@<内容ID>]`（8 位剪贴板 / 9 位投票 / 10 位图床）展开出来的
-  # 单条字符上限；它同时是消息正文与评论正文展开时的总预算。
-  # 引用博客正文与文章正文另有总预算（见上一条与 comments.article_max_chars）。
-  # 调大它意味着更多别人写的内容会被送进模型，按自己的模型上下文与成本决定。
-  content_ref_max_chars: 2000
-  max_output_chars: 5000
-  concurrency: 3
-  queue_size: 50
-  minute_attempt_limit: 100
-  daily_normal_limit: 7950
-  daily_absolute_limit: 8000
-  notice_cooldown_seconds: 300
-  reconnect_base_seconds: 3.0
-  reconnect_max_seconds: 60.0
-  ready_probe_seconds: 300.0
-  rate_limit_wait_seconds: 60.0
+ops:  # 只返回固定短文本的存活与就绪探针
+  host: "0.0.0.0"  # 健康探针监听地址；外部访问由部署端口映射决定
+  port: 8080  # 健康探针端口，提供 /livez 与 /readyz
 
-ops:
-  host: "0.0.0.0"
-  port: 8080
+storage:  # SQLite 运行状态；不存消息正文，发文标题例外见 D-107
+  db_path: "./data/bot.db"  # SQLite 文件路径，同目录须允许创建 WAL 和 SHM 文件
+  lobby_thread_retention_seconds: 604800  # 大区回复链无活动后的保留秒数
+  cleanup_interval_seconds: 3600  # 状态清理间隔秒数，不得超过大区链保留时间
+  send_attempt_retention_seconds: 172800  # 发送记录保留秒数，至少覆盖滚动 24 小时窗口
+  max_dm_channels: 10000  # 最多保留的已知私聊频道数，优先保留最近活动频道
+  sqlite_soft_limit_bytes: 134217728  # SQLite 主库软容量阈值，单位字节；超限只告警
+  wal_journal_limit_bytes: 16777216  # WAL journal_size_limit 字节数，须小于主库软阈值
 
-# 本配置文件有 1 MiB 硬上限（代码常量，不可在此调整）：超过时进程在启动阶段
-# 直接以配置错误退出，不会部分启动。
-storage:
-  db_path: "./data/bot.db"
-  # 大区共享链映射保留 7 天；7 天无活动即过期。
-  lobby_thread_retention_seconds: 604800
-  # 运行期清理周期，必须 <= lobby_thread_retention_seconds。
-  cleanup_interval_seconds: 3600
-  # 发送尝试记录保留 48 小时（覆盖滚动 24 小时配额窗口），不得小于 86400。
-  send_attempt_retention_seconds: 172800
-  # 已知私聊频道只保留最近活动的这么多条。
-  max_dm_channels: 10000
-  # SQLite 主库软上限（只告警，不硬截断）；需要收缩时由运维停机 VACUUM。
-  sqlite_soft_limit_bytes: 134217728
-  # WAL 的 journal_size_limit，必须小于 sqlite_soft_limit_bytes。
-  wal_journal_limit_bytes: 16777216
+logging:  # 白名单结构化日志；凭据统一脱敏，禁止写入正文
+  level: "INFO"  # 日志级别；DEBUG 也不允许记录正文或凭据
 
-logging:
-  level: "INFO"
-
-system_prompt: |
+system_prompt: |  # 聊天系统提示词；以下多行是实际发送内容，不在正文中添加 YAML 注释
   你是站内通用聊天机器人。明确自己的机器人身份，
   跟随用户语言，保持简洁友好，不代表站方作正式承诺。
 
-# 本地 Markdown 知识库默认关闭。启用后，聊天区的显式 `/kb <问题>` 会从 root_dir
-# 递归读取 .md 文件并检索；命中的片段会随当前轮问题一起发送给第三方模型。
-# 默认只允许私聊，且只允许 allowed_user_ids 中列出的站点用户 id；要在大区公开使用
-# 必须显式写 access_mode: all_chat（大厅仍需精确 @ 机器人）。
-# 上线前必须完成挂载目录的人工清点，确认其中没有密钥、隐私或无权转交模型的内容。
-knowledge_base:
-  enabled: false
-  # 容器部署时这是只读挂载点；不要把它放在镜像里或可写数据卷里。
-  root_dir: "./knowledge"
-  access_mode: allowlist
-  allowed_channel_kinds:
-    - dm
-  allowed_user_ids: []
-  refresh_seconds: 60
-  max_files: 2000
-  max_file_bytes: 1048576
-  max_total_bytes: 67108864
-  chunk_chars: 2400
-  chunk_overlap_chars: 200
-  top_k: 6
-  # 必须 <= behavior.context_input_tokens。
-  max_context_tokens: 4000
+knowledge_base:  # 本地只读 Markdown 检索；命中内容会发送给模型，目录须经授权清点
+  enabled: false  # 是否启用本模块；上级总开关也须开启
+  root_dir: "./knowledge"  # 知识库根目录，容器中应只读挂载
+  access_mode: allowlist  # allowlist 按用户和频道名单限制；all_chat 显式开放聊天范围
+  allowed_channel_kinds:  # allowlist 模式允许的频道；dm 为私聊，lobby 为大区
+    - dm  # 允许的频道类型；dm 为私聊，lobby 为大区
+  allowed_user_ids: []  # allowlist 模式允许的稳定用户 ID，不能填可修改的用户名
+  refresh_seconds: 60  # 读取或重建快照的间隔秒数
+  max_files: 2000  # 知识库扫描允许纳入的文件数量上限
+  max_file_bytes: 1048576  # 本模块单个 Markdown 文件的字节数上限
+  max_total_bytes: 67108864  # 知识库纳入文件的总字节数上限
+  chunk_chars: 2400  # 检索分块目标字符数
+  chunk_overlap_chars: 200  # 相邻块重叠字符数，须小于块长
+  top_k: 6  # 每次检索最多选取的片段数
+  max_context_tokens: 4000  # 单轮 KB 资料 token 上限，不得超过聊天上下文预算
 
-# 博客评论机器人默认关闭；启用前请确认机器人资料已披露第三方模型处理。
-comments:
-  enabled: false
-  recent_poll_seconds: 30
-  notification_poll_seconds: 15
-  notification_max_pages: 5
-  queue_size: 50
-  concurrency: 1
-  context_turns: 10
-  context_input_tokens: 8000
-  article_max_chars: 1000
-  # 一轮评论回复最多交给模型几张图，附件与两处正文里的 `[@10位]` 引用共用这一个
-  # 名额：评论附件 → 评论正文的引用 → 文章正文的引用，按这个顺序花。
-  # 0 表示评论侧不取图（聊天区不受影响）；整体关闭用 model.vision_enabled。
-  # 图片不计入上面的 context_input_tokens（那是文字预算），名额本身就是它们的成本上限。
-  max_images_per_reply: 3
-  max_output_chars: 5000
-  max_response_bytes: 8388608
-  max_tree_nodes: 10000
-  unmatched_attempt_limit: 5
-  minute_attempt_limit: 20
-  daily_reply_limit: 7950
-  daily_absolute_limit: 8000
-  article_cooldown_seconds: 5
-  conversation_retention_seconds: 2592000
-  dedupe_retention_seconds: 7776000
-  retry_base_seconds: 5
-  retry_max_seconds: 300
-  server_backoff_seconds: 3600
+comments:  # 博客评论子系统；独立队列与配额，共享模型并发闸门
+  enabled: false  # 是否启用评论机器人；成功评论会真实通知被回复者
+  recent_poll_seconds: 30  # 轮询全站最近评论的间隔秒数
+  notification_poll_seconds: 15  # 轮询评论回复通知的间隔秒数
+  notification_max_pages: 5  # 每轮通知读取页数上限；尾页未读尽时不完成冷启动基线
+  queue_size: 50  # 待处理请求队列的最大长度
+  concurrency: 1  # 处理请求的 worker 数
+  context_turns: 10  # 每个会话保留的完整对话轮数
+  context_input_tokens: 8000  # 文字上下文的估算 token 预算；图片成本另行限制
+  article_max_chars: 1000  # 文章正文可提供给模型的字符上限；超长只提供标题
+  max_images_per_reply: 3  # 每轮图片尝试名额；附件、评论引用、文章引用依次共用，失败也扣减，0 为不取图
+  max_output_chars: 5000  # 出站字符上限，超出时按自然段截断并添加后缀
+  max_response_bytes: 8388608  # 评论及相关读取响应的最大字节数，防止超大数据占满内存
+  max_tree_nodes: 10000  # 完整评论树节点上限；超限不能使用截断前缀
+  unmatched_attempt_limit: 5  # 通知成功读树后仍找不到匹配目标的尝试次数上限
+  minute_attempt_limit: 20  # 每分钟滑动窗口的本地发送限额，含在途预留
+  daily_reply_limit: 7950  # 滚动 24 小时模型评论回复数量上限，仅统计 reply
+  daily_absolute_limit: 8000  # 滚动 24 小时评论总上限，含本地回复；不得超过 8000
+  article_cooldown_seconds: 5  # 同一文章两次评论发送的最小间隔秒数
+  conversation_retention_seconds: 2592000  # 评论会话映射保留秒数，过期同步作废内存上下文
+  dedupe_retention_seconds: 7776000  # 评论去重、已发回复与通知终态的保留秒数
+  retry_base_seconds: 5  # 评论轮询或恢复失败后的基础退避秒数
+  retry_max_seconds: 300  # 评论重试退避的最大秒数
+  server_backoff_seconds: 3600  # 评论遇到站点限制时的默认退避秒数
 
-# 长期记忆目前为 Beta。默认关闭；启用后仍默认无人可用。
-memory:
-  enabled: false
+memory:  # 长期记忆 Beta；正文存授权 Markdown，公开与私有读取严格隔离
+  enabled: false  # 是否装配长期记忆；关闭时不读目录、不启记忆任务
 
-  # allowlist：只有 allow_user_list 中的用户能使用任何记忆能力。
-  # all：所有用户都能使用；共同记忆管理权仍只属于 admin_user_list。
-  access_mode: "allowlist"
-  allow_user_list: []
-  admin_user_list: []
+  access_mode: "allowlist"  # allowlist 限名单，all 开放接入；共同记忆管理权仍单独控制
+  allow_user_list: []  # 记忆接入名单，填写稳定用户 ID
+  admin_user_list: []  # 共同记忆管理员 ID；allowlist 模式须为接入名单子集
 
-  root_dir: "./data/memory"
-  refresh_seconds: 10
-  queue_size: 20
+  root_dir: "./data/memory"  # 记忆根目录，包含 common.md、users/、public/；只支持单进程写入
+  refresh_seconds: 10  # 读取或重建快照的间隔秒数
+  queue_size: 20  # 待处理请求队列的最大长度
 
-  max_common_entries_per_scope: 64
-  max_private_entries_per_user: 32
-  max_candidates: 128
-  max_entry_chars: 500
-  max_file_bytes: 262144
-  max_operations: 512
+  max_common_entries_per_scope: 64  # 每个共同记忆作用域的生效条目上限
+  max_private_entries_per_user: 32  # 每位用户的私有记忆条目上限
+  max_candidates: 128  # 共同记忆待审批候选总数上限，满额不静默删除
+  max_entry_chars: 500  # 单条记忆正文的字符上限
+  max_file_bytes: 262144  # 本模块单个 Markdown 文件的字节数上限
+  max_operations: 512  # 每份记忆文件保留的业务幂等操作记录上限
 
-  # 记忆自己的 token 上限：共同记忆（all_user 与 lobby）合计使用这一份，私有记忆各一份。
-  # 超过上限的条目整条跳过（不截断），记忆因此不会把整轮预算吃光、把历史挤掉。
-  common_context_tokens: 800
-  private_context_tokens: 800
-  writer_context_tokens: 2000
-  writer_timeout_seconds: 15
+  common_context_tokens: 800  # all_user 和 lobby 共同记忆合计的单轮 token 上限
+  private_context_tokens: 800  # 所属用户私有记忆的单轮 token 上限
+  writer_context_tokens: 2000  # 记忆撰写整份请求的 token 上限，包含 system、来源及既有条目
+  writer_timeout_seconds: 15  # 获取并发名额后，单次记忆撰写的超时秒数
 
-  # 公开个人记忆（用户把自己的一条私有记忆发布到大区与评论可见的公开投影）：
-  # 单个 owner 的公开条目上限、一轮最多选入的 owner 数、公开个人记忆分组的渲染上限。
-  # `max_public_entries_per_user` 不能大于 `max_private_entries_per_user`。
-  max_public_entries_per_user: 8
-  max_public_subjects_per_turn: 4
-  public_personal_context_tokens: 600
+  max_public_entries_per_user: 8  # 每位用户公开条目上限，不得超过私有条目上限
+  max_public_subjects_per_turn: 4  # 每轮最多纳入的公开记忆 owner 数
+  public_personal_context_tokens: 600  # 公开个人记忆资料组的单轮 token 上限
 
-  # 部署允许后，用户仍需在私聊中主动开启自动记忆。
-  auto_capture_available: false
+  auto_capture_available: false  # 部署是否允许自动记忆；用户仍需在私聊中主动开启
 
-# 定时发文（设计 BLOG_PUBLISH_DESIGN.md §4，内部合同 INTERFACES.md §53）。
-# 机器人以自己的账号、按固定 UTC+8 的调度点自动发布博客文章，默认整段关闭。
-# 两条来源产出的都是同一种草稿（YAML front matter + Markdown 正文）：
-#   - 现写型：写 prompt，到点让模型写一篇；
-#   - 稿库型：写 drafts_dir，到点从目录里按文件名顺序取一篇。
-# tier=must 到点必发起；tier=maybe 到点按 probability 掷一次骰。
-# 注意：这里没有 Web 界面，任务的增删改一律走本文件（也就是走版本控制）。
-blog:
-  enabled: false
+blog:  # UTC+8 定时自动发文；普通用户接口例外，真实站点验收见 USAGE.md
+  enabled: false  # 是否启动发文扫描、生成与对账；开启时至少配置一个任务
 
-  # 本地日预算，1..5，默认 2。只约束「本机器人记录的投递」；同账号在网页上手工发文
-  # 一样占站方的 20 篇/日额度，所以远端 429 仍必须处理。
-  # 结果不确定的行跨 UTC+8 午夜**持续占用额度**，不会在零点释放 —— 详见 USAGE.md。
-  max_posts_per_day: 2
+  max_posts_per_day: 3  # 机器人本地每日投递上限，范围 1–5；不确定记录跨日持续占额
 
-  # 任务表。enabled 为 true 时必须至少有一个任务；关闭时留空是合法的。
-  #
-  # 字段（`prompt` 与 `drafts_dir` 必须**恰好给一个**）：
-  #   name         任务名，非空、全局唯一；它是持久标识，**改名等同新建一个任务**
-  #   tier         must | maybe
-  #   schedule     "HH:MM" 列表，按 UTC+8 解释，同任务内不得重复
-  #   prompt       现写型的任务提示词（多行用 YAML 的 `|`）
-  #   drafts_dir   稿库型：稿件目录，相对路径以**本配置文件所在目录**为基准
-  #   category_id  公开栏目 id；留空即「未分类」。站点没有公开的栏目列表接口，
-  #                叶子栏目的 id 拿不到，只能人工填父栏目的 id（见设计 §2.2）
-  #   probability  仅 maybe 使用且必填，(0, 1]
-  tasks: []
+  tasks:  # 发文任务列表，每项只能选择 prompt 或 drafts_dir 之一
+    - name: "晨间随笔"  # 任务持久标识，必须唯一；改名等同新任务
+      tier: must  # must 到点发起，maybe 按概率决定；均受预算和校验限制
+      schedule: ["09:00"]  # UTC+8 的 HH:MM 调度点列表，同任务不得重复，停机错过不补发
+      category_id: 12  # 栏目整数 ID，null 为未分类；由维护者核对填写
+      prompt: |  # 现写任务提示词，作为 user 内容交给模型；多行正文中不添加 YAML 注释
+        写一篇晨间随笔，语气平和，400 字左右。
+        可以先用一次搜索工具取一点当天的素材。
 
-  # 用法示例（整段取消注释后按需修改）：
-  #
-  # tasks:
-  #   - name: "晨间随笔"
-  #     tier: must
-  #     schedule: ["09:00"]
-  #     category_id: 12
-  #     prompt: |
-  #       写一篇晨间随笔，语气平和，400 字左右。
-  #       可以先用一次搜索工具取一点当天的素材。
-  #
-  #   - name: "偶发感想"
-  #     tier: maybe
-  #     probability: 0.3
-  #     schedule: ["21:30"]
-  #     category_id: 7
-  #     prompt: |
-  #       写一段随想。
-  #
-  #   - name: "连载"
-  #     tier: must
-  #     schedule: ["20:00"]
-  #     category_id: 5
-  #     drafts_dir: ./drafts/serial
+    - name: "每日新闻速览"  # 任务持久标识，必须唯一；改名等同新任务
+      tier: maybe  # must 到点发起，maybe 按概率决定；均受预算和校验限制
+      probability: 0.99  # maybe 每个调度点的执行概率，须大于 0 且不超过 1
+      schedule: ["20:10"]  # UTC+8 的 HH:MM 调度点列表，同任务不得重复，停机错过不补发
+      category_id: 7  # 栏目整数 ID，null 为未分类；由维护者核对填写
+      prompt: |  # 现写任务提示词，作为 user 内容交给模型；多行正文中不添加 YAML 注释
+        调用搜索工具，简述每天国内国际新闻。
+  
+    - name: "连载"  # 任务持久标识，必须唯一；改名等同新任务
+      tier: must  # must 到点发起，maybe 按概率决定；均受预算和校验限制
+      schedule: ["20:18"]  # UTC+8 的 HH:MM 调度点列表，同任务不得重复，停机错过不补发
+      category_id: 5  # 栏目整数 ID，null 为未分类；由维护者核对填写
+      drafts_dir: ./drafts  # 稿库目录，相对本配置文件解析；按文件名选稿，与 prompt 互斥
