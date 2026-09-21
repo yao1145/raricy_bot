@@ -21,11 +21,13 @@ subject **不渲染进任何一条消息**，也不参与预算：它随历史�
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from ..text_utils import estimate_tokens
 from ..texts import MEMORY_SYSTEM_ADDENDUM, PUBLIC_PERSONAL_MEMORY_SYSTEM_ADDENDUM
+from ..time_context import render_current_time
 
 
 def dm_session_key(channel_id: str) -> str:
@@ -224,12 +226,38 @@ def _exceeds_group_caps(
 class ContextManager:
     """内存会话历史；只做追加、清空、裁剪与消息拼装。"""
 
-    def __init__(self, max_turns: int, max_input_tokens: int) -> None:
+    def __init__(
+        self,
+        max_turns: int,
+        max_input_tokens: int,
+        *,
+        now: Callable[[], float] = time.time,
+    ) -> None:
+        """`max_turns` / `max_input_tokens` 的位置与含义保持不变（大量调用方按位置传参）。
+
+        `now` 是 keyword-only 的时钟注入点（AGENTS.md：时钟必须可注入），返回 epoch 秒，
+        默认 `time.time`。它只用于渲染 system 末段的当前时间片段（D-114），不改变历史、
+        裁剪与预算口径之外的行为。
+        """
         self._max_turns = max_turns
         self._max_input_tokens = max_input_tokens
+        self._now = now
         self._sessions: dict[str, list[Turn]] = {}
         # 会话代次：reset / invalidate 时递增。用途见 reset() 的注释。
         self._generations: dict[str, int] = {}
+
+    def _time_fragment(self) -> str:
+        """本轮 system 末尾的当前时间片段（`render_current_time` 的**唯一**入口）。
+
+        它是 system 里唯一的动态内容（D-114）：由 `now()` 从进程时钟生成，不接受任何请求、
+        用户、记忆或工具数据，因此用户完全不可控。
+
+        `build_messages` 与 `select_recent_suffix` 必须共用这一个方法：两处各渲染一遍就是
+        预算口径分叉的起点。片段**定长**（设计 §7：24 字符 / 12 token），所以两处各自读取
+        `self._now()`、即使恰好跨越分钟边界，估出的 token 也完全一致 —— 这正是两处 system
+        末段能按同一口径计入预算的前提。
+        """
+        return render_current_time(self._now())
 
     def append_exchange(
         self,
@@ -319,8 +347,13 @@ class ContextManager:
 
         `pending_user` 只出现在返回值末尾，**不进历史**；它由调用方在回复送达后
         用 `append_exchange()` 提交。`system_addendum` 只拼进 system 消息，
-        且必须是静态文本（D-24）。历史按 `max_input_tokens` 从最旧整对丢弃，
-        至少保留最后一组；`pending_user` 永远保留（即使超限）。
+        且必须是静态文本（D-24）—— 这条静态要求在 `system_addendum` 本身依然成立。
+        唯一的例外是 system 的**最后一段**：由 `now()` 渲染的当前时间片段（D-114），
+        它排在 `system_prompt`、`system_addendum` 与两条记忆说明**全部之后**，由进程时钟
+        生成、用户不可控，因此不违反「用户内容只进 role=user」。它是 system 里唯一的动态
+        内容，此后任何新增的动态 system 内容都必须重新走决策记录，不得援引本次例外。
+        历史按 `max_input_tokens` 从最旧整对丢弃，至少保留最后一组；`pending_user` 永远
+        保留（即使超限）。
 
         `feature_context=True` 表示本轮带着能力数据块（当前只有 `/kb`）：此时
         `max_input_tokens` 被当作**硬上限**，历史可以整对丢到一条不剩（D-38）。
@@ -364,6 +397,13 @@ class ContextManager:
             # 契约要求 system 与静态附加说明分别计入预算；若把它们先拼接再估算，
             # 非 CJK 字符的 ceil 会少算一个分段的取整项。
             system_tokens += estimate_tokens(system_addendum)
+
+        # 时间片段固定是 system 的最后一段（D-114），但其正文要等记忆说明都追加完再拼，
+        # 因此这里**先**把它的 token 记进预算。与 `system_addendum` 一样单独估算：先拼接
+        # 再估算会少算非 CJK 分段的取整项。渲染只发生在这里与 `select_recent_suffix`，
+        # 两处共用 `_time_fragment`。
+        time_fragment = self._time_fragment()
+        system_tokens += estimate_tokens(time_fragment)
 
         history = list(self._sessions.get(session_key, []))
         base_tokens = system_tokens
@@ -410,6 +450,10 @@ class ContextManager:
                 # 公开个人记忆是**第三类**记忆，有自己的静态说明（§45.3、§50.4）：只有确实
                 # 选入至少一条公开个人条目时才追加，与上面那条各自生效、同样单独计入预算。
                 system = f"{system}\n\n{PUBLIC_PERSONAL_MEMORY_SYSTEM_ADDENDUM}"
+
+        # 时间片段永远是 system 的最后一段（D-114）：排在 system_prompt、system_addendum
+        # 与两条记忆说明之后，任何一条 system 内容都不能排在它后面。
+        system = f"{system}\n\n{time_fragment}"
 
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend({"role": turn.role, "content": turn.content} for turn in history)
@@ -563,7 +607,9 @@ class ContextManager:
         返回 S1 的条目（入参顺序，旧到新）：只有落在 S1 里的大区近期消息才可以贡献公开
         记忆的 subject，调用方随后把 S1 原样交给 `build_messages`。参数与 `build_messages`
         的同名预算输入逐条对应，估算口径也完全一致 —— 两处一旦分叉，S1 就不再是
-        「`_plan_turn` 最终选择的上界」。
+        「`_plan_turn` 最终选择的上界」。system 末段的当前时间片段（D-114）与
+        `build_messages` 同款单独计入，位置也一致（在 system 与 addendum 之后、本轮正文
+        之前），并用同一个 `_time_fragment` 渲染。
 
         **不预留记忆块的额度**：计算时假定本轮既没有记忆资料块、也没有记忆的 system 说明。
         `_plan_turn` 里记忆块**先于**近期块取（lobby 设计 §11.3 的既有合同，不翻转），所以
@@ -580,11 +626,16 @@ class ContextManager:
         """
         if not transient_user_items:
             return ()
-        # 与 `build_messages` 同款：system 与静态 addendum **分别**估算（先拼接再估会少算
-        # 非 CJK 分段的取整项），再计入本轮正文。
+        # 与 `build_messages` 同款：system、静态 addendum 与时间片段**分别**估算
+        # （先拼接再估会少算非 CJK 分段的取整项），再计入本轮正文。
         used = estimate_tokens(system_prompt)
         if system_addendum:
             used += estimate_tokens(system_addendum)
+        # 时间片段与 `build_messages` 的位置、口径严格一致：它是 system 里唯一的动态内容
+        # （D-114），走同一个 `_time_fragment`。片段**定长**，因此这里与 `build_messages`
+        # 各自读取 `self._now()`、即使跨越分钟边界，估出的 token 也完全相同 —— 这正是两处
+        # 预算不会分叉、S1 仍是实际选择上界的原因。
+        used += estimate_tokens(self._time_fragment())
         if pending_user is not None:
             used += estimate_tokens(pending_user)
         history = self._sessions.get(session_key, [])

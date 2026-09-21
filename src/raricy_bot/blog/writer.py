@@ -1,7 +1,8 @@
 """定时发文的生成器（INTERFACES §53.9）。
 
 一次 `write()` 就是**一次**两轮工具协议：system 是静态写作规则
-（`texts.BLOG_WRITE_SYSTEM_PROMPT`），user 是任务提示词，工具结果以 `role="tool"` 回传并
+（`texts.BLOG_WRITE_SYSTEM_PROMPT`）加上末尾的当前时间片段（`time_context`，D-114），
+user 是任务提示词，工具结果以 `role="tool"` 回传并
 就地标明不可信（`texts.BLOG_WRITE_TOOL_UNTRUSTED_PREFIX`）。首轮直接给出文章同样合法；
 至多执行一次合法工具调用，第二轮 `tool_choice="none"`。**不做多步研究循环**，也不在模型
 客户端的既有有界重试之外重试（`max_retries=0` 不变）。
@@ -17,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
 from typing import Any
@@ -29,6 +31,7 @@ from ..core.worker import (
 )
 from ..logging_setup import get_logger, log_event
 from ..mcp.contracts import ToolCall, ToolDefinition, ToolExecution
+from ..time_context import append_current_time
 from .codec import parse_draft
 from .models import Draft
 
@@ -55,6 +58,8 @@ class BlogWriter:
     - `max_input_tokens`：本轮请求的输入上限（装配时传 `behavior.context_input_tokens`）；
     - `model_gate`：App 共享的并发门，只在**每次模型 HTTP 请求**期间持有；
     - `sleep`：计时器注入点（默认 `asyncio.sleep`），用来施加 180 秒上限；
+    - `now`：时钟注入点（默认 `time.time`），返回 epoch 秒，只用于渲染 system 末段的
+      当前时间片段（D-114）；与 `sleep` 同为 keyword-only 的注入点；
     - `timeout_seconds`：整次 `write()` 的上限，默认就是上面的常量。
     """
 
@@ -68,6 +73,7 @@ class BlogWriter:
         max_input_tokens: int | None = None,
         model_gate: Any | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        now: Callable[[], float] = time.time,
         timeout_seconds: float = WRITE_TIMEOUT_SECONDS,
     ) -> None:
         self._model = model
@@ -77,6 +83,7 @@ class BlogWriter:
         self._max_input_tokens = max_input_tokens
         self._model_gate = model_gate
         self._sleep = sleep
+        self._now = now
         self._timeout_seconds = timeout_seconds
         # 工具预算**不新增配置项**：能力层是工具白名单与预算的唯一真值源（§53.9）。
         # 配置校验把它钉死为 1；这里的默认值只服务于手工构造的对象。
@@ -174,14 +181,20 @@ class BlogWriter:
                 max_input_tokens=self._max_input_tokens,
             )
 
-    @staticmethod
-    def _messages(prompt: str) -> list[dict[str, Any]]:
+    def _messages(self, prompt: str) -> list[dict[str, Any]]:
         """消息分工固定：静态写作规则进 system，任务提示词进 user。
 
-        任务提示词与工具正文都**不得**拼进 system —— 它们是数据，不是规则。
+        任务提示词与工具正文都**不得**拼进 system —— 它们是数据，不是规则。system 的**唯一**
+        动态内容是由 `now()` 渲染的当前时间片段（D-114），追加在静态写作规则之后；它由进程
+        时钟生成、用户完全不可控，因此不违反「用户内容只进 role=user」这条红线。
         """
         return [
-            {"role": "system", "content": texts.BLOG_WRITE_SYSTEM_PROMPT},
+            {
+                "role": "system",
+                "content": append_current_time(
+                    texts.BLOG_WRITE_SYSTEM_PROMPT, self._now()
+                ),
+            },
             {"role": "user", "content": prompt},
         ]
 

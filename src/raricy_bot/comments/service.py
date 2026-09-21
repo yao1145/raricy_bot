@@ -30,6 +30,7 @@ from ..site.comment_models import CommentNode, CommentTreeTooLarge as SiteCommen
 from ..site.client import SiteClient
 from ..store import CommentClaim, Store
 from ..text_utils import is_reset_command, strip_bot_mention, truncate_at_paragraph
+from ..time_context import append_current_time
 from .discovery import (
     CandidateCallback,
     NotificationPoller,
@@ -193,9 +194,14 @@ class CommentService:
         # 接受 reservation_token 后由本层完成 note/release，旧 Sender 则走兼容
         # 路径并交回其自身的预留逻辑。
         self.quota = quota
+        # 默认装配的 ContextManager 共用 service 自己的时钟：`build_messages` 与下面的
+        # 无 context_manager 回退分支各自渲染 system 末段的时间片段（D-114），若这里沿用
+        # `ContextManager` 的默认 `time.time`，两条路径就会看到两个时钟，测试注入的
+        # `now` 也只在回退分支生效。
         self.context_manager = context_manager or ContextManager(
             _cfg(config, "context_turns", 10),
             _cfg(config, "context_input_tokens", 8000),
+            now=self.now,
         )
         self.system_prompt = system_prompt
         # 内容引用解析器（§25）；没注入时正文里的 `[@<ID>]` 保持字面量。
@@ -1238,8 +1244,12 @@ class CommentService:
                 supplemental_caps=caps,
             )
         else:
+            # 无 `context_manager` 的回退分支不走 `build_messages`，因此这里手动补上
+            # system 末段的时间片段（D-114、设计 §6.2）：system 为空串时
+            # `append_current_time` 只返回片段。走 `build_messages` 的主路径已经由
+            # ContextManager 追加过一次，这里**不得**再补，否则片段会出现两遍。
             messages = [
-                {"role": "system", "content": system},
+                {"role": "system", "content": append_current_time(system, self.now())},
                 {"role": "user", "content": prompt},
             ]
         # 图片块排在正文之后，顺序只影响模型的阅读次序：附件 → 评论引用 → 文章引用。

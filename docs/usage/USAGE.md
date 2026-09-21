@@ -121,6 +121,8 @@
 
 不用下命令，下面这些我会在需要时自己读：
 
+- **当前时间**：每轮我都会带上**服务器时钟**的当前时间，固定按 **UTC+8** 换算，与站内日历是同一个刻度，
+  所以问「今天星期几」「现在几点」我能直接答。这只是让我知道「现在」，不会带来定时发帖、提醒之类的行动能力。
 - **你回复的那条消息**：它带的引用与正文会一起看。被引用的消息若是图片，我会去读**那张缩略图**
   （站点只提供缩略图，分辨率比原图低，图里的小字可能读不清）；取不到时我会记下「图片未提供」
   并照常回答，已删除的引用不会去读它的图。
@@ -239,6 +241,7 @@
 | 大区里会临时保留最近 50 条公开文字消息 | `core/lobby_context.py` 的 `LobbyRecentContextBuffer`（`MAX_RECENT_MESSAGES=50`、`MAX_CONTENT_CHARS=500`，内存滚动、重启即失）；`core/router.py` 的观察入口只在 `channel_id == "lobby"` 时调用；块头 `LOBBY_RECENT_CONTEXT_HEADER` 与 `LOBBY_SHARED_SYSTEM_ADDENDUM` 第四条声明它不可信且只属当前轮（§38、D-95） |
 | 只有装得下的部分会外送 | `core/context.py` 的 `transient_user_items` 按 `behavior.context_input_tokens`（默认 8000）从最新向旧选连续后缀；装不下就一条都不发，不会顶掉 system 与本轮正文 |
 | 记得最近约 10 轮 | `behavior.context_turns`（默认 10），超预算还会再按 token 裁一次 |
+| 每轮都知道当前时间（固定 UTC+8，取自服务器时钟） | `time_context.py` 的 `render_current_time` / `UTC8`；由 `core/context.py` 的 `ContextManager._time_fragment` 追加到 system 末段，评论与发文各自调用同一渲染函数（D-114） |
 | 聊天里能不能看图、联网边界、不能看博客正文 | `model.vision_enabled`（默认 `false`）决定看图的文案与行为；`/search`、`/zhihu`、`/map`、`/wolfram` 是聊天区的四个单轮能力入口；博客区每轮只读文章标题与 ≤1000 字正文且不获得 MCP |
 | 长期记忆默认没有、按名单开通、命令只在私聊 | `memory.enabled`（默认 `false`）、`memory.access_mode`（默认 `allowlist`）与 `memory.allow_user_list`；`memory/access.py` 的 `MemoryAccessPolicy`；`core/router.py` 的记忆命令分支（未通过门禁回 `MEMORY_BETA_DENIED_TEXT`，大区里回 `MEMORY_DM_ONLY_TEXT`） |
 | 私有记忆只在本人的私聊里被参考 | `MemoryService.context_for` 的作用域表（D-56）：`lobby` 与 `comment` 两种频道**连私有文件都不打开**；`permits_private` 两种接入模式下都要求频道是 `dm` |

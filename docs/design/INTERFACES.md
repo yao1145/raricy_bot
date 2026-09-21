@@ -96,8 +96,12 @@ Key、会话 Cookie；用户名不是密钥。
 ## 5. `texts.py`
 
 入口：[固定文案与帮助函数](../../src/raricy_bot/texts.py)、[提示词规范](SYSTEM_PROMPTS.md)。
-系统附加说明必须静态，不插入用户名、资料或配置正文。帮助文案由配置事实与用户门禁决定，
-不得写死可配置的博客/文章长度。修改固定提示词须同步规范正文和对应测试。
+系统附加说明必须静态，不插入用户名、资料或配置正文（system 里唯一的动态片段是时间片段，
+见 §54）。帮助文案由配置事实与用户门禁决定，不得写死可配置的博客/文章长度。
+修改固定提示词须同步规范正文和对应测试。
+
+本模块还持有 system 末段时间片段的固定文案：前缀 `CURRENT_TIME_LABEL` 与星期名 `WEEKDAYS`
+（下标对齐 `datetime.weekday()`，不得重排）；渲染与追加函数见 §54。
 
 ## 6. `site/models.py`
 
@@ -155,6 +159,11 @@ DM 按频道，公开链用 `lobby-thread:<root_id>`，重启保留归属但不�
 `pending_user` 只在当前请求出现。历史从最旧整对裁剪；普通路径至少保留最后一对，
 `feature_context=True` 允许清空历史，但不会截断 system 或当前输入，调用者仍须预算预检。
 记忆、近期消息和公开 subject 分别见 §33、§38、§45。
+
+`ContextManager.__init__` 另有 keyword-only 的 `now: Callable[[], float] = time.time`（时钟注入点）。
+`build_messages` 在 system 全部组装完成后把当前时间片段追加为 system 的**最后一段**；
+`select_recent_suffix` 必须用同一个私有 `_time_fragment` 计入同一口径 —— 两处一旦分叉，
+§45 的 S1 就不再是 `build_messages` 选中项的上界。片段本身见 §54。
 
 ## 12. `core/router.py`
 
@@ -571,7 +580,7 @@ memory off 只关私有读取与自动提取，公开副本不变；自动更新
 ### 53.9 生成
 
 [blog/writer.py](../../src/raricy_bot/blog/writer.py)、[严格模型调用](../../src/raricy_bot/core/worker.py)。
-system 静态、任务提示词进 user、工具返回进 tool；一次两轮协议，至多执行一次合法工具，
+system 是静态写作规则加 system 末段的当前时间片段（§54）、任务提示词进 user、工具返回进 tool；一次两轮协议，至多执行一次合法工具，
 第二轮 tool_choice=none。整份输入超限、截断或非法完成均失败，不发布半稿；
 共享 model_gate，取消传播，不自行扩展研究循环。
 
@@ -604,3 +613,16 @@ PublishOutcome.post_id 是否为 None 决定 status 是运行态还是投递态�
 
 对应 `tests/test_blog_publish_*.py`，全部使用替身。
 上线验收待办留在使用手册；不能把文档归档、单元测试通过或本地实现完成称为真实站点验收通过。
+
+## 54. 当前时间片段（`time_context.py`）
+
+入口：[渲染与追加](../../src/raricy_bot/time_context.py)。它是送进模型的 system 里**唯一**的
+动态片段：由代码从进程时钟生成，用户完全不可控，因此不违反「用户内容只进 role=user」
+（D-114）。口径固定 UTC+8，到分为止，片段定长 24 字符（文案前缀与星期名的归属见 §5）。
+它固定是 system 的**最后一段**，排在 `system_prompt`、所有静态附加说明与记忆说明之后；
+此后任何新增的动态 system 内容都必须重走一次决策记录，不得援引本次例外。
+
+`render_current_time(now: float) -> str` 渲染片段，`append_current_time(system: str, now: float) -> str`
+把它追加到 system 末尾（system 为空时只返回片段）。依赖方向固定为 `texts ← time_context`：
+只依赖标准库与 `texts`，不 import 任何业务模块，聊天、评论与 `blog/` 各调用点都能安全引用，
+不引入依赖环。
