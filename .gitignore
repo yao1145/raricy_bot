@@ -32,7 +32,21 @@ data/
 
 # 本地配置与密钥。可入库的配置只有 config.example.yaml
 config.yaml
+# `.env` 的其余写法（`.env.local`、`.env.production`…）同样只在本机存在。
+# 单独豁免 `.env.example`：那是不含真实值的模板。
 .env
+.env.*
+!.env.example
+# 常见的凭据备份与导出文件名：它们通常不会被误认为配置，因此更该列出来。
+*.pem
+*.key
+credentials.json
+service-account*.json
+
+# 运行期日志与永久归档。归档按设计只增不减，绝不能进版本库：
+# 它一旦入库，历史里的每一条错误都会永久留在 Git 对象里，删不掉。
+logs/
+*.jsonl
 
 # 编辑器 / 系统
 .vscode/

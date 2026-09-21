@@ -133,9 +133,15 @@ docker run --rm -it --pid=container:<容器> --cap-add SYS_PTRACE \
 
 ### 六、本事件暴露出的独立缺陷（与本事件因果未定，但都值得单独修）
 
+> **2026-09-21 补充：**下列第 1、5、6 条已经补上了**观测手段**，第 2、3、4 条仍未改动。
+> 补观测不等于故障已解决：本事件的结论仍是**未定案**，不要因为现在多几行日志就把它
+> 当成已定位。新增的取证方式见第九节。
+
 1. **worker 死亡无日志、无兜底**（core/worker.py:546、:492-495）：`except Exception` 兜不住
    BaseException；worker 一死 `/livez` 就永久 503，而现场毫无痕迹。修法：兜 `BaseException`，
    区分「真关停」与「逃逸取消」，对后者记稳定事件并让 worker 继续跑。
+   **2026-09-21**：已补上结束观察（`app.task_exit`，`reason=cancelled_escaped` 即逃逸取消），
+   worker 本身的行为**未改** —— 它仍会以 cancelled 结束，只是不再零日志。
 2. **MCP 调用的双路同值超时**（mcp/session.py:75 与 :148）：外层 `wait_for` 与 SDK 自己的
    读超时同值并存，是取消转换被破坏的窗口。修法：只留一路（去掉外层、依赖 SDK 的
    `MCPError(REQUEST_TIMEOUT)`，或让 SDK 的读超时严格大于外层）。
@@ -151,10 +157,17 @@ docker run --rm -it --pid=container:<容器> --cap-add SYS_PTRACE \
    （mcp/session.py:89-101）没有超时且持有 `self._lock`，拆除一旦挂住，后续每次重连都排队
    等锁，**一条日志都不会有**。本事件里 3 分 48 秒无任何 `mcp.*` 行、也没有任何指向 zhihu 的
    HTTP 行，而健康的重连周期是毫秒级且必留日志——与「卡在拆除」一致。
+   **2026-09-21**：已补上阶段耗时观测。connect / discover / close 三个阶段各自登记开始与
+   结束时刻，超过 60 秒未结束就记一条 `event=mcp.phase_stalled`（每个阶段只报一次），
+   结束若曾停滞则记 `event=mcp.phase_finished`。停滞**只报警、不取消** —— 拆除本身仍可能
+   挂住，但现场不再是一片空白。
 6. **第三方 logger 静音名单过期**（logging_setup.py:87-94）：名单里是 `httpx`，而
    openai 2.54 与 mcp 2.2 都改用 `httpx2`，其 INFO 行会漏进应用日志。本次正是靠这些行证明
    「zhihu 侧一个 HTTP 都没发出」；如果决定静音它，请同时保留一个针对性的
    「多久没发出过 MCP HTTP」诊断。
+   **2026-09-21**：`httpx2` 已加入静音名单（两个包名都列着）。它仍保留 INFO 级输出，
+   只有 WARNING 及以上会被换成受限的 `third_party.failure` 事件——上面那句「zhihu 侧
+   一个 HTTP 都没发出」的证据形式因此还在。针对性的"多久没发出过 MCP HTTP"诊断仍未实现。
 7. 记录性事实：健康检查行末尾 `503 192` 里的 192 不是正文长度——aiohttp 的 `%b` 统计的是
    **含响应头**的整个响应字节数（aiohttp 3.14 源码注释：`Size of response in bytes,
    including HTTP headers`），对应 `web.Response(status=503, text="down")`（正文 4 字节）。
@@ -179,3 +192,32 @@ docker run --rm -it --pid=container:<容器> --cap-add SYS_PTRACE \
   `reconnect_base_seconds` / `reconnect_max_seconds` 的实际取值；
 - 镜像构建自哪个 commit（本事件是否包含 2026-09-17 的 `lobby_recent` 提交 `86db8f1`）；
 - 容器有没有内存上限（用于彻底排除 OOM，虽然健康检查节拍已基本排除重启）。
+
+### 九、新的取证方式（2026-09-21 起可用）
+
+这一节只记录**怎么看得更清楚**，不改本事件的结论。永久错误归档（
+[D-112](../design/DESIGN_DECISIONS.md#d-112)）开启后，WARNING 及以上会落在
+`/app/logs/errors` 的分片里，不再随容器重建消失。
+
+```bash
+# 巡检分片完整性：末行被写坏会标 DAMAGED 并以非零退出码结束
+docker compose exec bot python -m raricy_bot archive verify --directory /app/logs/errors
+
+# 按级别与时间前缀取事件；时间戳是定长 UTC 串，前缀比较就是时间比较
+docker compose exec bot python -m raricy_bot archive read \
+  --directory /app/logs/errors --level WARNING --since 2026-09-21T00:00:00
+```
+
+与本次事件直接相关的几条新线索：
+
+| 观察 | 现在能看到什么 |
+|---|---|
+| worker 静默死亡（第 6 节第 1 条） | `event=app.task_exit task=worker-<n> reason=cancelled_escaped` —— **没有**取消请求却以 `CancelledError` 收尾，正是事件一的形态；`reason=failed` 时还带安全堆栈（模块、函数、行号） |
+| 健康状态翻转 | `event=app.health_changed from_state=up to_state=down reason=<组件> queue_depth=<n> worker_count=<n>`。只在**变化时**记一条，跨过静默开始那一刻就有据可查 |
+| MCP 重连停滞（第 6 节第 5 条） | `event=mcp.phase_stalled server=zhihu stage=close duration_ms=<n>` |
+| 追一条消息的全过程 | 新增 `trace_id`：路由判定、模型失败与发送结果都带上它。它只由随机数生成，不含 message_id 或用户信息 |
+| 归档自身 | `/archivez` 只回计数与布尔；`archive.write_failed` / `archive.recovered` 带 `gap_count`。**缺口补不回来**，它只说明丢了多少条 |
+
+**仍然查不到的**：控制台与归档都不保存消息正文、模型请求/响应与工具参数 —— 这套改动
+加的是**诊断信息**，不是现场回放。第 8 节列的三个环境未知项照旧要在下次事发前确认，
+归档不会替它们作答。

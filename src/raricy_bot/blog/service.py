@@ -379,6 +379,7 @@ class BlogService:
         # 现写：一次生成 + 一次预校验。`write()` 的失败只算本次生成失败（§53.9 的表）。
         reason: str | None = None
         error_name: str | None = None
+        model_fields: dict[str, object] | None = None
         try:
             draft = await self._writer.write(task)
             return prepare_draft(draft, redactor=self._redactor)
@@ -386,6 +387,7 @@ class BlogService:
             reason = exc.reason
         except ModelError as exc:
             reason = _MODEL_FAILURE_REASONS.get(exc.kind, REASON_MODEL_ERROR)
+            model_fields = exc.log_fields()
         except Exception as exc:  # noqa: BLE001 - 未分类异常也必须映射成稳定原因
             reason, error_name = REASON_GENERATION_FAILED, type(exc).__name__
         # 生成或预校验失败：立即告警并结束本次执行，同点不重试，**不停**发文子域。
@@ -397,6 +399,10 @@ class BlogService:
         }
         if error_name is not None:
             fields["error"] = error_name
+        if model_fields is not None:
+            # 模型失败时补上 kind / retryable / http_status：`reason` 只说明
+            # "哪一类失败"，这三项才说明"为什么"，而它们都不含正文。
+            fields.update(model_fields)
         log_event(self._logger, logging.ERROR, "blog.generation_failed", **fields)
         await self._finish_run(run, RUN_FAILED, reason)
         return None

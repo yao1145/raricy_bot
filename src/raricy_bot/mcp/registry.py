@@ -12,6 +12,7 @@ import inspect
 import json
 import logging
 import re
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import Any
@@ -20,6 +21,8 @@ from ..config import McpFeatureConfig
 from ..logging_setup import get_logger, log_event
 from ..text_utils import estimate_tokens
 from .contracts import (
+    STAGE_CALL,
+    STAGE_DISCOVER,
     McpCallCancelled,
     McpCallTimeoutError,
     McpProvider,
@@ -28,6 +31,7 @@ from .contracts import (
     ToolDefinition,
     ToolExecution,
     describe_error,
+    elapsed_ms,
 )
 from .adapter_kit import CapabilityLimiter
 from .contracts import McpNoResultsError
@@ -79,6 +83,7 @@ class InMemoryToolRegistry:
                     reason="provider_unavailable",
                 )
                 continue
+            started = time.monotonic()
             try:
                 definitions = await provider.list_tools()
             except Exception as exc:
@@ -89,7 +94,9 @@ class InMemoryToolRegistry:
                     logging.WARNING,
                     "mcp.discovery_failed",
                     server=server_name,
-                    error=describe_error(exc),
+                    stage=STAGE_DISCOVER,
+                    duration_ms=elapsed_ms(started),
+                    **describe_error(exc),
                 )
                 continue
             accepted = 0
@@ -240,6 +247,9 @@ class InMemoryToolRegistry:
             return await provider.call_tool(definition.tool_name, arguments)
 
         limiter = getattr(_adapter_target(adapter), "limiter", None)
+        # 从这里到返回是**调用阶段**：耗时只统计真正打出去的那一段，
+        # 不把前面的参数校验与白名单拒绝算进去（它们没发生网络等待）。
+        started = time.monotonic()
         try:
             if limiter is not None:
                 raw = await limiter.run(
@@ -250,12 +260,14 @@ class InMemoryToolRegistry:
                     return self._decline(
                         call, "generation_cancelled", "capability cancelled",
                         definition=definition, feature=feature_name, level=logging.DEBUG,
+                        duration_ms=elapsed_ms(started),
                     )
             else:
                 if generation_is_current is not None and not generation_is_current():
                     return self._decline(
                         call, "generation_cancelled", "capability cancelled",
                         definition=definition, feature=feature_name, level=logging.DEBUG,
+                        duration_ms=elapsed_ms(started),
                     )
                 raw = await call_provider()
         except McpCallCancelled:
@@ -264,6 +276,7 @@ class InMemoryToolRegistry:
             return self._decline(
                 call, "generation_cancelled", "capability cancelled",
                 definition=definition, feature=feature_name, level=logging.DEBUG,
+                duration_ms=elapsed_ms(started),
             )
         except McpProviderUnavailable:
             # 零个可用槽位：一次尝试都没发生，不是超时。这是池自己的瞬态（槽位都在
@@ -272,23 +285,27 @@ class InMemoryToolRegistry:
             return self._decline(
                 call, "tool_unavailable", "tool unavailable",
                 definition=definition, feature=feature_name,
+                duration_ms=elapsed_ms(started),
             )
         except McpCallTimeoutError:
             self._notify_provider_failure(definition.server_name, provider)
             return self._decline(
                 call, "tool_timeout", "tool timed out",
                 definition=definition, feature=feature_name,
+                duration_ms=elapsed_ms(started),
             )
         except Exception:
             self._notify_provider_failure(definition.server_name, provider)
             return self._decline(
                 call, "tool_unavailable", "tool unavailable",
                 definition=definition, feature=feature_name,
+                duration_ms=elapsed_ms(started),
             )
         if _result_is_error(raw):
             return self._decline(
                 call, "tool_unavailable", "tool unavailable",
                 definition=definition, feature=feature_name,
+                duration_ms=elapsed_ms(started),
             )
         if adapter is not None:
             try:
@@ -297,21 +314,25 @@ class InMemoryToolRegistry:
                 return self._decline(
                     call, "no_results", "no results",
                     definition=definition, feature=feature_name,
+                    duration_ms=elapsed_ms(started),
                 )
             except ValueError:
                 return self._decline(
                     call, "invalid_result", "invalid_result",
                     definition=definition, feature=feature_name,
+                    duration_ms=elapsed_ms(started),
                 )
             except Exception:
                 return self._decline(
                     call, "invalid_result", "invalid_result",
                     definition=definition, feature=feature_name,
+                    duration_ms=elapsed_ms(started),
                 )
             if not execution.is_error:
                 log_event(
                     _logger, logging.INFO, "mcp.tool_done",
                     tool=definition.model_name, server=definition.server_name,
+                    stage=STAGE_CALL, duration_ms=elapsed_ms(started),
                 )
             return execution
         if isinstance(raw, str):
@@ -323,6 +344,7 @@ class InMemoryToolRegistry:
                 return self._decline(
                     call, "invalid_result", "invalid_result",
                     definition=definition, feature=feature_name,
+                    duration_ms=elapsed_ms(started),
                 )
         # 未提供专用适配器的未来工具也不能把任意 MCP 响应无界地交给模型。
         # 以该 feature 的结果预算作为保守上限；专用适配器（如 Exa）在此之前
@@ -332,6 +354,7 @@ class InMemoryToolRegistry:
             return self._decline(
                 call, "invalid_result", "invalid_result",
                 definition=definition, feature=feature_name,
+                duration_ms=elapsed_ms(started),
             )
         max_tokens = max(1, feature.result_count * feature.result_item_token_limit)
         if estimate_tokens(content) > max_tokens:
@@ -339,6 +362,7 @@ class InMemoryToolRegistry:
         log_event(
             _logger, logging.INFO, "mcp.tool_done",
             tool=definition.model_name, server=definition.server_name,
+            stage=STAGE_CALL, duration_ms=elapsed_ms(started),
         )
         return ToolExecution(call.call_id, content, False)
 
@@ -351,12 +375,16 @@ class InMemoryToolRegistry:
         definition: ToolDefinition | None = None,
         feature: str = "",
         level: int = logging.WARNING,
+        duration_ms: int | None = None,
     ) -> ToolExecution:
         """记录一次未成功的调用并返回稳定错误结果。
 
         日志里的 ``reason`` 与返回给模型的 ``error_kind`` 同名，便于按一条
         稳定字符串同时 grep 日志与推演行为。工具参数、模型自报的工具名与
         上游返回正文都不在这里出现。
+
+        ``duration_ms`` 只由**调用阶段之后**的拒绝路径传入：那之前的拒绝
+        （白名单、参数不合法）没有发生过等待，记一个接近 0 的耗时会误导。
         """
         fields: dict[str, object] = {"reason": error_kind}
         if feature:
@@ -364,6 +392,9 @@ class InMemoryToolRegistry:
         if definition is not None:
             fields["tool"] = definition.model_name
             fields["server"] = definition.server_name
+        if duration_ms is not None:
+            fields["stage"] = STAGE_CALL
+            fields["duration_ms"] = duration_ms
         log_event(_logger, level, "mcp.tool_failed", **fields)
         return ToolExecution(call.call_id, content, True, error_kind)
 

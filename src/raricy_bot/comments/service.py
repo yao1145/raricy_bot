@@ -24,7 +24,8 @@ from ..core.context import (
     SupplementalItem,
 )
 from ..core.vision import ImageLoader, attach_image, with_image_marker
-from ..logging_setup import get_logger, log_event
+from ..core.worker import ModelError
+from ..logging_setup import get_logger, log_event, observe_task
 from ..site.comment_models import CommentNode, CommentTreeTooLarge as SiteCommentTreeTooLarge
 from ..site.client import SiteClient
 from ..store import CommentClaim, Store
@@ -324,6 +325,10 @@ class CommentService:
                     "notification",
                 ), name="comment-notification-poller"),
             ]
+            # 只加观测：评论 task 死亡会让 /livez 翻红（见 ops 的说明），
+            # 此前现场同样没有一行说明是哪一个、以什么方式结束的。
+            for task in self._tasks:
+                observe_task(task, task.get_name(), component="comment")
         except BaseException:
             tasks, self._tasks = self._tasks, []
             for task in tasks:
@@ -1019,11 +1024,18 @@ class CommentService:
         except Exception as exc:
             await self._release_reply(request, reservation)
             await self._set_event_status(comment_id, "skipped_model")
+            # 与聊天侧同一条约定：只记稳定分类（kind / retryable / http_status），
+            # 401 与 429 在评论链路上同样要能分开，而不是都塌成 ModelError。
             log_event(
                 self.logger,
                 logging.WARNING,
                 "comment.model_failed",
-                error=type(exc).__name__,
+                comment_id=comment_id,
+                **(
+                    exc.log_fields()
+                    if isinstance(exc, ModelError)
+                    else {"error": type(exc).__name__}
+                ),
             )
             return None
         if not isinstance(text, str) or not text.strip():

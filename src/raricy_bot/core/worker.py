@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Generic, Protocol, TypeVar
@@ -21,7 +22,7 @@ import httpx
 import openai
 
 from ..config import ModelConfig
-from ..logging_setup import get_logger, log_event
+from ..logging_setup import get_logger, log_event, new_trace_id, observe_task, safe_stack
 from ..mcp.contracts import (
     McpProvider,
     ToolCall,
@@ -29,6 +30,7 @@ from ..mcp.contracts import (
     ToolDefinition,
     ToolExecution,
     ToolExecutor,
+    elapsed_ms,
 )
 from ..redact import Redactor
 from ..text_utils import estimate_tokens
@@ -147,13 +149,59 @@ class ToolCapableModelClient(ModelClient, Protocol):
     ) -> ToolCompletion: ...
 
 
-class ModelError(Exception):
-    """模型调用失败；`retryable` 表示本模块是否已再试过（最终失败时抛出）。"""
+# 模型调用的两个阶段（计划 §4）。字符串进日志，是稳定取值而不是自由文本。
+STAGE_FIRST_ROUND = "first"
+STAGE_TOOL_FOLLOWUP = "tool_followup"
 
-    def __init__(self, kind: str, retryable: bool) -> None:
+
+def _status_code(exc: BaseException) -> int | None:
+    """取 SDK 异常上的 HTTP 状态码；没有或不是整数就返回 None。"""
+    value = getattr(exc, "status_code", None)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+class ModelError(Exception):
+    """模型调用失败；`retryable` 表示本模块是否已再试过（最终失败时抛出）。
+
+    三个可选元数据都是**结构化**的，不放异常正文：`http_status` 来自 SDK 的
+    `status_code`，`stage` 区分首轮与工具后续轮，`duration_ms` 是这一次尝试的耗时。
+    它们全部可以作为关键字参数省略，既有构造调用逐字不变。
+    """
+
+    def __init__(
+        self,
+        kind: str,
+        retryable: bool,
+        *,
+        http_status: int | None = None,
+        stage: str | None = None,
+        duration_ms: int | None = None,
+    ) -> None:
         super().__init__(kind)
         self.kind = kind
         self.retryable = retryable
+        self.http_status = http_status
+        self.stage = stage
+        self.duration_ms = duration_ms
+
+    def log_fields(self) -> dict[str, object]:
+        """供 `log_event` 使用的安全字段；未设置的元数据不出现在结果里。
+
+        日志字段名与 `ModelError` 的属性名刻意不同：`http_status` 对应日志里的
+        `http_status`，而 `error` 用异常类名 —— 与其余模块的约定保持一致。
+        """
+        fields: dict[str, object] = {
+            "kind": self.kind,
+            "retryable": self.retryable,
+            "error": type(self).__name__,
+        }
+        if self.http_status is not None:
+            fields["http_status"] = self.http_status
+        if self.stage is not None:
+            fields["stage"] = self.stage
+        if self.duration_ms is not None:
+            fields["duration_ms"] = self.duration_ms
+        return fields
 
 
 class OpenAIModelClient:
@@ -198,6 +246,7 @@ class OpenAIModelClient:
         attempt = 0
         while True:
             self._check_input_budget(messages, (), max_input_tokens)
+            started = time.monotonic()
             try:
                 response = await self._client.chat.completions.create(
                     model=self._cfg.model,
@@ -206,7 +255,11 @@ class OpenAIModelClient:
                     max_tokens=self._cfg.max_output_tokens,
                 )
             except Exception as exc:  # 任何异常都必须映射为 ModelError
-                error = self._map_error(exc)
+                error = self._map_error(
+                    exc,
+                    stage=STAGE_FIRST_ROUND,
+                    duration_ms=elapsed_ms(started),
+                )
                 if not error.retryable or attempt + 1 >= _MAX_ATTEMPTS:
                     raise error from exc
                 attempt += 1
@@ -214,8 +267,8 @@ class OpenAIModelClient:
                     logger,
                     logging.WARNING,
                     "model.retry",
-                    kind=error.kind,
                     attempt=attempt,
+                    **error.log_fields(),
                 )
                 continue
 
@@ -225,12 +278,21 @@ class OpenAIModelClient:
             text = self._extract_text(response)
 
             if not text:
-                error = ModelError("empty", True)
+                error = ModelError(
+                    "empty",
+                    True,
+                    stage=STAGE_FIRST_ROUND,
+                    duration_ms=elapsed_ms(started),
+                )
                 if attempt + 1 >= _MAX_ATTEMPTS:
                     raise error
                 attempt += 1
                 log_event(
-                    logger, logging.WARNING, "model.retry", kind=error.kind, attempt=attempt
+                    logger,
+                    logging.WARNING,
+                    "model.retry",
+                    attempt=attempt,
+                    **error.log_fields(),
                 )
                 continue
 
@@ -366,10 +428,11 @@ class OpenAIModelClient:
                 _FINISH_STOP_ONLY if require_complete else None
             ),
             max_input_tokens=max_input_tokens,
+            stage=STAGE_TOOL_FOLLOWUP,
         )
         self._check_generation(generation_is_current)
         if not final.text:
-            raise ModelError("empty", True)
+            raise ModelError("empty", True, stage=STAGE_TOOL_FOLLOWUP)
         history_context = next(
             (
                 execution.history_context
@@ -399,14 +462,20 @@ class OpenAIModelClient:
         detect_tools_unsupported: bool,
         accepted_finish_reasons: frozenset[str] | None = None,
         max_input_tokens: int | None = None,
+        stage: str = STAGE_FIRST_ROUND,
     ) -> "_ToolRound":
-        """发起一轮带工具请求并复用现有错误重试映射。"""
+        """发起一轮带工具请求并复用现有错误重试映射。
+
+        `stage` 区分首轮与工具后续轮：第一轮失败多半是提示词/请求本身的问题，
+        后续轮失败则与上一轮的工具结果大小直接相关，两者的处置完全不同。
+        """
         payload = tuple(self._tool_payload(tool) for tool in tools)
         attempt = 0
         while True:
             # 检查发生在请求序列化完成之后、网络调用之前，且对**每一轮**都生效：
             # 第二轮带着 assistant 工具调用参数与 tool 消息，体积通常比第一轮大得多。
             self._check_input_budget(messages, payload, max_input_tokens)
+            started = time.monotonic()
             try:
                 request_kwargs: dict[str, Any] = {
                     "model": self._cfg.model,
@@ -431,7 +500,11 @@ class OpenAIModelClient:
                         )
                 result = self._extract_tool_round(response)
             except Exception as exc:
-                error = self._map_error(exc)
+                error = self._map_error(
+                    exc,
+                    stage=stage,
+                    duration_ms=elapsed_ms(started),
+                )
                 if (
                     detect_tools_unsupported
                     and isinstance(exc, openai.APIStatusError)
@@ -445,14 +518,19 @@ class OpenAIModelClient:
                     logger,
                     logging.WARNING,
                     "model.retry",
-                    kind=error.kind,
                     attempt=attempt,
+                    **error.log_fields(),
                 )
                 continue
             # 与 `complete` 同一条理由：严格完成检查在异常映射之外，稳定且不重试。
             self._ensure_complete(response, accepted_finish_reasons)
             if not result.text and not result.tool_calls:
-                error = ModelError("empty", True)
+                error = ModelError(
+                    "empty",
+                    True,
+                    stage=stage,
+                    duration_ms=elapsed_ms(started),
+                )
                 if attempt + 1 >= _MAX_ATTEMPTS:
                     raise error
                 attempt += 1
@@ -460,8 +538,8 @@ class OpenAIModelClient:
                     logger,
                     logging.WARNING,
                     "model.retry",
-                    kind=error.kind,
                     attempt=attempt,
+                    **error.log_fields(),
                 )
                 continue
             return result
@@ -591,31 +669,53 @@ class OpenAIModelClient:
         return content.strip()
 
     @staticmethod
-    def _map_error(exc: Exception) -> ModelError:
-        """按 openai SDK 的异常类型映射；顺序敏感（父类在后）。"""
+    def _map_error(
+        exc: Exception, *, stage: str | None = None, duration_ms: int | None = None
+    ) -> ModelError:
+        """按 openai SDK 的异常类型映射；顺序敏感（父类在后）。
+
+        `http_status` 取自 SDK 的 `status_code`：401（凭据失效）、429（限流）、
+        500（上游故障）在日志里必须能分开，而它们的 `kind` 可能只是笼统的
+        `http` / `bad_request`（计划 §4 的「模型失败」一行）。
+        """
         if isinstance(exc, ModelError):
             return exc
+        status = _status_code(exc)
         if isinstance(exc, (openai.APITimeoutError, httpx.TimeoutException)):
             # APITimeoutError 是 APIConnectionError 的子类，必须先判。
             # 超时不重试（D-19）：这次调用已经等满整个超时预算，立即重试几乎必然再等满一次，
             # 只把用户看到的静默从 1 个超时周期拖成 2 个。
-            return ModelError(KIND_TIMEOUT, False)
+            return ModelError(
+                KIND_TIMEOUT, False, http_status=status, stage=stage, duration_ms=duration_ms
+            )
         if isinstance(exc, openai.APIConnectionError):
-            return ModelError("network", True)
+            return ModelError(
+                "network", True, http_status=status, stage=stage, duration_ms=duration_ms
+            )
         if isinstance(exc, (openai.RateLimitError, openai.InternalServerError)):
             # 429 与 5xx：可重试。二者都是 APIStatusError 的子类。
-            return ModelError("http", True)
+            return ModelError(
+                "http", True, http_status=status, stage=stage, duration_ms=duration_ms
+            )
         if isinstance(exc, (openai.AuthenticationError, openai.PermissionDeniedError)):
-            return ModelError("auth", False)
-        if isinstance(exc, openai.APIStatusError) and getattr(exc, "status_code", None) == 408:
+            return ModelError(
+                "auth", False, http_status=status, stage=stage, duration_ms=duration_ms
+            )
+        if isinstance(exc, openai.APIStatusError) and status == 408:
             # SDK 没有 408 分支，会把它归入通用 APIStatusError；必须在兜底之前显式判出，
             # 否则它会被下面的「其余 4xx」吃成 bad_request，日志里就看不出是超时了。
             # 归类为 timeout，因此同样不重试（D-19）。
-            return ModelError(KIND_TIMEOUT, False)
+            return ModelError(
+                KIND_TIMEOUT, False, http_status=status, stage=stage, duration_ms=duration_ms
+            )
         if isinstance(exc, openai.APIStatusError):
             # BadRequestError / NotFoundError 及其余确定性的 4xx 状态。
-            return ModelError("bad_request", False)
-        return ModelError("network", True)
+            return ModelError(
+                "bad_request", False, http_status=status, stage=stage, duration_ms=duration_ms
+            )
+        return ModelError(
+            "network", True, http_status=status, stage=stage, duration_ms=duration_ms
+        )
 
 
 class WorkerPool(Generic[RequestT]):
@@ -643,6 +743,11 @@ class WorkerPool(Generic[RequestT]):
         """所有 worker task 都仍在运行时为 True（未启动或已停止为 False）。"""
         return bool(self._tasks) and all(not task.done() for task in self._tasks)
 
+    @property
+    def alive_count(self) -> int:
+        """仍存活的 worker 数；健康变化事件用它（计划 §4）。"""
+        return sum(1 for task in self._tasks if not task.done())
+
     async def start(self) -> None:
         """启动 `concurrency` 个 worker task；重复调用幂等。"""
         if self._tasks:
@@ -651,6 +756,11 @@ class WorkerPool(Generic[RequestT]):
             asyncio.create_task(self._run(), name=f"worker-{index}")
             for index in range(self._concurrency)
         ]
+        # 只加观察，不改控制流：worker 死于异常 / 逃逸取消时至少会留下一条
+        # `app.task_exit`。事件档案 §六.1 记的正是「worker 一死 /livez 永久 503
+        # 而现场毫无痕迹」—— 这里补的就是那个痕迹（计划 §4）。
+        for task in self._tasks:
+            observe_task(task, task.get_name(), component="worker")
 
     async def stop(self) -> None:
         """取消全部 worker 并等待其结束；之后 `alive` 为 False。"""
@@ -685,6 +795,13 @@ class WorkerPool(Generic[RequestT]):
         """单个 worker 主循环；除取消外绝不退出。"""
         while True:
             request = await self._queue.get()
+            # 队列里的请求由 Router 生成 trace_id；没有的（替身、直接入队的测试）
+            # 这里补一个，保证「一次处理」在日志里总有一个可 grep 的标识。
+            if not getattr(request, "trace_id", ""):
+                try:
+                    request.trace_id = new_trace_id()
+                except AttributeError:
+                    pass
             # task_done 必须无条件下调，否则 queue.join() 会永远挂住；
             # 锁使用者的注销同样必须无条件执行，否则计数会失衡、锁无法淘汰。
             try:
@@ -697,8 +814,10 @@ class WorkerPool(Generic[RequestT]):
                             logger,
                             logging.ERROR,
                             "worker.handler_error",
+                            trace_id=getattr(request, "trace_id", None),
                             channel_id=getattr(request, "channel_id", None),
                             error=type(exc).__name__,
+                            stack=safe_stack(exc),
                         )
             finally:
                 self._release_lock(request.session_key)

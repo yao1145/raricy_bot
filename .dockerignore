@@ -14,9 +14,25 @@ docs
 *.db-wal
 *.db-shm
 config.yaml
+# `.env` 与它的各种写法：显式 COPY 不等于构建上下文里没有它们，
+# 而构建上下文是会被 `docker build --no-cache` 之外的一切路径带进 daemon 的。
+.env
+.env.*
+!.env.example
+# 凭据备份与导出文件（与 .gitignore 保持同一份名单）
+*.pem
+*.key
+credentials.json
+service-account*.json
+# 运行期日志与永久归档：归档只增不减，不该被复制进镜像层
+logs
+*.jsonl
 # 知识库只通过只读 bind mount 进入容器：不要把它复制进镜像，
 # 否则镜像层里的旧资料会一直留着，回滚镜像等于回滚资料。
 knowledge
+# 草稿与运行数据同样只走挂载
+drafts
+data
 .venv
 venv
 env

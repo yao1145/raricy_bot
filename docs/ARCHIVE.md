@@ -17,9 +17,13 @@
 | [manifest.json](archive/2026-09-20/manifest.json) | 本次七份原文件的 SHA-256、字节数及归档路径 |
 | [BLOG_PUBLISH_DESIGN.md](archive/BLOG_PUBLISH_DESIGN.md) | 定时发文设计，已实现、默认关闭 |
 | [BLOG_PUBLISH_IMPLEMENTATION_PLAN.md](archive/BLOG_PUBLISH_IMPLEMENTATION_PLAN.md) | 已完成 T0–T7 的实施交接计划 |
+| [SECURITY_AND_ERROR_LOGGING_PLAN.md](archive/SECURITY_AND_ERROR_LOGGING_PLAN.md) | 密钥安全修复、诊断增强与错误日志永久保留；阶段 A–D 已实施，验收项见部署手册 |
 
 两份发文稿原样移动；归档目录保留接口与决策的跳转页，使原相对链接继续可用。历史稿中的“下一步”“待实现”和旧规则均保留为当时记录，不代表当前待办。
 **定时发文真实站点验收尚未完成**，验收清单已留在 [USAGE.md §2.4](usage/USAGE.md)。
+**永久错误归档的上线验收同样尚未完成**：本地编码与离线检查已完成，但实际部署路径、宿主容量、
+备份目标与负责人、告警接收方式必须在上线时落实，清单见
+[DEPLOYMENT.md §10.6–§10.7](usage/DEPLOYMENT.md#106-永久错误归档)。
 
 旧索引、接口、决策和两份发文稿这五个已入库文件，可用整理前提交
 `435d72eab3e3992402cd691956bbe4bef8bcc3ee` 与原路径恢复，例如：

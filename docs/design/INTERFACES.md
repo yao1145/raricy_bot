@@ -28,16 +28,51 @@ Python >=3.12，包根为 `src/raricy_bot/`。依赖和测试配置见 [pyprojec
   聊天 8000 是默认值，不能误写成加载期硬上界。
 - 部署细节查 [DEPLOYMENT.md](../usage/DEPLOYMENT.md)，不修改本地密钥文件来维护文档。
 
+另有独立模块 [error_archive.py](../../src/raricy_bot/error_archive.py)（§2.1）。
+
 ## 2. `logging_setup.py`
 
-入口：[日志与白名单](../../src/raricy_bot/logging_setup.py)。`log_event` 丢弃不在
-`LOG_FIELDS` 中的字段；错误记录稳定 kind/reason 和异常类型，不记录请求/响应正文。
-MCP stderr 是 D-91 的特例：仅启动/重连失败时输出有界、单行、已脱敏的尾部。
+入口：[日志与白名单](../../src/raricy_bot/logging_setup.py)。`LOG_FIELDS` 由
+`FIELD_KINDS` 派生：字段名与取值类型一起登记，不在白名单里的字段、类型不合的取值
+一律整条丢弃，**不截断也不转写**。四类取值：`TOKEN`（受控标识）、`NAME`（Python
+标识符，如异常类名）、`LABEL`（配置短名称，如发文任务名）、`FRAMES`（`模块.函数:行号`
+列表），另有 `MODULE`（npm 包路径）。新字段必须先登记再使用。
+
+- `log_event` 先构造 `LogEvent`（已校验），再分别编码为控制台文本与归档 JSON。
+- 脱敏作用在 handler 的**最终输出**上（`RedactingFormatter`），覆盖消息、extra、
+  `exc_text` 与 `stack_info`；不改写共享 `LogRecord`。`RedactingFilter` 只作为
+  兼容入口保留，生产路径不用它。
+- 非 `raricy.*` 命名空间的 WARNING 及以上不渲染原文：控制台与归档都换成受限的
+  `third_party.failure` 事件（只留来源 logger 名）。低于 WARNING 的第三方行保持原样。
+- 安全堆栈只留模块、函数与行号；`safe_stack` 对异常链与帧数设上限。未捕获异常、
+  线程异常与 asyncio 未取回异常由 `install_exception_hooks` /
+  `install_asyncio_exception_handler` 兜底，不转储异常 context。
+- 后台任务用 `observe_task` 挂结束观察：`app.task_exit` 区分正常停止、主动取消、
+  **逃逸取消**与异常退出。它只补观测，不吞 `CancelledError`、不重启任务。
+- MCP 错误用结构化分类，不记录 stderr 原文或异常正文（D-111）。
+
+## 2.1 `error_archive.py`
+
+入口：[永久归档](../../src/raricy_bot/error_archive.py)。单写者 JSONL，按 UTC 日期
+与大小分片；文件名含 `boot_id` 与递增序号，`os.O_EXCL` 独占创建，**旧分片只增不删**。
+每条写入后 flush，ERROR/CRITICAL 额外 fsync，其余最迟每 `fsync_interval_seconds`
+批量同步；关闭时同步。归档自己的状态事件只走 stderr，不回写文件（否则写失败会递归）。
+
+只接收已清洗事件：WARNING 及以上，加上 `ARCHIVE_INFO_EVENTS` 里那张 INFO 白名单。
+归档门槛独立于控制台级别，未启用时 `/archivez` 返回 404。`iter_entries` /
+`verify_segments` 是只读工具，遇到损坏末行跳过但不修复原文件。配置见 §1 的
+`logging.archive`。
 
 ## 3. `redact.py`
 
-入口：[Redactor](../../src/raricy_bot/redact.py)。登记密码、模型/MCP Key、会话 Cookie；
-用户名不是密钥。凭据须同时登记出站 Redactor 和日志层过滤器，不能只保护其中一条通路。
+入口：[Redactor 与 SecretRegistry](../../src/raricy_bot/redact.py)。登记密码、模型/MCP
+Key、会话 Cookie；用户名不是密钥。
+
+`SecretRegistry` 是进程级登记中心：日志层 Redactor 与出站 Redactor 都订阅它，**一次
+登记两条通路同时生效**，后订阅者补上此前登记的凭据，旧值在轮换后仍保留（迟到返回的
+旧请求还带着轮换前的密钥）。装配方通过 `logging_setup.secret_registry()` 取得它；
+`register_secret()` 保留为兼容入口。测试用独立实例，不依赖进程级状态。
+
 记忆命中密钥时整条拒绝，不保存替换后的版本。
 
 ## 4. `text_utils.py`
@@ -168,8 +203,23 @@ resync 拉取按 message ID 去重，空 event ID 不抬水位。
 ## 17. `__main__.py`
 
 入口：[启动与退出码](../../src/raricy_bot/__main__.py)。
-解析配置路径、校验配置、初始化脱敏日志、运行 App；配置错误退出码 2，不回显凭据。
-停止须等待资源关闭，不能留下 pending task 或未关闭客户端。
+解析配置路径、校验配置、初始化脱敏日志、安装未捕获异常兜底、按需打开永久归档，
+再运行 App。退出码：配置错误 2，归档已启用却打不开 3，运行期致命错误 1，其余 0；
+任何一条错误路径都不回显凭据。停止须等待资源关闭，不能留下 pending task 或未关闭
+客户端；归档在 `finally` 里同步并关闭。
+
+「已启用但打不开」是致命的：继续跑只会让所有人以为永久记录正在工作。边界要说清楚 ——
+**配置解析成功、归档初始化完成之前**的启动错误只能安全写 stderr，仍依赖宿主保存；
+OS/OOM/断电等进程外故障同样依赖宿主监控。不能宣称所有启动失败都已入应用归档。
+
+另有两个只读子命令，不启动机器人、不连站点：
+
+```bash
+python -m raricy_bot archive verify --directory /app/logs/errors
+python -m raricy_bot archive read --directory /app/logs/errors --level WARNING --since 2026-09-21T00:00:00
+```
+
+`verify` 有损坏分片时退出码 1，便于备份脚本直接据它告警。
 
 ## 18. 测试约定
 
@@ -182,8 +232,14 @@ warning 按错误处理。测试目录当前被 Git 忽略，不能假设新克�
 1. 不增加未经依据核对的站点 API，不修改上游原始材料。
 2. 动态用户/引用/记忆数据只进 user 消息；MCP 结果进 tool 消息，不进 system。
 3. 密钥、正文、模型请求/响应不落日志或 SQLite；授权记忆 Markdown 与 D-107 的发文标题例外须明确区分。
+   永久归档同样受这条约束：它只收 `logging_setup` 已清洗的事件，不解析也不复制
+   原始日志，更不因为"已经过脱敏"就接收任意正文（D-111、D-112）。
 4. 模型不能决定工具权限、记忆作用域、owner、文件路径或写入权限。
 5. 取消不得吞成普通成功；持久状态、额度、发送和历史提交须保持各自的顺序与幂等边界。
+6. 归档分片只增不删：不设 `retention_days` / `max_files`，不用会按 `backupCount`
+   淘汰旧文件的轮转策略；损坏的分片保留原样，读工具跳过而不修复。
+7. `site` 与 `model` 的 `base_url` 对非回环地址必须是 https，且不得含 userinfo、
+   查询串或片段；本机 http 例外要显式打开（`allow_plain_http`，默认关闭）。
 
 ## 20. `core/vision.py`
 
@@ -205,6 +261,12 @@ warning 按错误处理。测试目录当前被 Git 忽略，不能假设新克�
 适配器按 `(feature_name, model_tool_name)` 查找，无跨 feature 回退；每个 feature 共享一个 limiter，
 每个 binding 独立适配器。stdio 与远程 SSE 配置互斥，SSE 需 HTTPS、环境 Bearer 与独立读超时。
 成功送达后才提交压缩摘要，原始工具消息不入历史；失败不影响普通聊天。
+
+诊断走**结构化字段**，不走原始正文（D-111）：阶段（`connect` / `discover` / `call` /
+`close`）、耗时、异常类型、JSON-RPC 数字错误码与子进程退出码；stdio 的 stderr 只按固定
+规则提取失败类别与经校验的模块名，原文一概不留。阶段停滞由 `McpManager` 的巡检任务
+报警一次（`mcp.phase_stalled`），阶段结束时若曾停滞则记 `mcp.phase_finished`。停滞
+**只报警、不取消**：可能有副作用的调用为了日志被取消或重放会制造重复副作用。
 
 ## 22. Exa 授权密钥池（`mcp/pool.py`）
 

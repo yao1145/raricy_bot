@@ -100,12 +100,15 @@ class SessionMcpProvider:
             else:
                 self._cleanup_transport()
 
-    def diagnostics(self) -> str | None:
-        """最近一次失败的可诊断细节（如子进程 stderr 的末尾）；默认没有。
+    def diagnostics(self) -> dict[str, object] | None:
+        """最近一次失败的**结构化**诊断字段（如子进程 stderr 的分类结果）；默认没有。
 
         生命周期管理器在记录 ``mcp.provider_start_failed`` / ``mcp.reconnect_failed``
-        时取它。传输不同，能说的话也不同：stdio 有子进程，所以有 stderr 可看；
+        时取它。传输不同，能说的话也不同：stdio 有子进程，所以有 stderr 可以分类；
         远程传输没有，于是返回 None 而不是编一个字段出来。
+
+        返回值必须是受限字段（见 ``logging_setup.FIELD_KINDS``），不是自由文本 ——
+        计划 §3.3 明确不再把上游原文当成可以保存的内容。
         """
         return None
 

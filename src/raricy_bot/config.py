@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import math
 import os
 import re
@@ -359,6 +360,25 @@ class StorageConfig:
 
 
 @dataclass(frozen=True)
+class ArchiveConfig:
+    """永久错误归档配置（INTERFACES §2）；默认关闭，部署验收时显式开启。
+
+    刻意**没有** `retention_days` / `max_files` 这类自动删除项：能按时间或数量
+    删除旧分片的策略，就不是「永久保留」。单条事件与安全堆栈的大小上限由代码强制。
+    """
+
+    enabled: bool = False
+    # 相对配置文件所在目录解析；必须是独立目录，不得与知识库、记忆或草稿目录重叠。
+    directory: str = "./logs/errors"
+    # 单个分片的目标上限；到量就换片，旧分片一个都不删。
+    segment_max_bytes: int = 10 * 1024 * 1024
+    # WARNING 与选定 INFO 的最长批量同步间隔；ERROR/CRITICAL 每条单独同步。
+    fsync_interval_seconds: float = 5.0
+    # 剩余空间低于此值就告警（stderr 与宿主监控双路可见）。
+    disk_warning_free_bytes: int = 2 * 1024 * 1024 * 1024
+
+
+@dataclass(frozen=True)
 class Config:
     """完整配置；不含 Cookie，也不含任何消息正文。"""
 
@@ -376,6 +396,7 @@ class Config:
     knowledge_base: KnowledgeBaseConfig = field(default_factory=KnowledgeBaseConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     blog: BlogConfig = field(default_factory=BlogConfig)
+    log_archive: ArchiveConfig = field(default_factory=ArchiveConfig)
 
     @property
     def db_path(self) -> str:
@@ -427,7 +448,23 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
     )
     # 稿库的相对路径以**配置文件所在目录**为基准：它与 `--config` 指的是同一处，
     # 也因此在容器里换了工作目录、或在别处启动进程时都不会指到另一个目录去。
-    blog = _blog(_section(raw, "blog"), os.path.dirname(os.path.abspath(resolved)))
+    config_dir = os.path.dirname(os.path.abspath(resolved))
+    blog = _blog(_section(raw, "blog"), config_dir)
+    # 归档目录同样以配置文件所在目录为基准，并在这里就检查它与知识库、记忆、
+    # 稿库互不重叠（计划 §5.2）：写错一个路径不该等到运行期才发现。
+    log_archive = _archive(
+        logging_raw,
+        config_dir,
+        foreign_dirs={
+            "knowledge_base": knowledge_base.root_dir,
+            "memory": memory.root_dir,
+            "storage": os.path.dirname(os.path.abspath(storage.db_path)),
+            **{
+                f"blog_drafts[{task.name}]": task.drafts_dir or ""
+                for task in blog.tasks
+            },
+        },
+    )
     ops = OpsConfig(
         host=_ops_host(ops_raw),
         port=_ops_port(ops_raw),
@@ -453,7 +490,65 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
         knowledge_base=knowledge_base,
         memory=memory,
         blog=blog,
+        log_archive=log_archive,
     )
+
+
+def _archive(
+    container: Mapping[str, Any],
+    base_dir: str,
+    *,
+    foreign_dirs: Mapping[str, str],
+) -> ArchiveConfig:
+    """解析 `logging.archive`；缺省关闭，路径与其它持久目录互不重叠。
+
+    重叠是**拒绝配置**而不是警告：归档目录按设计只增不减，一旦它就是知识库或
+    记忆所在的那棵树，长期增长会直接威胁那些数据的可用空间，事后没人能分清
+    哪些文件属于归档、哪些属于数据。
+    """
+    raw = container.get("archive", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raise ConfigError("配置 logging.archive 必须是映射")
+    enabled = _bool_flag(raw, "enabled", "logging.archive", False)
+    directory = _text_with_default(raw, "directory", "logging.archive", "./logs/errors")
+    # 相对路径以配置文件所在目录为基准：容器里换工作目录、或在别处启动进程时
+    # 都指到同一处（与稿库同一约定）。
+    resolved = directory if os.path.isabs(directory) else os.path.join(base_dir, directory)
+    resolved = os.path.normpath(resolved)
+    _reject_overlapping_dirs(resolved, foreign_dirs)
+    return ArchiveConfig(
+        enabled=enabled,
+        directory=resolved,
+        segment_max_bytes=_positive_int(
+            raw, "segment_max_bytes", "logging.archive", 10 * 1024 * 1024
+        ),
+        fsync_interval_seconds=_positive_number(
+            raw, "fsync_interval_seconds", "logging.archive", 5.0
+        ),
+        disk_warning_free_bytes=_positive_int(
+            raw, "disk_warning_free_bytes", "logging.archive", 2 * 1024 * 1024 * 1024
+        ),
+    )
+
+
+def _reject_overlapping_dirs(directory: str, foreign_dirs: Mapping[str, str]) -> None:
+    """归档目录不得与其它持久目录相同或互相包含。
+
+    判定前先 `realpath`：路径里带符号链接时，`logs -> /app/data` 这样的写法会让
+    「互不重叠」的字符串检查失效。归档目录本身还不存在是正常的，realpath 会就地
+    解析已存在的那部分。
+    """
+    target = os.path.realpath(os.path.abspath(directory))
+    for name, foreign in foreign_dirs.items():
+        if not foreign:
+            continue
+        other = os.path.realpath(os.path.abspath(foreign))
+        if os.path.normcase(target) == os.path.normcase(other):
+            raise ConfigError(f"配置 logging.archive.directory 不得与 {name} 目录相同")
+        if _path_contains(other, target) or _path_contains(target, other):
+            raise ConfigError(f"配置 logging.archive.directory 不得与 {name} 目录重叠")
 
 
 def _read_yaml(path: str) -> dict[str, Any]:
@@ -520,13 +615,54 @@ def _text_with_default(
 
 
 def _base_url(container: Mapping[str, Any], where: str) -> str:
-    """取 base_url，去尾斜杠并校验为 http/https。"""
+    """取 base_url，去尾斜杠并校验传输安全（计划 §3.4）。
+
+    三件事必须同时成立，缺一条就不是「地址写错了」而是**凭据会明文出海**：
+
+    - 非回环地址只允许 https。站点侧带会话 Cookie，模型侧带 API Key，
+      普通 HTTP 会把两者连同正文一起交给链路上的任何人。
+    - URL 里不得带 userinfo。`https://key@host/` 形式的凭据会原样出现在异常
+      文案、`httpx` 错误与重定向历史里，而我们登记脱敏的是「配置里的那个 Key」，
+      不是「用户随手拼进 URL 的另一个串」。
+    - URL 里不得带 query 或 fragment。它们对 base_url 毫无意义，却是一处
+      可以把任意文本塞进请求目标、进而进到日志与错误信息里的通道。
+
+    本机开发的 http 例外必须**显式**打开（`allow_plain_http: true`），默认关闭：
+    静默保留公网 HTTP 才是真正危险的那种"方便"。
+    """
     value = _required_text(container, "base_url", f"{where}.base_url")
     cleaned = value.rstrip("/")
     parsed = urllib.parse.urlsplit(cleaned)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise ConfigError(f"配置 {where}.base_url 必须是 http/https 地址")
+    if parsed.username is not None or parsed.password is not None:
+        raise ConfigError(f"配置 {where}.base_url 不得包含用户名或密码")
+    if parsed.query or parsed.fragment:
+        raise ConfigError(f"配置 {where}.base_url 不得包含查询串或片段")
+    if parsed.scheme != "https" and not _plain_http_allowed(container, where):
+        if not _is_loopback_host(parsed.hostname):
+            raise ConfigError(
+                f"配置 {where}.base_url 对非本机地址必须是 https；"
+                f"本机开发如确需 http，请显式设置 {where}.allow_plain_http: true"
+            )
     return cleaned
+
+
+def _plain_http_allowed(container: Mapping[str, Any], where: str) -> bool:
+    """显式打开的本机 http 例外；缺省关闭。"""
+    return _bool_flag(container, "allow_plain_http", f"{where}", False)
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    """主机名是否是回环地址；解析不出来的名字一律当公网处理。"""
+    if not host:
+        return False
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _number(value: Any, where: str, key: str) -> float:

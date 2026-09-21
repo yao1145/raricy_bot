@@ -25,7 +25,7 @@ from typing import Any
 
 from ..config import McpServerConfig
 from ..logging_setup import get_logger, log_event
-from ..redact import Redactor
+from ..redact import Redactor, SecretRegistry
 from .contracts import (
     McpCallCancelled,
     McpCallTimeoutError,
@@ -289,6 +289,7 @@ class ExaPooledProvider:
         *,
         host_env: dict[str, str] | None = None,
         redactor: Redactor | None = None,
+        registry: SecretRegistry | None = None,
         connect_timeout_seconds: float = 10.0,
         call_timeout_seconds: float = 20.0,
         required_tools: tuple[str, ...] = (),
@@ -306,6 +307,10 @@ class ExaPooledProvider:
         # 宿主环境只在构造时读一次；宿主里没有的变量在下面变成 disabled 槽位。
         self._host_env = dict(os.environ if host_env is None else host_env)
         self._redactor = redactor
+        # 池内每个槽位都要登记自己的 Key：共享登记中心让这一步只写一次（计划 §3.1）。
+        self._registry = registry
+        if self._registry is not None and self._redactor is not None:
+            self._registry.attach(self._redactor)
         self._connect_timeout = connect_timeout_seconds
         self._call_timeout = call_timeout_seconds
         self._required_tools = tuple(required_tools)
@@ -559,6 +564,7 @@ class ExaPooledProvider:
             child_config,
             host_env=self._host_env,
             redactor=self._redactor,
+            registry=self._registry,
             connect_timeout_seconds=self._connect_timeout,
             call_timeout_seconds=self._call_timeout,
         )
@@ -566,8 +572,10 @@ class ExaPooledProvider:
         if callable(resolver):
             # stdio Provider 在这里登记密钥；不读它的返回值，也就不会把明文带出这个作用域。
             resolver()
-        if self._redactor is not None:
+        if self._registry is not None:
             # 兜底：替身没有 resolve_environment 时也要保证「任何子进程启动前已脱敏」。
+            self._registry.register(value)
+        elif self._redactor is not None:
             self._redactor.add_secret(value)
         return provider
 

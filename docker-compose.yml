@@ -60,6 +60,12 @@ services:
       # 解析为 /app/data/bot.db，所以卷必须挂在 /app/data，默认配置才能开箱持久化。
       # 若改成别的路径（或改这里的挂载点），必须同步修改另一处。
       - bot-data:/app/data
+      # 永久错误归档卷（logging.archive.directory，相对 config.yaml 解析为
+      # /app/logs/errors）。它与 bot-data **分开**：只增不减的归档不该与 SQLite
+      # 抢同一块配额，独立卷也让备份可以只备份日志或只备份数据。
+      # 独立卷**不等于**独立磁盘，见 docs/usage/DEPLOYMENT.md §10.6。
+      # 归档关闭时保留这一行也无害（目录空着）。
+      - bot-logs:/app/logs
     # Docker 默认的 json-file 日志没有上限：一个长期运行的容器会把宿主磁盘写满。
     # 这里限制为 3 × 10 MiB（约 30 MiB/容器）。裸机运行时程序只写 stderr，
     # 轮转交给 systemd / 进程管理器 / shell 重定向，应用不与宿主争夺这件事（D-23）。
@@ -89,3 +95,4 @@ services:
 
 volumes:
   bot-data:
+  bot-logs:

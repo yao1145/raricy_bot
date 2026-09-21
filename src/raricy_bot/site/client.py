@@ -24,7 +24,7 @@ from typing import Any
 import httpx
 
 from ..logging_setup import get_logger, log_event, register_secret
-from ..redact import Redactor
+from ..redact import Redactor, SecretRegistry
 from .blog_models import (
     OUTCOME_PUBLISHED,
     OUTCOME_RATE_LIMITED,
@@ -213,6 +213,7 @@ class SiteClient:
         base_url: str,
         redactor: Redactor,
         *,
+        registry: SecretRegistry | None = None,
         timeout: float = 20.0,
         transport: httpx.AsyncBaseTransport | None = None,
         username: str = "",
@@ -222,8 +223,13 @@ class SiteClient:
     ) -> None:
         # username/password 是对 INTERFACES §7 构造签名的**追加**关键字参数：
         # 锁定签名里没有携带凭据的位置，而 login() 需要用它发登录请求。
+        # `registry` 同属追加参数：装配方注入共享登记中心后，出站 Redactor 订阅
+        # 同一份凭据表，Cookie 只需登记一次（计划 §3.1）。
         self._base_url = base_url.rstrip("/")
         self._redactor = redactor
+        self._registry = registry
+        if self._registry is not None:
+            self._registry.attach(redactor)
         self._timeout = timeout
         self._transport = transport
         self._username = username
@@ -240,7 +246,7 @@ class SiteClient:
         self._max_tree_nodes = max_tree_nodes
         # 只有密码算机密（INTERFACES §3）；用户名**不得**注册，否则日志与出站文本里
         # 机器人自己的名字会被抹成 [redacted]。登记密码是为了让服务端回显时也不进异常文案。
-        self._redactor.add_secret(password)
+        self._register(password)
         self._client: httpx.AsyncClient | None = None
         self._user: Author | None = None
         self._session_cookie: str | None = None
@@ -956,16 +962,29 @@ class SiteClient:
         return self._user
 
     def _store_session_cookie(self, response: httpx.Response) -> None:
-        """保存 Set-Cookie 里的会话值并登记脱敏；不依赖 httpx 的 cookie jar。"""
+        """保存 Set-Cookie 里的会话值并登记脱敏；不依赖 httpx 的 cookie jar。
+
+        每次更新都**立即**登记：Cookie 会随登录轮换，而旧值在迟到返回的请求里
+        仍可能出现，登记表因此只增不删（`SecretRegistry` 的语义）。
+        """
         cookie = response.cookies.get(SESSION_COOKIE_NAME)
         if not cookie:
             return
         self._session_cookie = cookie
-        self._redactor.add_secret(cookie)
-        register_secret(cookie)
+        self._register(cookie)
         if self._client is not None:
             # Cookie 已由显式请求头携带，清空 jar 以免两处来源互相覆盖。
             self._client.cookies.clear()
+
+    def _register(self, value: str) -> None:
+        """登记一个凭据；没有共享登记中心时退回「两处各写一遍」的兼容路径。"""
+        if not value:
+            return
+        if self._registry is not None:
+            self._registry.register(value)
+            return
+        self._redactor.add_secret(value)
+        register_secret(value)
 
     def _parse_sent_message(self, payload: Mapping[str, Any], channel_id: str) -> ChatMessage | None:
         """取发消息接口的返回消息体；不是对象或解析失败都降级为 None。"""

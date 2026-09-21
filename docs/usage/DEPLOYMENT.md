@@ -10,7 +10,7 @@
 
 ---
 
-## 1. 先读这一段：部署前必须确认的六件事
+## 1. 先读这一段：部署前必须确认的七件事
 
 1. **机器人账号必须先手动创建并提权到 core+。**
    `chat-bot.md` §2.1 明确写了机器人账号**不开放脚本自助注册**，且注册若需要人机验证
@@ -46,6 +46,10 @@
    密钥、Cookie、个人隐私、内部提示词、部署配置、日志、数据库、无权转交模型的版权材料，
    都不得放进挂载目录；目录名与文件名本身也会展示给提问者，所以命名同样要审。默认配置只对
    私聊白名单开放，要在大区公开必须显式改配置 —— 见 §4.2.1。
+7. **永久归档默认关闭，开启前要先定好容量与备份。** `logging.archive.enabled: true` 之后
+   错误事件会长期保留，**不会**自动过期。它不会自己删除旧分片，所以必须先落实宿主配额、
+   独立备份目标与负责人（§10.6、§10.7），否则就是把"永久保留"变成"迟早写满磁盘"。
+   容器部署已备好独立的 `bot-logs` 卷；注意 `docker compose down -v` 会把它一起删掉。
 
 ---
 
@@ -649,7 +653,10 @@ chmod 600 .env
 > 密码里含 `$`、反引号、反斜杠时尤其重要。值里含 `$`、空格时也可以直接用单引号包住：
 > `RARICY_PASSWORD='p@ss$word with space'`。不要加 `export` 前缀。
 
-`.env` 已在 `.gitignore` 里，不会被误提交。
+`.env` 与 `.env.*` 都在 `.gitignore` 与 `.dockerignore` 里，不会被误提交、也不会被带进
+构建上下文（`.env.example` 是唯一豁免，且只允许放不含真实值的模板）。Git 的历史与
+旧镜像不会因为新增一条忽略规则而被清掉：**忽略规则只防止新的泄漏**。已经提交过或已经
+进过镜像层的凭据要按「已泄漏」处理，另行轮换，并检查备份与旧镜像里的副本。
 
 **如果忘了站点或模型密钥**：compose 会把变量替换成空字符串，程序以配置错误退出（退出码 2），
 而 `restart: unless-stopped` 会让容器**反复重启**。看到容器不断重启、日志里是
@@ -898,6 +905,14 @@ docker compose logs --since 30m bot | grep -E 'router\.route|sender\.send|app\.'
 被动事件（输入中、已读、大区里与自己无关的消息）记在 DEBUG 级别，
 所以 `INFO` 下看到的一行行是一次真正的动作，不是噪音。
 
+字段的取值也受约束：`error` 只接受异常类名，`stage`/`kind`/`reason` 只接受代码里
+定义的短标识，安全堆栈只留「模块.函数:行号」。**子进程的 stderr 原文与上游异常正文
+不再进日志**（D-111）——MCP 启动失败会告诉你失败类别与缺哪个模块，而不是把整段
+输出贴上来。第三方库的 WARNING 及以上也只留 `event=third_party.failure source=<库名>`。
+
+上面这些行是**控制台**输出，会随容器重建、也会被 json-file 轮转淘汰。需要长期保留
+的是下一节的永久归档，两者是平行的两条通路。
+
 ### 10.2 限制日志体积
 
 默认的 `json-file` 驱动**不限制**日志大小，长期运行会把磁盘写满。
@@ -917,6 +932,9 @@ docker compose logs --since 30m bot | grep -E 'router\.route|sender\.send|app\.'
 **裸机（systemd / 直接运行）时应用只写 `stderr`**，不自己滚动文件：文件轮转是宿主的职责。
 用 systemd 就跑在 journald 下（由 journald 限体积），否则由 shell 重定向到文件时
 自行配 logrotate。应用不与宿主争夺轮转职责。
+
+这一节的限制只针对**控制台**。永久归档是另一套东西：它自己有分片上限但**不删除**
+旧分片，因此需要单独的容量与备份安排，见 §10.6。
 
 ### 10.3 数据库容量与清理
 
@@ -946,10 +964,11 @@ docker compose logs --since 30m bot | grep -E 'router\.route|sender\.send|app\.'
 | `docker compose restart bot` | 只重启进程          | 保留 | 保留           |
 | `docker compose stop bot`    | 只停进程            | 保留 | 保留           |
 | `docker compose down`        | 停进程并删容器/网络 | 删除 | **保留** |
-| `docker compose down -v`     | 上面 + 删数据卷     | 删除 | **删除** |
+| `docker compose down -v`     | 上面 + 删数据卷     | 删除 | **删除**（数据卷与日志卷一起） |
 
 推荐 `down`。**不要用 `down -v`**，它会丢掉去重记录、SSE 水位与当日配额计数，
-后果是当天额度从零重算，且可能重复回复已经回过的消息。
+后果是当天额度从零重算，且可能重复回复已经回过的消息。启用永久归档后它还会一并
+删掉 `bot-logs` 卷 —— 那正是本功能唯一要保住的东西，**禁止把 `down -v` 当日常升级步骤**。
 
 重启后对话记忆会清空（设计上如此，上下文只存内存），但**去重记录与当日配额计数会保留**，
 所以重启不会导致重复回复，也不会把当天额度重置。
@@ -1006,6 +1025,120 @@ docker compose exec bot rm /app/data/backup.db
 若启用了长期记忆（§4.2.2），卷里还多一个 `/app/data/memory` 目录，上面两种方式都会把它一起
 备走。它**含有用户私有内容**，按敏感数据管理；单独备份与恢复的步骤（停服务、先用 codec 离线
 校验、不进公开制品）见 §4.2.2。
+
+### 10.6 永久错误归档
+
+控制台日志会被轮转淘汰（§10.2），容器重建后也没了。`logging.archive` 打开的是**另一条
+通路**：应用把 WARNING 及以上、以及少量选定的 INFO 事件写成 JSONL，落在独立持久目录，
+**分片只增不删**。
+
+```yaml
+logging:
+  level: INFO  # 控制台级别；不抬高归档的 WARNING 门槛
+  archive:
+    enabled: false  # 部署验收时显式改为 true
+    directory: ./logs/errors  # 相对 config.yaml 解析，容器里即 /app/logs/errors
+    segment_max_bytes: 10485760
+    fsync_interval_seconds: 5
+    disk_warning_free_bytes: 2147483648
+```
+
+**目录与卷。** `docker-compose.yml` 已把命名卷 `bot-logs` 挂在 `/app/logs`，Dockerfile 也
+建好并授权给 uid 10001，只读根文件系统与非 root 用户都不放宽。`directory` **不得**与
+知识库、记忆、稿库或数据库目录重叠：归档只增不减，落在数据树里会挤占它们的空间，
+事后也没人能分清哪些文件属于谁。配置加载期就会拒绝这种重叠。
+
+**启用前先做一次离线验收**：在测试目录或测试容器里打开归档，制造几条已知事件，确认
+分片生成、`/archivez` 可见、`verify` 通过，再动生产配置。归档已启用却打不开目录时进程
+以退出码 3 结束 —— 这是刻意的，继续跑只会让人以为永久记录在工作。
+
+**查询。**
+
+```bash
+# 巡检：每个分片一行，末行被写坏会标 DAMAGED 并以非零退出码结束
+docker compose exec bot python -m raricy_bot archive verify --directory /app/logs/errors
+
+# 查询：按级别、事件名与时间前缀过滤；--since 用定长 UTC 串的前缀即可
+docker compose exec bot python -m raricy_bot archive read \
+  --directory /app/logs/errors --level WARNING --since 2026-09-21T00:00:00
+
+# 追一条消息：trace_id 会把路由判定、模型失败与发送结果串起来
+docker compose exec bot python -m raricy_bot archive read \
+  --directory /app/logs/errors | grep 'trace_id=<值>'
+```
+
+`read` 与 `verify` 都是只读的：它们跳过损坏的末行，但**不会**截断或修复原文件。
+
+归档的时间戳**永远是 UTC**（带 `Z` 后缀），不受容器 `TZ` 影响 —— 结构化归档要对齐
+跨机器的记录，本地时区的偏移只会让两边的同一时刻看起来不同。控制台仍按 §10.1 的规则。
+
+**健康检查。** `/livez` 与 `/readyz` 的语义没有变，磁盘或日志写入失败不会让它们翻红
+—— 否则宿主会反复重启一个仍在正常收发消息的进程。归档有自己的端点：
+
+```bash
+docker compose exec bot python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8080/archivez').read().decode())"
+```
+
+它只回计数与布尔（`written`、`unpersisted`、`disk_low`、`healthy`），不含路径与组件名；
+归档未启用时返回 404。把 `unpersisted > 0` 或 `disk_low: true` 接到宿主告警上。
+
+**容量。** `bot-logs` 是独立卷，**但不等于独立磁盘**。长期增长最终会吃掉宿主的同一块盘，
+所以要么给日志单独划一个文件系统，要么在宿主上设配额。空间不足时应用只告警
+（`archive.disk_low`），**不会**删旧日志腾地方。记录正常流量与故障风暴下的归档增长量，
+据此定容量预算。
+
+**写入失败的语义。** 磁盘满、权限变化或 I/O 错误时，归档自己隔离异常并继续服务，
+在 stderr 限频报告 `archive.write_failed` 并累计缺口；恢复后记 `archive.recovered`
+与缺口计数。**未落盘的事件补不回来** —— 缺口计数说的是"丢了多少条"，不是"会补上"。
+
+### 10.7 备份归档
+
+本地卷只覆盖重启与容器重建；宿主故障还需要第二份副本。
+
+已关闭的分片（文件名里带旧日期的那些）是完整文件，直接增量拷走即可：
+
+```bash
+cd /opt/raricy_bot
+mkdir -p /backup/raricy-archive
+docker run --rm -v raricy_bot_bot-logs:/logs:ro -v /backup/raricy-archive:/backup alpine \
+  sh -c 'cp -n /logs/*.jsonl /backup/ && ls -l /backup | tail -5'
+```
+
+当前**打开中**的分片只能通过协调换片或文件系统一致性快照来备份：它随时可能被追加，
+直接拷走会得到一个尾部不完整的文件。最稳的做法是先停一次服务（`docker compose stop bot`
+会让应用同步并关闭归档），拷完再 `start`。
+
+备份内容校验与恢复：
+
+```bash
+# 校验：对备份目录跑同一套巡检；DAMAGED 会让退出码非零，可直接接告警
+python -m raricy_bot archive verify --directory /backup/raricy-archive
+
+# 恢复：拷回卷里（先 stop），再 verify 一遍确认
+docker compose stop bot
+docker run --rm -v raricy_bot_bot-logs:/logs -v /backup/raricy-archive:/backup alpine \
+  sh -c 'cp -n /backup/*.jsonl /logs/'
+docker compose start bot
+```
+
+**备份不自动过期**：不要给它配保留策略，那与「永久保留」直接冲突。至少每月做一次抽样
+恢复，并记录上次成功时间；超过 24 小时没有成功备份就要告警。**实际恢复点取决于最近一次
+成功的备份** —— 磁盘损毁会丢掉那之后的记录，这是这套方案接受的上限。
+
+> 下面两项属于上线时必须落实的运维信息，不能由代码或文档代替。**未填之前不得声称灾备已完成。**
+>
+> | 项目 | 取值 |
+> |---|---|
+> | 备份目标（独立介质或已有受控备份系统） | 待填 |
+> | 备份负责人 | 待填 |
+> | 宿主容量/告警接收方式 | 待填 |
+
+**回退。** 需要回退时先正常关闭并同步归档，**保留日志卷与备份**。回退后旧程序会忽略
+新字段，必须显式提示"已不再归档"—— 不能因为容器健康就误判永久保留仍在工作。可以关闭
+`logging.archive` 或回退归档实现，**不可回退已经修复的密钥保护**。
+
+JSONL 每行带 `schema_version`，读工具兼容已有版本。历史日志不会因为新增这个功能而自动
+恢复；不批量迁移可能含密钥的旧日志，也不在未获授权时删除历史证据。
 
 ---
 
@@ -1161,6 +1294,7 @@ journalctl -u raricy-bot -f          # 跟日志
 | 退出码 | 含义                                                | 怎么办                                                                                    |
 | ------ | --------------------------------------------------- | ----------------------------------------------------------------------------------------- |
 | `2`  | 配置错误（缺必填项、YAML 非法、环境变量缺失或为空） | `docker compose logs` 里会有一行 `配置错误：具体原因`；修 `config.yaml` 或 `.env` |
+| `3`  | 归档已启用却打不开（目录不可写、分片建不出来）      | 日志里有一行 `归档启动失败：具体原因`；修目录权限或 `logging.archive.directory`。**这是刻意致命**：继续跑只会让人以为永久记录在工作 |
 | `1`  | 运行期致命错误                                      | 日志里只有异常**类型名**（不泄露取值），据此定位                                    |
 | `0`  | 正常停止（收到 SIGTERM/SIGINT）                     | 正常                                                                                      |
 
@@ -1180,7 +1314,10 @@ journalctl -u raricy-bot -f          # 跟日志
 | 一段时间后完全不回                                     | 可能当日额度用尽（7950 条后停止模型回复，8000 条后完全静默），或账号被禁言                                                                                                                   |
 | 机器人在线但对所有人不回，且 `/livez` 持续 503         | 未定案的线上现象，见 `usage/INCIDENTS.md` 事件一。特征：每 30 秒一条健康检查 503、日志再无 `sender.send`/`httpx2`/`app.*` 行、健康检查节拍没有中断（没重启过）。**先按事件一的取证清单抓现场，再重启**——重启会销毁现场 |
 | 回复里出现`[redacted]`                               | 输出命中已加载的机密被替换了。若被替换的是**机器人自己的名字**，说明有人把用户名注册成了机密——用户名不是机密，不该被注册                                                             |
-| 某个能力（`/search`、`/map`、`/wolfram`、`/zhihu`）恒回「暂不可用」 | 先 `docker compose logs bot \| grep 'event=mcp\.'` 看那台服务器那一行，一行就够定位：`provider_disabled reason=missing_env` = 密钥没给上（改 `.env` 后必须 `docker compose up -d`，`restart` 不会重新读值）；`provider_start_failed` 后面的 `error=` 与 `stderr=` 是子进程给出的退出原因——`ERR_MODULE_NOT_FOUND` 之类说明镜像里的依赖树不对（见 §2.2），不是账号问题 |
+| 某个能力（`/search`、`/map`、`/wolfram`、`/zhihu`）恒回「暂不可用」 | 先 `docker compose logs bot \| grep 'event=mcp\.'` 看那台服务器那一行，一行就够定位：`provider_disabled reason=missing_env` = 密钥没给上（改 `.env` 后必须 `docker compose up -d`，`restart` 不会重新读值）；`provider_start_failed` 后面的 `error=`、`code=`、`stage=` 与 `category=` 是子进程给出的退出原因——`category=module_missing` 说明镜像里的依赖树不对（见 §2.2），不是账号问题。**子进程 stderr 的原文不再进日志**（D-111），需要更细的现场时按 §4.1.2 在开发机上复刻取样 |
+| 日志里出现 `event=mcp.phase_stalled` | 某个 MCP 阶段（连接/发现/调用/关闭）超过 60 秒没结束。它**只报警、不取消**：可能有副作用的调用为了日志被取消会制造重复副作用。随后出现 `phase_finished` 说明它自己走完了 |
+| 日志里出现 `event=app.task_exit reason=cancelled_escaped` | **没有**任何取消请求，某个后台任务却以 `CancelledError` 收尾。这正是 `usage/INCIDENTS.md` 事件一记录过的形态——先按那份取证清单抓现场 |
+| 日志里出现 `event=archive.write_failed` | 归档写不进去（磁盘满、权限变化、I/O 错误）。服务本身不受影响，但**未落盘的事件补不回来**：`gap_count` 是"丢了多少条"。恢复后会有 `event=archive.recovered` |
 | 日志报`429`                                          | 站点限频。程序会遵循`Retry-After`，没有该头则等 60 秒并退避                                                                                                                                |
 | 日志只有一行行`router.route reason=no_mention`       | 正常噪音，剔掉再看：`grep -v 'reason=no_mention'`                                                                                                                                          |
 
@@ -1327,6 +1464,8 @@ docker compose logs --tail=200 bot | grep -E 'router\.route|sender\.send|app\.'
 - [ ] 日志里没有密码、API Key、Cookie 或消息正文
 - [ ] 已配置日志体积上限（第 10.2 节）与 `TZ`（第 10.1 节）
 - [ ] 已做过一次备份并验证能解开（第 10.5 节）
+- [ ] 若要启用永久归档：已在测试目录验证过开启、分片生成、`archive verify` 与 `/archivez`，
+      并填好 §10.7 的备份目标与负责人；宿主容量与告警也已落实（**未落实不得声称灾备完成**）
 - [ ] 若启用评论能力：已在测试文章上验证首次 @、直接回复、旁支静默、`/help` 与 `/reset`
 - [ ] 若启用长期记忆（Beta）：按 §4.2.2 走完「空跑确认不建目录 → 名单留空验证接入门 →
       管理员自测 `/remember` 与共同候选 → 小范围放行」，核对过 `/help`、公开确认与评论披露，
@@ -1364,6 +1503,14 @@ docker compose logs --tail=200 bot | grep -E 'router\.route|sender\.send|app\.'
   因为公开接口无法列出机器人尚不知道的私聊频道。
 - 评论发现依赖「最近 100 条评论」的滚动窗口，两轮之间溢出会永久漏失；冷启动基线建立前的
   旧评论不会补回复。
+- **「永久保留」不是有限磁盘上的无限容量承诺。** 归档不设自动到期、不覆盖旧分片，因此
+  磁盘告警、扩容、备份与恢复验证属于完整交付条件；备份目标与负责人未落实前不能算灾备完成。
+  它也不保证断电、磁盘损坏、强制杀进程或写入失败时零丢失 —— 写入失败只累计缺口计数，
+  未落盘的事件补不回来。
+- **配置解析成功、归档初始化完成之前**的启动错误只能安全写 stderr，仍依赖宿主保存；
+  OS/OOM/断电等进程外故障同样依赖宿主监控。不能宣称所有启动失败都已入应用归档。
+- 归档只保留**诊断事件**：不保存聊天正文、模型请求/响应、工具参数与结果。它解决的是
+  「出故障时能定位」，不是「事后能还原现场」。
 - **Docker 产物未在本机构建验证过**（开发机没有 Docker）。本文的命令按标准用法写成，
   但首次在服务器上执行时请留意 `docker compose build` 阶段的输出，
   若有报错请以实际输出为准。

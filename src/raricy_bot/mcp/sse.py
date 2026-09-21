@@ -22,7 +22,8 @@ from typing import Any
 from mcp.client.sse import sse_client
 
 from ..config import McpServerConfig
-from ..redact import Redactor
+from ..logging_setup import register_secret
+from ..redact import Redactor, SecretRegistry
 from .session import MissingEnvironmentError, SessionMcpProvider
 
 
@@ -35,6 +36,7 @@ class SseMcpProvider(SessionMcpProvider):
         *,
         host_env: dict[str, str] | None = None,
         redactor: Redactor | None = None,
+        registry: SecretRegistry | None = None,
         connect_timeout_seconds: float = 10.0,
         call_timeout_seconds: float = 20.0,
     ) -> None:
@@ -50,6 +52,10 @@ class SseMcpProvider(SessionMcpProvider):
         # （2026-09-16）。空字典仍然是「没有环境」，只有 None 才回落到 os.environ。
         self._host_env = dict(os.environ if host_env is None else host_env)
         self._redactor = redactor
+        # 装配方注入共享登记中心时，出站 Redactor 订阅同一份凭据表（计划 §3.1）。
+        self._registry = registry
+        if self._registry is not None and self._redactor is not None:
+            self._registry.attach(self._redactor)
 
     def resolve_headers(self) -> dict[str, str]:
         """把宿主环境里的 Bearer 令牌变成连接头，并登记脱敏。
@@ -61,9 +67,13 @@ class SseMcpProvider(SessionMcpProvider):
         value = self._host_env.get(name, "").strip()
         if not value:
             raise MissingEnvironmentError((name,))
-        if self._redactor is not None:
-            # 注册原值即可：Redactor 做子串替换，`Bearer <token>` 整段会被一起抹掉。
-            self._redactor.add_secret(value)
+        # 注册原值即可：Redactor 做子串替换，`Bearer <token>` 整段会被一起抹掉。
+        if self._registry is not None:
+            self._registry.register(value)
+        else:
+            if self._redactor is not None:
+                self._redactor.add_secret(value)
+            register_secret(value)
         return {"Authorization": f"Bearer {value}"}
 
     async def _open_transport(self, stack: AsyncExitStack) -> tuple[Any, Any]:

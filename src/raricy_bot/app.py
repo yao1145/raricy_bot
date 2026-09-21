@@ -81,7 +81,12 @@ from .core.worker import (
     WorkerPool,
 )
 from .kb.service import KnowledgeService
-from .logging_setup import get_logger, log_event
+from .logging_setup import (
+    get_logger,
+    log_event,
+    observe_task,
+    secret_registry,
+)
 from .mcp.adapters import build_adapters
 from .mcp.contracts import describe_error
 from .mcp.runtime import McpManager
@@ -200,17 +205,26 @@ class BotApp:
         memory_service: MemoryService | None = None,
         memory_writer: MemoryWriter | None = None,
         memory_controller: MemoryController | None = None,
+        archive: Any | None = None,
     ) -> None:
         self._config = config
         self._transport = transport
+        # 永久归档由 `__main__` 装配（它要在 BotApp 之前决定"打不开就退出"），
+        # 这里只保留一个只读引用供本地健康检查用。
+        self._archive = archive
         # 图片输入：默认关闭。关闭时 worker 完全不碰 ImageLoader，
         # 进程里也就没有任何新增的图床请求（设计 §3.5）。
         self._vision_enabled = config.model.vision_enabled
 
         # 只登记真正的机密：密码与模型 Key；机器人用户名不是机密（redact.py §3）。
-        self._redactor = Redactor(
-            [config.secrets.password, config.secrets.llm_api_key]
-        )
+        # 走上进程级登记中心而不是直接构造：出站 Redactor 订阅同一份凭据表后，
+        # 站点 Cookie、MCP 各槽位 Key 与 SSE 令牌都只需登记一次就两侧同时生效
+        # （计划 §3.1）。登记发生在网络客户端与 MCP 初始化**之前**。
+        self._registry = secret_registry()
+        self._redactor = Redactor()
+        self._registry.attach(self._redactor)
+        self._registry.register(config.secrets.password)
+        self._registry.register(config.secrets.llm_api_key)
 
         self._store = Store(
             config.storage.db_path,
@@ -221,6 +235,7 @@ class BotApp:
             dedupe_retention_seconds=config.comments.dedupe_retention_seconds,
         )
         client_kwargs: dict[str, object] = {
+            "registry": self._registry,
             "timeout": config.site.request_timeout_seconds,
             "transport": transport,
             "username": config.secrets.username,
@@ -346,11 +361,15 @@ class BotApp:
             handler=self._handle_request,
             concurrency=config.behavior.concurrency,
         )
+        # 健康变化只在**变化时**记一条（计划 §4）。判定点就放在探针上：
+        # 宿主按固定周期询问，这正是"状态被观测到"的时刻，不需要另起一个定时任务。
+        self._health_state: dict[str, bool] = {}
         self._ops = OpsServer(
             config.ops.host,
             config.ops.port,
-            livez=lambda: self.live,
-            readyz=lambda: self.ready,
+            livez=lambda: self._observe_health("live", self.live),
+            readyz=lambda: self._observe_health("ready", self.ready),
+            archive_status=self._archive_status,
         )
 
         # 下面这些在 start() 里按装配顺序建立。
@@ -384,6 +403,7 @@ class BotApp:
         return McpManager(
             self._config.mcp,
             redactor=self._redactor,
+            registry=self._registry,
             adapters=build_adapters(self._config.mcp),
         )
 
@@ -585,6 +605,10 @@ class BotApp:
 
         self._sse_task = asyncio.create_task(self._sse.run(), name="bot-sse")
         self._cleanup_task = asyncio.create_task(self._cleanup_loop(), name="bot-cleanup")
+        # 只加观测：这三个任务此前一旦安静地结束，/livez 会翻红而日志里没有一行
+        # 说明是哪一个、以什么方式结束的（计划 §4 的「后台任务退出」）。
+        observe_task(self._sse_task, "sse")
+        observe_task(self._cleanup_task, "cleanup")
         self._started = True
         log_event(_logger, logging.INFO, "app.started")
 
@@ -624,6 +648,59 @@ class BotApp:
             sleep=asyncio.sleep,
             random=random.random,
         )
+
+    def _observe_health(self, kind: str, healthy: bool) -> bool:
+        """记录一次健康观测，状态**变化**时写一条 `app.health_changed`。
+
+        首次观测只用来建立基线，不算变化：进程刚起来时 `/readyz` 本来就是
+        down（还没登录、SSE 还没连上），把它记成一次"故障"是纯噪音。
+        """
+        previous = self._health_state.get(kind)
+        self._health_state[kind] = healthy
+        if previous is None or previous == healthy:
+            return healthy
+        fields: dict[str, object] = {
+            "kind": kind,
+            "from_state": "up" if previous else "down",
+            "to_state": "up" if healthy else "down",
+            "queue_depth": self._queue.qsize(),
+            "worker_count": self._workers.alive_count,
+        }
+        if not healthy:
+            fields["reason"] = self._unhealthy_component()
+        log_event(
+            _logger,
+            logging.INFO if healthy else logging.WARNING,
+            "app.health_changed",
+            **fields,
+        )
+        return healthy
+
+    def _unhealthy_component(self) -> str:
+        """当前最可能让探针翻红的组件名；只用于日志，取值是固定短标识。"""
+        if self._stopped or not self._started:
+            return "app"
+        sse_task = self._sse_task
+        if sse_task is None or sse_task.done():
+            return "sse"
+        if not self._workers.alive:
+            return "workers"
+        if not self._client.logged_in:
+            return "auth"
+        if self._queue.full():
+            return "queue"
+        if self._config.comments.enabled:
+            service = self._comment_service
+            if service is None or not service.alive:
+                return "comments"
+        return "unknown"
+
+    def _archive_status(self) -> dict[str, object] | None:
+        """归档健康检查回调；未启用归档时返回 None（端点回 404）。"""
+        if self._archive is None:
+            return None
+        status = getattr(self._archive, "status", None)
+        return status() if callable(status) else None
 
     async def run_forever(self) -> None:
         """启动并阻塞，直到 `stop()` 被调用（或信号处理方调用 stop）。"""
@@ -1562,12 +1639,17 @@ class BotApp:
                 }:
                     await self._send_capability_unavailable(request, capability, exc.kind)
                     return
+                # 只记稳定分类，不带异常正文：超时、401、429、5xx 与非法请求
+                # 在日志里必须能分开，而它们此前都塌缩成 error=ModelError 一行
+                # （计划 §4 的「模型失败」）。trace_id 用来把同一条消息的
+                # 判定、模型失败与发送结果串起来。
                 log_event(
                     _logger,
                     logging.WARNING,
                     "app.model_failed",
+                    trace_id=request.trace_id,
                     channel_id=request.channel_id,
-                    error=type(exc).__name__,
+                    **exc.log_fields(),
                 )
                 await self._notify_failure(request)
                 return
@@ -1576,6 +1658,7 @@ class BotApp:
                     _logger,
                     logging.WARNING,
                     "app.model_failed",
+                    trace_id=request.trace_id,
                     channel_id=request.channel_id,
                     error=type(exc).__name__,
                 )
@@ -2067,6 +2150,7 @@ class BotApp:
         if self._resync_task is not None and not self._resync_task.done():
             return  # 已有一次在跑，避免 resync 风暴
         self._resync_task = asyncio.create_task(self._resync(), name="bot-resync")
+        observe_task(self._resync_task, "resync")
 
     async def _resync(self) -> None:
         """拉取大区与已知私聊的最新 100 条，合并去重后交给同一套路由。"""
@@ -2121,6 +2205,7 @@ class BotApp:
         log_event(_logger, logging.ERROR, "app.unavailable", status=403)
         if self._probe_task is None or self._probe_task.done():
             self._probe_task = asyncio.create_task(self._probe_loop(), name="bot-probe")
+            observe_task(self._probe_task, "probe")
 
     async def _probe_loop(self) -> None:
         """每 `ready_probe_seconds` 探测一次；恢复后解除不可用标志。

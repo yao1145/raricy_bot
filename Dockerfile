@@ -51,8 +51,12 @@ RUN pip install --no-cache-dir .
 # 数据目录不变量：WORKDIR 是 /app，配置默认 storage.db_path=./data/bot.db，
 # 解析为 /app/data/bot.db；docker-compose.yml 必须把数据卷挂到 /app/data，
 # 否则默认配置会把 SQLite 落到临时层、容器重启即丢。改动其一时同步改另一处。
+# 归档目录不变量：配置里 logging.archive.directory 相对 config.yaml 解析，
+# 而 config.yaml 挂在 /app/config.yaml，所以 ./logs/errors 指的是 /app/logs/errors。
+# 这里连同 /app/data 一起建出来并交给 bot：根文件系统是只读的（compose 的
+# read_only: true），唯一的可写处就是这两个挂载点。只读根 + 非 root 都不放宽。
 RUN useradd -r -u 10001 bot \
-    && mkdir -p /app/data \
+    && mkdir -p /app/data /app/logs \
     && chown -R bot:bot /app
 
 USER bot

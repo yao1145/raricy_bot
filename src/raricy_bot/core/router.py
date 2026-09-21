@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from .. import texts
 from ..capabilities import CAPABILITY_BY_FEATURE
 from ..config import BehaviorConfig, StorageConfig
-from ..logging_setup import get_logger, log_event
+from ..logging_setup import get_logger, log_event, new_trace_id
 from ..memory.access import MemoryAccessPolicy
 from ..memory.commands import (
     MemoryCommand,
@@ -150,6 +150,9 @@ class Request:
     # 这条消息被唤起之前积累的大区公开消息（§38.2），入队那一刻固化；**私聊恒为空元组**。
     # 用不可变 tuple 而不是引用：请求进了队列之后，缓冲器还可以继续被 SSE 改动。
     lobby_recent: tuple[LobbyRecentMessage, ...] = ()
+    # 本地随机关联标识（计划 §4）：把同一条消息的路由判定、模型失败与发送结果串起来。
+    # 它只由随机数生成，不编码 message_id / 用户 / 频道 —— 因此可以安全地进日志与归档。
+    trace_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -571,6 +574,7 @@ class MessageRouter:
         # 因此同一事件循环里不会被 SSE 回调或 resync 任务插进来 —— 快照与删除边界一致。
         lobby_recent = self._peek_lobby_recent(trigger_sequence)
         request = Request(
+            trace_id=new_trace_id(),
             event_id=event_id,
             channel_id=channel_id,
             channel_kind=channel_kind,

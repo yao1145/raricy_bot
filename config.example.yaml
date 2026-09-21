@@ -1,9 +1,11 @@
 site:  # 站点连接；账号与密码从 RARICY_USERNAME、RARICY_PASSWORD 环境变量读取
-  base_url: "https://raricy.com"  # 机器人访问网站地址
+  base_url: "https://raricy.com"  # 机器人访问网站地址；非本机地址必须是 https，且不得含用户名、查询串或片段
+  allow_plain_http: false  # 仅本机开发需要 http 时才改为 true；回环地址始终允许 http
   request_timeout_seconds: 20  # 普通 HTTP 请求超时秒数；SSE 长连接单独设置读超时
 
 model:  # 模型服务配置；API Key 从 LLM_API_KEY 环境变量读取
-  base_url: "https://example.com/v1"  # 兼容 OpenAI API 的模型服务地址
+  base_url: "https://example.com/v1"  # 兼容 OpenAI API 的模型服务地址；非本机地址必须是 https
+  allow_plain_http: false  # 仅本机开发需要 http 时才改为 true；回环地址始终允许 http
   model: "model_name"  # 模型名称
   temperature: 0.4  # 生成随机性；值越低回答通常越稳定
   timeout_seconds: 45  # 单次模型请求超时秒数；超时不自动重试
@@ -144,7 +146,7 @@ behavior:  # 聊天上下文、输入输出、并发与配额
 
 ops:  # 只返回固定短文本的存活与就绪探针
   host: "0.0.0.0"  # 健康探针监听地址；外部访问由部署端口映射决定
-  port: 8080  # 健康探针端口，提供 /livez 与 /readyz
+  port: 8080  # 健康探针端口，提供 /livez、/readyz 与 /archivez（归档启用时才有）
 
 storage:  # SQLite 运行状态；不存消息正文，发文标题例外见 D-107
   db_path: "./data/bot.db"  # SQLite 文件路径，同目录须允许创建 WAL 和 SHM 文件
@@ -156,7 +158,14 @@ storage:  # SQLite 运行状态；不存消息正文，发文标题例外见 D-1
   wal_journal_limit_bytes: 16777216  # WAL journal_size_limit 字节数，须小于主库软阈值
 
 logging:  # 白名单结构化日志；凭据统一脱敏，禁止写入正文
-  level: "INFO"  # 日志级别；DEBUG 也不允许记录正文或凭据
+  level: "INFO"  # 控制台级别；不抬高归档的 WARNING 门槛，DEBUG 也不允许记录正文或凭据
+
+  archive:  # 永久错误归档：独立于控制台轮转的 JSONL 归档，部署验收时须显式开启
+    enabled: false  # 是否持久保存 WARNING 及以上与选定的 INFO 事件；默认关闭
+    directory: "./logs/errors"  # 归档目录，相对本配置文件解析；不得与知识库、记忆或稿库重叠
+    segment_max_bytes: 10485760  # 单分片目标上限（字节）；到量就换新片，旧片一个都不删
+    fsync_interval_seconds: 5  # WARNING 与选定 INFO 的最长批量同步间隔（秒）；ERROR 每条单独同步
+    disk_warning_free_bytes: 2147483648  # 剩余空间低于此值即告警（字节），即使没有新错误也会周期巡检
 
 system_prompt: |  # 聊天系统提示词；以下多行是实际发送内容，不在正文中添加 YAML 注释
   你是站内通用聊天机器人。明确自己的机器人身份，
