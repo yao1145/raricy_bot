@@ -160,6 +160,67 @@ def _status_code(exc: BaseException) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+# 结构化「端点不支持 tools」判定用的白名单（计划 §3.2 第 3 条）。
+# 只认 SDK 异常 `.body["error"]` 的结构化字段，**绝不**扫描 message 原始正文。
+_TOOLS_PARAM_NAMES: frozenset[str] = frozenset(
+    {"tools", "tool_choice", "parallel_tool_calls"}
+)
+"""错误信封里 `error.param` 精确点名工具相关参数时才算命中。"""
+
+_TOOLS_UNSUPPORTED_CODES: frozenset[str] = frozenset(
+    {
+        "unsupported_parameter",
+        "unknown_parameter",
+        "unrecognized_parameter",
+        "unsupported_value",
+    }
+)
+"""`error.code` 表示「无法识别 / 不支持参数」的稳定取值。"""
+
+_TOOLS_UNSUPPORTED_TYPES: frozenset[str] = frozenset({"invalid_request_error"})
+"""`error.type` 的无效请求类别；必须与工具参数名同时命中才生效。"""
+
+
+def _is_tools_unsupported(exc: Exception) -> bool:
+    """结构化判定：该异常是否**明确**表示「端点不接受 tools 参数」。
+
+    判定依据与取舍（为什么这条窄判定是安全的）：
+
+    1. 只看 openai SDK 异常对象 `.body["error"]` 里的结构化字段（`param` / `code` /
+       `type`），**不读** `error["message"]` 或 `str(exc)` 的自由正文。报错文案里
+       偶然出现 "tools" 字样（例如「提示词过长」的文案恰好提到工具）不会触发。
+    2. 只有 `param` 精确点名工具相关参数，**且** `code` / `type` 明确属于「无法识别或
+       不支持参数」类别时才返回 True。任一结构化字段缺失、取值对不上，或状态码不在
+       400/404 内，都返回 False，交回 `_map_error` 的通用分类。
+    3. 结果是**本次调用**的结论，不写回任何实例状态：一次请求的失败绝不能当作端点
+       永久不支持工具的证据（真相见 INCIDENTS 事件一第六节第 3 条）。
+
+    窄判定的代价是：把「不支持工具」只写进正文而不用结构化字段的提供方会被漏判，
+    它们退回通用 `bad_request`。这是刻意选择 —— 漏判只让一次调用按普通错误处理，
+    误判却会把无关错误改写成「能力不可用」，二者不对称。
+    """
+    if not isinstance(exc, openai.APIStatusError):
+        return False
+    if _status_code(exc) not in {400, 404}:
+        return False
+    body = getattr(exc, "body", None)
+    if not isinstance(body, dict):
+        return False
+    # openai SDK 会把信封里的 `error` 对象**解包**后放进 `.body`（body 即为错误对象本身）；
+    # 兼容仍带一层 `{"error": {...}}` 的提供方，两种形状都接受。
+    error = body.get("error")
+    if not isinstance(error, dict):
+        error = body
+    param = error.get("param")
+    if not isinstance(param, str) or param not in _TOOLS_PARAM_NAMES:
+        return False
+    code = error.get("code")
+    error_type = error.get("type")
+    return (
+        isinstance(code, str) and code in _TOOLS_UNSUPPORTED_CODES
+    ) or (isinstance(error_type, str) and error_type in _TOOLS_UNSUPPORTED_TYPES)
+
+
 class ModelError(Exception):
     """模型调用失败；`retryable` 表示本模块是否已再试过（最终失败时抛出）。
 
@@ -216,7 +277,6 @@ class OpenAIModelClient:
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._cfg = cfg
-        self._tools_unsupported = False
         # 密钥登记进脱敏器，确保任何出站文本与日志都不会泄露它。
         redactor.add_secret(api_key)
         kwargs: dict[str, Any] = {
@@ -298,11 +358,6 @@ class OpenAIModelClient:
 
             return text
 
-    @property
-    def tools_unsupported(self) -> bool:
-        """当前模型端点是否已确认不支持 tools；只缓存首轮 400/404。"""
-        return self._tools_unsupported
-
     async def complete_with_tools(
         self,
         messages: list[dict[str, Any]],
@@ -327,8 +382,6 @@ class OpenAIModelClient:
         """
         if not tools:
             raise ModelError("tools_unavailable", False)
-        if self._tools_unsupported:
-            raise ModelError("tools_unsupported", False)
         if max_tool_calls < 1:
             raise ModelError("tools_unavailable", False)
 
@@ -499,18 +552,23 @@ class OpenAIModelClient:
                             **request_kwargs,
                         )
                 result = self._extract_tool_round(response)
-            except Exception as exc:
+            except Exception as exc:  # 任何异常都必须映射为 ModelError
+                if detect_tools_unsupported and _is_tools_unsupported(exc):
+                    # 只有结构化、可识别的「端点不接受 tools」才归入该稳定 kind：
+                    # 它是**本次调用**的结论，不写任何实例状态、不重试（与原语义一致）。
+                    # 普通 400/404 走下面的通用映射（bad_request），只终结当前请求。
+                    raise ModelError(
+                        "tools_unsupported",
+                        False,
+                        http_status=_status_code(exc),
+                        stage=stage,
+                        duration_ms=elapsed_ms(started),
+                    ) from exc
                 error = self._map_error(
                     exc,
                     stage=stage,
                     duration_ms=elapsed_ms(started),
                 )
-                if (
-                    detect_tools_unsupported
-                    and isinstance(exc, openai.APIStatusError)
-                    and getattr(exc, "status_code", None) in {400, 404}
-                ):
-                    self._tools_unsupported = True
                 if not error.retryable or attempt + 1 >= _MAX_ATTEMPTS:
                     raise error from exc
                 attempt += 1

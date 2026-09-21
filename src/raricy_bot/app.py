@@ -1850,16 +1850,11 @@ class BotApp:
         if accepts_gate:
             kwargs["model_gate"] = self._model_gate
 
-        try:
-            if accepts_gate:
+        if accepts_gate:
+            completion = await complete_with_tools(messages, **kwargs)
+        else:
+            async with self._model_gate:
                 completion = await complete_with_tools(messages, **kwargs)
-            else:
-                async with self._model_gate:
-                    completion = await complete_with_tools(messages, **kwargs)
-        except ModelError as exc:
-            if exc.kind == "bad_request" and getattr(model, "tools_unsupported", False):
-                raise ModelError("tools_unsupported", False) from exc
-            raise
         return completion.text, completion.history_context
 
     async def _prepare_kb(self, request: Request) -> str | None:

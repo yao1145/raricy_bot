@@ -115,8 +115,9 @@ class BlogWriter:
     def _tool_plan(self) -> tuple[tuple[ToolDefinition, ...] | None, str]:
         """这一轮能不能走工具协议；不能时给出稳定原因（只进日志）。
 
-        四类**调用前已知**的条件都在这里判定：MCP 未启用、没配 `blog_write`、工具不可用、
-        客户端已缓存「不支持 tools」。任何一条成立都直接以无工具方式生成一次（§53.9）。
+        三类**调用前已知**的条件都在这里判定：MCP 未启用、没配 `blog_write`、工具不可用。
+        任何一条成立都直接以无工具方式生成一次（§53.9）。**不缓存**端点「不支持 tools」：
+        一次结构化拒绝只结束那次生成，下一次调度点仍会重新尝试工具路径（计划 §3.2）。
         """
         if not self._mcp_enabled:
             return None, "mcp_disabled"
@@ -124,9 +125,6 @@ class BlogWriter:
             return None, "feature_unconfigured"
         if self._registry is None:
             return None, "registry_missing"
-        if getattr(self._model, "tools_unsupported", False):
-            # 端点已经用 400/404 明确拒绝过 tools：不必再撞一次，直接无工具生成。
-            return None, "tools_unsupported"
         if not callable(getattr(self._model, "complete_with_tools", None)):
             return None, "client_without_tools"
         if not self._registry.feature_available(FEATURE_NAME):
@@ -146,26 +144,20 @@ class BlogWriter:
         if not _accepts_strict_calls(complete_with_tools):
             # 拿不到严格完成检查就等于可能发布半篇正文：**明确失败**，不静默降级。
             raise ModelError(KIND_STRICT_UNSUPPORTED, False)
-        try:
-            completion = await complete_with_tools(
-                self._messages(prompt),
-                tools=tools,
-                execute=self._execute,
-                max_tool_calls=self._max_tool_calls,
-                # 发文没有会话代次（聊天侧的 `/reset` 概念）——这一轮永远算「当前」。
-                generation_is_current=_always_current,
-                model_gate=self._model_gate,
-                require_complete=True,
-                max_input_tokens=self._max_input_tokens,
-            )
-        except ModelError as exc:
-            if exc.kind == "bad_request" and getattr(
-                self._model, "tools_unsupported", False
-            ):
-                # **首次调用**才发现端点不认 tools：结束本次生成，后续调度点再走无工具
-                # 路径。同轮不降级、不重试、也不退回聊天的 `search` 授权（§53.9）。
-                raise ModelError("tools_unsupported", False) from exc
-            raise
+        # 端点结构化拒绝 tools 时，客户端已经返回 `ModelError("tools_unsupported")`；
+        # 这里让它原样抛出结束本次生成。不做同轮降级、不重试，也不退回聊天的 `search`
+        # 授权（§53.9）—— 但**不缓存**该结论，下一次调度点仍会重新尝试工具路径（计划 §3.2）。
+        completion = await complete_with_tools(
+            self._messages(prompt),
+            tools=tools,
+            execute=self._execute,
+            max_tool_calls=self._max_tool_calls,
+            # 发文没有会话代次（聊天侧的 `/reset` 概念）——这一轮永远算「当前」。
+            generation_is_current=_always_current,
+            model_gate=self._model_gate,
+            require_complete=True,
+            max_input_tokens=self._max_input_tokens,
+        )
         return completion.text
 
     async def _generate_without_tools(self, prompt: str) -> str:
