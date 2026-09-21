@@ -1046,7 +1046,9 @@ logging:
 **目录与卷。** `docker-compose.yml` 已把命名卷 `bot-logs` 挂在 `/app/logs`，Dockerfile 也
 建好并授权给 uid 10001，只读根文件系统与非 root 用户都不放宽。`directory` **不得**与
 知识库、记忆、稿库或数据库目录重叠：归档只增不减，落在数据树里会挤占它们的空间，
-事后也没人能分清哪些文件属于谁。配置加载期就会拒绝这种重叠。
+事后也没人能分清哪些文件属于谁。**启用归档时**配置加载会拒绝这种重叠 —— 关闭时不做
+这项检查，否则像 `storage.db_path: ./bot.db` 这样的旧配置会因为一个从不写盘的目录而
+起不来。
 
 **启用前先做一次离线验收**：在测试目录或测试容器里打开归档，制造几条已知事件，确认
 分片生成、`/archivez` 可见、`verify` 通过，再动生产配置。归档已启用却打不开目录时进程
@@ -1071,6 +1073,11 @@ docker compose exec bot python -m raricy_bot archive read \
 
 归档的时间戳**永远是 UTC**（带 `Z` 后缀），不受容器 `TZ` 影响 —— 结构化归档要对齐
 跨机器的记录，本地时区的偏移只会让两边的同一时刻看起来不同。控制台仍按 §10.1 的规则。
+分片也按 **UTC 日期**滚动：跨过 UTC 零点后的第一条事件会写进新日期的分片，所以
+「文件名里的日期」就是内容日期的可靠上界 —— §10.7 的增量备份正是靠这一点选片。
+
+归档里的字段值在写出前会再过一次**与控制台完全相同**的密钥替换：类型约束只保证字段
+"形状"合法，不保证内容安全，所以两条通路不能只有一条脱敏。
 
 **健康检查。** `/livez` 与 `/readyz` 的语义没有变，磁盘或日志写入失败不会让它们翻红
 —— 否则宿主会反复重启一个仍在正常收发消息的进程。归档有自己的端点：
@@ -1095,18 +1102,36 @@ docker compose exec bot python -c "import urllib.request; print(urllib.request.u
 
 本地卷只覆盖重启与容器重建；宿主故障还需要第二份副本。
 
-已关闭的分片（文件名里带旧日期的那些）是完整文件，直接增量拷走即可：
+分片在**卷内的 `errors/` 子目录**里（`/app/logs/errors`，卷挂在 `/app/logs`），
+所以下面的辅助容器看到的是 `/logs/errors/*.jsonl`。漏掉这一层会得到一条
+「复制成功、什么都没拷到」的命令 —— `cp` 对不存在的通配符不报错。
+
+**推荐的每日增量（短暂停机，最不易出错）：**
 
 ```bash
 cd /opt/raricy_bot
 mkdir -p /backup/raricy-archive
+docker compose stop bot          # 应用会同步并关闭归档：此刻每个分片都是完整文件
 docker run --rm -v raricy_bot_bot-logs:/logs:ro -v /backup/raricy-archive:/backup alpine \
-  sh -c 'cp -n /logs/*.jsonl /backup/ && ls -l /backup | tail -5'
+  sh -c 'cp /logs/errors/*.jsonl /backup/ && ls -lt /backup | head -5'
+docker compose start bot
 ```
 
-当前**打开中**的分片只能通过协调换片或文件系统一致性快照来备份：它随时可能被追加，
-直接拷走会得到一个尾部不完整的文件。最稳的做法是先停一次服务（`docker compose stop bot`
-会让应用同步并关闭归档），拷完再 `start`。
+用 `cp` 而不是 `cp -n`：已关闭的分片不会再变，重复拷同样的字节没有副作用；而
+`cp -n` 一旦拷到过一份不完整的文件，之后**永远**不会再更新它。
+
+**不停机的变体（可选）：** 只拷**日期早于今天（UTC）**的分片，然后对备份跑一次
+`verify`。跨过 UTC 零点后第一个分片才会封口，所以这个筛选有几分钟的窗口 ——
+`verify` 正好能发现它：报 `DAMAGED` 就说明拷到了还在写入的那个，等下一个换片
+周期再拷一次即可。当天那份只能靠停机或文件系统一致性快照。
+
+```bash
+TODAY=$(date -u +%Y%m%d)
+docker run --rm -v raricy_bot_bot-logs:/logs:ro -v /backup/raricy-archive:/backup \
+  -e TODAY="$TODAY" alpine \
+  sh -c 'cp /logs/errors/*.jsonl /backup/ 2>/dev/null; rm -f /backup/errors-$TODAY-*; ls -lt /backup | head -5'
+python -m raricy_bot archive verify --directory /backup/raricy-archive
+```
 
 备份内容校验与恢复：
 
@@ -1117,8 +1142,16 @@ python -m raricy_bot archive verify --directory /backup/raricy-archive
 # 恢复：拷回卷里（先 stop），再 verify 一遍确认
 docker compose stop bot
 docker run --rm -v raricy_bot_bot-logs:/logs -v /backup/raricy-archive:/backup alpine \
-  sh -c 'cp -n /backup/*.jsonl /logs/'
+  sh -c 'mkdir -p /logs/errors && cp /backup/*.jsonl /logs/errors/'
 docker compose start bot
+python -m raricy_bot archive verify --directory /backup/raricy-archive
+```
+
+还原本地后也可以直接在容器里核对一次（`archive read` 是只读的，不会动文件）：
+
+```bash
+docker compose exec bot python -m raricy_bot archive read \
+  --directory /app/logs/errors --limit 5
 ```
 
 **备份不自动过期**：不要给它配保留策略，那与「永久保留」直接冲突。至少每月做一次抽样

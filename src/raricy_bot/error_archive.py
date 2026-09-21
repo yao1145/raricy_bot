@@ -5,14 +5,16 @@
 `logging.handlers.RotatingFileHandler` —— 它的 `backupCount` 会删掉旧文件，而
 「永久保留」的第一条就是**不设置自动到期、不覆盖旧分片**。
 
-四条贯穿全文件的约束：
+五条贯穿全文件的约束：
 
 - 归档只接收**已清洗的安全事件**（字段名与取值都过了 `logging_setup` 的白名单与
   类型约束）。它不解析、也不复制 Docker 或子进程的原始日志。
+- 每条写出前再施加一次**与出站文本同一套**的密钥替换（`_serialize`）。类型约束
+  只保证"形状"安全，不保证"内容"安全；只有一条通路脱敏等于没有脱敏。
 - 单写者：所有写入走同一把锁与同一个文件对象；不引入可能溢出的内存队列，
   代价是 fsync 会落在调用线程上（这个取舍是显式接受的，见 §5.1）。
-- 归档自己的状态事件（写入失败、恢复、磁盘告警）只走 stderr，绝不回到归档文件，
-  否则一条写失败会变成一次递归。
+- 状态事件在**锁外**发出。`logging.Handler` 是"先拿 handler 锁再 emit"，
+  在持锁时发日志会与写入路径构成 ABBA 死锁（见 `_deliver`）。
 - 读工具跳过损坏末行，但**不截断、不修复**原文件：损坏就是损坏，不能把它
   改造成"看起来完整"的记录。
 """
@@ -25,7 +27,7 @@ import os
 import shutil
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,6 +40,7 @@ from .logging_setup import (
     event_payload,
     get_logger,
     log_event,
+    redact_text,
     third_party_event,
     utc_timestamp,
 )
@@ -83,6 +86,26 @@ class SegmentReport:
     last_seq: int | None
 
 
+# 攒下来、待出锁之后发出的状态事件：`(级别, 事件名, 字段)`。
+_Outbox = list[tuple[int, str, dict[str, object]]]
+
+
+def _serialize(entry: Mapping[str, Any]) -> str:
+    """把一条事件编成归档行，**并施加与出站文本同一套密钥替换**。
+
+    脱敏不能只在控制台做。字段虽然都过了白名单与类型约束，但约束只保证"形状"
+    安全，不保证"内容"安全：`task_name` 允许中英文短标识，`module`/`reason` 允许
+    普通短串 —— 一个形状恰好合法的密钥会照样通过。控制台隐藏了它、归档却留着
+    明文，是最糟的一种不一致：安全的那条通路人人都会看，不安全的那条躺在盘上。
+
+    顺序是先编码再替换：JSON 转义会改变字面形式（`"` → `\\"`），在最终文本上
+    替换才能覆盖两种形式。这与 `RedactingFormatter` 的做法完全一致 —— 同一份
+    局限也一致：精确替换不承诺识别 URL 编码或跨字节拆开的秘密。
+    """
+    line = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
+    return redact_text(line) + _LINE_TERMINATOR
+
+
 def _default_wall_clock() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -125,6 +148,10 @@ class ErrorArchive:
         self._lock = threading.RLock()
         self._file: Any = None
         self._path: Path | None = None
+        # `_opened` 与「有没有文件句柄」是两件事：换片或写入失败会留下
+        # 没有句柄的状态，那不是"归档已关闭"，不该把后续事件静默丢掉。
+        self._opened = False
+        self._day: str | None = None
         self._segment_index = 0
         self._seq = 0
         self._written = 0
@@ -135,7 +162,7 @@ class ErrorArchive:
         self._gap_reported = 0
         self._disk_low = False
         self._last_disk_check = 0.0
-        # 归档自己的状态事件在 `_announce_locked` 里把当前线程的计数抬起；
+        # 归档自己的状态事件在 `_announce` 里把当前线程的计数抬起；
         # handler 见到非零就不再落盘，递归就在这一行被切断。
         self._local = threading.local()
         self._stopping = threading.Event()
@@ -152,6 +179,7 @@ class ErrorArchive:
         self._prepare_directory()
         self._inspect_existing_segments()
         self._open_segment()
+        self._opened = True
         self._last_fsync = self._clock()
         self._last_disk_check = self._clock()
         self._start_maintenance()
@@ -169,6 +197,7 @@ class ErrorArchive:
         if thread is not None:
             thread.join(timeout=2.0)
         with self._lock:
+            self._opened = False
             if self._file is None:
                 return
             try:
@@ -210,76 +239,94 @@ class ErrorArchive:
 
     def append(self, entry: dict[str, Any]) -> bool:
         """写入一条已清洗的事件；失败时隔离错误并返回 False。"""
+        outbox: _Outbox = []
         with self._lock:
-            if self._file is None or not isinstance(entry, dict):
+            written = self._append_locked(entry, outbox)
+        self._deliver(outbox)
+        return written
+
+    def _append_locked(self, entry: dict[str, Any], outbox: _Outbox) -> bool:
+        """持锁的写入主体；状态事件先进 `outbox`，由调用方在**锁外**发出。"""
+        if not isinstance(entry, dict):
+            return False
+        if self._file is None:
+            if not self._opened:
+                return False  # 已关闭：不再往里写，也不算丢
+            # 上一次换片失败会留下"没有文件"的状态。这里重试打开，而不是永久停摆：
+            # 磁盘满通常是暂时的，而一个悄悄不再归档的进程比一条报错危险得多。
+            if not self._reopen_locked():
+                self._note_failure_locked(ArchiveError("归档分片不可用"), outbox)
                 return False
-            try:
-                line = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
-            except (TypeError, ValueError):
-                # 事件本身不是可编码的 JSON：这是调用方的错误，不能拖垮归档。
-                self._unpersisted += 1
-                return False
-            raw = line + _LINE_TERMINATOR
-            if len(raw.encode("utf-8")) > MAX_ENTRY_BYTES:
-                self._unpersisted += 1
-                self._announce_locked(
-                    logging.ERROR, "archive.entry_rejected", reason="too_large"
-                )
-                return False
-            try:
-                if self._file.tell() >= self._segment_max_bytes:
-                    self._rotate_locked()
-                self._file.write(raw)
-                self._file.flush()
-                self._written += 1
-                level = _level_value(entry.get("level"))
-                if level >= logging.ERROR:
-                    self._sync_locked()
-                else:
-                    self._pending_fsync = True
-                if self._failed:
-                    # 上一次写失败过，这一次成功了 —— 现在才是"已恢复"。
-                    self._failed = False
-                    self._note_recovery_locked()
-                return True
-            except OSError as exc:
-                self._note_failure_locked(exc)
-                return False
+        try:
+            raw = _serialize(entry)
+        except (TypeError, ValueError):
+            # 事件本身不是可编码的 JSON：这是调用方的错误，不能拖垮归档。
+            self._unpersisted += 1
+            return False
+        if len(raw.encode("utf-8")) > MAX_ENTRY_BYTES:
+            self._unpersisted += 1
+            outbox.append(
+                (logging.ERROR, "archive.entry_rejected", {"reason": "too_large"})
+            )
+            return False
+        try:
+            if self._needs_rotation_locked():
+                if not self._rotate_locked(outbox):
+                    self._note_failure_locked(ArchiveError("归档换片失败"), outbox)
+                    return False
+            self._file.write(raw)
+            self._file.flush()
+            self._written += 1
+            level = _level_value(entry.get("level"))
+            if level >= logging.ERROR:
+                self._sync_locked()
+            else:
+                self._pending_fsync = True
+            if self._failed:
+                # 上一次写失败过，这一次成功了 —— 现在才是"已恢复"。
+                self._failed = False
+                self._note_recovery_locked(outbox)
+            return True
+        except OSError as exc:
+            self._note_failure_locked(exc, outbox)
+            return False
 
     def flush(self, *, force: bool = False) -> None:
         """按策略同步到磁盘；`force=True` 无视间隔。"""
+        outbox: _Outbox = []
         with self._lock:
-            if self._file is None:
-                return
-            if not self._pending_fsync:
-                return
-            if not force and self._clock() - self._last_fsync < self._fsync_interval:
-                return
-            try:
-                self._sync_locked()
-            except OSError as exc:
-                self._note_failure_locked(exc)
+            if self._file is not None and self._pending_fsync:
+                if force or self._clock() - self._last_fsync >= self._fsync_interval:
+                    try:
+                        self._sync_locked()
+                    except OSError as exc:
+                        self._note_failure_locked(exc, outbox)
+        self._deliver(outbox)
 
     def check_disk(self, *, force: bool = False) -> None:
         """巡检剩余空间；低于阈值时告警一次，恢复后再告警一次。"""
+        outbox: _Outbox = []
         with self._lock:
             now = self._clock()
-            if not force and now - self._last_disk_check < self._disk_check_interval:
-                return
-            self._last_disk_check = now
-            try:
-                free = self._disk_free(self.directory)
-            except OSError:
-                return
-            low = free < self._disk_warning_free_bytes
-            if low and not self._disk_low:
-                self._disk_low = True
-                self._announce_locked(
-                    logging.ERROR, "archive.disk_low", free_bytes=free
-                )
-            elif not low and self._disk_low:
-                self._disk_low = False
-                self._announce_locked(logging.WARNING, "archive.disk_ok", free_bytes=free)
+            if force or now - self._last_disk_check >= self._disk_check_interval:
+                self._last_disk_check = now
+                try:
+                    free = self._disk_free(self.directory)
+                except OSError:
+                    free = None
+                if free is not None:
+                    low = free < self._disk_warning_free_bytes
+                    if low and not self._disk_low:
+                        self._disk_low = True
+                        outbox.append(
+                            (logging.ERROR, "archive.disk_low", {"free_bytes": free})
+                        )
+                    elif not low and self._disk_low:
+                        self._disk_low = False
+                        outbox.append(
+                            (logging.WARNING, "archive.disk_ok", {"free_bytes": free})
+                        )
+        self._deliver(outbox)
 
     # --- 内部实现 ---------------------------------------------------------
 
@@ -333,9 +380,13 @@ class ErrorArchive:
         except ValueError:
             return None
 
+    def _segment_day(self) -> str:
+        """当前 UTC 日期，分片名与换片判据共用同一个来源。"""
+        return self._wall_clock().strftime("%Y%m%d")
+
     def _open_segment(self) -> None:
         """独占创建一个新分片；已存在就换下一个序号，绝不覆盖。"""
-        day = self._wall_clock().strftime("%Y%m%d")
+        day = self._segment_day()
         for _ in range(1000):
             self._segment_index += 1
             path = self.directory / _SEGMENT_TEMPLATE.format(
@@ -350,11 +401,40 @@ class ErrorArchive:
                 raise ArchiveError(f"归档分片创建失败：{type(exc).__name__}") from exc
             self._file = os.fdopen(fd, "a", encoding="utf-8", newline="")
             self._path = path
+            self._day = day
             return
         raise ArchiveError("归档分片序号耗尽")
 
-    def _rotate_locked(self) -> None:
-        """换片：先同步并关掉旧片，再独占创建新片；旧片一个都不删。"""
+    def _reopen_locked(self) -> bool:
+        """没文件时重新开一个分片；失败返回 False，由调用方计入缺口。
+
+        捕的是 `Exception` 而不是 `ArchiveError`：这条路径在日志写入的调用栈上，
+        任何异常从这里逃出去都会绕过缺口计数，变成一次静默丢弃 —— 那正是这个
+        方法存在的理由。`_open_segment` 正常只会抛 `ArchiveError`。
+        """
+        try:
+            self._open_segment()
+            return True
+        except Exception:
+            return False
+
+    def _needs_rotation_locked(self) -> bool:
+        """是否该换片：跨 UTC 日期，或到量。
+
+        日期这一条不能省。只按大小换片时，一个低流量日的分片会带着昨天的日期
+        继续接收今天的条目 —— 而运维手册告诉备份方「文件名里是旧日期的都已关闭」，
+        于是那些分片的后半段永远不会被备份，也永远不会被人发现。
+        """
+        if self._day != self._segment_day():
+            return True
+        return self._file.tell() >= self._segment_max_bytes
+
+    def _rotate_locked(self, outbox: _Outbox) -> bool:
+        """换片：先同步并关掉旧片，再独占创建新片；旧片一个都不删。
+
+        返回 False 表示新片建不出来 —— 此时文件句柄已是 None，本次事件算丢失，
+        由调用方计入缺口；下一次写入会重试打开（见 `_append_locked`）。
+        """
         old = self._segment_index
         try:
             self._sync_locked()
@@ -364,10 +444,10 @@ class ErrorArchive:
             self._file.close()
         finally:
             self._file = None
-        self._open_segment()
-        self._announce_locked(
-            logging.INFO, "archive.segment_rolled", segment=old
-        )
+        if not self._reopen_locked():
+            return False
+        outbox.append((logging.INFO, "archive.segment_rolled", {"segment": old}))
+        return True
 
     def _sync_locked(self) -> None:
         """把缓冲刷进操作系统并 fsync 到设备。"""
@@ -377,21 +457,22 @@ class ErrorArchive:
         self._pending_fsync = False
         self._last_fsync = self._clock()
 
-    def _note_failure_locked(self, exc: BaseException) -> None:
+    def _note_failure_locked(self, exc: BaseException, outbox: _Outbox) -> None:
         """隔离一次写失败：继续服务，只在 stderr 限频报告并累计缺口。"""
         self._failed = True
         self._unpersisted += 1
         if self._unpersisted != 1 and self._unpersisted % 100 != 0:
             # 限频：磁盘满时每一条 ERROR 都失败，逐条报告会把 stderr 也写满。
             return
-        self._announce_locked(
-            logging.ERROR,
-            "archive.write_failed",
-            error=type(exc).__name__,
-            gap_count=self._unpersisted,
+        outbox.append(
+            (
+                logging.ERROR,
+                "archive.write_failed",
+                {"error": type(exc).__name__, "gap_count": self._unpersisted},
+            )
         )
 
-    def _note_recovery_locked(self) -> None:
+    def _note_recovery_locked(self, outbox: _Outbox) -> None:
         """写失败之后又写成功了：把恢复与缺口一次记清楚。"""
         gap, self._unpersisted = self._unpersisted, 0
         self._gap_reported = gap
@@ -401,22 +482,31 @@ class ErrorArchive:
             component="archive",
             fields={"gap_count": gap},
         )
-        if entry is not None:
+        if entry is not None and self._file is not None:
             # 恢复事件直接落盘：此刻 `_failed` 已清，写这一条不会再触发递归。
             try:
-                line = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
-                self._file.write(line + _LINE_TERMINATOR)
+                self._file.write(_serialize(entry))
                 self._file.flush()
                 self._written += 1
-            except OSError:
+            except (OSError, TypeError, ValueError):
                 pass
-        self._announce_locked(
-            logging.WARNING,
-            "archive.recovered",
-            gap_count=gap,
-        )
+        outbox.append((logging.WARNING, "archive.recovered", {"gap_count": gap}))
 
-    def _announce_locked(self, level: int, event: str, **fields: object) -> None:
+    # --- 状态事件的投递 ---------------------------------------------------
+
+    def _deliver(self, outbox: _Outbox) -> None:
+        """在**锁外**发出已经攒下的状态事件。
+
+        顺序是硬约束，不是风格问题：`logging.Handler.handle()` 会先拿 handler 锁
+        再调用 `emit()`，而 `emit()` 要拿归档锁。于是业务线程的顺序是
+        handler 锁 → 归档锁。如果这里改成在持锁时发日志，顺序就变成
+        归档锁 → handler 锁 —— 与业务线程构成一对 ABBA，双方各持一把互等。
+        死锁会连累整个机器人，所以状态事件必须攒下来、出了锁再发。
+        """
+        for level, event, fields in outbox:
+            self._announce(level, event, **fields)
+
+    def _announce(self, level: int, event: str, **fields: object) -> None:
         """发出归档自身的状态事件：只到 stderr，不再回到归档文件。
 
         未落盘的事件**不能假装可以补回**：这里报告的是缺口计数，不是补写。

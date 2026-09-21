@@ -8,6 +8,9 @@
 
 另有只读的归档子命令 `archive read` / `archive verify`：它们不连接站点、不启动
 机器人，只在本地读分片。
+
+运行期致命错误走 `log_event`（事件 `app.fatal`，级别 CRITICAL）而不是裸 `print`：
+归档此时已经装好，一条只写到 stderr 的失败不会留下任何永久记录。
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ from .logging_setup import (
     install_asyncio_exception_handler,
     install_exception_hooks,
     log_event,
+    safe_stack,
     setup_logging,
     shutdown_logging,
 )
@@ -79,12 +83,27 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         return EXIT_OK
     except Exception as exc:  # 运行期致命错误：只报类型，不泄露任何取值
-        print(f"运行失败：{type(exc).__name__}", file=sys.stderr)
+        # 走 `log_event` 而不是 `print`：归档这时已经装好了，一条只写到 stderr 的
+        # 致命错误等于"进程为什么退出"永远进不了永久记录 —— 而那正是最该留下的一条。
+        # 控制台照样看得到它（同一个根 logger 也有 stderr handler）。
+        _fatal(exc)
         return EXIT_RUNTIME
     finally:
         _close_archive(archive)
         shutdown_logging()
     return EXIT_OK
+
+
+def _fatal(exc: BaseException) -> None:
+    """记录一条运行期致命错误：稳定类型 + 安全堆栈，不带异常正文。"""
+    log_event(
+        _logger,
+        logging.CRITICAL,
+        "app.fatal",
+        task="main",
+        error=type(exc).__name__,
+        stack=safe_stack(exc),
+    )
 
 
 # `_open_archive` 的失败哨兵：与「归档关闭」的 None 必须区分开。

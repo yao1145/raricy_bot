@@ -500,11 +500,16 @@ def _archive(
     *,
     foreign_dirs: Mapping[str, str],
 ) -> ArchiveConfig:
-    """解析 `logging.archive`；缺省关闭，路径与其它持久目录互不重叠。
+    """解析 `logging.archive`；缺省关闭，启用时路径与其它持久目录互不重叠。
 
     重叠是**拒绝配置**而不是警告：归档目录按设计只增不减，一旦它就是知识库或
     记忆所在的那棵树，长期增长会直接威胁那些数据的可用空间，事后没人能分清
     哪些文件属于归档、哪些属于数据。
+
+    但这条检查**只在启用时**执行。归档关闭时它没有任何风险，却会误伤旧配置：
+    `storage.db_path: ./bot.db`（数据库就放在配置目录里）是很常见的旧写法，
+    它会让默认的 `./logs/errors` 落在同一个目录下 —— 一个从不写盘的归档不该
+    因此让机器人起不来（计划 §5.2「旧配置保持可加载」）。
     """
     raw = container.get("archive", {})
     if raw is None:
@@ -517,7 +522,8 @@ def _archive(
     # 都指到同一处（与稿库同一约定）。
     resolved = directory if os.path.isabs(directory) else os.path.join(base_dir, directory)
     resolved = os.path.normpath(resolved)
-    _reject_overlapping_dirs(resolved, foreign_dirs)
+    if enabled:
+        _reject_overlapping_dirs(resolved, foreign_dirs)
     return ArchiveConfig(
         enabled=enabled,
         directory=resolved,
@@ -627,8 +633,9 @@ def _base_url(container: Mapping[str, Any], where: str) -> str:
     - URL 里不得带 query 或 fragment。它们对 base_url 毫无意义，却是一处
       可以把任意文本塞进请求目标、进而进到日志与错误信息里的通道。
 
-    本机开发的 http 例外必须**显式**打开（`allow_plain_http: true`），默认关闭：
-    静默保留公网 HTTP 才是真正危险的那种"方便"。
+    本机开发的 http 例外必须**显式**打开（`allow_plain_http: true`），默认关闭，
+    且**只对回环地址生效**：公网明文不是"配置项"，它是凭据与正文在链路上裸奔，
+    没有哪种"我确实知道自己在做什么"能让它变成可以接受的选项。
     """
     value = _required_text(container, "base_url", f"{where}.base_url")
     cleaned = value.rstrip("/")
@@ -639,17 +646,20 @@ def _base_url(container: Mapping[str, Any], where: str) -> str:
         raise ConfigError(f"配置 {where}.base_url 不得包含用户名或密码")
     if parsed.query or parsed.fragment:
         raise ConfigError(f"配置 {where}.base_url 不得包含查询串或片段")
-    if parsed.scheme != "https" and not _plain_http_allowed(container, where):
+    if parsed.scheme != "https":
         if not _is_loopback_host(parsed.hostname):
+            # 非回环地址无条件要求 https：开关也不放行（见上面的说明）。
+            raise ConfigError(f"配置 {where}.base_url 对非本机地址必须是 https")
+        if not _plain_http_allowed(container, where):
             raise ConfigError(
-                f"配置 {where}.base_url 对非本机地址必须是 https；"
-                f"本机开发如确需 http，请显式设置 {where}.allow_plain_http: true"
+                f"配置 {where}.base_url 使用 http 需要显式设置 "
+                f"{where}.allow_plain_http: true（仅回环地址可用）"
             )
     return cleaned
 
 
 def _plain_http_allowed(container: Mapping[str, Any], where: str) -> bool:
-    """显式打开的本机 http 例外；缺省关闭。"""
+    """显式打开的本机 http 例外；缺省关闭，且只对回环地址有意义。"""
     return _bool_flag(container, "allow_plain_http", f"{where}", False)
 
 

@@ -1,11 +1,11 @@
 site:  # 站点连接；账号与密码从 RARICY_USERNAME、RARICY_PASSWORD 环境变量读取
   base_url: "https://raricy.com"  # 机器人访问网站地址；非本机地址必须是 https，且不得含用户名、查询串或片段
-  allow_plain_http: false  # 仅本机开发需要 http 时才改为 true；回环地址始终允许 http
+  allow_plain_http: false  # 仅回环地址可用：本机开发确需 http 时显式打开；非本机地址始终要求 https
   request_timeout_seconds: 20  # 普通 HTTP 请求超时秒数；SSE 长连接单独设置读超时
 
 model:  # 模型服务配置；API Key 从 LLM_API_KEY 环境变量读取
   base_url: "https://example.com/v1"  # 兼容 OpenAI API 的模型服务地址；非本机地址必须是 https
-  allow_plain_http: false  # 仅本机开发需要 http 时才改为 true；回环地址始终允许 http
+  allow_plain_http: false  # 仅回环地址可用：本机开发确需 http 时显式打开；非本机地址始终要求 https
   model: "model_name"  # 模型名称
   temperature: 0.4  # 生成随机性；值越低回答通常越稳定
   timeout_seconds: 45  # 单次模型请求超时秒数；超时不自动重试

@@ -54,9 +54,19 @@ Python >=3.12，包根为 `src/raricy_bot/`。依赖和测试配置见 [pyprojec
 ## 2.1 `error_archive.py`
 
 入口：[永久归档](../../src/raricy_bot/error_archive.py)。单写者 JSONL，按 UTC 日期
-与大小分片；文件名含 `boot_id` 与递增序号，`os.O_EXCL` 独占创建，**旧分片只增不删**。
+与大小分片（**跨 UTC 零点必须换片**，否则文件名里的日期就不再是内容的可靠上界）；
+文件名含 `boot_id` 与递增序号，`os.O_EXCL` 独占创建，**旧分片只增不删**。
 每条写入后 flush，ERROR/CRITICAL 额外 fsync，其余最迟每 `fsync_interval_seconds`
-批量同步；关闭时同步。归档自己的状态事件只走 stderr，不回写文件（否则写失败会递归）。
+批量同步；关闭时同步。
+
+三条硬约束：
+
+- 写出前施加**与控制台完全相同**的密钥替换（`_serialize`）。类型约束只保证字段形状
+  合法；只有一条通路脱敏等于没有脱敏。
+- 归档自己的状态事件在**锁外**发出。`Handler.handle()` 先拿 handler 锁再 `emit()`，
+  而 `emit()` 要拿归档锁；在持锁时发日志会与写入路径构成 ABBA 死锁，连带卡住机器人。
+- 自身状态事件只走 stderr，不回写文件（否则写失败会递归）；换片或写入失败后
+  必须能重试打开并逐条累计缺口，不能静默停摆。
 
 只接收已清洗事件：WARNING 及以上，加上 `ARCHIVE_INFO_EVENTS` 里那张 INFO 白名单。
 归档门槛独立于控制台级别，未启用时 `/archivez` 返回 404。`iter_entries` /
@@ -238,8 +248,9 @@ warning 按错误处理。测试目录当前被 Git 忽略，不能假设新克�
 5. 取消不得吞成普通成功；持久状态、额度、发送和历史提交须保持各自的顺序与幂等边界。
 6. 归档分片只增不删：不设 `retention_days` / `max_files`，不用会按 `backupCount`
    淘汰旧文件的轮转策略；损坏的分片保留原样，读工具跳过而不修复。
-7. `site` 与 `model` 的 `base_url` 对非回环地址必须是 https，且不得含 userinfo、
-   查询串或片段；本机 http 例外要显式打开（`allow_plain_http`，默认关闭）。
+7. `site` 与 `model` 的 `base_url` 对非回环地址**无条件**要求 https，且不得含
+   userinfo、查询串或片段。回环地址的 http 也需要显式打开 `allow_plain_http`
+   （默认关闭）；该开关**只**对回环地址有意义，公网明文没有任何配置能放行。
 
 ## 20. `core/vision.py`
 
