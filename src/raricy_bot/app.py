@@ -71,6 +71,7 @@ from .core.lobby_context import (
     render_lobby_recent,
 )
 from .core.router import MessageRouter, Request, RouteResult
+from .core.scheduler import SessionScheduler
 from .core.sender import MessageSender, SendResult
 from .core.vision import ImageLoader, attach_image, with_image_marker
 from .core.worker import (
@@ -288,7 +289,10 @@ class BotApp:
             max_ref_chars=config.behavior.content_ref_max_chars,
             image_loader=self._image_loader if self._comment_vision else None,
         )
-        self._queue: asyncio.Queue[Request] = asyncio.Queue(
+        # 会话调度器（§14）：入队与容量判定沿用 Queue 形状（Router 只 `put_nowait`，
+        # readiness / `queue_depth` 只读 `full()`/`qsize()`），但工作器按「可运行会话」
+        # 领取请求 —— 等待同一会话的请求不再占用执行容量（计划 §5）。
+        self._queue: SessionScheduler[Request] = SessionScheduler(
             maxsize=config.behavior.queue_size
         )
         self._ctx = ContextManager(
@@ -346,10 +350,10 @@ class BotApp:
         # 跑起来之后才存在。为 None 时整个公开个人记忆路径不存在（`enabled=false`、
         # 装配失败或解析器构造失败），DM 与普通聊天一个字都不受影响（D-60）。
         self._public_memory_resolver: PublicMemorySubjectResolver | None = None
-        self._memory_queue: asyncio.Queue[MemoryCommandRequest] = asyncio.Queue(
+        self._memory_queue: SessionScheduler[MemoryCommandRequest] = SessionScheduler(
             maxsize=config.memory.queue_size
         )
-        # 并发固定为 1：命令路径要串行，`WorkerPool` 已按会话键加锁，这里再收一层总闸。
+        # 并发固定为 1：命令路径要串行；`SessionScheduler` 另保证同会话请求不占执行容量。
         self._memory_workers = WorkerPool(
             queue=self._memory_queue,
             handler=self._handle_memory_command,

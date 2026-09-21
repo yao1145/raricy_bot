@@ -65,6 +65,7 @@ from .context import (
     sanitize_username,
 )
 from .lobby_context import LobbyRecentContextBuffer, LobbyRecentMessage
+from .scheduler import EnqueueQueue
 
 _logger = get_logger("core.router")
 
@@ -182,14 +183,14 @@ class MessageRouter:
         bot_username: str,
         ctx: ContextManager,
         store: Store,
-        queue: asyncio.Queue[Request],
+        queue: EnqueueQueue[Request],
         cfg: BehaviorConfig,
         storage: StorageConfig,
         now: Callable[[], float] = time.time,
         vision_enabled: bool = False,
         kb_enabled: bool = False,
         memory_access: MemoryAccessPolicy | None = None,
-        memory_queue: asyncio.Queue[MemoryCommandRequest] | None = None,
+        memory_queue: EnqueueQueue[MemoryCommandRequest] | None = None,
         private_enabled: Callable[[str | None], bool] | None = None,
         capabilities: frozenset[str] = frozenset(),
         lobby_recent: LobbyRecentContextBuffer | None = None,

@@ -2,8 +2,9 @@
 
 - `OpenAIModelClient` 封装 openai SDK，把各类异常统一映射为 `ModelError`，
   并且**只由本模块**控制重试（SDK 的 `max_retries=0`）；
-- `WorkerPool` 起固定数量的 worker task 消费队列，**同一 `session_key` 严格串行**、
-  不同会话按 `concurrency` 并发，handler 抛异常只记日志、不终止 worker。
+- `WorkerPool` 起固定数量的 worker task 消费 `SessionScheduler`（`core/scheduler.py`），
+  **同一 `session_key` 严格串行**、等待同一会话的请求不占用执行容量，不同会话按
+  `concurrency` 并发，handler 抛异常只记日志、不终止 worker。
 
 日志只写稳定事件字段，绝不写模型请求体或响应正文（§19 红线）。
 """
@@ -34,6 +35,7 @@ from ..mcp.contracts import (
 )
 from ..redact import Redactor
 from ..text_utils import estimate_tokens
+from .scheduler import RunnableQueue
 
 logger = get_logger("worker")
 
@@ -777,12 +779,17 @@ class OpenAIModelClient:
 
 
 class WorkerPool(Generic[RequestT]):
-    """固定并发的工作器池；同一 `session_key` 的请求严格串行。"""
+    """固定并发的工作器池；同一 `session_key` 的请求严格串行且不占用执行容量。
+
+    队列不是裸 `asyncio.Queue`，而是 `SessionScheduler`（`core/scheduler.py`）。
+    工作器只领取**可运行会话**的一条请求；同一会话的后续请求留在调度器里等待，
+    不再出现「一个在处理、其余 worker 排队等会话锁」而把别的会话挡在全局队列里的情况。
+    """
 
     def __init__(
         self,
         *,
-        queue: asyncio.Queue[RequestT],
+        queue: RunnableQueue[RequestT],
         handler: Callable[[RequestT], Awaitable[None]],
         concurrency: int,
     ) -> None:
@@ -790,11 +797,6 @@ class WorkerPool(Generic[RequestT]):
         self._handler = handler
         self._concurrency = concurrency
         self._tasks: list[asyncio.Task[None]] = []
-        # 每个会话一把锁；单线程事件循环里并发访问字典本身是安全的。
-        # `_lock_users` 记录每个会话当前「持有或等待」的 task 数，归零即淘汰锁，
-        # 否则大区按 lobby:{user_id} 建键会让字典随历史用户数无限增长。
-        self._locks: dict[str, asyncio.Lock] = {}
-        self._lock_users: dict[str, int] = {}
 
     @property
     def alive(self) -> bool:
@@ -830,29 +832,17 @@ class WorkerPool(Generic[RequestT]):
 
     # --- 内部实现 ---
 
-    def _acquire_lock(self, session_key: str) -> asyncio.Lock:
-        """取会话锁并登记一名使用者；不存在则新建。"""
-        lock = self._locks.get(session_key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._locks[session_key] = lock
-        self._lock_users[session_key] = self._lock_users.get(session_key, 0) + 1
-        return lock
-
-    def _release_lock(self, session_key: str) -> None:
-        """注销一名使用者；没有任何持有者或等待者时淘汰锁，避免字典无界增长。"""
-        remaining = self._lock_users.get(session_key, 0) - 1
-        if remaining > 0:
-            self._lock_users[session_key] = remaining
-            return
-        self._lock_users.pop(session_key, None)
-        # 计数归零意味着此刻既无人持有也无人等待，可以安全移除。
-        self._locks.pop(session_key, None)
-
     async def _run(self) -> None:
-        """单个 worker 主循环；除取消外绝不退出。"""
+        """单个 worker 主循环；除取消外绝不退出。
+
+        只向调度器领取**可运行会话**的一条请求（调度器同时把该会话标为 active），
+        因此等待同一会话的其他请求留在调度器里，不占住这个 worker。
+        handler 异常或取消都必须走 `finally` 的 `task_done`，否则活跃计数会失衡、
+        `join()` 会永远挂住。取消发生在 `get_runnable()`（还没领到请求）时不会误标任何
+        未处理请求为 done —— 那些请求仍留在调度器的等待队列里。
+        """
         while True:
-            request = await self._queue.get()
+            request = await self._queue.get_runnable()
             # 队列里的请求由 Router 生成 trace_id；没有的（替身、直接入队的测试）
             # 这里补一个，保证「一次处理」在日志里总有一个可 grep 的标识。
             if not getattr(request, "trace_id", ""):
@@ -860,23 +850,18 @@ class WorkerPool(Generic[RequestT]):
                     request.trace_id = new_trace_id()
                 except AttributeError:
                     pass
-            # task_done 必须无条件下调，否则 queue.join() 会永远挂住；
-            # 锁使用者的注销同样必须无条件执行，否则计数会失衡、锁无法淘汰。
             try:
-                lock = self._acquire_lock(request.session_key)
-                async with lock:
-                    try:
-                        await self._handler(request)
-                    except Exception as exc:  # 单条请求失败不得终止 worker
-                        log_event(
-                            logger,
-                            logging.ERROR,
-                            "worker.handler_error",
-                            trace_id=getattr(request, "trace_id", None),
-                            channel_id=getattr(request, "channel_id", None),
-                            error=type(exc).__name__,
-                            stack=safe_stack(exc),
-                        )
+                try:
+                    await self._handler(request)
+                except Exception as exc:  # 单条请求失败不得终止 worker
+                    log_event(
+                        logger,
+                        logging.ERROR,
+                        "worker.handler_error",
+                        trace_id=getattr(request, "trace_id", None),
+                        channel_id=getattr(request, "channel_id", None),
+                        error=type(exc).__name__,
+                        stack=safe_stack(exc),
+                    )
             finally:
-                self._release_lock(request.session_key)
-                self._queue.task_done()
+                self._queue.task_done(request)
