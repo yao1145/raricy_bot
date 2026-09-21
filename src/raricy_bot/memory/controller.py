@@ -589,7 +589,16 @@ class MemoryController:
     async def _auto_capture(
         self, *, user_id: str, message_id: int, source_text: str
     ) -> MemoryCaptureResult:
-        """一次自动提取：门禁 → 部署开关 → 幂等 → 快照 → 撰写 → 宿主校验 → 原子写入。"""
+        """一次自动提取：门禁 → 部署开关 → 幂等 → 取令牌 → 撰写 → 原子复核提交。
+
+        授权与条目快照由 `MemoryService.begin_auto_capture` 在**同一把写锁内**一并取得；模型
+        调用发生在写锁**之外**，因此隐私命令无需等待模型返回。模型返回后提交走
+        `MemoryService.commit_auto_capture`，由服务在写锁内复核令牌仍然有效 —— 控制器**不**
+        自己实现一套授权规则（修复计划 §2.3 第 3 条）。
+
+        令牌失效（期间用户 `/memory off`、`/memory auto off`、`/memory clear` 或 `/memory forget`
+        成功）时提交返回稳定 no-op，因此这里既不写入、也不产生「记忆已保存」的披露。
+        """
         if not self.access.permits_private(user_id, _DM_KIND):
             return self._capture(STATUS_FORBIDDEN)
         if not self._auto_capture_available:
@@ -598,10 +607,6 @@ class MemoryController:
             # 状态取 `forbidden`（§27.4「访问门……拒绝」）：这是部署策略的拒绝，不是出错，
             # 也不是 `noop`（那读起来像「没什么要做的」，会把拒绝藏起来）；未写入，无披露。
             return self._capture(STATUS_FORBIDDEN)
-        settings = await self.service.private_settings(user_id)
-        if not settings.auto_capture:
-            # 用户没有开启自动记忆：调用方漏判也不能替用户决定（§6.1 的用户授权）。
-            return self._capture(STATUS_NOOP)
         operation_id = f"{_AUTO_CAPTURE_SOURCE}:{message_id}"
         # 与 `/remember` 同样的理由：重放必须先查 operations，不能让重放再烧一次模型调用。
         replay = await self.service.find_operation(operation_id, user_id=user_id)
@@ -609,18 +614,26 @@ class MemoryController:
             # 这一次没有写入任何东西，因此不是 `ok`（§27.2「只有确实写入成功才是 ok」）；
             # 调用方也不会为它追加一条重复的写入披露（§34.4）。
             return self._capture(STATUS_NOOP)
-        existing = await self.service.private_entries(user_id)
-        proposal_result = await self.writer.propose_private(source_text, existing, automatic=True)
+        token = await self.service.begin_auto_capture(user_id)
+        if token is None:
+            # 用户没有开启自动记忆（或服务/快照不可用）：调用方漏判也不能替用户决定
+            # （§6.1 的用户授权）。不调用撰写器，也不写入。
+            return self._capture(STATUS_NOOP)
+        # 模型调用在写锁之外：这段时间里用户可以完成任何隐私命令而不必等它返回。
+        proposal_result = await self.writer.propose_private(
+            source_text, token.entries, automatic=True
+        )
         proposal = proposal_result.proposal
         if proposal_result.status != STATUS_OK or proposal is None:
             return self._capture(STATUS_INVALID_PROPOSAL)
         if proposal.action is ProposalAction.NOOP:
             # 低置信度与「不值得保存」都在撰写器里落成 noop（§31.1）：自动提取静默跳过。
             return self._capture(STATUS_NOOP)
-        outcome = await self.service.apply_private_proposal(
-            user_id, proposal, operation_id=operation_id
+        outcome = await self.service.commit_auto_capture(
+            token, proposal, operation_id=operation_id
         )
         if outcome.status != STATUS_OK or outcome.object_id is None:
+            # 令牌失效的稳定 no-op 也走这里：没有写入，因此不追加「记忆已保存」披露。
             return self._capture(outcome.status)
         return MemoryCaptureResult(
             status=STATUS_OK,

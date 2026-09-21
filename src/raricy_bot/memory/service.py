@@ -82,6 +82,7 @@ from .models import (
     STATUS_PUBLIC_CONFLICT,
     STATUS_SECRET_DETECTED,
     STATUS_UNAVAILABLE,
+    AutoCaptureToken,
     MemoryCandidate,
     MemoryContext,
     MemoryEntry,
@@ -259,6 +260,11 @@ class MemoryService:
             int(config.max_private_entries_per_user),
         )
         self._write_lock = asyncio.Lock()
+        # 自动提取的进程内失效状态（修复计划 §2.3）：`_capture_epoch` 随服务停止递增，
+        # `_capture_generation` 按用户记录提取代次。两者都不落盘 —— 进程重启后没有旧的模型调用
+        # 会继续返回，因此不需要持久字段。它们与写锁一起保证「同一把锁内复核」。
+        self._capture_epoch: int = 0
+        self._capture_generation: dict[str, int] = {}
         self._common: _Snapshot | None = None
         self._users: "OrderedDict[str, _Snapshot]" = OrderedDict()
         # 公开快照按 owner key 索引（owner key 是不可逆的存储键，原始 user ID 不参与索引）。
@@ -317,6 +323,9 @@ class MemoryService:
 
     async def stop(self) -> None:
         """停掉刷新任务；未启用或未启动时什么都不做，绝不抛出（§30.1）。"""
+        # 停止即让所有未提交的自动提取令牌失效（修复计划 §2.3 第 5 条）：停止之后不该再接受
+        # 停止之前发出的令牌。放在最前，未启用/未启动的服务同样走这一步。
+        self._capture_epoch += 1
         task = self._refresh_task
         self._refresh_task = None
         if task is None:
@@ -769,25 +778,35 @@ class MemoryService:
     async def set_private_enabled(
         self, user_id: str, enabled: bool, *, operation_id: str
     ) -> OperationResult:
-        """开关私有记忆读取；值没变时是 noop，不写文件（§30.2）。"""
+        """开关私有记忆读取；值没变时是 noop，不写文件（§30.2）。
+
+        关闭读取时一并失效在途的自动提取令牌（修复计划 §2.3 第 4 条）：`/memory off` 的第一步
+        走这里，即便文件的 `private_enabled` 已经是 False（noop 不写文件），失效处理也必须执行。
+        """
         return await self._mutate_private(
             user_id,
             operation_id,
             lambda document: self._apply_private_setting(
                 document, operation_id, "private_enabled", enabled
             ),
+            invalidate_capture=not enabled,
         )
 
     async def set_auto_capture(
         self, user_id: str, enabled: bool, *, operation_id: str
     ) -> OperationResult:
-        """开关自动提取；值没变时是 noop，不写文件（§30.2）。"""
+        """开关自动提取；值没变时是 noop，不写文件（§30.2）。
+
+        关闭自动提取时一并失效在途令牌（修复计划 §2.3 第 4 条）：即便值本来就是 False
+        （noop 不写文件），失效处理也必须执行 —— 不能只靠文档 revision 是否增加。
+        """
         return await self._mutate_private(
             user_id,
             operation_id,
             lambda document: self._apply_private_setting(
                 document, operation_id, "auto_capture", enabled
             ),
+            invalidate_capture=not enabled,
         )
 
     async def apply_private_proposal(
@@ -810,19 +829,73 @@ class MemoryService:
     async def delete_private(
         self, user_id: str, memory_id: str, *, operation_id: str
     ) -> OperationResult:
-        """删除该用户的一条私有条目；ID 前缀与所在作用域在入口再次校验。"""
+        """删除该用户的一条私有条目；ID 前缀与所在作用域在入口再次校验。
+
+        删除同样失效在途的自动提取令牌（修复计划 §2.3 第 7 条）：否则一次基于删除前快照的
+        迟到提取会在新基线上看到目标 key 已不存在，把被删内容当成新增重新写回。
+        """
         return await self._mutate_private(
             user_id,
             operation_id,
             lambda document: self._apply_private_delete(document, memory_id, operation_id),
+            invalidate_capture=True,
         )
 
     async def clear_private(self, user_id: str, *, operation_id: str) -> OperationResult:
-        """清空该用户的私有条目，但保留幂等元数据与设置，因此重放旧命令不会再次执行（D-59）。"""
+        """清空该用户的私有条目，但保留幂等元数据与设置，因此重放旧命令不会再次执行（D-59）。
+
+        清空一并失效在途令牌（修复计划 §2.3 第 4 条）：空记忆上的 clear 是「值未变」的路径，
+        失效处理放在 mutation 入口，不依赖文档 revision 是否增加。
+        """
         return await self._mutate_private(
             user_id,
             operation_id,
             lambda document: self._apply_private_clear(document, operation_id),
+            invalidate_capture=True,
+        )
+
+    # --- 自动提取的授权令牌（修复计划 §2.3） --------------------------------
+
+    async def begin_auto_capture(self, user_id: str) -> AutoCaptureToken | None:
+        """开始一次自动提取：在同一把写锁内一并取授权、条目快照与该用户的提取代次。
+
+        返回 None 表示当时不满足授权（服务关闭、用户 ID 不可用、私有快照不可用，或用户没有
+        开启自动提取）—— 调用方据此静默跳过，不调用撰写器。取得令牌之后，模型调用发生在写锁
+        **之外**，因此隐私命令无需等待模型返回（修复计划 §2.3 第 2 条）。
+        """
+        if not self._enabled or not user_id or _storage_key(user_id) is None:
+            return None
+        async with self._write_lock:
+            state = self._user_state(user_id)
+            if not isinstance(state.document, PrivateDocument):
+                return None
+            if not bool(state.document.auto_capture):
+                # 用户没有开启自动提取（或文件被人手改过）：不发放令牌（§6.1 的用户授权）。
+                return None
+            return AutoCaptureToken(
+                user_id=user_id,
+                generation=self._capture_generation.get(user_id, 0),
+                epoch=self._capture_epoch,
+                entries=tuple(state.document.entries),
+            )
+
+    async def commit_auto_capture(
+        self, token: AutoCaptureToken, proposal: MemoryProposal, *, operation_id: str
+    ) -> OperationResult:
+        """提交一次自动提取：在写锁内复核令牌仍然有效，再应用提案。
+
+        令牌失效（提取代次被隐私操作推进、服务纪元变化、授权被关闭或不可确认）时返回稳定的
+        `noop`：**不写入**，也不产生「记忆已保存」披露。授权规则的唯一实现留在本层，
+        控制器不再自己重写一套（修复计划 §2.3 第 3 条）。
+        """
+        return await self._mutate_private(
+            token.user_id,
+            operation_id,
+            lambda document: self._apply_guarded_proposal(
+                document, token.user_id, proposal, operation_id
+            ),
+            screen=lambda _document: (proposal.key, proposal.content),
+            capture_token=token,
         )
 
     # --- mutation：公开投影 -------------------------------------------------
@@ -1065,10 +1138,16 @@ class MemoryService:
         apply_fn: _ApplyFn,
         *,
         screen: _ScreenFn | None = None,
+        capture_token: AutoCaptureToken | None = None,
+        invalidate_capture: bool = False,
     ) -> OperationResult:
         """私有文件的 mutation 骨架：门禁 → 幂等 → 密钥筛 → 原子写（§30.2）。
 
         `screen` 拿到基线文档、返回将要写进 Markdown 的文本；筛选发生在 render 与写入之前。
+
+        两个自动提取相关的开关都在写锁之内生效（修复计划 §2.3）：`invalidate_capture` 供隐私
+        操作推进提取代次；`capture_token` 供自动提取提交时复核令牌。二者与 `begin_auto_capture`
+        共用同一把锁，因此「开始提取」与「隐私操作生效」之间没有可观察的中间态。
         """
         if not self._enabled or not user_id or _storage_key(user_id) is None:
             # 关闭时能力根本没被注入；真被调到说明调用方绕过了访问门（§28、§34.1）。
@@ -1083,6 +1162,16 @@ class MemoryService:
             if hit is not None:
                 # 幂等命中：返回第一次的稳定结果，不再改动文件，也不重新调 AI（§30.2、D-67）。
                 return hit
+            if invalidate_capture:
+                # 隐私操作与令牌失效用同一把锁（修复计划 §2.3 第 4 条）：放在幂等命中之后、应用
+                # 之前，因此「值本来就是 noop」的路径（空记忆 clear、auto 本来为 False）同样会
+                # 失效在途令牌，不依赖文档 revision 是否增加。
+                self._invalidate_auto_capture(user_id)
+            if capture_token is not None and not self._capture_token_valid(
+                capture_token, state.document
+            ):
+                # 令牌已失效：稳定 no-op，不写入、不产生披露（修复计划 §2.3 第 3 条）。
+                return OperationResult(status=STATUS_NOOP, object_id=None, revision=state.revision)
             if screen is not None and self._contains_secret(screen(state.document)):
                 return OperationResult(
                     status=STATUS_SECRET_DETECTED, object_id=None, revision=state.revision
@@ -1146,6 +1235,24 @@ class MemoryService:
                         candidate_id=object_id,
                     )
             return OperationResult(status=status, object_id=object_id, revision=written.revision)
+
+    def _invalidate_auto_capture(self, user_id: str) -> None:
+        """推进该用户的提取代次，使此前取得的所有自动提取令牌失效。
+
+        必须在写锁内调用（`_mutate_private` 已经持锁）：它与 `begin_auto_capture` /
+        `commit_auto_capture` 共用同一把锁，这正是「同一把锁内复核」的实现（修复计划 §2.3）。
+        """
+        self._capture_generation[user_id] = self._capture_generation.get(user_id, 0) + 1
+
+    def _capture_token_valid(self, token: AutoCaptureToken, document: PrivateDocument) -> bool:
+        """令牌此刻是否仍可提交：服务纪元、授权开关与提取代次三者都要成立。"""
+        if token.epoch != self._capture_epoch or not self._enabled:
+            # 服务已停止（或本实例已被替换过）：停止前发出的令牌一律不再被接受。
+            return False
+        if not bool(document.auto_capture):
+            # 授权被关闭（或文件被外部改成关闭）：重新校验授权，而不是只信令牌。
+            return False
+        return self._capture_generation.get(token.user_id, 0) == token.generation
 
     def _contains_secret(self, texts: tuple[str, ...]) -> bool:
         """密钥筛（§30.2、§37）：脱敏前后不一致就是命中，整条拒绝。

@@ -137,6 +137,29 @@ class MemoryCaptureResult:
 
 
 @dataclass(frozen=True)
+class AutoCaptureToken:
+    """一次自动提取的**进程内**不透明令牌（修复计划 §2.3 第 1、5 条）。
+
+    `MemoryService.begin_auto_capture` 在同一把写锁内一并取得用户的授权状态、条目快照与该
+    用户的提取代次；随后调用方把模型调用放在锁**之外**，模型返回后再由
+    `MemoryService.commit_auto_capture` 在写锁内复核同一份授权仍然成立，才应用提案。
+
+    - `entries`：开始提取时的私有条目快照，只用于给撰写器提供上下文；提交仍以磁盘/快照的
+      **最新**版本为基线（外部编辑照常被采纳，§30.4）。
+    - `generation`：该用户当前的提取代次。隐私操作（关闭自动提取、关闭读取、清空、删除）
+      推进它，使此前取得的所有令牌失效。
+    - `epoch`：服务级纪元。`MemoryService.stop()` 递增它，使服务停止前发出的令牌不再被接受。
+      代次只保存在进程内、不落任何持久字段：进程重启后没有旧模型调用会继续返回，因此不需要
+      持久化它（计划 §2.3 第 5 条）。
+    """
+
+    user_id: str
+    generation: int
+    epoch: int
+    entries: tuple[MemoryEntry, ...]
+
+
+@dataclass(frozen=True)
 class PublicMemoryEntry:
     """一条公开个人记忆条目（INTERFACES §40.1）。
 
