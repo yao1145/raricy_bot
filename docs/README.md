@@ -10,6 +10,7 @@
 | 快速启动、功能概览 | [根 README](../README.md)、[配置示例](../config.example.yaml) |
 | 开发约定 | [AGENTS.md](../AGENTS.md) |
 | 跨模块行为与代码入口 | [INTERFACES.md](design/INTERFACES.md) |
+| 本次代码审查的四项问题与待实施修复计划 | [CODE_REVIEW_FIX_PLAN.md](design/CODE_REVIEW_FIX_PLAN.md)；计划不替代现行契约 |
 | 行为的理由、例外与取舍 | [DESIGN_DECISIONS.md](design/DESIGN_DECISIONS.md)（D-1–D-113） |
 | 系统提示词规范 | [SYSTEM_PROMPTS.md](design/SYSTEM_PROMPTS.md)；文档不参与运行，配置提示词须同步到部署配置，静态附加说明须同步 `texts.py` |
 | 用户命令、隐私说明、定时发文操作与待验收项 | [USAGE.md](usage/USAGE.md) |
