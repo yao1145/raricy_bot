@@ -177,10 +177,13 @@ _TOOLS_UNSUPPORTED_CODES: frozenset[str] = frozenset(
         "unsupported_value",
     }
 )
-"""`error.code` 表示「无法识别 / 不支持参数」的稳定取值。"""
+"""`error.code` 表示「无法识别 / 不支持参数」的**明确**取值；这是唯一被接受的证据。
 
-_TOOLS_UNSUPPORTED_TYPES: frozenset[str] = frozenset({"invalid_request_error"})
-"""`error.type` 的无效请求类别；必须与工具参数名同时命中才生效。"""
+白名单之外的具体错误码（例如 `invalid_function_parameters`，它表示工具**参数值/形状**
+有错，而不是端点不支持该参数）一律不命中。通用 `error.type`（如 `invalid_request_error`）
+既不能覆盖一个具体的 `code`，也不能单独成立 —— `param=tools` + 该类型同样可能来自
+「tools[0].function.name 类型不对」这类参数错误。
+"""
 
 
 def _is_tools_unsupported(exc: Exception) -> bool:
@@ -188,18 +191,23 @@ def _is_tools_unsupported(exc: Exception) -> bool:
 
     判定依据与取舍（为什么这条窄判定是安全的）：
 
-    1. 只看 openai SDK 异常对象 `.body["error"]` 里的结构化字段（`param` / `code` /
-       `type`），**不读** `error["message"]` 或 `str(exc)` 的自由正文。报错文案里
-       偶然出现 "tools" 字样（例如「提示词过长」的文案恰好提到工具）不会触发。
-    2. 只有 `param` 精确点名工具相关参数，**且** `code` / `type` 明确属于「无法识别或
-       不支持参数」类别时才返回 True。任一结构化字段缺失、取值对不上，或状态码不在
-       400/404 内，都返回 False，交回 `_map_error` 的通用分类。
+    1. 只看 openai SDK 异常对象 `.body["error"]` 里的结构化字段（`param` / `code`），
+       **不读** `error["message"]` 或 `str(exc)` 的自由正文。报错文案里偶然出现 "tools"
+       字样（例如「提示词过长」的文案恰好提到工具）不会触发。
+    2. 只有 `param` 精确点名工具相关参数，**且** `code` 存在、是字符串、并命中
+       `_TOOLS_UNSUPPORTED_CODES` 白名单时才返回 True。**只认明确的不支持错误码**：
+       通用 `type` 不参与判定，它既不能覆盖一个具体的 `code`，也不能单独作为依据
+       （`type=invalid_request_error` 是通用请求错误类别，`param=tools` 加上它并不能
+       证明端点不支持 tools）。任一结构化字段缺失、取值对不上，或状态码不在 400/404
+       内，都返回 False，交回 `_map_error` 的通用分类。
     3. 结果是**本次调用**的结论，不写回任何实例状态：一次请求的失败绝不能当作端点
        永久不支持工具的证据（真相见 INCIDENTS 事件一第六节第 3 条）。
 
-    窄判定的代价是：把「不支持工具」只写进正文而不用结构化字段的提供方会被漏判，
-    它们退回通用 `bad_request`。这是刻意选择 —— 漏判只让一次调用按普通错误处理，
-    误判却会把无关错误改写成「能力不可用」，二者不对称。
+    已知代价（刻意的取舍，不是「不会漏判」）：缺 `code` 的提供方 —— 只把
+    「不支持工具」写进正文、或只给通用 `type` 而不给具体错误码 —— 会被漏判，退回
+    通用 `bad_request`。之所以接受漏判：漏判只让一次调用按普通错误处理，误判却会把
+    与「不支持」无关的具体错误（如 `invalid_function_parameters`）改写成「能力不可用」，
+    二者不对称。
     """
     if not isinstance(exc, openai.APIStatusError):
         return False
@@ -216,11 +224,9 @@ def _is_tools_unsupported(exc: Exception) -> bool:
     param = error.get("param")
     if not isinstance(param, str) or param not in _TOOLS_PARAM_NAMES:
         return False
+    # 只认明确的不支持错误码；通用 `type` 不参与判定（见 docstring 第 2、3 点）。
     code = error.get("code")
-    error_type = error.get("type")
-    return (
-        isinstance(code, str) and code in _TOOLS_UNSUPPORTED_CODES
-    ) or (isinstance(error_type, str) and error_type in _TOOLS_UNSUPPORTED_TYPES)
+    return isinstance(code, str) and code in _TOOLS_UNSUPPORTED_CODES
 
 
 class ModelError(Exception):
