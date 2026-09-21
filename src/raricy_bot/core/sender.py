@@ -4,15 +4,21 @@
 
 - **预留不泄漏**：每一笔 `reserve()` 返回 ALLOW 的调用，在所有出口
   （成功、确定失败、重发失败、异常、取消）都恰好转为 `note_sent()` 或 `release()` 一次；
+- **已确认送达不被取消改判**：`POST` 成功返回后，本地发送记录与配额转正收敛为
+  一次受取消保护的终结操作（`_commit_delivery`）；调用方在等待结算时被取消，
+  只延迟取消传播，不会把这次已送达的发送降级成 release；
 - **只有 `SiteError.status == 0` 才是结果不确定**，其余状态都是确定答复，
   不确定时才进入对账，且最多重发一次（D-8：对账窗口 `after=reply_to, limit=100`）。
+  远端结果尚不确定时被取消，保留既有语义：释放预留，绝不盲目重投（计划 §4.2 第 7 条）。
 
 日志只写白名单字段（频道、kind、reason、message_id），绝不写正文、Cookie 或密钥。
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Awaitable
 from dataclasses import dataclass
 
 from ..config import BehaviorConfig
@@ -47,6 +53,24 @@ class SendResult:
     reason: str
 
 
+@dataclass(frozen=True)
+class _Delivery:
+    """`_deliver` 的产出：结果 + 终结所需信息。
+
+    所有权模型（计划 §4.2 第 1 条）：`_deliver` 只负责 `POST` 与对账，
+    **不做任何结算**；是否转正、要写哪条本地记录，全部交回 `send`，
+    由它调用恰好一次终结操作。这样「是否已确认送达」只有一个判定点，
+    任何出口都只能结算一次。
+
+    - `record`：已确认送达后要写入本地去重表的消息（可能为 None）。
+    - `charge`：True → 预留转正（`note_sent`）；False → 释放预留（`release`）。
+    """
+
+    result: SendResult
+    record: ChatMessage | None
+    charge: bool
+
+
 class MessageSender:
     """站内消息发送器；配额、去重与对账逻辑都收敛在这里。"""
 
@@ -66,6 +90,10 @@ class MessageSender:
         self._redactor = redactor
         self._cfg = cfg
         self._logger = logger if logger is not None else _LOGGER
+        # 受取消保护的终结任务强引用（计划 §4.2 第 3 条）：`asyncio` 只对 task
+        # 持弱引用，调用方在 `await` 处被取消而提前退出时，必须由这里保住引用，
+        # 记账才不会被 GC 掉、关闭时也才有一个统一的等待点。
+        self._settle_tasks: set[asyncio.Task[None]] = set()
 
     async def send(
         self,
@@ -99,39 +127,114 @@ class MessageSender:
             return result
 
         # 从这里开始持有预留：下面每一个出口都必须恰好 note_sent / release 一次。
+        # `_deliver` 只做 POST 与对账，不结算；结算统一在本方法里做，保证唯一所有权。
         try:
-            result, charge = await self._deliver(
-                channel_id, content, reply_to, thread_root_id
-            )
+            delivery = await self._deliver(channel_id, content, reply_to)
         except BaseException:
-            # 未预期的异常（含取消）也不能让预留泄漏。
-            await self._quota.release(channel_id, kind, actor_id=actor_id)
+            # 未预期的异常（含取消）也不能让预留泄漏；release 同样受取消保护，
+            # 否则取消恰好落在 quota 锁等待上时，这笔预留会永久占额。
+            await self._run_settlement(self._release_reservation(channel_id, kind, actor_id))
             raise
 
-        if charge:
-            await self._quota.note_sent(channel_id, reply_to, kind, actor_id=actor_id)
+        if delivery.charge:
+            # 已确认送达：本地发送记录 + 配额转正收敛为一次受取消保护的终结操作。
+            # 调用方此时被取消只会延迟取消传播，不会把这次送达改判成未发送。
+            await self._run_settlement(
+                self._commit_delivery(
+                    delivery.record, channel_id, reply_to, kind, actor_id, thread_root_id
+                )
+            )
         else:
-            await self._quota.release(channel_id, kind, actor_id=actor_id)
-        self._log(result, channel_id, kind)
-        return result
+            await self._run_settlement(self._release_reservation(channel_id, kind, actor_id))
+        self._log(delivery.result, channel_id, kind)
+        return delivery.result
+
+    async def wait_settled(self) -> None:
+        """等待所有在途终结任务结束。
+
+        关闭路径在 `Store` 关闭前调用（计划 §4.2 第 6 条）：正常取消已经由
+        `_run_settlement` 在传播前等待到位，但重复取消有可能让调用方提前退出，
+        留下仍在写库的终结任务。这里给它们一个统一的汇合点，避免 Store 关掉后
+        它们还在访问数据库。不新增后台任务，等待的是本来就有生命周期的终结任务；
+        等待长度只是最多两笔 SQLite 写，落在 App 既有的 10 秒总预算内。
+        """
+        pending = tuple(self._settle_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     # --- 内部实现 ---
+
+    async def _run_settlement(self, operation: Awaitable[None]) -> None:
+        """把终结操作放进独立 task 执行，并在取消到来时等它完成再传播。
+
+        只套 `asyncio.shield()` 不够：调用方仍可能在 `await` 处被取消而提前退出，
+        把还没跑完的记账丢给事件循环。这里额外做两件事（计划 §4.2 第 3、4 条）：
+
+        - 用 `self._settle_tasks` 保存强引用，任务不会被 GC，关闭时也能统一等待；
+        - 取消时先等内层 task 结束再原样传播。重复取消只是更早地传播，
+          内层 task 本身不在取消作用域内，仍会跑完，因此不会二次 POST 或双重记账。
+        """
+        task: asyncio.Task[None] = asyncio.ensure_future(operation)
+        self._settle_tasks.add(task)
+        task.add_done_callback(self._settle_tasks.discard)
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # 等结算完成；期间再次取消不会中断内层 task（它没有被 cancel）。
+            # 用 asyncio.wait 而不是 gather：gather 被取消时会连带取消内层 task。
+            while not task.done():
+                try:
+                    await asyncio.wait({task})
+                except asyncio.CancelledError:
+                    continue
+            if not task.cancelled():
+                # 取出可能的异常，避免“Task exception was never retrieved”。
+                task.exception()
+            raise
+
+    async def _commit_delivery(
+        self,
+        message: ChatMessage | None,
+        channel_id: str,
+        reply_to: int | None,
+        kind: str,
+        actor_id: str | None,
+        thread_root_id: int | None,
+    ) -> None:
+        """一次受取消保护的终结：先落本地发送记录，再把预留转正。
+
+        本地去重表写失败是既有降级（只记 error 日志），绝不能因此跳过转正 ——
+        消息确实已经发出，`finally` 保证预留一定结清；把 dispatch 的意外异常
+        （含被直接 cancel 内层任务时抛出的 `CancelledError`）也挡在转正之前。
+        """
+        try:
+            await self._record_sent(message, channel_id, reply_to, thread_root_id)
+        finally:
+            await self._quota.note_sent(channel_id, reply_to, kind, actor_id=actor_id)
+
+    async def _release_reservation(
+        self, channel_id: str, kind: str, actor_id: str | None
+    ) -> None:
+        """释放一笔预留（异常/确定失败/取消路径的终结操作）。"""
+        await self._quota.release(channel_id, kind, actor_id=actor_id)
 
     async def _deliver(
         self,
         channel_id: str,
         content: str,
         reply_to: int | None,
-        thread_root_id: int | None,
-    ) -> tuple[SendResult, bool]:
-        """执行一次 POST 并处理结果；返回 (结果, 是否应 note_sent)。"""
+    ) -> _Delivery:
+        """执行一次 POST 并处理结果；不做结算，只回报是否已确认送达。"""
         try:
             message = await self._post_once(channel_id, content, reply_to)
         except SiteError as exc:
-            return await self._on_error(channel_id, content, reply_to, thread_root_id, exc)
+            return await self._on_error(channel_id, content, reply_to, exc)
 
-        await self._record_sent(message, channel_id, reply_to, thread_root_id)
-        return SendResult(True, message.id if message is not None else None, "delivered"), True
+        return _Delivery(
+            SendResult(True, message.id if message is not None else None, "delivered"),
+            message,
+            True,
+        )
 
     async def _post_once(
         self, channel_id: str, content: str, reply_to: int | None
@@ -145,23 +248,20 @@ class MessageSender:
         channel_id: str,
         content: str,
         reply_to: int | None,
-        thread_root_id: int | None,
         exc: SiteError,
-    ) -> tuple[SendResult, bool]:
+    ) -> _Delivery:
         """把确定性的站点错误映射为发送结果；status == 0 才进入对账。"""
         self._note_site_error(exc)
         if exc.status == 429:
-            return SendResult(False, None, "backoff"), False
+            return _Delivery(SendResult(False, None, "backoff"), None, False)
         if exc.status == 403:
             # 细分 CSRF（我方配置错误）与权限/禁言（可能恢复），两者都不重试。
-            return SendResult(False, None, _forbidden_reason(exc.message)), False
+            return _Delivery(SendResult(False, None, _forbidden_reason(exc.message)), None, False)
         if exc.status == 400 and reply_to is not None:
-            return SendResult(False, None, "reply_target_gone"), False
+            return _Delivery(SendResult(False, None, "reply_target_gone"), None, False)
         if exc.status == 0:
-            return await self._reconcile(
-                channel_id, content, reply_to, thread_root_id
-            )
-        return SendResult(False, None, "failed"), False
+            return await self._reconcile(channel_id, content, reply_to)
+        return _Delivery(SendResult(False, None, "failed"), None, False)
 
     def _note_site_error(self, exc: SiteError) -> None:
         """站点错误的副作用：429 时登记退避（失败重发路径也必须走到）。"""
@@ -179,16 +279,20 @@ class MessageSender:
         channel_id: str,
         content: str,
         reply_to: int | None,
-        thread_root_id: int | None,
-    ) -> tuple[SendResult, bool]:
-        """结果不确定时的对账：先查本地记录，再拉 `after=reply_to` 的最新一页。"""
+    ) -> _Delivery:
+        """结果不确定时的对账：先查本地记录，再拉 `after=reply_to` 的最新一页。
+
+        远端结果尚不确定时被取消会直接从本方法抛出，由 `send` 的 `BaseException`
+        分支释放预留（计划 §4.2 第 7 条）：只在重发确实拿到成功响应后，
+        才把这次 «已确认送达» 记进返回的 `_Delivery`，绝不为了结清预留盲目重投。
+        """
         if reply_to is None:
-            return SendResult(False, None, "failed"), False
+            return _Delivery(SendResult(False, None, "failed"), None, False)
 
         existing = await self._store.find_sent_for_reply(channel_id, reply_to)
         if existing is not None:
             # 此前那次发送已经记过账（note_sent），本次预留直接释放。
-            return SendResult(True, existing, "deduped"), False
+            return _Delivery(SendResult(True, existing, "deduped"), None, False)
 
         try:
             messages = await self._client.fetch_messages(
@@ -196,7 +300,7 @@ class MessageSender:
             )
         except SiteError:
             # 对账查询本身失败：无法确认是否已发出，宁可不重发，避免双发。
-            return SendResult(False, None, "failed"), False
+            return _Delivery(SendResult(False, None, "failed"), None, False)
 
         self_user = self._client.self_user
         self_id = self_user.id if self_user is not None else None
@@ -206,9 +310,8 @@ class MessageSender:
             if message.reply is None or message.reply.id != reply_to:
                 continue
             # 命中的消息确实由本机器人发出，只是此前没记账：补记并转正预留。
-            # 补记同样是尽力而为，写库失败不得影响预算记账。
-            await self._record_sent(message, channel_id, reply_to, thread_root_id)
-            return SendResult(True, message.id, "deduped"), True
+            # 补记同样是尽力而为，写库失败不得影响预算记账（由终结操作保证顺序）。
+            return _Delivery(SendResult(True, message.id, "deduped"), message, True)
 
         # 仍未命中：允许一次重发，仅一次。重发必须完整走第 5 步的错误副作用，
         # 尤其是 429 时的退避，否则会把站点的每分钟硬限撞穿。
@@ -216,9 +319,12 @@ class MessageSender:
             resent = await self._post_once(channel_id, content, reply_to)
         except SiteError as exc:
             self._note_site_error(exc)
-            return SendResult(False, None, "failed"), False
-        await self._record_sent(resent, channel_id, reply_to, thread_root_id)
-        return SendResult(True, resent.id if resent is not None else None, "delivered"), True
+            return _Delivery(SendResult(False, None, "failed"), None, False)
+        return _Delivery(
+            SendResult(True, resent.id if resent is not None else None, "delivered"),
+            resent,
+            True,
+        )
 
     async def _record_sent(
         self,

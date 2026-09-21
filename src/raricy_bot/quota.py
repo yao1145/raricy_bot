@@ -167,30 +167,46 @@ class QuotaGuard:
         `kind="notice"` 时还要顺手落下该 (频道, 触发者) 的通知冷却（D-18）：
         冷却只能在这里写，因为只有这里知道消息**确实发出去了** —— 被拒绝或失败的
         发送走 `release()`，用户什么都没收到，不该被冷却。
+
+        取消也不例外：`CancelledError` 不是 `Exception` 的子类，若在等待 quota 锁
+        或写库时被打断而不结清预留，这笔预留会永久占用分钟额度。这里在取消传播前
+        先把预留消费掉（并记一笔内存窗口，与写库失败的降级同一口径），再原样抛出。
         """
-        async with self._lock:
-            try:
-                await self._store.record_send_attempt(channel_id, reply_to, kind)
-                if kind == "notice":
-                    await self._store.set_cooldown(
-                        notice_cooldown_key(channel_id, actor_id),
-                        self._now() + self._cfg.notice_cooldown_seconds,
+        # `settled` 记录预留是否已经消费，保证恰好消费一次。
+        settled = False
+        try:
+            async with self._lock:
+                try:
+                    await self._store.record_send_attempt(channel_id, reply_to, kind)
+                    if kind == "notice":
+                        await self._store.set_cooldown(
+                            notice_cooldown_key(channel_id, actor_id),
+                            self._now() + self._cfg.notice_cooldown_seconds,
+                        )
+                except Exception as exc:  # 任何写库失败都必须走降级路径，不能外抛
+                    # 尝试确实发生过，内存窗口照记；预留必须释放，避免泄漏。
+                    self._recent.append(self._mono())
+                    self._consume_pending(channel_id, kind, actor_id)
+                    settled = True
+                    log_event(
+                        logger,
+                        logging.ERROR,
+                        "quota.note_sent_failed",
+                        channel_id=channel_id,
+                        kind=kind,
+                        error=type(exc).__name__,
                     )
-            except Exception as exc:  # 任何写库失败都必须走降级路径，不能外抛
-                # 尝试确实发生过，内存窗口照记；预留必须释放，避免泄漏。
+                    return
                 self._recent.append(self._mono())
                 self._consume_pending(channel_id, kind, actor_id)
-                log_event(
-                    logger,
-                    logging.ERROR,
-                    "quota.note_sent_failed",
-                    channel_id=channel_id,
-                    kind=kind,
-                    error=type(exc).__name__,
-                )
-                return
-            self._recent.append(self._mono())
-            self._consume_pending(channel_id, kind, actor_id)
+                settled = True
+        except asyncio.CancelledError:
+            if not settled:
+                # 消息已经发出，取消只是打断结算：内存窗口照记，预留必须结清。
+                # `_consume_pending` 是同步的，不会在两次 await 之间被交错。
+                self._recent.append(self._mono())
+                self._consume_pending(channel_id, kind, actor_id)
+            raise
 
     async def release(self, channel_id: str, kind: str, *, actor_id: str | None = None) -> None:
         """发送失败/放弃：只释放预留，不写 send_attempts，也不落通知冷却。"""
