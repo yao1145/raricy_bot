@@ -887,12 +887,18 @@ class MemoryService:
         令牌失效（提取代次被隐私操作推进、服务纪元变化、授权被关闭或不可确认）时返回稳定的
         `noop`：**不写入**，也不产生「记忆已保存」披露。授权规则的唯一实现留在本层，
         控制器不再自己重写一套（修复计划 §2.3 第 3 条）。
+
+        令牌随 applier 一起传入（`capture_token=token`），因此授权会被检查**两次**，各管一段：
+        `_mutate_private` 入口那次用 TTL 缓存快照，跑在 `screen` 之前，保住「令牌失效 → 稳定
+        noop」的次序并免去注定 noop 的写入流程；applier 里那次在**每一份真正成为写入前提的
+        基线**上重判——`_write_document` 接手外部版本后会用外部基线重放 applier，入口那次缓存
+        快照看不见这份基线（例如用户在 TTL 窗口内直接改盘关掉了 `auto_capture`）。
         """
         return await self._mutate_private(
             token.user_id,
             operation_id,
             lambda document: self._apply_guarded_proposal(
-                document, token.user_id, proposal, operation_id
+                document, token.user_id, proposal, operation_id, capture_token=token
             ),
             screen=lambda _document: (proposal.key, proposal.content),
             capture_token=token,
@@ -1148,6 +1154,13 @@ class MemoryService:
         两个自动提取相关的开关都在写锁之内生效（修复计划 §2.3）：`invalidate_capture` 供隐私
         操作推进提取代次；`capture_token` 供自动提取提交时复核令牌。二者与 `begin_auto_capture`
         共用同一把锁，因此「开始提取」与「隐私操作生效」之间没有可观察的中间态。
+
+        `capture_token` 在这里检查是**第一处**，用的是本入口拿到的（TTL 缓存）快照，且必须留在
+        `screen` 之前：守住「令牌失效 → 稳定 noop」优先于「密钥命中 → secret_detected」的既有
+        次序（§2.3 的强制顺序），也免去为一次注定 noop 的提交跑完 `_write_document` 的整套机制。
+        **第二处**在 applier（`_apply_guarded_proposal`，`commit_auto_capture` 会把令牌传下去）：
+        `_write_document` 接手外部版本后会用外部基线重放 applier，那份基线在缓存之外，必须在
+        真正要写的那一份上重新确认授权。两处不是重复，各覆盖一段。
         """
         if not self._enabled or not user_id or _storage_key(user_id) is None:
             # 关闭时能力根本没被注入；真被调到说明调用方绕过了访问门（§28、§34.1）。
@@ -1703,13 +1716,27 @@ class MemoryService:
         user_id: str,
         proposal: MemoryProposal,
         operation_id: str,
+        *,
+        capture_token: AutoCaptureToken | None = None,
     ) -> tuple[PrivateDocument | None, str, str | None]:
-        """§42.6 的公开保护 + 既有提案逻辑。
+        """§42.6 的公开保护 + 自动提取的授权复查 + 既有提案逻辑。
 
-        保护放在 applier 里而不是 `_mutate_private` 的入口：applier 会被 `_write_document`
+        两道门都放在 applier 里而不是 `_mutate_private` 的入口：applier 会被 `_write_document`
         用两次——一次以内存快照为基线、一次以接手的**外部版本**为基线（§5.5 第 4 步）——
-        所以「同 key 的 add 到底替不替换」这个问题会在每一份真正成为前提的基线上重新判一次。
+        所以「同 key 的 add 到底替不替换」与「授权此刻是否仍然成立」这两个问题都会在每一份
+        真正成为前提的基线上重新判一次。
+
+        `capture_token` 只有自动提取的提交路径会传（`apply_private_proposal` 是用户命令触发的
+        路径，本就不该受自动提取令牌约束，因此不传）。入口那次检查（`_mutate_private`）与这次
+        不是重复：入口那次跑在 `screen` 之前，保住「令牌失效 → 稳定 noop」优先于「密钥命中 →
+        secret_detected」的既有次序（§2.3 的强制顺序），也避免为一次注定 noop 的提交走完
+        `_write_document` 的机制；这里这次覆盖的则是入口检查够不到的「基线被接手」情形——
+        入口用的是 TTL 缓存快照，而真正写盘的前提是接手后的外部版本。
         """
+        if capture_token is not None and not self._capture_token_valid(capture_token, document):
+            # 外部版本接手后基线可能已经不同：授权必须对**真正要写的**那一份基线重新确认。
+            # 令牌失效时保持稳定 no-op：不写盘、不产生「记忆已保存」披露（§2.3）。
+            return None, STATUS_NOOP, None
         blocked = self._public_guard(document, user_id, proposal)
         if blocked is not None:
             return None, blocked.status, None
