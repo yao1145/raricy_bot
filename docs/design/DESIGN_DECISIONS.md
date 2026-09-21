@@ -1,6 +1,6 @@
 # 设计决策摘要
 
-保留 D-1–D-114 的稳定编号，只维护仍影响实现的规则、理由及替代关系。
+保留 D-1–D-118 的稳定编号，只维护仍影响实现的规则、理由及替代关系。
 签名与代码入口见 [INTERFACES.md](INTERFACES.md)。旧设计中的原文引述、实施分工和逐项讨论见
 [2026-09-20 完整快照](../archive/2026-09-20/DESIGN_DECISIONS.md)，Git 恢复方式见
 [归档索引](../ARCHIVE.md)。归档里的旧规则不能覆盖本文件或上游契约。
@@ -8,7 +8,8 @@
 阅读时先定位子系统：D-1–D-27 聊天/评论，D-28–D-54 图片/引用/MCP/KB，
 D-55–D-80 长期记忆，D-81–D-94 能力与基础设施，D-95–D-103 近期上下文/公开记忆，
 D-104–D-110 上游鉴权/额度/发文，D-111–D-113 日志/永久归档/传输安全，D-114 系统提示词中的
-当前时间片段。后续变更沿用编号注明替代关系，不叠加互相矛盾的补丁段落。
+当前时间片段，D-115–D-118 代码审查修复（记忆提交授权、工具能力按次调用、配额结算抗取消、
+按可运行会话调度）。后续变更沿用编号注明替代关系，不叠加互相矛盾的补丁段落。
 
 <a id="d-1"></a>
 
@@ -212,7 +213,7 @@ Provider 发现工具不等于允许执行；只有 feature 绑定可生成 serv
 
 ## D-34 MCP 是软故障扩展，不参与健康判定
 
-MCP 连接、凭据、工具发现或模型 tools 不支持只停对应能力；普通聊天、评论与健康端点不受影响。确定缺环境不重连，确定模型不支持 tools 时在本进程缓存。
+MCP 连接、凭据、工具发现或模型 tools 不支持只停对应能力；普通聊天、评论与健康端点不受影响。确定缺环境不重连。原「确定模型不支持 tools 时在本进程缓存」已由 D-116 取代：该结论只属本次调用，不写共享状态。
 
 <a id="d-35"></a>
 
@@ -731,6 +732,77 @@ memory off 只暂停私有读取和自动提取，不撤回公开条目；reset 
 - 片段只由 `now()` 渲染，**不接受任何额外入参**，结构上没有位置装进请求、用户、记忆或工具数据。
 - 它**固定是 system 的最后一段**，排在 `system_prompt`、所有静态附加说明与记忆说明之后，不得排在其它 system 内容之前。
 - 此后任何新增的动态 system 内容都必须**重新走一次决策记录**，不得援引本次例外。
+
+<a id="d-115"></a>
+
+## D-115 自动提取的提交授权在写锁内原子复核（令牌 + 进程内代次）
+
+`MemoryService.begin_auto_capture` 在**同一把写锁**内一并取得用户的授权状态、条目快照与该用户的
+提取代次，返回不透明 `AutoCaptureToken`（`memory/models.py`）；模型调用放在锁**之外**，隐私命令
+因此无需等待模型返回。`commit_auto_capture` 在写锁内复核 token 的 epoch、`_enabled`、
+`document.auto_capture` 与该用户 generation，任一失效即返回稳定 `noop`（不写入、不追加
+「记忆已保存」披露）。失效入口是四个隐私 mutation：`set_auto_capture(False)`、
+`set_private_enabled(False)`、`clear_private`、`delete_private`；失效处理放在幂等命中之后、
+应用之前，因此**值未变的 no-op 路径**（空记忆 clear、`auto_capture` 本来为 False）同样失效，
+不依赖文档 revision 是否增加。代次与纪元都是**进程内**字段（`_capture_generation` /
+`_capture_epoch`），不落盘、不迁移表；`stop()` 递增纪元，使停止前发出的令牌全部失效。
+
+理由：聊天与记忆命令走两个独立 `WorkerPool`，会话锁不共享；`MemoryService` 的写锁只保护单次
+mutation，挡不住「等待模型期间完成的隐私操作被迟到结果越过」。授权规则的唯一实现留在服务层，
+控制器不再自建一套（旧路径在撰写前查开关，无法阻止提交）。这条保证的是**提交授权**，不声称能
+撤回此前已经发送给模型的数据。
+
+<a id="d-116"></a>
+
+## D-116 端点「不支持 tools」只属本次调用（取代 D-34 的进程内缓存）
+
+`OpenAIModelClient` 不再持有「tools 不支持」的共享可变标记：普通 400/404 只终结当前请求并归类
+`bad_request`。`tools_unsupported` 只在提供方给出**结构化**错误时产生
+（`core/worker.py::_is_tools_unsupported`：`error.param` 精确为 `tools` / `tool_choice` /
+`parallel_tool_calls`，且 `code` / `type` 命中窄白名单），且只是**本次调用**的结论。App 与
+`blog/writer.py` 只依据 `ModelError.kind` 决定本地提示，不再读模型客户端的共享可变属性。
+本条目**取代 D-34 末句**「确定模型不支持 tools 时在本进程缓存」。
+
+取舍：真正不支持工具的端点会在后续调度点被重新尝试一次（用一次多余请求换掉「一次无关错误
+持续到重启」）。窄判定会漏判只在正文里写「不支持工具」的提供方，它们退回通用 `bad_request`
+—— 漏判只让一次调用按普通错误处理，误判却会把无关错误改写成「能力不可用」，二者不对称。
+本轮不新增 TTL 缓存或恢复探测状态机。
+
+<a id="d-117"></a>
+
+## D-117 配额结算抗协作式取消：所有权模型 + 受取消保护的终结
+
+`MessageSender` 引入 `_Delivery(result, record, charge)` 所有权模型：`_deliver` / `_on_error` /
+`_reconcile` 只做 POST 与对账、**不结算**；`send` 是唯一结算点，确认送达后由 `_commit_delivery`
+把 `store.record_sent` 与 `quota.note_sent` 收敛成一次受取消保护的终结操作（`_run_settlement`：
+`ensure_future` + `shield` + 强引用集合 `_settle_tasks`）。重复取消只提前传播，内层 task 不在
+取消作用域内，因此不二次 POST、不双重记账。新增公开方法 `MessageSender.wait_settled()`
+（跨模块契约见 §13），`app._shutdown` 在 `Store` 关闭前调用它（§16）。`QuotaGuard.note_sent`
+用 `settled` 标志 + `except asyncio.CancelledError` 兜住结算中途的取消（§10）。
+
+已知边界：强制杀进程 / 断电 / 超出既有 10 秒关闭预算，不承诺「远端发送」与「本地记账」跨系统
+原子一致；事件循环整体拆除时仍存活的终结 task 被 cancel，该硬路径下内存预留可能丢失。远端结果
+尚不确定时被取消仍按既有语义释放预留、不盲目重投（D-8）。
+
+<a id="d-118"></a>
+
+## D-118 工作器按可运行会话调度（`core/scheduler.py::SessionScheduler`）
+
+每个会话一条 FIFO 等待队列，另维护一条可运行会话队列；工作器只领取**可运行会话**的一条请求并
+把该会话标 active，同会话后续请求留在队列里、不占执行容量。本条结束清除 active，有积压则把会话
+放回可运行队列**队尾**（公平轮转，不饿死）。这取代旧顺序「先从全局队列取一条、再等会话锁」——
+后者在三个 worker 遇到同一会话三条请求时，一个处理、两个等锁，把别的会话挡在全局队列里。
+
+容量口径：`qsize()` / `full()` / `empty()` 是**未派发的等待请求数**（含 active 会话后面的积压，
+与 `asyncio.Queue`「get 后即出队」一致），`active_count` 是执行中请求数（≤ 并发数）；任何时刻
+等待数不超过 `maxsize`，没有搬进无界内部队列制造虚假容量。`put_nowait` 仍抛
+`asyncio.QueueFull`，Router 的 busy 语义不变；`MessageRouter` 的队列参数类型改为
+`EnqueueQueue`（§12）。空闲会话状态（无执行中且无积压）被回收。
+
+与 D-20–D-22 的关系：会话归属、大区 reset 建新链与完整轮次提交的边界不变；本项只改「取请求
+与排队的顺序」，同会话串行、generation 检查、事件去重与恢复状态照旧。关闭语义：worker 被取消时
+不会把**未领取**的请求误标 done（它们留在等待队列里），因此 `stop()` 之后 `join()` 会因未处理
+积压而挂住 —— 这是刻意的，且没有任何调用方在关闭时 `join()`。评论子系统仍走自己的调度路径。
 
 ## 实施期编号兼容
 

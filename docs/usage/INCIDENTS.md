@@ -133,9 +133,10 @@ docker run --rm -it --pid=container:<容器> --cap-add SYS_PTRACE \
 
 ### 六、本事件暴露出的独立缺陷（与本事件因果未定，但都值得单独修）
 
-> **2026-09-21 补充：**下列第 1、5、6 条已经补上了**观测手段**，第 2、3、4 条仍未改动。
-> 补观测不等于故障已解决：本事件的结论仍是**未定案**，不要因为现在多几行日志就把它
-> 当成已定位。新增的取证方式见第九节。
+> **2026-09-21 补充：**下列第 1、5、6 条已经补上了**观测手段**，第 3 条已按计划**修复**
+> （见该条）。第 2、4 条仍未改动。补观测、修一个独立缺陷都不等于故障已解决：本事件的结论
+> 仍是**未定案**，不要因为现在多几行日志、少一个独立缺陷就把它当成已定位。新增的取证方式见
+> 第九节。
 
 1. **worker 死亡无日志、无兜底**（core/worker.py:546、:492-495）：`except Exception` 兜不住
    BaseException；worker 一死 `/livez` 就永久 503，而现场毫无痕迹。修法：兜 `BaseException`，
@@ -149,6 +150,16 @@ docker run --rm -it --pid=container:<容器> --cap-add SYS_PTRACE \
    （带 tools）遇到任何 400/404 都会把共享模型客户端标记为「不支持 tools」，之后
    `/search` `/zhihu` `/map` `/wolfram` 恒回「暂不可用」直到进程重启。
    「提示词过长」的 400 落在第一轮就会触发。
+   **2026-09-21**：已修复永久负缓存。客户端不再持有「不支持 tools」的共享可变标记；普通
+   400/404 只终结当前请求并归类 `bad_request`；`tools_unsupported` 只在提供方返回**结构化**
+   错误时产生（`core/worker.py::_is_tools_unsupported`：`error.param` 精确为 `tools` /
+   `tool_choice` / `parallel_tool_calls`，且 `code` / `type` 命中窄白名单），且只属**本次调用**。
+   App 与 `blog/writer.py` 只依据 `ModelError.kind`，不再读模型客户端的共享属性（D-116）。
+   对应的离线回归用例在 `tests/test_tools_capability.py`，消费方回归在 `tests/test_app.py` 与
+   `tests/test_blog_publish_model.py`（`tests/` 被 Git 忽略，不入库）。
+   这是本事件暴露出的**独立缺陷**，改它的依据是一条无关错误不应持续到重启，而不是「已证明
+   它造成了本事件」：事件一的因果仍未定案，本条不构成「工具能力污染导致 3 分 48 秒静默」的
+   证据。
 4. **工具回合第二轮不参与预算**（core/worker.py:263-276）：第二轮消息（含工具结果，
    zhihu/search 单轮上限 5×3000 估算 token）直接拼接发出；叠加 `estimate_tokens` 对非 CJK
    按 4 字符/token 低估（text_utils.py:107-113，XML/URL 实际约 2–3 字符/token）——

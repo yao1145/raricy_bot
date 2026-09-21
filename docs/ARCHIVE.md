@@ -4,6 +4,25 @@
 `docs/archive/` 按现有 `.gitignore` **不入库**；这里的链接指向本地副本，新克隆可能没有这些文件。
 不删除未入库的唯一副本；需要跨机器保存时另行备份。
 
+## 2026-09-21 归档
+
+代码审查四项修复（记忆提交授权、工具永久负缓存、配额结算抗取消、按可运行会话调度）实现并
+验证后，一次性修复计划移出 `design/`：
+
+| 文件 | 内容 |
+|---|---|
+| [CODE_REVIEW_FIX_PLAN.md](archive/CODE_REVIEW_FIX_PLAN.md) | 四项修复的问题、实施步骤与验收；均已实施，现行行为见契约与决策，本稿只作历史参考 |
+
+计划原路径为 `docs/design/CODE_REVIEW_FIX_PLAN.md`，可用移出前提交 `f39146b` 与原路径恢复：
+
+```bash
+git show f39146b:docs/design/CODE_REVIEW_FIX_PLAN.md
+```
+
+历史稿里的“待实施”“拟议行为”“预计”等措辞保留为当时记录，不代表当前待办；现行行为见
+[INTERFACES.md](design/INTERFACES.md) 与 [DESIGN_DECISIONS.md](design/DESIGN_DECISIONS.md)
+的 D-115–D-118。
+
 ## 2026-09-20 整理
 
 接口文档改为行为约束与代码导航，决策记录保留全部 D 编号、理由和修订关系；完整旧稿逐字节保留：

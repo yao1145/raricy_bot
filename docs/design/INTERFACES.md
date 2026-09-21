@@ -149,6 +149,10 @@ notice 冷却、分钟滑动窗口判定。**reply 阈值比较的是全部发�
 只有 `notice` 按 `notice:{channel_id}:{actor_id or '-'}` 冷却，默认 300 秒，
 没有每频道每天一次的名额。每笔成功预留恰好 `note_sent` 或 `release` 一次；冷却仅在发出后登记。
 
+`note_sent` 用 `settled` 标志保证预留恰好消费一次，并在 `except asyncio.CancelledError` 里
+先结清预留再原样传播（取消不是 `Exception` 子类）：等待配额锁或写库时被打断也不能让预留永久
+占额（D-117）。
+
 ## 11. `core/context.py`
 
 入口：[ContextManager](../../src/raricy_bot/core/context.py)。
@@ -180,6 +184,10 @@ DM 按频道，公开链用 `lobby-thread:<root_id>`，重启保留归属但不�
 
 大区 reset 以命令 ID 建新链，不清旧链；DM reset 清历史并递增 generation（D-21）。
 
+`queue` 与 `memory_queue` 的参数类型是 `EnqueueQueue`（`core/scheduler.py`）：只要求
+`put_nowait`，容量满时抛 `asyncio.QueueFull`。生产注入 `SessionScheduler`，测试可直接注入
+`asyncio.Queue`，两者都结构性地满足它；入队与 busy 判定口径不变（§14）。
+
 ## 13. `core/sender.py`
 
 入口：[MessageSender](../../src/raricy_bot/core/sender.py)。
@@ -188,12 +196,32 @@ DM 按频道，公开链用 `lobby-thread:<root_id>`，重启保留归属但不�
 未找到时最多重发一次，不能保证严格 exactly-once。**该策略不适用于博客发文**（D-109）。
 所有取消和异常出口都须结清预留。
 
+`_deliver` / `_on_error` / `_reconcile` 只做 POST 与对账、**不结算**，用
+`_Delivery(result, record, charge)` 回报是否已确认送达；`send` 是唯一结算点，确认送达后由
+`_commit_delivery` 把 `store.record_sent` 与 `quota.note_sent` 收敛成一次受取消保护的终结操作
+（`_run_settlement`：`ensure_future` + `shield` + 强引用集合 `_settle_tasks`）。**新增公开方法
+`MessageSender.wait_settled()`**：等待所有在途终结任务结束，供关闭路径在 `Store` 关闭前调用
+（§16）。取消只延迟传播，不把已确认送达改判成 release（D-117）。
+
+强制杀进程、断电或超出既有 10 秒关闭预算时，不承诺远端发送与本地记账跨系统原子一致。
+
 ## 14. `core/worker.py`
 
 入口：[模型客户端与 WorkerPool](../../src/raricy_bot/core/worker.py)。
 SDK `max_retries=0`，重试只由本层控制：网络错误、429、5xx 最多重试一次；
 超时及 HTTP 408 不重试（D-19）。固定 worker 数、同 session 串行，handler 普通异常不杀 worker。
 严格完成检查只由发文显式启用（§53）；不能把被截断或非法完成当作可发布稿件。
+
+**工具能力没有永久负缓存**（D-116）：客户端不持有「不支持 tools」的共享可变标记；普通
+400/404 只终结当前请求并归类 `bad_request`；`tools_unsupported` 只在提供方给出结构化错误时
+产生（`_is_tools_unsupported`：`error.param` 精确为 `tools` / `tool_choice` /
+`parallel_tool_calls`，且 `code` / `type` 命中窄白名单），且只属**本次调用**。App 与
+`blog/writer.py` 只依据 `ModelError.kind`，不再读模型客户端上的共享属性。
+
+`WorkerPool` 消费的是 `core/scheduler.py::SessionScheduler`（`RunnableQueue` 协议），不再从
+裸 `asyncio.Queue` 取请求：工作器只领取**可运行会话**的一条请求（`get_runnable`），本条结束
+经 `task_done` 清 active、有积压则把会话放回可运行队列队尾。同会话严格串行且不占执行容量；
+容量口径与关闭语义见 D-118。
 
 ## 15. `ops.py`
 
@@ -209,6 +237,11 @@ MCP、KB、记忆、发文为软故障扩展，不纳入健康就绪条件。Com
 resync 拉取按 message ID 去重，空 event ID 不抬水位。
 403 中 CSRF 为客户端错误，其余权限/禁言进入不可用并定时探测。
 仅在回复成功后提交历史；退出总预算 10 秒，先停止发文/记忆等消费者，再关闭共享模型与 MCP。
+
+两条队列都是 `SessionScheduler`（§14），容量取 `behavior.queue_size` / `memory.queue_size`；
+记忆 worker 并发固定为 1。关闭顺序里，`_shutdown` 在 `Store` 关闭**之前**调用
+`MessageSender.wait_settled()`，等在途的受取消保护终结任务（`record_sent` + `note_sent`）
+结束，再关 `Store`，避免它们撞上已关闭的连接（D-117）。
 
 ## 16.1 评论子系统
 
@@ -365,6 +398,13 @@ Markdown 保存条目和 operations；不把业务幂等结果另存 SQLite。
 `find_operation` 有 user_id 时依次查私有→公开→共同，无 user_id 只查共同；
 clear 保留幂等元数据。私有读取停用不等于删除。
 
+**自动提取的提交授权**（D-115）：`begin_auto_capture` 在写锁内一并取得授权、条目快照与
+该用户提取代次，返回不透明 `AutoCaptureToken`（`memory/models.py`）；模型调用在锁外。
+`commit_auto_capture` 在写锁内复核 token 的 epoch / `_enabled` / `document.auto_capture` /
+generation，失效返回稳定 `noop`（不写、不产生披露）。失效入口是 `set_auto_capture(False)`、
+`set_private_enabled(False)`、`clear_private`、`delete_private`；失效处理先于应用，因此值未变的
+no-op 路径同样生效。代次与纪元都是进程内字段，不落盘。
+
 ## 31. `memory/writer.py`（AI 撰写器）
 
 入口：[MemoryWriter](../../src/raricy_bot/memory/writer.py)。
@@ -382,6 +422,8 @@ clear 保留幂等元数据。私有读取停用不等于删除。
 重放返回首次结果，不重复调用 AI，也不改成 duplicate。
 共同候选由管理员提出、审批；批准的是已展示版本，不再调模型，目标变动则 conflict。
 私有开关、手动保存与自动提取分开；reset 不动长期记忆。公开命令和两阶段删除见 §52。
+自动提取的授权规则不由控制器自建：控制器从 `begin_auto_capture` 取令牌，模型调用后经
+`commit_auto_capture` 提交，失效判定全部落在服务层的写锁内（D-115）。
 
 ## 33. `core/context.py`（记忆预算）
 
@@ -396,6 +438,8 @@ Router 只授权、构造请求、入记忆队列；只有 worker 成功启动�
 记忆 worker finally 终结事件，不阻塞 SSE。关闭功能不读写目录、不启任务。
 自动提取仅在满足 DM/用户/部署开关后，于回答生成后、发送前执行；成功写入后拼披露并预留截断空间。
 披露装不下的已知例外必须保留 warning（D-77），不能宣称任何情况下都能告知。
+关闭或清空（`/memory off`、`/memory auto off`、`/memory clear`，以及 `/memory forget`）成功后，
+**此前已开始的提取不再写入**：提交走 `commit_auto_capture` 的写锁内复核，失效即 no-op（D-115）。
 
 ## 35. 评论记忆集成
 
