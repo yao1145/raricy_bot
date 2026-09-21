@@ -113,14 +113,21 @@ def estimate_tokens(text: str) -> int:
     return cjk_count + math.ceil(other_count / 4)
 
 
-def truncate_at_paragraph(text: str, limit: int) -> tuple[str, bool]:
-    """在自然段边界截断文本，返回 (截断结果, 是否发生截断)。
+def truncate_with_cut(text: str, limit: int) -> tuple[str, int, bool]:
+    """在自然段边界截断文本，返回 (截断结果, 真实切点 cut, 是否发生截断)。
 
     切点取 limit 之前最后一个换行或句末标点（含该字符）；切点不超过 limit // 2 时
     退化为硬切 text[:limit]。截断结果末尾追加 TRUNCATION_SUFFIX。
+
+    ``cut`` 是被保留原始区间的终点（对 ``text`` 的下标，不含截断提示）：发生截断时
+    ``body == text[:cut].rstrip() + TRUNCATION_SUFFIX``，未截断时为 ``len(text)``
+    且 ``body == text``。调用方可据此判断切点是否落在某个区间内部并回退。
+
+    契约：``limit`` 不含截断提示的长度，故截断结果的长度上界是 ``limit`` 加上
+    ``TRUNCATION_SUFFIX``；收口由调用方扣减 ``limit`` 完成，本函数不改变该语义。
     """
     if len(text) <= limit:
-        return text, False
+        return text, len(text), False
     cut = 0
     for index in range(min(limit, len(text)) - 1, -1, -1):
         if text[index] in _SENTENCE_ENDS:
@@ -128,7 +135,16 @@ def truncate_at_paragraph(text: str, limit: int) -> tuple[str, bool]:
             break
     if cut <= limit // 2:
         cut = limit
-    return text[:cut].rstrip() + TRUNCATION_SUFFIX, True
+    return text[:cut].rstrip() + TRUNCATION_SUFFIX, cut, True
+
+
+def truncate_at_paragraph(text: str, limit: int) -> tuple[str, bool]:
+    """在自然段边界截断文本，返回 (截断结果, 是否发生截断)。
+
+    行为与 ``truncate_with_cut`` 一致，只是丢弃切点；签名与既有调用点保持不变。
+    """
+    body, _cut, truncated = truncate_with_cut(text, limit)
+    return body, truncated
 
 
 def is_secret_probe(text: str) -> bool:

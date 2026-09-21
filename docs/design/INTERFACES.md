@@ -191,7 +191,10 @@ DM 按频道，公开链用 `lobby-thread:<root_id>`，重启保留归属但不�
 ## 13. `core/sender.py`
 
 入口：[MessageSender](../../src/raricy_bot/core/sender.py)。
-出站脱敏、段落截断、去重、配额预留；回复引用触发消息，返回实际发送正文供历史提交。
+**出站准备已改为统一走 [`prepare_outbound`](../../src/raricy_bot/outbound.py)（§55）**：
+原来的「脱敏 + 段落截断」两点，现为「脱敏 → 表情归一 → 逐 token 敏感串复检 → 截断 →
+区间回退」五步管线，顺序与预算口径只由该处决定；其后才是去重与配额预留。回复引用触发消息，
+返回实际发送正文供历史提交。
 只有网络层 `SiteError.status == 0` 走聊天不确定对账：`after=reply_to, limit=100`，
 未找到时最多重发一次，不能保证严格 exactly-once。**该策略不适用于博客发文**（D-109）。
 所有取消和异常出口都须结清预留。
@@ -679,3 +682,81 @@ PublishOutcome.post_id 是否为 None 决定 status 是运行态还是投递态�
 把它追加到 system 末尾（system 为空时只返回片段）。依赖方向固定为 `texts ← time_context`：
 只依赖标准库与 `texts`，不 import 任何业务模块，聊天、评论与 `blog/` 各调用点都能安全引用，
 不引入依赖环。
+
+## 55. 出站文本管线与表情规范化（`outbound.py` / `stickers.py`）
+
+入口：[prepare_outbound 与 OutboundReport](../../src/raricy_bot/outbound.py)、
+[StickerTable、render、StickerReport](../../src/raricy_bot/stickers.py)。**签名、字段与默认值
+以源码为准**，本节只定顺序、接线与预算口径；理由与取舍见 D-119。
+
+聊天与评论两条出站链路共用**同一个**收口：`core/sender.py::MessageSender.send`（§13）与
+`comments/sender.py` 的 `_prepare_content` → `_normalize`（§16.1）都调用 `prepare_outbound`，
+版本与顺序只由一处决定。查找表在装配期构造一次（§55.4），两条链路共用同一张表。
+
+### 55.1 固定顺序（承重，不能调换）
+
+1. **脱敏**（`redact`）—— 隐私边界，最先执行，**与表情功能开关无关**；
+2. **表情归一**（`stickers.render`）—— 归一**可能让正文变长**，所以必须排在截断之前。
+   `table is None`（配置 `stickers.enabled: false`）时整段跳过，正文除脱敏外一个字节不动；
+3. **逐 token 敏感串复检** —— 归一的去空白容错可能把第 1 步没拦住的敏感串重新拼出来
+   （如 `[@14/上 班]`），命中则**整枚丢弃**，不回填 `[redacted]`（那会留下一个非法 token）。
+   对每个**归一后**的 token 独立跑一遍脱敏器，因此这一步是完备的：`render` 唯一会新建的
+   文本就在 token 内部，token 之外的正文第 1 步已经处理过；
+4. **截断**（`truncate_with_cut`，§4）；
+5. **区间回退** —— 切点落在某个 token 或代码区区间内部时回退到该区间起点。只依据第 2 步
+   产出的区间表，不按正则猜归属，因此不会误伤无斜杠的内容引用 `[@a1b2c3d4]`。
+
+**幂等不变量（承重）**：`render` 对已规范化的正文是恒等变换。因此 `app.py` 的披露路径可以
+先归一、按既有算法算披露预算，Sender 再跑一遍时不会增长，那套三段预留（披露 + 脱敏增长 +
+`TRUNCATION_SUFFIX`）依然成立（D-63）。
+
+### 55.2 `max_chars` 的语义
+
+**`max_chars` 是「含截断提示在内」的最终上限**，返回正文长度恒不超过它：
+
+- 未超出时不截断、不追加提示，原样返回。
+- 需要截断时只传 `limit = max_chars - len(TRUNCATION_SUFFIX)`。`truncate_at_paragraph` 的既有
+  契约是「`limit` **不含**提示」，最多返回 `limit + 12`；收口只能由调用方在 `prepare_outbound`
+  里扣减，不能改 `truncate_at_paragraph`（那会推翻既有语义）。
+- 极小预算：`max_chars <= len(TRUNCATION_SUFFIX)` 时放弃提示、直接硬切 `text[:max_chars]`；
+  `max_chars < 1` 时返回空串。提示本身不允许把正文顶出上限。
+- **`max_chars is None` 是「不做长度预算」模式**：跳过第 4、5 步，`truncated` 恒为 False、
+  不追加提示、返回长度不设上界；脱敏、归一与逐 token 敏感串复检照常执行。
+
+### 55.3 聊天披露路径：先归一、后披露，且**不**在此处截断
+
+聊天发送路径（`app.py`）在 `_auto_capture_answer` **之前**做一次
+`prepare_outbound(max_chars=None)`：
+
+- 归一必须在披露**之前**：聊天短期历史提交的是模型原文，而披露绝不进历史，所以历史拿到的
+  必须是「已归一、不含披露」的正文，否则会留下未修正的坏 token，下一轮模型模仿自己。
+- 但**不能同时截断**：`_auto_capture_answer` 之后 Sender 还会按披露预算再截一次，两次截断
+  会让正文末尾出现两份截断提示。长度预算在那里由既有的披露算术独占，本管线只贡献归一后的
+  正文及其真实长度。
+- **首次归一后显式判空**：`rendered.strip()` 为空则复查 generation，然后走既有的
+  `_notify_failure()` 结束——不提取记忆、不发送、不提交历史。若放行，空正文会流进
+  `_auto_capture_answer`，自动记忆写入成功时返回「空 body + 非空披露」，最终发出一条只含
+  记忆披露的回复，并向历史提交一条空的 assistant 轮次。该判空条件与功能开关无关
+  （D-119 的连带修正之二）。
+- 历史提交用归一后的 `rendered`（不含披露）。评论侧历史跟随 Sender 实际发布的正文
+  （`_published_text`），把归一挂进 `_prepare_content` 即自动修好（§16.1）。
+
+### 55.4 表情提示词的来源与装配
+
+`texts.sticker_system_addendum(*, collection, names)` 是文本构造函数（不是模块级常量），
+正文口径见 [SYSTEM_PROMPTS.md §1.10](SYSTEM_PROMPTS.md)。装配期 `app.py` 用一次
+`StickerTable.from_config` 同时喂给两个 Sender（`table=`）与 `CommentService`
+（`sticker_addendum=`）；聊天 system 在 `system_addenda` 里追加，评论把 addendum 并入既有的
+`addendum` 变量（含无 `ContextManager` 的回退分支）。它排在时间片段**之前**（D-114 第 2 条）。
+它是继模块级常量与时钟片段之后的**第三类 system 来源**，D-114 的例外不得被援引到它
+（SYSTEM_PROMPTS.md §1.6、D-119）。
+
+### 55.5 日志
+
+`sticker.render`：字段 `candidates` / `kept` / `fixed` / `dropped` / `dropped_for_secret`，
+类型均为 `TOKEN`（整数，§2）。前四者互斥且完备地描述**一次 `render`**：
+`candidates == kept + fixed + dropped`，只统计会被处理的候选（代码区内的候选不占名额）。
+`dropped_for_secret` 属第 3 步（逐 token 敏感串复检），与前者**处于不同阶段、可以重叠**：
+同一个 token 可能既被计为 `kept`，又被计为 `dropped_for_secret`，因此实际发出的 token 数是
+`kept + fixed - dropped_for_secret`，不是 `candidates - dropped`。功能关闭（`table is None`）
+时不记该事件；**不记正文，也不记具体名字**。

@@ -18,6 +18,7 @@ from typing import Any
 
 import yaml
 
+from . import stickers
 from . import texts
 from .capabilities import (
     CAPABILITY_BY_FEATURE,
@@ -84,6 +85,10 @@ TIER_MAYBE: str = "maybe"
 # 记录的投递，配得再大也绕不过站方日限，只会让「发到一半被 429 拦住」更容易发生。
 BLOG_MAX_POSTS_PER_DAY_MIN: int = 1
 BLOG_MAX_POSTS_PER_DAY_MAX: int = 5
+
+# 表情包合集：首版只支持站点 "14" 素材目录（设计 §4.3）。其它取值需要新的合集语义，
+# 在加载期直接失败，而不是留到运行期把 token 发给一个对不上的合集。
+STICKER_COLLECTION: str = "14"
 
 # 调度点字面量：严格的 00:00 .. 23:59。`24:00`、`9:00`、`09:00:00` 都不是合法写法 ——
 # 宽松解析会让「09:00」与「9:00」两个写法指向同一分钟而彼此看不出重复。
@@ -332,6 +337,27 @@ class BlogConfig:
 
 
 @dataclass(frozen=True)
+class StickerEntryConfig:
+    """一个表情条目：规范名（写进出站 token）与别名（只做查表键）。
+
+    别名永远不会被写进出站 token，只用来把模型可能写出的同义说法精确映射回规范名，
+    因此它对字符集没有名称那样的硬要求；真正的约束在加载期校验里（设计 §4.3）。
+    """
+
+    name: str
+    aliases: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class StickerConfig:
+    """表情包出站规范化配置（设计 §4.3）；默认关闭以保持现有部署行为。"""
+
+    enabled: bool = False
+    collection: str = STICKER_COLLECTION
+    entries: tuple[StickerEntryConfig, ...] = ()
+
+
+@dataclass(frozen=True)
 class Secrets:
     """密钥集合；repr 必须脱敏。"""
 
@@ -396,6 +422,7 @@ class Config:
     knowledge_base: KnowledgeBaseConfig = field(default_factory=KnowledgeBaseConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     blog: BlogConfig = field(default_factory=BlogConfig)
+    stickers: StickerConfig = field(default_factory=StickerConfig)
     log_archive: ArchiveConfig = field(default_factory=ArchiveConfig)
 
     @property
@@ -450,6 +477,7 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
     # 也因此在容器里换了工作目录、或在别处启动进程时都不会指到另一个目录去。
     config_dir = os.path.dirname(os.path.abspath(resolved))
     blog = _blog(_section(raw, "blog"), config_dir)
+    stickers_cfg = _stickers(_section(raw, "stickers"))
     # 归档目录同样以配置文件所在目录为基准，并在这里就检查它与知识库、记忆、
     # 稿库互不重叠（计划 §5.2）：写错一个路径不该等到运行期才发现。
     log_archive = _archive(
@@ -490,6 +518,7 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
         knowledge_base=knowledge_base,
         memory=memory,
         blog=blog,
+        stickers=stickers_cfg,
         log_archive=log_archive,
     )
 
@@ -1533,6 +1562,81 @@ def _blog_drafts_dir(value: str, config_dir: str) -> str:
     if os.path.isabs(value):
         return os.path.normpath(value)
     return os.path.normpath(os.path.join(config_dir, value))
+
+
+def _stickers(container: Mapping[str, Any]) -> StickerConfig:
+    """构造表情包配置（设计 §4.3）；**只在启用时**读取并校验条目。
+
+    关闭即不介入：`enabled: false` 时连 `collection` 与 `entries` 都不读，写错的
+    名字不会阻止一个从不发送表情的部署启动，与其它可选子系统的总开关一致。
+
+    校验的取值一律**不回显**：报错只用 `stickers.entries[3].name` 这类位置信息，
+    因为被拒绝的条目正是模型可能写错的名字，不该被写进启动日志。
+
+    碰撞检测必须在与运行期查表**同一归一口径**下进行（都走
+    `stickers.normalize_clue`）：否则全角与半角写法会生成两个不同的键，
+    配得出来的重名会在运行期悄悄覆盖彼此。
+    """
+    where = "stickers"
+    enabled = _bool_flag(container, "enabled", where, False)
+    if not enabled:
+        return StickerConfig()
+
+    collection = container.get("collection", STICKER_COLLECTION)
+    if collection != STICKER_COLLECTION:
+        # 首版不扩展成任意合集支持：换个合集名需要配套的素材语义，先拒绝。
+        raise ConfigError(f"配置 {where}.collection 首版必须是 {STICKER_COLLECTION}")
+
+    raw_entries = container.get("entries", [])
+    if raw_entries is None:
+        raw_entries = []
+    if not isinstance(raw_entries, list):
+        raise ConfigError(f"配置 {where}.entries 必须是列表")
+
+    # 归一后的查表键 -> 它在配置里的位置。键口径与 stickers.normalize_clue 完全一致。
+    seen: dict[str, str] = {}
+
+    def claim(value: str, path: str) -> None:
+        """把一个名称或别名登记进查表键空间；重复或归一后为空即配置错误。"""
+        key = stickers.normalize_clue(value)
+        if not key:
+            raise ConfigError(f"配置 {path} 归一后为空")
+        if key in seen:
+            raise ConfigError(f"配置 {path} 与 {seen[key]} 归一后重复")
+        seen[key] = path
+
+    entries: list[StickerEntryConfig] = []
+    for index, raw_entry in enumerate(raw_entries):
+        # 与 blog.tasks 一样用 1 起数的位置定位，方便维护者对着 YAML 找。
+        path = f"{where}.entries[{index + 1}]"
+        if not isinstance(raw_entry, dict):
+            raise ConfigError(f"配置 {path} 必须是映射")
+
+        raw_name = raw_entry.get("name")
+        reason = stickers.validate_sticker_name(raw_name)
+        if reason is not None:
+            # 契约里的坑（名字含 `_` 在线上会静默变成字面量）在这里挡在启动期；
+            # reason 是固定短句，不含被拒绝的取值。
+            raise ConfigError(f"配置 {path}.name 非法：{reason}")
+        name: str = raw_name
+        claim(name, f"{path}.name")
+
+        raw_aliases = raw_entry.get("aliases", [])
+        if raw_aliases is None:
+            raw_aliases = []
+        if not isinstance(raw_aliases, list) or any(
+            not isinstance(alias, str) for alias in raw_aliases
+        ):
+            raise ConfigError(f"配置 {path}.aliases 必须是字符串列表")
+        aliases: list[str] = []
+        for alias_index, alias in enumerate(raw_aliases):
+            # 别名只做查表键、永远不写进出站 token，因此不做名称那套字符集校验；
+            # 但它们与任何规范名、彼此之间仍然不得在归一后相撞。
+            claim(alias, f"{path}.aliases[{alias_index + 1}]")
+            aliases.append(alias)
+        entries.append(StickerEntryConfig(name=name, aliases=tuple(aliases)))
+
+    return StickerConfig(enabled=True, collection=collection, entries=tuple(entries))
 
 
 def _mcp_args(value: Any, server: str) -> tuple[str, ...]:

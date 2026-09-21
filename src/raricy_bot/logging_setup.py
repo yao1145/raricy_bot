@@ -124,6 +124,17 @@ FIELD_KINDS: dict[str, str] = {
     "free_bytes": TOKEN,
     "gap_count": TOKEN,
     "written_count": TOKEN,
+    # 表情包出站规范化（设计 §4.6）：`sticker.render` 的四个计数只描述一次归一里候选
+    # 的去向，互斥且完备 —— `candidates == kept + fixed + dropped`。正文与具体名字
+    # 属于模型生成的内容，一律不进日志，因此这四个字段都是计数。
+    "candidates": TOKEN,
+    "kept": TOKEN,
+    "fixed": TOKEN,
+    "dropped": TOKEN,
+    # 逐 token 敏感串复检的计数（设计 §4.1 第 3 步）。它与上面四个**处于不同阶段**、可以
+    # 重叠：能命中复检的只可能是被归一判为 kept 或 fixed 的 token。因此实际发出的 token
+    # 数是 `kept + fixed - dropped_for_secret`，不是 `candidates - dropped`。
+    "dropped_for_secret": TOKEN,
 }
 
 # 允许出现在日志里的字段名白名单；由 FIELD_KINDS 派生，两者不允许各存一份。

@@ -1,4 +1,4 @@
-"""消息发送器：脱敏、截断、配额预留、发消息与「结果不确定」时的对账。
+"""消息发送器：脱敏、表情归一、截断、配额预留、发消息与「结果不确定」时的对账。
 
 发送流程见 `docs/design/INTERFACES.md` §13。两条硬约束：
 
@@ -27,11 +27,12 @@ from dataclasses import dataclass
 
 from ..config import BehaviorConfig
 from ..logging_setup import get_logger, log_event
+from ..outbound import prepare_outbound
 from ..quota import Decision, QuotaGuard
 from ..redact import Redactor
 from ..site.client import SiteClient, SiteError
 from ..site.models import ChatMessage
-from ..text_utils import truncate_at_paragraph
+from ..stickers import StickerTable
 from ..store import Store
 
 _LOGGER = get_logger("sender")
@@ -90,6 +91,7 @@ class MessageSender:
         quota: QuotaGuard,
         redactor: Redactor,
         cfg: BehaviorConfig,
+        table: StickerTable | None = None,
         logger=None,
     ) -> None:
         self._client = client
@@ -97,6 +99,8 @@ class MessageSender:
         self._quota = quota
         self._redactor = redactor
         self._cfg = cfg
+        # 表情表：None 表示功能关闭，出站管线跳过归一，正文一个字节不动（设计 §4.1）。
+        self._table = table
         self._logger = logger if logger is not None else _LOGGER
         # 受取消保护的终结任务强引用（计划 §4.2 第 3 条）：`asyncio` 只对 task
         # 持弱引用，调用方在 `await` 处被取消而提前退出时，必须由这里保住引用，
@@ -113,7 +117,7 @@ class MessageSender:
         actor_id: str | None = None,
         thread_root_id: int | None = None,
     ) -> SendResult:
-        """脱敏、截断后发送；`kind` 与 `actor_id` 原样透传给 `quota`（三值见 §10）。
+        """脱敏、表情归一与截断后发送；`kind` 与 `actor_id` 原样透传给 `quota`（三值见 §10）。
 
         `actor_id` 是触发这条消息的用户，只有 `kind="notice"` 用得上：
         主动通知的冷却按 (频道, 触发者) 计（D-18）。
@@ -121,10 +125,30 @@ class MessageSender:
         `thread_root_id` 是大区共享链的根：非空时随 `record_sent` 一起写入映射，
         让这条出站消息成为后续加入该链的锚点（D-20）。私聊恒为 None。
         """
-        # 第 1 步：先脱敏，再在自然段边界截断。
-        redacted = self._redactor.redact(text)
-        content = truncate_at_paragraph(redacted, self._cfg.max_output_chars)[0]
+        # 第 1 步：脱敏 → 表情归一 → 逐 token 敏感串复检 → 在自然段边界截断。
+        # 归一是纯函数、可能让正文变长，因此与截断同处一次收口（outbound.py，设计 §4.1）。
+        content, report = prepare_outbound(
+            text,
+            redactor=self._redactor,
+            table=self._table,
+            max_chars=self._cfg.max_output_chars,
+        )
+        if report.sticker is not None:
+            # 功能关闭（`table is None`）时不记事件，避免噪声。只记计数，不记正文与名字。
+            log_event(
+                self._logger,
+                logging.INFO,
+                "sticker.render",
+                channel_id=channel_id,
+                kind=kind,
+                candidates=report.sticker.candidates,
+                kept=report.sticker.kept,
+                fixed=report.sticker.fixed,
+                dropped=report.sticker.dropped,
+                dropped_for_secret=report.dropped_for_secret,
+            )
         if not content.strip():
+            # 判空必须留在 `quota.reserve` **之前**，否则这一笔预留会被白占一次。
             return SendResult(False, None, "failed")
 
         # 第 2 步：配额预留；三种拒绝都不写 send_attempts。

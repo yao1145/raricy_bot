@@ -16,10 +16,11 @@ from typing import Any
 
 from ..config import CommentConfig
 from ..logging_setup import get_logger, log_event
+from ..outbound import OutboundReport, prepare_outbound
 from ..redact import Redactor
 from ..site.client import SiteClient, SiteError
 from ..site.comment_models import CommentNode
-from ..text_utils import truncate_at_paragraph
+from ..stickers import StickerTable
 from .router import CommentRequest
 
 logger = get_logger("comments.sender")
@@ -80,6 +81,7 @@ class CommentSender:
         redactor: Redactor,
         cfg: CommentConfig,
         self_user_id: str | None = None,
+        table: StickerTable | None = None,
         logger_instance: logging.Logger | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
@@ -89,6 +91,8 @@ class CommentSender:
         self._redactor = redactor
         self._cfg = cfg
         self._self_user_id = self_user_id
+        # 表情查找表；None 表示表情功能关闭，`prepare_outbound` 会整段跳过归一（设计 §4.5）。
+        self._table = table
         self._logger = (
             logger_instance
             if logger_instance is not None
@@ -141,7 +145,9 @@ class CommentSender:
             self._log(result, target.blog_id, kind)
             return result
 
-        content = self._prepare_content(text)
+        content = self._prepare_content(
+            text, blog_id=target.blog_id, comment_id=target.comment_id
+        )
         if not content.strip():
             return CommentSendResult(False, None, "failed")
 
@@ -180,11 +186,63 @@ class CommentSender:
         self._log(result, target.blog_id, kind)
         return result
 
-    def _prepare_content(self, text: str) -> str:
-        """生成唯一的实际出站正文：先脱敏，再按自然段截断。"""
-        return truncate_at_paragraph(
-            self._redactor.redact(text), self._cfg.max_output_chars
-        )[0]
+    def _prepare_content(
+        self,
+        text: str,
+        *,
+        blog_id: str | None = None,
+        comment_id: str | None = None,
+    ) -> str:
+        """生成唯一的实际出站正文：脱敏 → 表情归一 → 敏感串复检 → 截断（设计 §4.1、§4.5）。
+
+        `max_output_chars` 现在是**含截断提示在内**的最终上限（设计 §4.1），因此不再直接
+        调用 `truncate_at_paragraph`；收口与顺序都由 `prepare_outbound` 一处决定。表情功能
+        关闭（`table is None`）时跳过归一，正文除脱敏与截断外一个字节不动。
+
+        归一确实发生时记一条 `sticker.render`：只记四个计数与逐 token 复检计数，不记正文、
+        不记名字（§4.6）。`blog_id` / `comment_id` 只在日志里用作定位字段。
+        """
+        content, report = self._normalize(text)
+        self._log_sticker(report, blog_id=blog_id, comment_id=comment_id)
+        return content
+
+    def _normalize(self, text: str) -> tuple[str, OutboundReport]:
+        """出站正文的唯一收口。
+
+        实际发送（`_prepare_content`）与远端对账重建已发布正文（`_reconcile_and_retry`）
+        必须共用它：两边若用不同口径（例如一边归一、一边不归），历史里留下的正文就可能
+        与真正发出去的那份分叉。`prepare_outbound` 对已规范化的正文是恒等变换，因此对
+        对账拿回的远端正文再跑一遍不会改动字节。
+        """
+        return prepare_outbound(
+            text,
+            redactor=self._redactor,
+            table=self._table,
+            max_chars=self._cfg.max_output_chars,
+        )
+
+    def _log_sticker(
+        self, report: OutboundReport, *, blog_id: str | None, comment_id: str | None
+    ) -> None:
+        """表情功能开启且这一趟确实跑过归一（`sticker is not None`）时记一条事件。
+
+        关闭时 `report.sticker` 为 None，一个字段都不记 —— 与「关闭即不介入」一致。
+        """
+        sticker = report.sticker
+        if sticker is None:
+            return
+        log_event(
+            self._logger,
+            logging.INFO,
+            "sticker.render",
+            blog_id=blog_id or "",
+            comment_id=comment_id or "",
+            candidates=sticker.candidates,
+            kept=sticker.kept,
+            fixed=sticker.fixed,
+            dropped=sticker.dropped,
+            dropped_for_secret=report.dropped_for_secret,
+        )
 
     def _coerce_request(
         self,
@@ -348,10 +406,13 @@ class CommentSender:
             recorded = await self._record_sent(
                 request, chosen, kind, reservation_token=reservation_token
             )
+            # 对账命中时这份正文会作为「实际发布正文」返回（`CommentSendResult.content`），
+            # 并最终写进评论短期历史（`_published_text`）。因此它必须与真正发出去的那份
+            # 同口径：走 `_normalize`（脱敏 → 归一 → 复检 → 截断），而不是只脱敏截断。
+            # `prepare_outbound` 对已规范化的正文是恒等变换，远端正文本就是当时发出的字节，
+            # 所以这里通常不改动它；这一步是为了不让归一上线后两份正文分叉。
             matched_content = (
-                truncate_at_paragraph(
-                    self._redactor.redact(chosen.content), self._cfg.max_output_chars
-                )[0]
+                self._normalize(chosen.content)[0]
                 if isinstance(chosen.content, str)
                 else content
             )

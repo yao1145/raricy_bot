@@ -169,6 +169,7 @@ class CommentService:
         model_gate: asyncio.Semaphore | None = None,
         context_manager: object | None = None,
         system_prompt: str = "",
+        sticker_addendum: str = "",
         content_refs: ContentRefResolver | None = None,
         image_loader: ImageLoader | None = None,
         memory_context: (
@@ -204,6 +205,11 @@ class CommentService:
             now=self.now,
         )
         self.system_prompt = system_prompt
+        # 表情包静态附加说明（设计 §4.5）：由装配层从启动时已校验的部署配置渲染后注入，
+        # 空串表示表情功能关闭 —— 此时与升级前逐字节一致，不追加任何内容。它并入
+        # system 的静态附加说明段（`COMMENT_SYSTEM_ADDENDUM` 之后、时间片段之前），
+        # 因此主路径与无 `ContextManager` 的回退分支都拿得到。
+        self.sticker_addendum = sticker_addendum
         # 内容引用解析器（§25）；没注入时正文里的 `[@<ID>]` 保持字面量。
         self.content_refs = content_refs
         # 图片输入（§20）；None 表示视觉关闭（或评论侧名额为 0），一个字节都不取。
@@ -1173,6 +1179,12 @@ class CommentService:
         )
         system = self.system_prompt or ""
         addendum = texts.COMMENT_SYSTEM_ADDENDUM
+        # 表情说明并入**同一个** `addendum` 变量（设计 §4.5）：主路径把它作为
+        # `system_addendum` 交给 `build_messages`，回退分支用的是下面已经拼过它的 `system`，
+        # 因此两条分支都拿得到，且都排在时间片段之前（D-114 第 2 条）。关闭时
+        # `sticker_addendum` 为空串，不产生多余分隔符，system 与升级前逐字节一致。
+        if self.sticker_addendum:
+            addendum = addendum + "\n\n" + self.sticker_addendum
         system = f"{system}\n\n{addendum}" if system else addendum
         context = self.context_manager
         if context is not None and hasattr(context, "build_messages"):

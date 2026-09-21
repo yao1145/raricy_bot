@@ -99,11 +99,13 @@ from .memory.service import MemoryService
 from .memory.subjects import PublicMemoryInputs, PublicMemorySubjectResolver
 from .memory.writer import MemoryWriter
 from .ops import OpsServer
+from .outbound import prepare_outbound
 from .quota import QuotaGuard, notice_cooldown_key
 from .redact import Redactor
 from .site.client import SiteClient, SiteError
 from .site.models import LOBBY, ChatMessage
 from .site.sse import SSEReceiver
+from .stickers import StickerTable
 from .store import Store
 from .text_utils import has_media, truncate_at_paragraph
 
@@ -305,12 +307,27 @@ class BotApp:
         # 聊天和评论共用同一模型门；评论 worker 仍保持自身 concurrency=1。
         self._model_gate = asyncio.Semaphore(config.behavior.concurrency)
         self._quota = QuotaGuard(self._store, config.behavior)
+        # 表情包出站规范化（设计 §4.3、§4.4）：装配期构造**一次**，两个 Sender 与聊天
+        # system 共用同一份。`enabled=false` 时表为 None、提示词为空串，正文与 system
+        # 一个字节都不变；提示词正文只在名字表非空时才非空（`sticker_system_addendum`
+        # 对空 names 返回空串）。
+        self._sticker_table = (
+            StickerTable.from_config(config.stickers) if config.stickers.enabled else None
+        )
+        self._sticker_addendum = (
+            texts.sticker_system_addendum(
+                collection=config.stickers.collection, names=self._sticker_table.names
+            )
+            if self._sticker_table is not None
+            else ""
+        )
         self._sender = MessageSender(
             client=self._client,
             store=self._store,
             quota=self._quota,
             redactor=self._redactor,
             cfg=config.behavior,
+            table=self._sticker_table,
         )
 
         # 注入的假模型不归本对象关闭；内部构造的才需要 aclose。
@@ -531,6 +548,8 @@ class BotApp:
                     redactor=self._redactor,
                     cfg=self._config.comments,
                     self_user_id=user.id,
+                    # 与聊天侧共用同一张表：评论出站也走 `prepare_outbound`（设计 §4.5）。
+                    table=self._sticker_table,
                 )
                 self._comment_router = CommentRouter(
                     self_user_id=user.id,
@@ -558,6 +577,10 @@ class BotApp:
                     quota=self._comment_quota,
                     context_manager=self._comment_ctx,
                     system_prompt=self._config.system_prompt,
+                    # 与聊天 system 同一份表情附加说明（设计 §4.5）；关闭时是空串，
+                    # 评论侧的 system 与升级前逐字节一致。无 `ContextManager` 的回退分支
+                    # 由评论子系统内部单独拼接（那一条不走 `build_messages`）。
+                    sticker_addendum=self._sticker_addendum,
                     content_refs=self._comment_ref_resolver,
                     image_loader=(
                         self._image_loader if self._comment_vision else None
@@ -1130,10 +1153,11 @@ class BotApp:
                 content=result.content,
                 created=result.action is ProposalAction.ADD,
             )
-            # 预留按**脱敏后**的长度算：Sender 先脱敏、后截断（core/sender.py 第 1 步），
-            # 而模型回显一个比 "[redacted]" 短的密钥会让正文变长 —— 拼好的文本就会顶出上限，
-            # 披露的尾巴被 Sender 的第二次截断切掉（D-63 要防的正是这个）。脱敏不会把文本变
-            # 短到需要补回，所以这里只减正增长；外送的仍是模型原文，脱敏依旧由 Sender 统一做。
+            # 预留按**脱敏后**的长度算：Sender 先脱敏、后截断（core/sender.py 第 1 步）。
+            # 聊天调用方现在已先把正文归一 + 脱敏（`prepare_outbound`，max_chars=None），
+            # 因此这里的 `growth` 通常为 0；算术保持不变，既覆盖未经预处理的调用方，也让
+            # 「披露 + 增长 + 截断提示」三段预留继续成立——否则拼好的文本会顶出上限，披露的
+            # 尾巴被 Sender 的第二次截断切掉（D-63 要防的正是这个）。
             growth = max(len(self._redactor.redact(answer)) - len(answer), 0)
             limit = (
                 self._config.behavior.max_output_chars
@@ -1528,6 +1552,11 @@ class BotApp:
                 addendum = capability.system_addendum
                 if addendum is not None:
                     system_addenda.append(addendum)
+            # 表情包用法的静态附加说明（设计 §4.4/§4.5）：继模块级常量与时钟片段之后的
+            # 第三类 system 来源，只从启动时已校验的部署配置渲染。它必须排在时间片段**之前**——
+            # 时间片段由 `build_messages` 追加，天然在最后（D-114 第 2 条）。关闭时是空串，不追加。
+            if self._sticker_addendum:
+                system_addenda.append(self._sticker_addendum)
             # 记忆候选只在本轮作者可用时取（§34.3）；取失败传空元组继续，绝不打断聊天（D-60）。
             # 位置在 `/kb` 的本地收口之后：那些分支本来就不调模型，也就没有必要读记忆。
             supplemental: tuple[SupplementalItem, ...] = ()
@@ -1682,11 +1711,31 @@ class BotApp:
                 )
                 return
 
+            # 表情归一必须排在自动提取**之前**（设计 §4.5）：短期历史提交的是模型原文，
+            # 而披露绝不进历史，所以历史拿到的必须是「已归一、不含披露」的正文，否则会留下
+            # 未修正的坏 token，下一轮模型模仿自己。这里传 `max_chars=None`：归一要做，
+            # 但**不能**截断——否则 `_auto_capture_answer` 再截一次，正文末尾会出现两个提示。
+            rendered, _report = prepare_outbound(
+                text,
+                redactor=self._redactor,
+                table=self._sticker_table,
+                max_chars=None,
+            )
+            if not rendered.strip():
+                # 归一后判空：模型整条回复就是一个非法 token，或只剩空白。若放行，空正文会流进
+                # `_auto_capture_answer`，自动记忆写入成功时返回「空 body + 非空披露」，于是发出
+                # 一条只含记忆披露的回复，并向历史提交一条空的 assistant 轮次（设计 §4.5）。
+                # 收口：复查代次后走既有的失败通知；不提取记忆、不发送、不写历史。
+                if self._ctx.generation(request.session_key) == request.generation:
+                    await self._notify_failure(request)
+                return
+
             # 自动提取（§34.4）就在这一格：主模型已经给出回答、这条回答还没有发出。
             # 位置在代次检查之二**之后**：被 /reset 作废的那一轮连提取都不做（本方法自己
-            # 还会再复查一次代次）。它换出来的是**要发出的文本**，历史提交仍用模型原文 `text` ——
-            # 披露里就是记忆正文，绝不进历史（§33 的红线）。
-            send_text = await self._auto_capture_answer(request, text)
+            # 还会再复查一次代次）。它换出来的是**要发出的文本**，历史提交用已归一的
+            # `rendered`（不含披露）—— 披露里就是记忆正文，绝不进历史（§33 的红线）。
+            # 披露预算按归一后的长度算，`growth` 那套算术不用改。
+            send_text = await self._auto_capture_answer(request, rendered)
 
             # 发送器也是异步边界；/reset 在此期间到达时，旧请求不得再发送。
             # 自动提取本身也是一段异步边界，这个检查因此不只是形式：记忆已经落盘而回复不发的
@@ -1717,7 +1766,7 @@ class BotApp:
                     self._ctx.append_exchange(
                         request.session_key,
                         history_user,
-                        text,
+                        rendered,
                         subject=request.public_memory_subject,
                     )
             if outcome.reason == "quota":
