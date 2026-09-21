@@ -752,6 +752,17 @@ mutation，挡不住「等待模型期间完成的隐私操作被迟到结果越
 控制器不再自建一套（旧路径在撰写前查开关，无法阻止提交）。这条保证的是**提交授权**，不声称能
 撤回此前已经发送给模型的数据。
 
+授权检查有两处，各管一段、**不是重复**。第一处在 `_mutate_private` 入口（`commit_auto_capture`
+经 `capture_token=token` 传入）：用的是本入口拿到的 TTL 缓存快照，且必须跑在 `screen` 之前 ——
+守住「令牌失效 → 稳定 `noop`」优先于「密钥命中 → `secret_detected`」的既有次序，也免去为一次
+注定 noop 的提交跑完 `_write_document`。但这份缓存快照看不见**真正要写盘的前提**：`_write_document`
+发现磁盘摘要变化时会接手外部版本，并以那份外部基线**重放 applier**。进程内代次
+（`_capture_generation`）只拦得住隐私命令路径，外部手改文件（把 `auto_capture` 改成 `False`、
+直接删掉文件）不会推进代次，所以授权必须再对**每一份真正成为写入前提的基线**重判一次
+`document.auto_capture`。第二处因此在 applier（`_apply_guarded_proposal` 新增关键字参数
+`capture_token`）里做：失效同样返回 `(None, STATUS_NOOP, None)`，不写盘、不产生披露。用户命令
+路径的 `apply_private_proposal` 不受自动提取令牌约束，不传该参数。
+
 <a id="d-116"></a>
 
 ## D-116 端点「不支持 tools」只属本次调用（取代 D-34 的进程内缓存）
@@ -759,14 +770,19 @@ mutation，挡不住「等待模型期间完成的隐私操作被迟到结果越
 `OpenAIModelClient` 不再持有「tools 不支持」的共享可变标记：普通 400/404 只终结当前请求并归类
 `bad_request`。`tools_unsupported` 只在提供方给出**结构化**错误时产生
 （`core/worker.py::_is_tools_unsupported`：`error.param` 精确为 `tools` / `tool_choice` /
-`parallel_tool_calls`，且 `code` / `type` 命中窄白名单），且只是**本次调用**的结论。App 与
-`blog/writer.py` 只依据 `ModelError.kind` 决定本地提示，不再读模型客户端的共享可变属性。
-本条目**取代 D-34 末句**「确定模型不支持 tools 时在本进程缓存」。
+`parallel_tool_calls`，且 `code` 命中明确的不支持错误码白名单，即 `_TOOLS_UNSUPPORTED_CODES`），
+且只是**本次调用**的结论。App 与 `blog/writer.py` 只依据 `ModelError.kind` 决定本地提示，不再读
+模型客户端的共享可变属性。本条目**取代 D-34 末句**「确定模型不支持 tools 时在本进程缓存」。
+
+本轮**收紧**本条目原先「`code` / `type` 命中窄白名单」的写法：通用 `type`
+（`invalid_request_error`）不再参与判定，`_TOOLS_UNSUPPORTED_TYPES` 已删除。原因是
+`code=invalid_function_parameters` 这类**具体**错误码表示工具的**参数值/形状**有错，并非端点不支持
+该参数，而旧写法里的通用 `type` 会盖过它、把参数错误误判成「能力不可用」。
 
 取舍：真正不支持工具的端点会在后续调度点被重新尝试一次（用一次多余请求换掉「一次无关错误
-持续到重启」）。窄判定会漏判只在正文里写「不支持工具」的提供方，它们退回通用 `bad_request`
-—— 漏判只让一次调用按普通错误处理，误判却会把无关错误改写成「能力不可用」，二者不对称。
-本轮不新增 TTL 缓存或恢复探测状态机。
+持续到重启」）。窄判定会漏判**缺 `code`** 的提供方 —— 只把「不支持工具」写进正文、或只给通用
+`type` 而不给具体错误码 —— 它们退回通用 `bad_request`。之所以接受漏判：漏判只让一次调用按普通
+错误处理，误判却会把无关错误改写成「能力不可用」，二者不对称。本轮不新增 TTL 缓存或恢复探测状态机。
 
 <a id="d-117"></a>
 
@@ -776,12 +792,20 @@ mutation，挡不住「等待模型期间完成的隐私操作被迟到结果越
 `_reconcile` 只做 POST 与对账、**不结算**；`send` 是唯一结算点，确认送达后由 `_commit_delivery`
 把 `store.record_sent` 与 `quota.note_sent` 收敛成一次受取消保护的终结操作（`_run_settlement`：
 `ensure_future` + `shield` + 强引用集合 `_settle_tasks`）。重复取消只提前传播，内层 task 不在
-取消作用域内，因此不二次 POST、不双重记账。新增公开方法 `MessageSender.wait_settled()`
-（跨模块契约见 §13），`app._shutdown` 在 `Store` 关闭前调用它（§16）。`QuotaGuard.note_sent`
-用 `settled` 标志 + `except asyncio.CancelledError` 兜住结算中途的取消（§10）。
+取消作用域内，因此不二次 POST、不双重记账。等待是**有界**的：`_run_settlement` 在传播取消前经
+新私有方法 `_await_settlement` 等待，用一次算好的截止时刻封顶（重复取消不重置预算）；`wait_settled()`
+从 `gather` 改为 `asyncio.wait(pending, timeout=...)`。两处各自封顶模块常量
+`_SETTLE_WAIT_TIMEOUT_SECONDS`（3 秒），两次上限之和仍留在 App 的 10 秒关闭总预算内；超时只记一条
+`sender.settle_timeout`（`count=N`）便返回，**不取消**内层终结任务 —— 强引用仍在、任务仍会自行跑完。
+新增公开方法 `MessageSender.wait_settled()`（跨模块契约见 §13），`app._shutdown` 在 `Store` 关闭前
+调用它（§16）。`QuotaGuard.note_sent` 用 `settled` 标志 + `except asyncio.CancelledError` 兜住结算
+中途的取消（§10）。
 
-已知边界：强制杀进程 / 断电 / 超出既有 10 秒关闭预算，不承诺「远端发送」与「本地记账」跨系统
-原子一致；事件循环整体拆除时仍存活的终结 task 被 cancel，该硬路径下内存预留可能丢失。远端结果
+已知边界：强制杀进程 / 断电时，不承诺「远端发送」与「本地记账」跨系统原子一致；关闭路径上内层
+终结因磁盘满、SQLite 卡死、锁被长期持有等病态原因**超出有界等待**（`_SETTLE_WAIT_TIMEOUT_SECONDS`）
+时，超时放弃等待会让那笔本地记账丢失（预留的结清仍由 `quota.note_sent` 的取消保护兜住，写库却
+可能撞上已关闭的 `Store`）。这是刻意的取舍：宁可 `App.stop()` 能结束，也不要被一个永久阻塞的
+写库拖住。事件循环整体拆除时仍存活的终结 task 被 cancel，该硬路径下内存预留可能丢失。远端结果
 尚不确定时被取消仍按既有语义释放预留、不盲目重投（D-8）。
 
 <a id="d-118"></a>

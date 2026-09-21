@@ -153,7 +153,8 @@ docker run --rm -it --pid=container:<容器> --cap-add SYS_PTRACE \
    **2026-09-21**：已修复永久负缓存。客户端不再持有「不支持 tools」的共享可变标记；普通
    400/404 只终结当前请求并归类 `bad_request`；`tools_unsupported` 只在提供方返回**结构化**
    错误时产生（`core/worker.py::_is_tools_unsupported`：`error.param` 精确为 `tools` /
-   `tool_choice` / `parallel_tool_calls`，且 `code` / `type` 命中窄白名单），且只属**本次调用**。
+   `tool_choice` / `parallel_tool_calls`，且 `code` 命中明确的不支持错误码白名单；只认 `code`，
+   通用 `type` 不作依据），且只属**本次调用**。
    App 与 `blog/writer.py` 只依据 `ModelError.kind`，不再读模型客户端的共享属性（D-116）。
    对应的离线回归用例在 `tests/test_tools_capability.py`，消费方回归在 `tests/test_app.py` 与
    `tests/test_blog_publish_model.py`（`tests/` 被 Git 忽略，不入库）。

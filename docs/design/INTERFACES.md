@@ -200,10 +200,14 @@ DM 按频道，公开链用 `lobby-thread:<root_id>`，重启保留归属但不�
 `_Delivery(result, record, charge)` 回报是否已确认送达；`send` 是唯一结算点，确认送达后由
 `_commit_delivery` 把 `store.record_sent` 与 `quota.note_sent` 收敛成一次受取消保护的终结操作
 （`_run_settlement`：`ensure_future` + `shield` + 强引用集合 `_settle_tasks`）。**新增公开方法
-`MessageSender.wait_settled()`**：等待所有在途终结任务结束，供关闭路径在 `Store` 关闭前调用
-（§16）。取消只延迟传播，不把已确认送达改判成 release（D-117）。
+`MessageSender.wait_settled()`**：等待所有在途终结任务结束；等待是**有界**的
+（`_SETTLE_WAIT_TIMEOUT_SECONDS`，3 秒），超时记一条 `sender.settle_timeout` 便返回，**不取消**
+在途终结任务（强引用仍在、仍会跑完），供关闭路径在 `Store` 关闭前调用（§16）。取消只延迟传播，
+不把已确认送达改判成 release（D-117）。
 
-强制杀进程、断电或超出既有 10 秒关闭预算时，不承诺远端发送与本地记账跨系统原子一致。
+强制杀进程或断电时，不承诺远端发送与本地记账跨系统原子一致；即便在正常关闭路径，有界等待超时
+（在途终结因存储阻塞等病态原因未结）也会放弃等待、让关闭继续，代价是丢掉那一笔本地记账
+（预留的结清仍由 `quota.note_sent` 的取消保护兜住）。
 
 ## 14. `core/worker.py`
 
@@ -215,7 +219,8 @@ SDK `max_retries=0`，重试只由本层控制：网络错误、429、5xx 最多
 **工具能力没有永久负缓存**（D-116）：客户端不持有「不支持 tools」的共享可变标记；普通
 400/404 只终结当前请求并归类 `bad_request`；`tools_unsupported` 只在提供方给出结构化错误时
 产生（`_is_tools_unsupported`：`error.param` 精确为 `tools` / `tool_choice` /
-`parallel_tool_calls`，且 `code` / `type` 命中窄白名单），且只属**本次调用**。App 与
+`parallel_tool_calls`，且 `code` 命中明确的不支持错误码白名单，即 `_TOOLS_UNSUPPORTED_CODES`；
+通用 `type` 不作依据），且只属**本次调用**。App 与
 `blog/writer.py` 只依据 `ModelError.kind`，不再读模型客户端上的共享属性。
 
 `WorkerPool` 消费的是 `core/scheduler.py::SessionScheduler`（`RunnableQueue` 协议），不再从
@@ -241,7 +246,8 @@ resync 拉取按 message ID 去重，空 event ID 不抬水位。
 两条队列都是 `SessionScheduler`（§14），容量取 `behavior.queue_size` / `memory.queue_size`；
 记忆 worker 并发固定为 1。关闭顺序里，`_shutdown` 在 `Store` 关闭**之前**调用
 `MessageSender.wait_settled()`，等在途的受取消保护终结任务（`record_sent` + `note_sent`）
-结束，再关 `Store`，避免它们撞上已关闭的连接（D-117）。
+结束，再关 `Store`，避免它们撞上已关闭的连接。`wait_settled()` 有界（超时放弃等待、让关闭
+继续，见 §13 / D-117）。
 
 ## 16.1 评论子系统
 
@@ -401,9 +407,12 @@ clear 保留幂等元数据。私有读取停用不等于删除。
 **自动提取的提交授权**（D-115）：`begin_auto_capture` 在写锁内一并取得授权、条目快照与
 该用户提取代次，返回不透明 `AutoCaptureToken`（`memory/models.py`）；模型调用在锁外。
 `commit_auto_capture` 在写锁内复核 token 的 epoch / `_enabled` / `document.auto_capture` /
-generation，失效返回稳定 `noop`（不写、不产生披露）。失效入口是 `set_auto_capture(False)`、
-`set_private_enabled(False)`、`clear_private`、`delete_private`；失效处理先于应用，因此值未变的
-no-op 路径同样生效。代次与纪元都是进程内字段，不落盘。
+generation，失效返回稳定 `noop`（不写、不产生披露）；并把令牌传给 applier
+（`_apply_guarded_proposal` 的 `capture_token`），在**实际写入的基线**上复查授权 ——
+`_write_document` 接手外部版本后会用该基线重放 applier，入口的 TTL 缓存快照看不见它，因此外部把
+`auto_capture` 改成 `False`、或直接删掉私有文件时，迟到的提交同样落稳定 `noop`。失效入口是
+`set_auto_capture(False)`、`set_private_enabled(False)`、`clear_private`、`delete_private`；
+失效处理先于应用，因此值未变的 no-op 路径同样生效。代次与纪元都是进程内字段，不落盘。
 
 ## 31. `memory/writer.py`（AI 撰写器）
 

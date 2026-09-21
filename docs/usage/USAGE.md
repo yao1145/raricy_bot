@@ -111,6 +111,7 @@
 - **关闭或清空会作废在途的自动提取**：`/memory off`、`/memory auto off`、`/memory clear`
   成功后，此前已经开始、还没写完的那次自动提取不再写入，不会在你关掉之后又冒出一条记忆。
   （已经交给模型的那段原文无法收回，这条保证的是**不再写入**。）
+  你自己直接编辑私有文件、把 `auto_capture` 关掉（或直接删掉文件）同样算数。
 - **公开的是发布那一刻的快照**：之后改私人条目，公开的那一份不会跟着变。
 - **`/reset` 不等于删除**：它只换一段新对话，已保存的条目还在，已经公开的仍然公开。
 - 条目有上限（默认私有 32 条、公开 8 条）；到顶我会实话实说，绝不自动删除已有条目。
@@ -256,7 +257,7 @@
 | 不做模糊匹配 | 同上：只按完整合法用户名 token 精确比对，`alice` 不会命中 `alice2` |
 | 未公开的私有条目绝不进入公开请求 | 公开路径只读 `root_dir/public/`，不是「读了私人文件再过滤」（D-96、Global Constraints 第 7 条）；`users/<存储键>.md` 在 `lobby` / `comment` 两种频道下一次都不打开 |
 | `/memory off` 不撤回公开条目 | D-102：`off` 只改私聊里的读取与自动提取开关；回复里逐字说明「你此前公开过的条目仍然公开」（`MEMORY_OFF_DONE_TEXT`） |
-| `/memory off`、`/memory auto off`、`/memory clear` 作废在途自动提取 | `MemoryService.commit_auto_capture` 在写锁内复核 `AutoCaptureToken` 的 epoch / 授权开关 / generation，失效返回稳定 noop；失效入口为 `set_auto_capture(False)`、`set_private_enabled(False)`、`clear_private`、`delete_private`（D-115） |
+| `/memory off`、`/memory auto off`、`/memory clear` 作废在途自动提取 | `MemoryService.commit_auto_capture` 在写锁内复核 `AutoCaptureToken` 的 epoch / 授权开关 / generation，并把令牌传给 applier 在**实际写入的基线**上复查授权，失效返回稳定 noop；失效入口为 `set_auto_capture(False)`、`set_private_enabled(False)`、`clear_private`、`delete_private`（D-115） |
 | 撤回入口是 `/memory unpublic <UM-ID>` | 公开与撤回走 `MemoryService.publish_private` / `unpublish_private`，成功文案由 `texts.memory_published_text` / `memory_unpublished_text` 给出（§50） |
 | `/memory clear` 先撤回公开副本、再删除私人条目 | D-100 的两阶段删除；确认文案报出本次「撤回 N 条、删除 M 条」，重放时如实报 0（`texts.memory_cleared_text`） |
 | `/reset` 不删除长期记忆 | `core/router.py` 的 reset 分支只作废短上下文；记忆条目只由 `/memory forget` / `/memory clear` 删除，公开副本只由 `/memory unpublic` 撤回（§32、D-100） |
