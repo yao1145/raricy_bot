@@ -6,7 +6,11 @@
   （成功、确定失败、重发失败、异常、取消）都恰好转为 `note_sent()` 或 `release()` 一次；
 - **已确认送达不被取消改判**：`POST` 成功返回后，本地发送记录与配额转正收敛为
   一次受取消保护的终结操作（`_commit_delivery`）；调用方在等待结算时被取消，
-  只延迟取消传播，不会把这次已送达的发送降级成 release；
+  只延迟取消传播，不会把这次已送达的发送降级成 release。等待是**有界**的
+  （`_SETTLE_WAIT_TIMEOUT_SECONDS`）：超时后不再等待，但终结任务本身不被取消、
+  仍持有强引用；因此关闭路径上超预算的病态阻塞会丢掉那一笔本地记账
+  （预留的结清仍由 `quota.note_sent` 的取消保护兜住，写库却可能撞上已关闭的
+  Store —— 这是刻意的取舍：宁可 `stop()` 能结束，也不要无限挂住）；
 - **只有 `SiteError.status == 0` 才是结果不确定**，其余状态都是确定答复，
   不确定时才进入对账，且最多重发一次（D-8：对账窗口 `after=reply_to, limit=100`）。
   远端结果尚不确定时被取消，保留既有语义：释放预留，绝不盲目重投（计划 §4.2 第 7 条）。
@@ -35,6 +39,10 @@ _LOGGER = get_logger("sender")
 # 403 里判定「客户端配置错误」的标记（D-4）：命中说明是我方错误地设置了
 # Origin / Referer，属于程序缺陷，不是账号权限问题，绝不该进入探测重试。
 _CSRF_MARKERS: tuple[str, ...] = ("跨源", "CSRF")
+
+# 受取消保护的终结最多等多久。两处等待各自封顶：传播取消前等待终结、关闭时汇合在途终结；
+# 两次上限之和仍留在 App 的 10 秒关闭总预算内（正常情况只是两笔 SQLite 写，毫秒级结束）。
+_SETTLE_WAIT_TIMEOUT_SECONDS: float = 3.0
 
 
 def _forbidden_reason(message: str) -> str:
@@ -150,29 +158,45 @@ class MessageSender:
         return delivery.result
 
     async def wait_settled(self) -> None:
-        """等待所有在途终结任务结束。
+        """等待在途终结任务结束；有截止时间，超时只记事件并返回。
 
         关闭路径在 `Store` 关闭前调用（计划 §4.2 第 6 条）：正常取消已经由
         `_run_settlement` 在传播前等待到位，但重复取消有可能让调用方提前退出，
         留下仍在写库的终结任务。这里给它们一个统一的汇合点，避免 Store 关掉后
-        它们还在访问数据库。不新增后台任务，等待的是本来就有生命周期的终结任务；
-        等待长度只是最多两笔 SQLite 写，落在 App 既有的 10 秒总预算内。
+        它们还在访问数据库。不新增后台任务，等待的是本来就有生命周期的终结任务。
+
+        **等待是有界的**（`_SETTLE_WAIT_TIMEOUT_SECONDS`）：若在途终结因存储阻塞等
+        病态原因超时未结，本方法只记一条 `sender.settle_timeout` 事件便返回，不再
+        等待 —— 这也意味着 `Store` 可能在那笔终结写库完成前就被关闭，丢掉那笔本地
+        记账。终结任务本身不被取消、仍被强引用，超预算时它仍会自行跑完
+        （预留的结清由 `quota.note_sent` 的取消保护兜住）。这样 `App.stop()` 的关闭
+        总预算才不会被一个永久阻塞的写库拖穿。
         """
         pending = tuple(self._settle_tasks)
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        if not pending:
+            return
+        # 用 asyncio.wait 而不是 gather：等到超时或本方法被取消都不会连带取消终结任务。
+        _, still_running = await asyncio.wait(pending, timeout=_SETTLE_WAIT_TIMEOUT_SECONDS)
+        if still_running:
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "sender.settle_timeout",
+                count=len(still_running),
+            )
 
     # --- 内部实现 ---
 
     async def _run_settlement(self, operation: Awaitable[None]) -> None:
-        """把终结操作放进独立 task 执行，并在取消到来时等它完成再传播。
+        """把终结操作放进独立 task 执行，并在取消到来时**有界地**等它完成再传播。
 
         只套 `asyncio.shield()` 不够：调用方仍可能在 `await` 处被取消而提前退出，
         把还没跑完的记账丢给事件循环。这里额外做两件事（计划 §4.2 第 3、4 条）：
 
         - 用 `self._settle_tasks` 保存强引用，任务不会被 GC，关闭时也能统一等待；
-        - 取消时先等内层 task 结束再原样传播。重复取消只是更早地传播，
-          内层 task 本身不在取消作用域内，仍会跑完，因此不会二次 POST 或双重记账。
+        - 取消时先等内层 task 结束再原样传播，但等待有界（`_await_settlement`）。
+          重复取消只是更早地传播，内层 task 本身不在取消作用域内，仍会跑完，
+          因此不会二次 POST 或双重记账。
         """
         task: asyncio.Task[None] = asyncio.ensure_future(operation)
         self._settle_tasks.add(task)
@@ -180,17 +204,41 @@ class MessageSender:
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
-            # 等结算完成；期间再次取消不会中断内层 task（它没有被 cancel）。
-            # 用 asyncio.wait 而不是 gather：gather 被取消时会连带取消内层 task。
-            while not task.done():
-                try:
-                    await asyncio.wait({task})
-                except asyncio.CancelledError:
-                    continue
-            if not task.cancelled():
-                # 取出可能的异常，避免“Task exception was never retrieved”。
-                task.exception()
+            # 等结算完成（有界）；期间再次取消不会中断内层 task（它没有被 cancel）。
+            await self._await_settlement(task)
             raise
+
+    async def _await_settlement(self, task: asyncio.Task[None]) -> None:
+        """在取消传播前有界等待受保护的终结任务；超时只记事件，绝不取消它。
+
+        内层终结任务（写 Store / 拿 quota 锁）可能因磁盘满、SQLite 卡死或锁被长期
+        持有而一直阻塞：此时若无限等待，取消就永远传播不出去，连 `App.stop()` 都会
+        被拖住。这里用一次算好的截止时刻封顶，重复取消不重置预算；超时只记一条事件
+        便返回，任务本身仍被强引用、仍会跑完 —— 「已确认送达不被取消改判」的底线
+        因此不变，代价是关闭路径上超预算的那笔本地记账会丢失。
+        """
+        # 用一次算好的截止时刻，而不是每次循环重置超时：否则重复取消会把预算无限续期。
+        # 仍然用 asyncio.wait 而不是 gather —— gather 被取消会连带取消内层任务。
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _SETTLE_WAIT_TIMEOUT_SECONDS
+        while not task.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                log_event(
+                    self._logger,
+                    logging.WARNING,
+                    "sender.settle_timeout",
+                    count=len(self._settle_tasks),
+                )
+                return
+            try:
+                await asyncio.wait({task}, timeout=remaining)
+            except asyncio.CancelledError:
+                # 重复取消不重置预算，也不打断内层任务（它没有被 cancel）。
+                continue
+        if not task.cancelled():
+            # 取出可能的异常，避免“Task exception was never retrieved”。
+            task.exception()
 
     async def _commit_delivery(
         self,

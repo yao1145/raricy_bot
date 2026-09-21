@@ -2294,8 +2294,9 @@ class BotApp:
         await self._client.aclose()
         # 发送器的受取消保护终结（store.record_sent + quota.note_sent）可能仍有在途任务：
         # 正常取消已由 send 在传播前等待到位，重复取消则可能让调用方提前退出，留下仍在
-        # 写库的终结任务。Store 关闭前统一汇合，避免它们撞上已关闭的连接；等待的只是
-        # 最多两笔 SQLite 写，仍在 10 秒总预算内（计划 §4.2 第 6 条）。
+        # 写库的终结任务。Store 关闭前统一汇合，避免它们撞上已关闭的连接；等待是**有界**的
+        # （sender 侧 `_SETTLE_WAIT_TIMEOUT_SECONDS`，正常只是最多两笔 SQLite 写），超时便放弃
+        # 等待、让关闭继续，仍在 10 秒总预算内（计划 §4.2 第 6 条）。
         await self._sender.wait_settled()
         await self._store.close()
 
