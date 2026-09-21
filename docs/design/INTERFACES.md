@@ -39,7 +39,7 @@ Python >=3.12，包根为 `src/raricy_bot/`。依赖和测试配置见 [pyprojec
 列表），另有 `MODULE`（npm 包路径）。新字段必须先登记再使用。
 
 - `log_event` 先构造 `LogEvent`（已校验），再分别编码为控制台文本与归档 JSON。
-- 脱敏作用在 handler 的**最终输出**上（`RedactingFormatter`），覆盖消息、extra、
+- 控制台脱敏作用在 handler 的**最终输出**上（`RedactingFormatter`），覆盖消息、extra、
   `exc_text` 与 `stack_info`；不改写共享 `LogRecord`。`RedactingFilter` 只作为
   兼容入口保留，生产路径不用它。
 - 非 `raricy.*` 命名空间的 WARNING 及以上不渲染原文：控制台与归档都换成受限的
@@ -61,12 +61,14 @@ Python >=3.12，包根为 `src/raricy_bot/`。依赖和测试配置见 [pyprojec
 
 三条硬约束：
 
-- 写出前施加**与控制台完全相同**的密钥替换（`_serialize`）。类型约束只保证字段形状
-  合法；只有一条通路脱敏等于没有脱敏。
+- 归档与控制台使用同一凭据登记表；`_serialize` 先递归脱敏字符串值，再编码 JSON。
+  不替换 JSON 语法、字段名或数值元数据，避免转义后的密钥漏匹配或数字密钥破坏结构。
+  类型约束只保证字段形状合法，不能代替脱敏。
 - 归档自己的状态事件在**锁外**发出。`Handler.handle()` 先拿 handler 锁再 `emit()`，
   而 `emit()` 要拿归档锁；在持锁时发日志会与写入路径构成 ABBA 死锁，连带卡住机器人。
 - 自身状态事件只走 stderr，不回写文件（否则写失败会递归）；换片或写入失败后
-  必须能重试打开并逐条累计缺口，不能静默停摆。
+  必须能重试打开并逐条累计缺口，不能静默停摆。部分写入、短写或 flush 失败后，
+  不再向可能损坏的分片追加；保留原分片，后续事件使用新分片，恢复记录也遵守相同规则。
 
 只接收已清洗事件：WARNING 及以上，加上 `ARCHIVE_INFO_EVENTS` 里那张 INFO 白名单。
 归档门槛独立于控制台级别，未启用时 `/archivez` 返回 404。`iter_entries` /

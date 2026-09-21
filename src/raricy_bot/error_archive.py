@@ -90,20 +90,34 @@ class SegmentReport:
 _Outbox = list[tuple[int, str, dict[str, object]]]
 
 
+def _redact_value(value: Any) -> Any:
+    """递归脱敏 JSON 值里的字符串，不改写字段名或数字元数据。"""
+    if isinstance(value, str):
+        return redact_text(value)
+    if isinstance(value, Mapping):
+        return {key: _redact_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_value(item) for item in value)
+    return value
+
+
 def _serialize(entry: Mapping[str, Any]) -> str:
-    """把一条事件编成归档行，**并施加与出站文本同一套密钥替换**。
+    """把一条事件先递归脱敏，再编成归档 JSON 行。
 
     脱敏不能只在控制台做。字段虽然都过了白名单与类型约束，但约束只保证"形状"
     安全，不保证"内容"安全：`task_name` 允许中英文短标识，`module`/`reason` 允许
     普通短串 —— 一个形状恰好合法的密钥会照样通过。控制台隐藏了它、归档却留着
     明文，是最糟的一种不一致：安全的那条通路人人都会看，不安全的那条躺在盘上。
 
-    顺序是先编码再替换：JSON 转义会改变字面形式（`"` → `\\"`），在最终文本上
-    替换才能覆盖两种形式。这与 `RedactingFormatter` 的做法完全一致 —— 同一份
-    局限也一致：精确替换不承诺识别 URL 编码或跨字节拆开的秘密。
+    必须在 JSON 编码**之前**处理字符串值。若先处理整行，含引号或反斜杠的密钥会
+    因转义而漏替换，纯数字密钥还可能把 JSON 数字替换成无效语法；递归处理值则
+    保留字段名与数值元数据的结构语义。
     """
-    line = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
-    return redact_text(line) + _LINE_TERMINATOR
+    safe_entry = _redact_value(entry)
+    line = json.dumps(safe_entry, ensure_ascii=False, separators=(",", ":"))
+    return line + _LINE_TERMINATOR
 
 
 def _default_wall_clock() -> datetime:
@@ -274,7 +288,9 @@ class ErrorArchive:
                 if not self._rotate_locked(outbox):
                     self._note_failure_locked(ArchiveError("归档换片失败"), outbox)
                     return False
-            self._file.write(raw)
+            written = self._file.write(raw)
+            if written != len(raw):
+                raise OSError("归档分片短写")
             self._file.flush()
             self._written += 1
             level = _level_value(entry.get("level"))
@@ -284,10 +300,12 @@ class ErrorArchive:
                 self._pending_fsync = True
             if self._failed:
                 # 上一次写失败过，这一次成功了 —— 现在才是"已恢复"。
-                self._failed = False
                 self._note_recovery_locked(outbox)
             return True
         except OSError as exc:
+            # 写入、短写或 flush/fsync 失败都可能留下半行；旧分片必须封存，
+            # 之后只能在新分片里继续，不能拿同一个句柄制造虚假的恢复。
+            self._seal_segment_locked()
             self._note_failure_locked(exc, outbox)
             return False
 
@@ -300,6 +318,7 @@ class ErrorArchive:
                     try:
                         self._sync_locked()
                     except OSError as exc:
+                        self._seal_segment_locked()
                         self._note_failure_locked(exc, outbox)
         self._deliver(outbox)
 
@@ -405,6 +424,18 @@ class ErrorArchive:
             return
         raise ArchiveError("归档分片序号耗尽")
 
+    def _seal_segment_locked(self) -> None:
+        """关闭当前分片并保留原文件，后续写入只能重新开片。"""
+        handle, self._file = self._file, None
+        self._pending_fsync = False
+        if handle is None:
+            return
+        try:
+            handle.close()
+        except Exception:
+            # 原句柄已经从写入状态摘下；关闭本身失败也不能再次沿用它。
+            pass
+
     def _reopen_locked(self) -> bool:
         """没文件时重新开一个分片；失败返回 False，由调用方计入缺口。
 
@@ -436,16 +467,17 @@ class ErrorArchive:
         由调用方计入缺口；下一次写入会重试打开（见 `_append_locked`）。
         """
         old = self._segment_index
+        sync_error: OSError | None = None
         try:
             self._sync_locked()
-        except OSError:
-            pass
-        try:
-            self._file.close()
-        finally:
-            self._file = None
+        except OSError as exc:
+            # 同步失败的旧片也必须封存；若新片能建好，当前事件仍可继续写入。
+            sync_error = exc
+        self._seal_segment_locked()
         if not self._reopen_locked():
             return False
+        if sync_error is not None:
+            self._note_failure_locked(sync_error, outbox)
         outbox.append((logging.INFO, "archive.segment_rolled", {"segment": old}))
         return True
 
@@ -473,23 +505,31 @@ class ErrorArchive:
         )
 
     def _note_recovery_locked(self, outbox: _Outbox) -> None:
-        """写失败之后又写成功了：把恢复与缺口一次记清楚。"""
-        gap, self._unpersisted = self._unpersisted, 0
-        self._gap_reported = gap
+        """在新分片成功写入恢复记录后，才报告恢复与缺口。"""
+        gap = self._unpersisted
         entry = self._build_entry(
             level=logging.WARNING,
             event="archive.recovered",
             component="archive",
             fields={"gap_count": gap},
         )
-        if entry is not None and self._file is not None:
-            # 恢复事件直接落盘：此刻 `_failed` 已清，写这一条不会再触发递归。
-            try:
-                self._file.write(_serialize(entry))
-                self._file.flush()
-                self._written += 1
-            except (OSError, TypeError, ValueError):
-                pass
+        if entry is None or self._file is None:
+            return
+        try:
+            raw = _serialize(entry)
+            written = self._file.write(raw)
+            if written != len(raw):
+                raise OSError("归档分片短写")
+            self._file.flush()
+        except (OSError, TypeError, ValueError) as exc:
+            # 恢复记录也不能写回可能损坏的分片；不发 recovered，避免虚假恢复。
+            self._seal_segment_locked()
+            self._note_failure_locked(exc, outbox)
+            return
+        self._written += 1
+        self._unpersisted = 0
+        self._gap_reported = gap
+        self._failed = False
         outbox.append((logging.WARNING, "archive.recovered", {"gap_count": gap}))
 
     # --- 状态事件的投递 ---------------------------------------------------
