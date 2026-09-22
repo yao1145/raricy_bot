@@ -126,13 +126,22 @@ class _WinInstanceGuard:
             pass
 
 
+# 已连接客户端的请求等待上限：超过即丢弃该连接，沉默客户端不能占住服务线程。
+_SERVE_DEADLINE_MS = 10_000
+
+
 class _WinActivationListener:
-    """串行接受的激活管道服务端；一次只服务一个连接，队列由系统缓冲。"""
+    """串行接受的激活管道服务端；一次只服务一个连接，队列由系统缓冲。
+
+    accept 与读取都走 overlapped I/O：close() 置位取消事件即可让服务线程
+    立刻退出，不依赖再建立一个唤醒连接（沉默客户端会把那种唤醒一起卡住）。
+    """
 
     def __init__(self, pipe_name: str, attrs) -> None:
         self._pipe_name = pipe_name
         self._attrs = attrs
         self._stop = threading.Event()
+        self._cancel = win32event.CreateEvent(None, True, False, None)
         self._thread: threading.Thread | None = None
         self._pending = None
         # accept 级故障的固定类别，供 Controller 在 close 后诊断。
@@ -150,22 +159,28 @@ class _WinActivationListener:
 
     def close(self) -> None:
         self._stop.set()
-        # 用一个空连接唤醒阻塞中的 ConnectNamedPipe；服务端会把它当坏请求
-        # 回应后看到 stop 标志退出。不主动 Close 待接受实例，避免与线程
-        # 刚取走同一根句柄形成双重关闭。
-        try:
-            win32pipe.CallNamedPipe(self._pipe_name, b"{}", 16, 200)
-        except pywintypes.error:
-            pass
+        # 直接取消在途的 accept/read 等待。
+        cancel = self._cancel
+        if cancel is not None:
+            win32event.SetEvent(cancel)
         thread, self._thread = self._thread, None
         if thread is not None:
             thread.join(timeout=2)
+            if thread.is_alive():
+                # 只剩同步写/冲刷可能未退出；句柄留给 OS 随进程回收。
+                return
+        if cancel is not None:
+            self._cancel = None
+            try:
+                win32api.CloseHandle(cancel)
+            except pywintypes.error:
+                pass
 
     def _create_pipe(self):
         try:
             return win32pipe.CreateNamedPipe(
                 self._pipe_name,
-                win32pipe.PIPE_ACCESS_DUPLEX,
+                win32pipe.PIPE_ACCESS_DUPLEX | win32file.FILE_FLAG_OVERLAPPED,
                 win32pipe.PIPE_TYPE_MESSAGE
                 | win32pipe.PIPE_READMODE_MESSAGE
                 | win32pipe.PIPE_WAIT,
@@ -178,17 +193,103 @@ class _WinActivationListener:
         except pywintypes.error as exc:
             raise PlatformError("pipe_create_failed") from exc
 
+    def _await_io(self, pipe, overlapped, timeout_ms: int) -> bool:
+        """等待 overlapped I/O 完成；取消事件或截止到达时取消操作并返回 False。"""
+        result = win32event.WaitForMultipleObjects(
+            (overlapped.hEvent, self._cancel), False, timeout_ms
+        )
+        if result == win32event.WAIT_OBJECT_0:
+            return True
+        # 取消在途操作并等它落地，之后由调用方丢弃该连接。本函数总在发起
+        # I/O 的服务线程内调用，无 CancelIoEx 时 CancelIo 也只管本线程的操作。
+        try:
+            cancel = getattr(win32file, "CancelIoEx", None)
+            if cancel is not None:
+                cancel(pipe, overlapped)
+            else:
+                win32file.CancelIo(pipe)
+            win32file.GetOverlappedResult(pipe, overlapped, True)
+        except pywintypes.error:
+            pass
+        return False
+
+    def _connect(self, pipe) -> bool:
+        """接受一个连接（overlapped）；stop/取消或接受失败返回 False。"""
+        overlapped = pywintypes.OVERLAPPED()
+        overlapped.hEvent = win32event.CreateEvent(None, True, False, None)
+        try:
+            try:
+                hr = win32pipe.ConnectNamedPipe(pipe, overlapped)
+            except pywintypes.error as exc:
+                hr = exc.winerror
+            if hr is None or hr == winerror.ERROR_PIPE_CONNECTED:
+                # 客户端在 Connect 之前已连上：也是成功。
+                hr = 0
+            if hr == winerror.ERROR_IO_PENDING:
+                if not self._await_io(pipe, overlapped, win32event.INFINITE):
+                    return False
+                try:
+                    win32file.GetOverlappedResult(pipe, overlapped, False)
+                except pywintypes.error:
+                    return False
+            elif hr != 0:
+                return False
+            return not self._stop.is_set()
+        finally:
+            win32api.CloseHandle(overlapped.hEvent)
+
+    def _read_request(self, pipe) -> bytes | None:
+        """读取一条请求；沉默超过 _SERVE_DEADLINE_MS、取消或失败返回 None。"""
+        overlapped = pywintypes.OVERLAPPED()
+        overlapped.hEvent = win32event.CreateEvent(None, True, False, None)
+        try:
+            try:
+                hr, data = win32file.ReadFile(pipe, activation.MAX_MESSAGE_BYTES, overlapped)
+            except pywintypes.error:
+                return None
+            if hr == winerror.ERROR_IO_PENDING:
+                if not self._await_io(pipe, overlapped, _SERVE_DEADLINE_MS):
+                    return None
+            elif hr != 0:
+                return None
+            # 同步完成与异步完成都统一取真实字节数：overlapped 句柄的
+            # ReadFile 同步返回时不会截断缓冲。
+            try:
+                size = win32file.GetOverlappedResult(pipe, overlapped, False)
+            except pywintypes.error:
+                return None
+            return bytes(data)[:size]
+        finally:
+            win32api.CloseHandle(overlapped.hEvent)
+
+    def _write_response(self, pipe, response: bytes) -> bool:
+        """overlapped 写回响应；取消或失败返回 False。"""
+        overlapped = pywintypes.OVERLAPPED()
+        overlapped.hEvent = win32event.CreateEvent(None, True, False, None)
+        try:
+            try:
+                hr = win32file.WriteFile(pipe, response, overlapped)[0]
+            except pywintypes.error as exc:
+                hr = exc.winerror
+            if hr is None:
+                hr = 0
+            if hr == winerror.ERROR_IO_PENDING:
+                if not self._await_io(pipe, overlapped, _SERVE_DEADLINE_MS):
+                    return False
+                try:
+                    win32file.GetOverlappedResult(pipe, overlapped, False)
+                except pywintypes.error:
+                    return False
+                return True
+            return hr == 0
+        finally:
+            win32api.CloseHandle(overlapped.hEvent)
+
     def _loop(self, handler: Callable[[bytes], bytes]) -> None:
         pipe = self._pending
         self._pending = None
         while pipe is not None and not self._stop.is_set():
-            try:
-                win32pipe.ConnectNamedPipe(pipe, None)
-                connected = True
-            except pywintypes.error as exc:
-                # 客户端在 Connect 之前已连上：ERROR_PIPE_CONNECTED 也是成功。
-                connected = exc.winerror == winerror.ERROR_PIPE_CONNECTED
-            if not connected or self._stop.is_set():
+            if not self._connect(pipe):
                 self._close_pipe(pipe)
                 return
             # 先备好下一个实例再服务当前连接：实例数不降到 0，紧跟的下一个
@@ -201,6 +302,9 @@ class _WinActivationListener:
             self._serve_one(pipe, handler)
             self._close_pipe(pipe)
             pipe = next_pipe
+        if pipe is not None:
+            # 退出时释放尚未接受连接的待服务实例。
+            self._close_pipe(pipe)
 
     @staticmethod
     def _close_pipe(pipe) -> None:
@@ -211,14 +315,15 @@ class _WinActivationListener:
 
     def _serve_one(self, pipe, handler: Callable[[bytes], bytes]) -> None:
         try:
-            hr, data = win32file.ReadFile(pipe, activation.MAX_MESSAGE_BYTES)
-            if hr != 0:
+            data = self._read_request(pipe)
+            if data is None:
                 return
             try:
-                response = handler(bytes(data))
+                response = handler(data)
             except Exception:
                 response = activation.encode_response(ok=False, error="internal_error")
-            win32file.WriteFile(pipe, response)
+            if not self._write_response(pipe, response):
+                return
             win32file.FlushFileBuffers(pipe)
         except pywintypes.error:
             # 客户端在读写间隙消失：丢弃这次连接，不影响后续接受。
