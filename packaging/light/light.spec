@@ -24,6 +24,9 @@ a = Analysis(
         "uvicorn.lifespan",
         "uvicorn.lifespan.on",
         "uvicorn.lifespan.off",
+        # keyring 是**惰性导入**（在方法体里），静态分析看不到；不列它的话冻结包
+        # 里根本没有 keyring，保存凭据会永远回 503（审查 F3）。
+        "keyring",
         "keyring.backends.Windows",
         "keyring.backends.null",
     ],

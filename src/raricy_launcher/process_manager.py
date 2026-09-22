@@ -130,12 +130,17 @@ class WorkerProcess:
         self._platform = platform
         self._instance_id = instance_id
         self._run_id = run_id
+        # 所有句柄属性**先**初始化再创建：创建失败时 close() 会读它们，
+        # 否则清理路径自己抛 AttributeError，句柄照样泄漏、原因也被盖掉（复审 HIGH）。
+        self._process: SuspendedProcess | None = None
         self._job: WorkerJob | None = None
         self._control = None
         self._report: ReportPipe | None = None
         self._drain: ReportPipe | None = None
+        self._reader: threading.Thread | None = None
+        self._drainer: threading.Thread | None = None
         try:
-            # Job 与管道都在 try 内：任何一步失败都要走 close() 回收已建的句柄（审查 M6）。
+            # Job 与管道都在 try 内：任何一步失败都要走 close() 回收已建的句柄。
             self._job = platform.create_worker_job()
             self._control = platform.create_control_pipe()
             self._report = platform.create_report_pipe()
@@ -143,15 +148,12 @@ class WorkerProcess:
         except Exception:
             self.close()
             raise
-        self._process: SuspendedProcess | None = None
         self._forced_stop = False
         self._seq = 0
         self._seq_lock = threading.Lock()
         self._frames: queue.Queue[dict | None] = queue.Queue(maxsize=256)
         self.report_closed = threading.Event()
         self.drained_bytes = 0
-        self._reader: threading.Thread | None = None
-        self._drainer: threading.Thread | None = None
         argv = [
             *spec.argv,
             "--run-config",
@@ -453,11 +455,16 @@ class WorkerManager:
         self._operation: Operation | None = None
         self._operations: dict[str, Operation] = {}
         self._cancel_start = threading.Event()
+        # 停止请求的“代次”：restart 在停止阶段前记下它，停止后若变过就放弃启动阶段
+        # —— 否则停止阶段的 stop 会被自己的清理动作抹掉（复审 MEDIUM）。
+        self._stop_epoch = 0
         self._quitting = False
         self._forced_stop = False
         self._exit_reason: str | None = None
         self._monitor: threading.Thread | None = None
         self._last_status: dict | None = None
+        # 正在运行的 Worker 是用哪个 revision 起的；停止后清空（§6.5 的 running_revision）。
+        self._running_revision: int | None = None
         self._run_seq = 0
 
     # --- 查询 -------------------------------------------------------------
@@ -492,6 +499,7 @@ class WorkerManager:
             return {
                 "state": self._state,
                 "pid": worker.pid if worker is not None else None,
+                "running_revision": self._running_revision,
                 # 记住最后一次停止是否只能强制完成；Worker 已经回收时也要如实报告。
                 "forced_stop": bool(
                     (worker is not None and worker.forced_stop) or self._forced_stop
@@ -527,6 +535,7 @@ class WorkerManager:
                 operation = self._new_operation("stop", None)
                 return self._finish(operation, OP_FINISHED, "stopped")
             self._cancel_start.set()  # 抢占 starting（§9.2）
+            self._stop_epoch += 1
             if self._state == STATE_STOPPING and self._operation is not None:
                 return self._operation
             operation = self._new_operation("stop", None)
@@ -547,6 +556,7 @@ class WorkerManager:
         with self._lock:
             self._quitting = True
             self._cancel_start.set()
+            self._stop_epoch += 1
 
     def shutdown(self) -> None:
         """退出收尾：停掉 Worker 并等所有在途操作结束。"""
@@ -583,10 +593,22 @@ class WorkerManager:
             with self._lock:
                 self._state = STATE_FAILED
                 self._exit_reason = _worker_failure_code(exc)
-            self._on_event("worker.start_failed", {"reason": _worker_failure_code(exc)})
+            self._on_event(
+                "worker.start_failed", {"reason": _worker_failure_code(exc)}, "warning"
+            )
             return
         with self._lock:
-            self._worker = worker
+            abandoned = self._quitting or self._cancel_start.is_set()
+            if not abandoned:
+                self._worker = worker
+        if abandoned:
+            # 创建进程的这段时间里来了退出/取消：就地回收，不放进运行态。
+            self.drain(worker)
+            self._reap(worker)
+            with self._lock:
+                self._state = STATE_STOPPED
+            self._finish(operation, OP_FINISHED, "cancelled")
+            return
         outcome = self._wait_ready(worker)
         if outcome != "ready":
             if outcome == "cancelled":
@@ -615,6 +637,7 @@ class WorkerManager:
             self._state = STATE_RUNNING
             self._exit_reason = None
             self._forced_stop = False
+            self._running_revision = revision
         self._start_monitor(worker)
         self._finish(operation, OP_FINISHED, "running")
         self._on_event("worker.started", {"revision": revision, "pid": worker.pid}, "info")
@@ -673,11 +696,6 @@ class WorkerManager:
                 return
             self._consume(frame)
 
-    def record_status(self, status: dict) -> None:
-        """外部（Controller 的帧泵）折进来的状态快照。"""
-        if isinstance(status, dict):
-            self._last_status = status
-
     def _do_stop(self, operation: Operation) -> None:
         with self._lock:
             # 停止落在 starting 上等于「取消这次启动」：进程还没进入运行态，
@@ -691,9 +709,13 @@ class WorkerManager:
     def _do_restart(self, operation: Operation, revision: int | None) -> None:
         with self._lock:
             cancelled_start = self._state == STATE_STARTING
+            epoch = self._stop_epoch
             self._state = STATE_STOPPING
         self._stop_synchronously(cancelled_start=cancelled_start)
-        if self._cancel_start.is_set():
+        with self._lock:
+            superseded = self._quitting or self._stop_epoch != epoch
+        if superseded:
+            # 停止阶段里又来了一个 stop/退出：重启意图作废，不再起新进程。
             self._finish(operation, OP_FINISHED, "stopped")
             return
         with self._lock:
@@ -761,6 +783,8 @@ class WorkerManager:
                 self._exit_reason = None
                 result = "stopped"
         self._cancel_start.clear()
+        self._last_status = None
+        self._running_revision = None
         return result
 
     def _reap(self, worker: WorkerProcess) -> None:
@@ -769,6 +793,8 @@ class WorkerManager:
         if worker.wait(2000) is None:
             worker.terminate()
             worker.wait(2000)
+        # 退出瞬间可能刚送到一帧诊断（配置无效、数据被占用）：关句柄前再收一次。
+        self.drain(worker)
         worker.close()
 
     def _start_monitor(self, worker: WorkerProcess) -> None:

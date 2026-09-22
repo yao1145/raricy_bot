@@ -32,7 +32,7 @@ from . import __version__, activation, paths, texts
 from .activation import ActivationError
 from .api import LocalApi
 from .config_service import ConfigService, ConfigServiceError
-from .credential_store import CredentialStore, SystemKeyringStore
+from .credential_store import CredentialStore, SessionMemoryStore, SystemKeyringStore
 from .events import EventService
 from .platform import InstanceGuard, LauncherPlatform
 from .process_manager import (
@@ -78,11 +78,28 @@ class Controller:
         self._quit = threading.Event()
         self._ready = threading.Event()
 
-        self._credentials = credential_store or SystemKeyringStore()
+        # 没有显式注入时按 §7 选择后端：系统凭据库不可用就退到**会话内存**，
+        # 并在日志里说明（界面另会显示后端名与可用性）。绝不落到明文文件。
+        if credential_store is not None:
+            self._credentials = credential_store
+        else:
+            system_store = SystemKeyringStore()
+            if system_store.describe().available:
+                self._credentials = system_store
+            else:
+                self._credentials = SessionMemoryStore()
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "launcher.credentials_fallback",
+                    status="session_only",
+                    error="SystemKeyringStore",
+                )
         self._config = ConfigService(
             self._data_root, credential_store=self._credentials, profile_id=profile_id
         )
-        self._events = EventService(instance_id=self._instance_id, clock=time.monotonic)
+        # 事件时间要与管理页显示的墙钟一致（同一处时钟时基缺陷，复审指出）。
+        self._events = EventService(instance_id=self._instance_id, clock=time.time)
         self._sessions = SessionManager(instance_id=self._instance_id, clock=time.monotonic)
         self._manager = WorkerManager(
             platform,
@@ -101,6 +118,7 @@ class Controller:
         self._api: LocalApi | None = None
         self._server = None
         self._api_thread: threading.Thread | None = None
+        self._stop_lock = threading.Lock()
         self._api_socket: socket.socket | None = None
         self._port = 0
         self._listener = None
@@ -157,11 +175,19 @@ class Controller:
             self.stop()
 
     def stop(self) -> None:
-        """停止 Worker、API、激活管道与互斥体；幂等（§9.3）。"""
-        if self._quit.is_set() and self._api is None and self._listener is None:
-            return
-        self._quit.set()
-        self._api = None  # 置空后重复 stop() 走上面的幂等早退（审查 M1）
+        """停止 Worker、API、激活管道与互斥体；幂等（§9.3）。
+
+        关闭步骤在进程内锁里串行：并发的两个 stop() 里，后到的那个走幂等早退，
+        不会把拆到一半的组件再拆一遍。
+        """
+        with self._stop_lock:
+            if self._quit.is_set() and self._api is None and self._listener is None:
+                return
+            self._quit.set()
+            self._stop_locked()
+
+    def _stop_locked(self) -> None:
+        """真正的关闭步骤；只在 `stop()` 的关闭锁里执行。"""
         self._manager.shutdown()
         self._sessions.revoke_all()
         self._events.close()
@@ -190,6 +216,8 @@ class Controller:
             status="ok",
             trace_id=self._instance_id,
         )
+        # 最后一步才置空：API 线程已经退出，重复 stop() 由此走幂等早退。
+        self._api = None
 
     def request_quit(self) -> None:
         self._quit.set()
@@ -228,8 +256,9 @@ class Controller:
             port=self._port,
             on_quit=self.request_quit,
         )
+        api = self._api  # 线程只认这个局部引用：stop() 会先把 self._api 置空
         self._api_thread = threading.Thread(
-            target=self._serve_api, name="raricy-api", daemon=True
+            target=lambda: self._serve_api(api), name="raricy-api", daemon=True
         )
         self._api_thread.start()
         deadline = time.monotonic() + 15
@@ -240,11 +269,11 @@ class Controller:
             time.sleep(0.02)
         self._write_runtime_metadata()
 
-    def _serve_api(self) -> None:
+    def _serve_api(self, api: LocalApi) -> None:
         import uvicorn
 
         config = uvicorn.Config(
-            self._api.app,
+            api.app,
             log_level="warning",
             access_log=False,
             server_header=False,

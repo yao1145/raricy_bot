@@ -4,6 +4,9 @@
 干净 Windows 验收（无 Python/Node/Docker 的独立机器）仍需人工执行，见
 [docs/usage/LIGHT.md](../docs/usage/LIGHT.md) §7。
 
+注意：激活通道与单实例互斥体都按**当前用户**命名，因此冒烟运行时本机不能同时
+有另一个 Light 实例（那会让冒烟拿到别的实例的端口并失败 —— 是安全失败，不是误报）。
+
 用法::
 
     python tools/build_light.py --pyinstaller
@@ -15,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -114,6 +118,19 @@ def _session_and_status(url: str):
         page = client.get(f"{base}/")
         if page.status_code != 200 or "RARICY_LIGHT" not in page.text:
             raise SmokeError("管理页没有正常返回")
+        # 构建产物必须真的取得到：缺 bundle 的发行包在浏览器里只会白屏（复审 F10）。
+        asset = re.search(r'src="(/assets/[^"]+\.js)"', page.text)
+        if asset is None:
+            raise SmokeError("管理页没有引用构建产物")
+        if client.get(f"{base}{asset.group(1)}").status_code != 200:
+            raise SmokeError("构建产物取不到")
+        # 凭据后端必须真的可用：冻结包里缺 keyring 时保存凭据会永远 503（复审 F3）。
+        config = client.get(f"{base}/api/config").json()
+        backend = (config.get("credentials") or {}).get("backend") or {}
+        if not backend:
+            raise SmokeError(f"配置接口没有返回凭据状态：{config}")
+        if not backend["available"]:
+            raise SmokeError(f"凭据后端不可用：{backend['name']}")
     return csrf, cookies
 
 

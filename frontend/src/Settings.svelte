@@ -7,17 +7,20 @@
   let { onchanged }: { onchanged: () => void } = $props();
 
   let view = $state<api.ConfigView | null>(null);
-  let texts = $state<Record<string, string>>({});
-  let simple = $state(true);
+  let texts = $state<Record<string, string>>({}); // 非布尔字段的输入框文本
+  let flags = $state<Record<string, boolean>>({}); // 布尔字段
   let showAdvanced = $state(false);
   let busy = $state(false);
   let message = $state<string | null>(null);
   let failure = $state<string | null>(null);
+
+  let account = $state("");
   let password = $state("");
   let apiKey = $state("");
   let passwordAction = $state<"keep" | "replace" | "delete">("keep");
   let apiKeyAction = $state<"keep" | "replace" | "delete">("keep");
   let startOnLaunch = $state(false);
+
   let kbFile = $state("knowledge.md");
   let kbContent = $state("");
   let kbFiles = $state<number | null>(null);
@@ -25,22 +28,29 @@
 
   async function load(): Promise<void> {
     try {
-      view = await api.getConfig();
-      const next: Record<string, string> = {};
+      const loaded = await api.getConfig();
+      view = loaded;
+      const nextTexts: Record<string, string> = {};
+      const nextFlags: Record<string, boolean> = {};
       for (const spec of FIELDS) {
-        next[spec.key] = toInput(spec, view.values[spec.key]);
+        const raw = loaded.values[spec.key];
+        if (spec.kind === "bool") nextFlags[spec.key] = raw === true;
+        else nextTexts[spec.key] = toInput(spec, raw);
       }
-      texts = next;
-      startOnLaunch = view.start_bot_on_launch;
+      texts = nextTexts;
+      flags = nextFlags;
+      account = loaded.account ?? "";
+      startOnLaunch = loaded.start_bot_on_launch;
       try {
         kbFiles = (await api.kbStatus()).files;
       } catch {
         kbFiles = null;
       }
     } catch (error) {
-      failure = error instanceof api.ApiError && error.status === 401
-        ? "会话已失效，请重新打开管理页。"
-        : "无法读取配置。";
+      failure =
+        error instanceof api.ApiError && error.status === 401
+          ? "会话已失效，请从桌面图标重新打开管理页。"
+          : "无法读取配置。";
     }
   }
 
@@ -48,16 +58,16 @@
     void load();
   });
 
-  function spec(key: string): FieldSpec | undefined {
-    return FIELDS.find((item) => item.key === key);
-  }
-
   function collect(): Record<string, unknown> {
     const values: Record<string, unknown> = {};
-    for (const item of FIELDS) {
-      const text = texts[item.key] ?? "";
-      if (text.trim() === "") continue; // 空白字段保留服务端原值，不覆盖成空
-      values[item.key] = fromInput(item, text);
+    for (const spec of FIELDS) {
+      if (spec.kind === "bool") {
+        values[spec.key] = flags[spec.key] === true;
+        continue;
+      }
+      const text = (texts[spec.key] ?? "").trim();
+      if (text === "") continue; // 空白字段保留服务端原值，不覆盖成空
+      values[spec.key] = fromInput(spec, text);
     }
     return values;
   }
@@ -68,21 +78,23 @@
     message = null;
     failure = null;
     try {
-      const credentials: Record<string, unknown> = {};
-      if (passwordAction === "replace") credentials.password = { action: "replace", value: password };
-      else if (passwordAction === "delete") credentials.password = { action: "delete" };
-      else credentials.password = { action: "keep" };
-      if (apiKeyAction === "replace") credentials.llm_api_key = { action: "replace", value: apiKey };
-      else if (apiKeyAction === "delete") credentials.llm_api_key = { action: "delete" };
-      else credentials.llm_api_key = { action: "keep" };
-
+      const credentials: Record<string, unknown> = {
+        password:
+          passwordAction === "replace"
+            ? { action: "replace", value: password }
+            : { action: passwordAction },
+        llm_api_key:
+          apiKeyAction === "replace"
+            ? { action: "replace", value: apiKey }
+            : { action: apiKeyAction },
+      };
       const body: Record<string, unknown> = {
         expected_revision: view.revision ?? 0,
         values: collect(),
         credentials,
         start_bot_on_launch: startOnLaunch,
       };
-      if (!view.account) body.account = "";
+      if (!view.account && account.trim() !== "") body.account = account.trim();
       const result = await api.saveConfig(body);
       password = "";
       apiKey = "";
@@ -130,16 +142,35 @@
     }
   }
 
+  // 409 在不同接口上有不同含义，按稳定码分别说明（不把「重启中」说成「另一个页面改过」）。
+  const CONFLICT_TEXT: Record<string, string> = {
+    revision_conflict: "配置已被另一个页面改过，请刷新后重试。",
+    bot_running: "机器人正在运行：先停止它，再测试站点。",
+    test_in_progress: "上一次测试还没结束，请稍等。",
+    config_not_ready: "还没有可用的正式配置，请先保存。",
+    no_active_config: "还没有可用的正式配置，请先保存。",
+    credentials_unresolved: "凭据不可用：请在下面重新填写密码与模型 Key。",
+  };
+
   function describe(error: unknown): string {
     if (error instanceof api.ApiError) {
-      if (error.status === 409) return "配置已被另一个页面改过，请刷新后重试。";
+      if (error.status === 401) return "会话已失效，请从桌面图标重新打开管理页。";
+      if (error.status === 409) return CONFLICT_TEXT[error.code] ?? `操作冲突：${error.code}`;
       if (error.field) return `字段有问题：${error.field}（${error.code}）`;
       return `操作失败：${error.code}`;
     }
     return "操作失败；请查看近期事件。";
   }
 
-  const simpleFields = $derived(FIELDS.filter((item) => item.group === "simple"));
+  const simpleFields = $derived(
+    FIELDS.filter(
+      (item) =>
+        item.group === "simple" &&
+        !item.key.startsWith("model.") &&
+        item.key !== "system_prompt",
+    ),
+  );
+  const modelFields = $derived(FIELDS.filter((item) => item.key.startsWith("model.")));
   const advancedFields = $derived(FIELDS.filter((item) => item.group === "advanced"));
 </script>
 
@@ -147,10 +178,10 @@
   <div class="panel">
     <h2>模型与提示词</h2>
     <div class="grid">
-      {#each simpleFields.filter((item) => item.key.startsWith("model.")) as item (item.key)}
+      {#each modelFields as item (item.key)}
         <label>{item.label}
           {#if item.kind === "bool"}
-            <input type="checkbox" bind:checked={texts[item.key] as any} />
+            <input type="checkbox" bind:checked={flags[item.key]} />
           {:else}
             <input bind:value={texts[item.key]} />
           {/if}
@@ -187,6 +218,11 @@
       </dd>
     </dl>
     <div class="grid">
+      {#if !view.account}
+        <label>站点账号
+          <input bind:value={account} autocomplete="username" />
+        </label>
+      {/if}
       <label>密码操作
         <select bind:value={passwordAction}>
           <option value="keep">保持不变</option>
@@ -217,10 +253,10 @@
   <div class="panel">
     <h2>能力</h2>
     <div class="grid">
-      {#each simpleFields.filter((item) => !item.key.startsWith("model.") && item.key !== "system_prompt") as item (item.key)}
+      {#each simpleFields as item (item.key)}
         <label class:checkbox={item.kind === "bool"}>
           {#if item.kind === "bool"}
-            <input type="checkbox" bind:checked={texts[item.key] as any} />
+            <input type="checkbox" bind:checked={flags[item.key]} />
             {item.label}
           {:else}
             {item.label}
@@ -234,7 +270,10 @@
 
   <div class="panel">
     <h2>知识库导入</h2>
-    <p class="hint">当前资料 {kbFiles ?? "未知"} 份。只接受 Markdown 单文件，写入受管目录后由既有刷新机制加载。</p>
+    <p class="hint">
+      当前资料 {kbFiles ?? "未知"} 份。只接受单份 Markdown（上限 1 MiB），写入受管目录后
+      由既有刷新机制加载。
+    </p>
     <div class="grid">
       <label>文件名<input bind:value={kbFile} /></label>
     </div>
@@ -280,8 +319,5 @@
 
   <div class="row">
     <button class="action" disabled={busy} onclick={save}>保存</button>
-    <button class="ghost" disabled={busy} onclick={() => (simple = !simple)}>
-      {simple ? "收起说明" : "展开说明"}
-    </button>
   </div>
 {/if}

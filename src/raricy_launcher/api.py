@@ -234,20 +234,21 @@ class LocalApi:
         if not content_type.startswith("application/json"):
             raise ApiError(415, "unsupported_media_type")
 
-    async def _json_body(self, request: Request) -> dict:
+    async def _json_body(self, request: Request, *, limit: int = MAX_JSON_BYTES) -> dict:
+        """读并解析 JSON 请求体；上限在**读取过程中**生效（审查 I6）。"""
         declared = request.headers.get("content-length")
         if declared is not None:
             try:
                 declared_bytes = int(declared)
             except ValueError as exc:
                 raise ApiError(400, "bad_request") from exc
-            if declared_bytes > MAX_JSON_BYTES:
+            if declared_bytes > limit:
                 raise ApiError(413, "request_too_large")
         # 边读边判上限：ASGI 服务器不限制请求体，先整体缓冲再检查等于没有上限（审查 I6）。
         chunks = bytearray()
         async for chunk in request.stream():
             chunks.extend(chunk)
-            if len(chunks) > MAX_JSON_BYTES:
+            if len(chunks) > limit:
                 raise ApiError(413, "request_too_large")
         raw = bytes(chunks)
         if not raw:
@@ -780,7 +781,9 @@ class LocalApi:
         try:
             session = self._require_session(request)
             self._require_write(request, session)
-            body = await self._json_body(request)
+            # 导入走更宽的传输上限（JSON 包装另留余量）：单文件上限才是真正生效的
+            # 那道门，而不是被通用请求体上限抢先拒绝（审查 M9）。
+            body = await self._json_body(request, limit=MAX_IMPORT_BYTES + 16 * 1024)
         except ApiError as exc:
             return self._json(exc.status, exc.payload())
         name = body.get("name")
@@ -887,8 +890,13 @@ def _sse(event: str, data: dict) -> str:
 
 
 def _sse_frame(event) -> str:
+    """事件帧：不带 `event:` 行，走 SSE 默认的 `message` 事件。
+
+    事件名放在 data 里。具名 `event:` 只会派发给同名的 addEventListener，
+    而事件名是开放的（每个 `log_event` 名都可能出现）—— 客户端不可能预先
+    枚举，于是「近期事件」永远是空的（复审 F4）。
+    """
     return (
         f"id: {event.event_id}\n"
-        f"event: {event.name}\n"
         f"data: {json.dumps(event.as_dict(), ensure_ascii=False)}\n\n"
     )

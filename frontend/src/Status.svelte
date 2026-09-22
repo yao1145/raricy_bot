@@ -41,7 +41,8 @@
   }
 
   async function poll(operationId: string): Promise<void> {
-    for (let attempt = 0; attempt < 60; attempt += 1) {
+    // 轮询预算要盖住 Worker 的启动等待（60 秒），否则慢启动会被误报成「仍在进行」。
+    for (let attempt = 0; attempt < 180; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 500));
       const body = await api.getOperation(operationId);
       if (body.operation.finished) {
@@ -109,6 +110,10 @@
       </span>
       {#if status.config.revision !== null}<span class="hint">revision {status.config.revision}</span>{/if}
       {#if status.config.account}<span class="hint">账号 {status.config.account}</span>{/if}
+      {#if status.restart_required}
+        <span class="state warn">有改动待重启生效</span>
+        <button class="ghost" onclick={() => act("restart")}>现在重启</button>
+      {/if}
     </dd>
     <dt>状态快照</dt>
     <dd>
@@ -163,6 +168,18 @@
       <dd>{#if memory}{memory.enabled ? (memory.armed ? "运行中" : "已开启、未就绪") : "未开启"}{:else}未知{/if}</dd>
       <dt>永久归档</dt>
       <dd>{#if archive}{archive.enabled ? "已开启" : "未开启"}{:else}未知{/if}</dd>
+      <dt>最近显式测试</dt>
+      <dd>
+        {#each Object.entries(status.tests) as [kind, result] (kind)}
+          <span class="hint">
+            {kind === "site" ? "站点" : "模型"}：{result.state === "fresh"
+              ? (result.ok ? "通过" : `未通过（${result.detail}）`)
+              : result.state === "stale"
+                ? "已过期（配置变更后需重测）"
+                : "未测试"}
+          </span>
+        {/each}
+      </dd>
     </dl>
   </div>
 {/if}

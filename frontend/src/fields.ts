@@ -38,11 +38,18 @@ export const FIELDS: FieldSpec[] = [
     help: "启用前必须选定使用范围并导入至少一份 Markdown",
   },
   {
+    key: "knowledge_base.access_mode",
+    label: "知识库访问模式",
+    kind: "text",
+    group: "simple",
+    help: "allowlist（默认，只放行下面列出的用户）或 all_chat（所有精确 @ 的会话）",
+  },
+  {
     key: "knowledge_base.allowed_channel_kinds",
-    label: "知识库使用范围",
+    label: "知识库可用频道",
     kind: "list",
     group: "simple",
-    help: "逗号分隔，例如 dm；填 all_chat 表示也允许大区",
+    help: "逗号分隔：dm 与/或 lobby",
   },
   {
     key: "knowledge_base.allowed_user_ids",

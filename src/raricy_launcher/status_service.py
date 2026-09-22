@@ -86,8 +86,17 @@ class StatusService:
                 freshness = STALE
             else:
                 freshness = FRESH
+        running_revision = process.get("running_revision")
         return {
             "instance_id": self._instance_id,
+            # 保存的版本与正在跑的版本分开报；两者不同就是「待重启」。
+            "saved_revision": revision,
+            "running_revision": running_revision,
+            "restart_required": (
+                running_revision is not None
+                and revision is not None
+                and running_revision != revision
+            ),
             "config": {
                 "state": config_status.state,
                 "revision": revision,

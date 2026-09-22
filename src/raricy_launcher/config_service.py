@@ -381,9 +381,15 @@ class ConfigService:
         return self._profile_id or self.active_profile()
 
     def require_profile(self) -> str:
+        """当前档案 id；全新实例上**建立第一个档案**并落指针（§5.1 第 1 步）。
+
+        向导的第一步是「读配置」（此时还没有任何档案），把它当错误会让首次启动
+        直接失败；初始化数据目录本来就属于启动流程的一部分。
+        """
         profile_id = self.profile_id()
         if profile_id is None:
-            raise ConfigServiceError("no_active_profile")
+            profile_id = paths.new_profile_id()
+            self.set_active_profile(profile_id)
         return profile_id
 
     def profile(self) -> Path:

@@ -94,6 +94,9 @@ function failure(status: number, body: unknown): ApiError {
 
 export interface StatusSnapshot {
   instance_id: string;
+  saved_revision?: number | null;
+  running_revision?: number | null;
+  restart_required?: boolean;
   config: { state: string; revision: number | null; account: string | null; error: string | null };
   process: {
     state: string;
@@ -145,6 +148,11 @@ export function saveConfig(payload: Record<string, unknown>): Promise<{ revision
 
 export function saveDraft(payload: Record<string, unknown>): Promise<{ revision: number }> {
   return apiWrite("/api/config/draft", payload);
+}
+
+/** 读向导草稿（只含非敏感字段与它自己的 revision）。 */
+export function getDraft(): Promise<{ revision: number; values: Record<string, unknown> }> {
+  return apiGet("/api/config/draft");
 }
 
 export function validateConfig(payload: Record<string, unknown>): Promise<{ ok: true }> {
