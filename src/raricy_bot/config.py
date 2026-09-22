@@ -47,8 +47,26 @@ PASSWORD_ENV: str = "RARICY_PASSWORD"
 LLM_API_KEY_ENV: str = "LLM_API_KEY"
 
 
+# ConfigError 的机器可读分类：`KIND_MISSING` 只表示**还没填**（草稿可以接受、
+# 正式配置必须拒绝），其余一律是取值/格式/跨字段问题（草稿也必须拒绝）。
+KIND_MISSING: str = "missing"
+KIND_INVALID: str = "invalid"
+
+
 class ConfigError(Exception):
-    """配置缺失、格式非法或取值越界。"""
+    """配置缺失、格式非法或取值越界。
+
+    `field`（配置路径，如 `model.model`）与 `kind` 是给调用方的机器可读信息：
+    Launcher 的草稿校验要能区分「这一项还没填」与「这一项填错了」，而不能去
+    匹配错误文案（设计 §6.2）。
+    """
+
+    def __init__(
+        self, message: str, *, field: str | None = None, kind: str = KIND_INVALID
+    ) -> None:
+        super().__init__(message)
+        self.field = field
+        self.kind = kind
 
 
 @dataclass(frozen=True)
@@ -438,11 +456,42 @@ def default_config_path(env: Mapping[str, str] | None = None) -> str:
 
 
 def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -> Config:
-    """加载并校验配置；任何问题都以 ConfigError 抛出。"""
+    """加载并校验配置；任何问题都以 ConfigError 抛出。
+
+    只做两件事：按 CLI 的路径优先级解析文件路径并从环境变量取凭据。字段解析与
+    校验全部交给 `parse_config()`，Launcher 走同一个入口（设计 §6.1）。
+    """
     source = os.environ if env is None else env
     resolved = path if path is not None else default_config_path(source)
-    raw = _read_yaml(resolved)
+    raw = read_config_yaml(resolved)
+    # 稿库与归档的相对路径以**配置文件所在目录**为基准：它与 `--config` 指的是同一处，
+    # 也因此在容器里换了工作目录、或在别处启动进程时都不会指到另一个目录去。
+    config_dir = os.path.dirname(os.path.abspath(resolved))
+    return parse_config(
+        raw,
+        config_dir=config_dir,
+        secrets=Secrets(
+            username=_secret(source, USERNAME_ENV),
+            password=_secret(source, PASSWORD_ENV),
+            llm_api_key=_secret(source, LLM_API_KEY_ENV),
+        ),
+    )
 
+
+def read_config_yaml(path: str) -> dict[str, Any]:
+    """有界读取并解析配置文件；超限、非 UTF-8、顶层非映射都以 ConfigError 抛出。"""
+    return _read_yaml(path)
+
+
+def parse_config(
+    raw: Mapping[str, Any], *, config_dir: str, secrets: Secrets
+) -> Config:
+    """把**非敏感映射**解析成冻结的 `Config`；凭据由调用方组合后传入。
+
+    这是 GUI 与 CLI 共享的唯一校验入口（设计 §6.1）：字段默认值、跨字段限制与
+    URL 安全策略都只有这一份。`config_dir` 是相对路径（稿库、归档目录）的基准，
+    Launcher 传档案目录，CLI 传配置文件所在目录。
+    """
     site_raw = _section(raw, "site")
     model_raw = _section(raw, "model")
     behavior_raw = _section(raw, "behavior")
@@ -473,9 +522,8 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
     memory = _memory(
         _section(raw, "memory"), behavior, comments, knowledge_base, storage
     )
-    # 稿库的相对路径以**配置文件所在目录**为基准：它与 `--config` 指的是同一处，
-    # 也因此在容器里换了工作目录、或在别处启动进程时都不会指到另一个目录去。
-    config_dir = os.path.dirname(os.path.abspath(resolved))
+    # 稿库的相对路径以调用方给的基准目录解析（CLI 传配置文件所在目录、
+    # Launcher 传档案目录），不随进程的工作目录漂移。
     blog = _blog(_section(raw, "blog"), config_dir)
     stickers_cfg = _stickers(_section(raw, "stickers"))
     # 归档目录同样以配置文件所在目录为基准，并在这里就检查它与知识库、记忆、
@@ -508,11 +556,7 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
         log_level=_text_with_default(logging_raw, "level", "logging", "INFO"),
         system_prompt=system_prompt,
         system_prompt_sha256=hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()[:12],
-        secrets=Secrets(
-            username=_secret(source, USERNAME_ENV),
-            password=_secret(source, PASSWORD_ENV),
-            llm_api_key=_secret(source, LLM_API_KEY_ENV),
-        ),
+        secrets=secrets,
         comments=comments,
         mcp=mcp,
         knowledge_base=knowledge_base,
@@ -635,7 +679,7 @@ def _required_text(container: Mapping[str, Any], key: str, path: str) -> str:
     """取必填文本；缺失或全为空白则报错。path 是用于报错的完整配置路径。"""
     value = container.get(key)
     if not isinstance(value, str) or not value.strip():
-        raise ConfigError(f"缺少必填配置 {path}")
+        raise ConfigError(f"缺少必填配置 {path}", field=path, kind=KIND_MISSING)
     return value.strip()
 
 
@@ -670,15 +714,27 @@ def _base_url(container: Mapping[str, Any], where: str) -> str:
     cleaned = value.rstrip("/")
     parsed = urllib.parse.urlsplit(cleaned)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise ConfigError(f"配置 {where}.base_url 必须是 http/https 地址")
+        raise ConfigError(
+            f"配置 {where}.base_url 必须是 http/https 地址",
+            field=f"{where}.base_url",
+        )
     if parsed.username is not None or parsed.password is not None:
-        raise ConfigError(f"配置 {where}.base_url 不得包含用户名或密码")
+        raise ConfigError(
+            f"配置 {where}.base_url 不得包含用户名或密码",
+            field=f"{where}.base_url",
+        )
     if parsed.query or parsed.fragment:
-        raise ConfigError(f"配置 {where}.base_url 不得包含查询串或片段")
+        raise ConfigError(
+            f"配置 {where}.base_url 不得包含查询串或片段",
+            field=f"{where}.base_url",
+        )
     if parsed.scheme != "https":
         if not _is_loopback_host(parsed.hostname):
             # 非回环地址无条件要求 https：开关也不放行（见上面的说明）。
-            raise ConfigError(f"配置 {where}.base_url 对非本机地址必须是 https")
+            raise ConfigError(
+                f"配置 {where}.base_url 对非本机地址必须是 https",
+                field=f"{where}.base_url",
+            )
         if not _plain_http_allowed(container, where):
             raise ConfigError(
                 f"配置 {where}.base_url 使用 http 需要显式设置 "
@@ -993,7 +1049,11 @@ def _mcp(container: Mapping[str, Any]) -> McpConfig:
             continue
         command = raw_value.get("command")
         if not isinstance(command, str) or not command.strip():
-            raise ConfigError(f"缺少必填配置 mcp.servers.{name}.command")
+            raise ConfigError(
+                f"缺少必填配置 mcp.servers.{name}.command",
+                field=f"mcp.servers.{name}.command",
+                kind=KIND_MISSING,
+            )
         # stdio 服务器不得带 SSE 字段：两套连接方式并存时谁生效取决于实现细节，
         # 直接拒绝，避免出现「以为在连远程、其实起的是子进程」的静默行为。
         _reject_server_fields(raw_value, name, ("url", "bearer_env", "stream_read_timeout_seconds"))
@@ -1069,7 +1129,11 @@ def _mcp_sse_server(
     )
     url = raw.get("url")
     if not isinstance(url, str) or not url.strip():
-        raise ConfigError(f"缺少必填配置 mcp.servers.{name}.url")
+        raise ConfigError(
+            f"缺少必填配置 mcp.servers.{name}.url",
+            field=f"mcp.servers.{name}.url",
+            kind=KIND_MISSING,
+        )
     url = url.strip()
     if not url.lower().startswith("https://"):
         # Bearer 令牌会随每个请求发出，明文 http 等于把它交给链路上的任何人。
@@ -1810,5 +1874,5 @@ def _secret(env: Mapping[str, str], name: str) -> str:
     """从环境变量读取密钥；缺失或全为空白则报错（不打印取值）。"""
     value = env.get(name)
     if not isinstance(value, str) or not value.strip():
-        raise ConfigError(f"缺少环境变量 {name}")
+        raise ConfigError(f"缺少环境变量 {name}", field=name, kind=KIND_MISSING)
     return value
