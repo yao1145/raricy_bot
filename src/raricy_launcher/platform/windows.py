@@ -316,7 +316,11 @@ class _WinActivationListener:
             overlapped.hEvent = win32event.CreateEvent(None, True, False, None)
             try:
                 try:
-                    hr = win32file.ReadFile(pipe, 1, overlapped)[0]
+                    # 必须保留返回的读缓冲：挂起的 overlapped 读由系统在完成时写入
+                    # 这块内存，只取状态码会让它在完成前就被回收，客户端随后补发
+                    # 数据时内核会写到已释放的对象上。`read_buffer` 是局部名，活到
+                    # 本轮迭代结束 —— 完成或取消落地之后（见 `_await_io`）。
+                    hr, read_buffer = win32file.ReadFile(pipe, 1, overlapped)
                 except pywintypes.error:
                     # 客户端已关闭（含 ERROR_BROKEN_PIPE）：交付结束。
                     return
