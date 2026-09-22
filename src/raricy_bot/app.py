@@ -81,6 +81,7 @@ from .core.worker import (
     ToolGenerationCancelled,
     WorkerPool,
 )
+from .diag import describe_error
 from .kb.service import KnowledgeService
 from .logging_setup import (
     get_logger,
@@ -89,7 +90,6 @@ from .logging_setup import (
     secret_registry,
 )
 from .mcp.adapters import build_adapters
-from .mcp.contracts import describe_error
 from .mcp.runtime import McpManager
 from .memory.access import MemoryAccessPolicy
 from .memory.commands import MemoryCommandRequest

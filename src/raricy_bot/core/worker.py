@@ -23,6 +23,7 @@ import httpx
 import openai
 
 from ..config import ModelConfig
+from ..diag import elapsed_ms
 from ..logging_setup import get_logger, log_event, new_trace_id, observe_task, safe_stack
 from ..mcp.contracts import (
     McpProvider,
@@ -31,7 +32,6 @@ from ..mcp.contracts import (
     ToolDefinition,
     ToolExecution,
     ToolExecutor,
-    elapsed_ms,
 )
 from ..redact import Redactor
 from ..text_utils import estimate_tokens
