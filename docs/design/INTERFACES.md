@@ -838,12 +838,20 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 - **草稿**（§6.2）走同一套校验，只接受 `kind == missing` 类错误（"还没填"），
   `invalid` 一律拒绝；草稿有自己的 revision，不改变正式配置，也不接触凭据库。
 - **凭据库**（§7）：引用是随机不透明标识，载荷 `{username, password, llm_api_key}` 只进后端；
-  `SystemKeyringStore` 惰性导入 `keyring`，明文/空/必然失败的后端**一律拒绝**，
-  不可用时由调用方降级到 `SessionMemoryStore` 并如实报告（重启后引用不可解析 →
-  `needs_credentials`，不假装已保存）。
+  `SystemKeyringStore` 惰性导入 `keyring`，后端必须来自 `keyring.backends`（系统后端命名空间），
+  名字里出现空/明文/必然失败的特征词一律拒绝，**链式后端逐环递归检查**（`ChainerBackend`
+  可以把写入转交给明文后端）；不可用时由调用方降级到 `SessionMemoryStore` 并如实报告
+  （重启后引用不可解析 → `needs_credentials`，不假装已保存）。
 - **状态**（§9.1）：`needs_setup` / `needs_credentials` / `configured` / `invalid`；
-  `invalid` 覆盖版本、字段、能力策略与路径包含。`build_run_config()` 生成只含非敏感字段、
-  按 revision 命名的运行快照；`credentials_for()` 供入口把凭据注入子进程环境。
+  `invalid` 覆盖版本、字段、能力策略与路径包含，`error` 一律是稳定类别码（不是中文文案）。
+  账号名在档案内**不可变**（§13.3：换账号走重新设置），因此界面显示的账号与实际登录凭据
+  不会拆成两个事实。
+- **运行快照**（§6.5）：`build_run_launch(revision)` 在写锁内**一次**取到「指定版本的运行
+  快照 + 对应凭据」（分开调用会拼出旧配置配新 Key）；`build_run_config()` / `credentials_for()`
+  都**必须显式给 revision**，快照写在档案自己的 `runtime/` 下，换档案不会互相覆盖。
+- **档案路径**（§9.5）：`profile_dir()` 以规范化后的数据根为锚点，档案目录自身指向根外
+  时直接拒绝 —— 只校验 id 会让后续以档案为根的包含检查跟着链接解析出去。
 - **数据档案锁**（§9.5）：锁标识由规范化后的**存储目录**（数据库文件所在目录）派生，
-  完整版 CLI 与 Light Worker 因此天然争用同一个标识；`acquire_data_lock()` 立即取得，
-  被占用时 CLI 以退出码 4 结束（§17）。锁文件里的 pid 只用于诊断，不是夺锁依据。
+  规范化要**先解析数据库文件自身的链接**再取父目录 —— 否则指向同一个数据库的两条路径
+  会各拿一把锁。完整版 CLI 与 Light Worker 因此天然争用同一个标识；`acquire_data_lock()`
+  立即取得，被占用时 CLI 以退出码 4 结束（§17）。锁文件里的 pid 只用于诊断，不是夺锁依据。
