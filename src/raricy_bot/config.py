@@ -809,7 +809,10 @@ def _temperature(container: Mapping[str, Any]) -> float:
     """取温度配置，合法区间 [0, 2]。"""
     value = _number(container.get("temperature", 0.4), "model", "temperature")
     if not 0 <= value <= 2:
-        raise ConfigError("配置 model.temperature 必须在 0 到 2 之间")
+        raise ConfigError(
+            "配置 model.temperature 必须在 0 到 2 之间",
+            field="model.temperature",
+        )
     return value
 
 

@@ -473,10 +473,20 @@ class _WinSuspendedProcess:
             raise PlatformError("process_resume_failed") from exc
 
     def wait(self, timeout_ms: int) -> int | None:
-        result = win32event.WaitForSingleObject(self._process_handle, timeout_ms)
-        if result == win32event.WAIT_TIMEOUT:
+        # 句柄可能被另一个线程（停止流程）关闭：全程用**捕获到的局部句柄**，
+        # 不在等待之后重新读属性 —— 那是一个 TOCTOU 窗口，会撞上无效句柄。
+        handle = self._process_handle
+        if handle is None:
+            # 已经回收：退出结果不再可查，由调用方按「已回收」处理。
             return None
-        return win32process.GetExitCodeProcess(self._process_handle)
+        try:
+            result = win32event.WaitForSingleObject(handle, timeout_ms)
+            if result == win32event.WAIT_TIMEOUT:
+                return None
+            return win32process.GetExitCodeProcess(handle)
+        except pywintypes.error:
+            # 等待期间句柄被停止流程关闭：同样按「已回收」处理，不向调用方抛错。
+            return None
 
     def terminate(self) -> None:
         try:

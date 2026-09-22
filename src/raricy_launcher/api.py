@@ -23,6 +23,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from starlette.datastructures import MutableHeaders
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -58,6 +60,8 @@ MODEL_TEST_TIMEOUT_SECONDS: float = 15.0
 
 # SSE 心跳：没有新事件时也要让浏览器知道连接还活着（§12）。
 SSE_HEARTBEAT_SECONDS: float = 15.0
+# SSE 轮询间隔：订阅队列的轮询周期，取消要立刻生效。
+SSE_POLL_SECONDS: float = 0.5
 
 CSP_POLICY: str = (
     "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
@@ -79,6 +83,36 @@ class ApiError(Exception):
         if self.field:
             body["field"] = self.field
         return body
+
+
+class _HostGuardMiddleware:
+    """每个请求校验精确 Host，并给 API 响应补 `no-store`、给页面补 CSP（§8.1/§8.2）。"""
+
+    def __init__(self, app, *, api: "LocalApi") -> None:
+        self._app = app
+        self._api = api
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+        request = Request(scope, receive=receive)
+        if not self._api._host_allowed(request):
+            await self._api._json(403, {"ok": False, "code": "bad_host"})(scope, receive, send)
+            return
+        is_api = str(scope.get("path", "")).startswith("/api/")
+
+        async def _send(message):
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                if is_api:
+                    headers["Cache-Control"] = "no-store"
+                if headers.get("content-type", "").startswith("text/html"):
+                    headers["Content-Security-Policy"] = CSP_POLICY
+                    headers["X-Content-Type-Options"] = "nosniff"
+            await send(message)
+
+        await self._app(scope, receive, _send)
 
 
 class LocalApi:
@@ -127,18 +161,9 @@ class LocalApi:
 
     def _build(self) -> FastAPI:
         app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-
-        @app.middleware("http")
-        async def _host_guard(request: Request, call_next):
-            if not self._host_allowed(request):
-                return self._json(403, {"ok": False, "code": "bad_host"})
-            response = await call_next(request)
-            if request.url.path.startswith("/api/"):
-                response.headers["Cache-Control"] = "no-store"
-            if response.headers.get("content-type", "").startswith("text/html"):
-                response.headers["Content-Security-Policy"] = CSP_POLICY
-                response.headers["X-Content-Type-Options"] = "nosniff"
-            return response
+        # 纯 ASGI 中间件而不是 BaseHTTPMiddleware：后者会把响应体缓冲一遍，
+        # 无限的事件流因此永远发不出第一段（实测挂住）。
+        app.add_middleware(_HostGuardMiddleware, api=self)
 
         app.add_api_route("/api/session/exchange", self._exchange, methods=["POST"])
         app.add_api_route("/api/config", self._get_config, methods=["GET"])
@@ -665,20 +690,22 @@ class LocalApi:
                     yield _sse("gap", {"reason": gap})
                 for event in replayed:
                     yield _sse_frame(event)
+                idle = 0.0
                 while True:
                     if await request.is_disconnected():
                         return
                     try:
                         event = subscriber.get_nowait()
                     except queue.Empty:
-                        try:
-                            event = await asyncio.to_thread(
-                                subscriber.get, True, SSE_HEARTBEAT_SECONDS
-                            )
-                        except queue.Empty:
-                            # 心跳：让浏览器知道连接还在，也让断开尽快被发现。
+                        # 轮询而不是把阻塞读取丢进线程池：取消要立刻生效，
+                        # 否则关闭页面会留下等心跳的线程（§12 的慢消费者清理）。
+                        await asyncio.sleep(SSE_POLL_SECONDS)
+                        idle += SSE_POLL_SECONDS
+                        if idle >= SSE_HEARTBEAT_SECONDS:
+                            idle = 0.0
                             yield _sse("heartbeat", {})
-                            continue
+                        continue
+                    idle = 0.0
                     if event is None:
                         return
                     yield _sse_frame(event)

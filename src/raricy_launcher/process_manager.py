@@ -23,6 +23,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 from raricy_bot.config import LLM_API_KEY_ENV, PASSWORD_ENV, USERNAME_ENV, Secrets
 
@@ -190,6 +191,11 @@ class WorkerProcess:
         return self._forced_stop
 
     @property
+    def closed(self) -> bool:
+        """是否已被回收（`close()` 之后）；监视线程据此结束等待。"""
+        return self._process is None
+
+    @property
     def job(self) -> WorkerJob | None:
         """纳管本进程的 Job；Controller 持有，崩溃模拟测试据此直接关闭。"""
         return self._job
@@ -197,7 +203,13 @@ class WorkerProcess:
     # --- 会话 -------------------------------------------------------------
 
     def send_command(self, kind: str, payload: dict | None = None) -> int:
-        """发一条控制命令，返回本会话内递增的序号（§10.1）。"""
+        """发一条控制命令，返回本会话内递增的序号（§10.1）。
+
+        已关闭的 Worker 上再发指令是空操作：停止流程、监视线程与用户操作会交叉，
+        重复的「请停」不该变成异常。
+        """
+        if self._control is None:
+            return 0
         self._seq += 1
         frame = ipc.encode_frame(
             kind,
@@ -211,6 +223,8 @@ class WorkerProcess:
 
     def next_frame(self, timeout: float) -> dict | None:
         """取一条上报帧；超时返回 None。EOF 后队列会立刻排空并由 `report_closed` 标记。"""
+        if self._report is None:
+            return None
         try:
             frame = self._frames.get(timeout=timeout)
         except queue.Empty:
@@ -242,22 +256,29 @@ class WorkerProcess:
         return getattr(self, "_ready_payload", {})
 
     def request_stop(self) -> None:
-        """经控制通道请求优雅停止；幂等，进程已退出时不报错。"""
+        """经控制通道请求优雅停止；幂等，进程已退出或已关闭时不报错。"""
         self.send_command("stop")
 
     # --- 进程 -------------------------------------------------------------
 
     def wait(self, timeout_ms: int) -> int | None:
-        """等待退出；返回退出码，超时返回 None。"""
-        if self._process is None:
+        """等待退出；返回退出码，超时或已回收返回 None。
+
+        句柄可能被停止流程在同一时刻回收：这里先捕获局部引用，避免在检查与调用
+        之间被换掉（那会让监视线程撞上 `None`）。
+        """
+        process = self._process
+        if process is None:
             return None
-        return self._process.wait(timeout_ms)
+        return process.wait(timeout_ms)
 
     def terminate(self) -> None:
         """停止超时后的强制终止；标记 forced_stop，不得声称优雅完成。"""
         self._forced_stop = True
-        if self._process is not None:
-            self._process.terminate()
+        process, self._process = self._process, None
+        if process is not None:
+            process.terminate()
+            self._process = process
 
     def close(self) -> None:
         """关闭管道、进程句柄与 Job；重复关闭是安全的。
@@ -421,6 +442,7 @@ class WorkerManager:
         self._operations: dict[str, Operation] = {}
         self._cancel_start = threading.Event()
         self._quitting = False
+        self._forced_stop = False
         self._exit_reason: str | None = None
         self._monitor: threading.Thread | None = None
         self._last_status: dict | None = None
@@ -458,7 +480,10 @@ class WorkerManager:
             return {
                 "state": self._state,
                 "pid": worker.pid if worker is not None else None,
-                "forced_stop": bool(worker is not None and worker.forced_stop),
+                # 记住最后一次停止是否只能强制完成；Worker 已经回收时也要如实报告。
+                "forced_stop": bool(
+                    (worker is not None and worker.forced_stop) or self._forced_stop
+                ),
                 "exit_reason": self._exit_reason,
                 "operation_id": self._operation.operation_id if self._operation else None,
             }
@@ -525,9 +550,11 @@ class WorkerManager:
     def _do_start(self, operation: Operation) -> None:
         revision = operation.target_revision
         self._on_event("worker.starting", {"revision": revision})
-        try:
-            spec = self._spec_factory(revision)
+        with self._lock:
             self._run_seq += 1
+            run_id = f"{self._instance_id}-{self._run_seq}"
+        try:
+            spec = self._spec_factory(revision, run_id)
             worker = WorkerProcess(
                 self._platform, spec, instance_id=self._instance_id, run_id=run_id
             )
@@ -542,6 +569,9 @@ class WorkerManager:
             self._worker = worker
         if not self._wait_ready(worker):
             reason = "cancelled" if self._cancel_start.is_set() else "start_timeout"
+            with self._lock:
+                if self._worker is worker:
+                    self._worker = None
             self._reap(worker)
             with self._lock:
                 self._state = STATE_STOPPED if reason == "cancelled" else STATE_FAILED
@@ -551,6 +581,7 @@ class WorkerManager:
         with self._lock:
             self._state = STATE_RUNNING
             self._exit_reason = None
+            self._forced_stop = False
             self._last_status = worker.ready_payload.get("status")
         self._start_monitor(worker)
         self._finish(operation, OP_FINISHED, "running")
@@ -571,15 +602,19 @@ class WorkerManager:
 
     def _do_stop(self, operation: Operation) -> None:
         with self._lock:
+            # 停止落在 starting 上等于「取消这次启动」：进程还没进入运行态，
+            # 因此强制结束也不算「在处理中被打断」（§9.2）。
+            cancelled_start = self._state == STATE_STARTING
             self._state = STATE_STOPPING
-        result = self._stop_synchronously()
+        result = self._stop_synchronously(cancelled_start=cancelled_start)
         self._finish(operation, OP_FINISHED, result)
         self._on_event("worker.stopped", {"result": result})
 
     def _do_restart(self, operation: Operation, revision: int | None) -> None:
         with self._lock:
+            cancelled_start = self._state == STATE_STARTING
             self._state = STATE_STOPPING
-        self._stop_synchronously()
+        self._stop_synchronously(cancelled_start=cancelled_start)
         if self._cancel_start.is_set():
             self._finish(operation, OP_FINISHED, "stopped")
             return
@@ -608,8 +643,8 @@ class WorkerManager:
             self._operations[operation.operation_id] = final
             self._operation = final
 
-    def _stop_synchronously(self) -> str:
-        """停止并回收当前 Worker；返回固定结果码（stopped / forced_stop / failed）。"""
+    def _stop_synchronously(self, *, cancelled_start: bool = False) -> str:
+        """停止并回收当前 Worker；返回固定结果码（stopped / cancelled / forced_stop / failed）。"""
         with self._lock:
             worker = self._worker
             self._worker = None
@@ -625,8 +660,15 @@ class WorkerManager:
             forced = True
             code = worker.wait(self._stop_budget_ms)
         worker.close()
+        if forced:
+            self._forced_stop = True
         with self._lock:
-            if forced or code != 0:
+            if cancelled_start:
+                # 半初始化的进程被回收：没有在途工作，如实报「已取消」而不是失败。
+                self._state = STATE_STOPPED
+                self._exit_reason = None
+                result = "cancelled"
+            elif forced or code != 0:
                 self._state = STATE_FAILED
                 if forced:
                     self._exit_reason = "forced_stop"
@@ -654,9 +696,17 @@ class WorkerManager:
         """监视意外退出：不是本机发起的停止就进 failed，不自动重启（§9.2）。"""
 
         def _wait() -> None:
-            code = worker.wait(0)
-            if code is None:
-                return
+            while True:
+                if worker.closed:
+                    # 正常停止流程已经回收了它，不重复报「意外退出」。
+                    return
+                code = worker.wait(1000)
+                if code is not None:
+                    break
+                with self._lock:
+                    if self._worker is not worker:
+                        # 正常的停止流程已经接管了这个进程，不重复报「意外退出」。
+                        return
             with self._lock:
                 if self._worker is not worker:
                     return
