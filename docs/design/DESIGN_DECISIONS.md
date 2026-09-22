@@ -9,7 +9,8 @@
 D-55–D-80 长期记忆，D-81–D-94 能力与基础设施，D-95–D-103 近期上下文/公开记忆，
 D-104–D-110 上游鉴权/额度/发文，D-111–D-113 日志/永久归档/传输安全，D-114 系统提示词中的
 当前时间片段，D-115–D-118 代码审查修复（记忆提交授权、工具能力按次调用、配额结算抗取消、
-按可运行会话调度），D-119 出站文本管线与表情规范化（第三类 system 静态来源）。
+按可运行会话调度），D-119 出站文本管线与表情规范化（第三类 system 静态来源），
+D-120 Light 桌面平台层的 Windows 绑定选择。
 后续变更沿用编号注明替代关系，不叠加互相矛盾的补丁段落。
 
 <a id="d-1"></a>
@@ -892,6 +893,21 @@ D-114 第 3 条本就要求此后任何新增的动态 system 内容重新走决
 `sticker.render`，字段 `candidates` / `kept` / `fixed` / `dropped` / `dropped_for_secret`
 （均 `TOKEN`）；前四者描述 `render`，`dropped_for_secret` 属复检阶段、可与之重叠，实际发出
 token 数是 `kept + fixed - dropped_for_secret`（§55.5）。不记正文，也不记具体名字。
+
+<a id="d-120"></a>
+
+## D-120 Light 桌面平台层选用 pywin32 作为 Windows 系统 API 绑定
+
+`raricy_launcher.platform` 需要四类系统能力（LIGHT_EDITION_DESIGN §9.3/§9.4）：
+Job Object（`KILL_ON_JOB_CLOSE` 崩溃回收）、当前用户范围的命名互斥体、带 ACL
+且拒绝远程客户端的命名管道、挂起创建子进程（先纳管后放行）。L0 选定
+`pywin32`（>=306）作为唯一绑定：这些 API 在 pywin32 里都是受维护的一等封装
+（win32job / win32event / win32pipe / win32security / win32process），安全描述符
+与句柄继承语义直接可见可测。ctypes 手写等量绑定会把结构体布局与错误处理的正确性
+责任移进本项目；单独引入 Rust/C++ 绑定则多出一条工具链与发行矩阵。约束：绑定只许
+出现在 `raricy_launcher/platform/`，业务模块只依赖其中的协议与固定错误码；依赖只进
+`packaging/light/` 清单与根 pyproject 的 dev extra（带 `sys_platform == "win32"`
+标记，供平台集成测试），完整版运行依赖与部署入口不变。
 
 ## 实施期编号兼容
 
