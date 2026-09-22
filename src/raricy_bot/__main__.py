@@ -23,6 +23,7 @@ import signal
 import sys
 
 from .app import BotApp
+from .assembly import AssemblyError
 from .blog.assembly import build_blog_service
 from .config import Config, ConfigError, load_config
 from .error_archive import ArchiveError, ArchiveHandler, ErrorArchive, iter_entries, verify_segments
@@ -85,6 +86,11 @@ def main(argv: list[str] | None = None) -> int:
         asyncio.run(_serve(config, archive))
     except KeyboardInterrupt:
         return EXIT_OK
+    except AssemblyError as exc:
+        # 装配接缝错位（配置要求某个子域、完整版入口本该给出实现）：与配置错误
+        # 同等对待 —— 一行原因加退出码 2。`exc` 的文案是稳定类别码，不含任何取值。
+        print(f"装配错误：{exc}", file=sys.stderr)
+        return EXIT_CONFIG
     except Exception as exc:  # 运行期致命错误：只报类型，不泄露任何取值
         # 走 `log_event` 而不是 `print`：归档这时已经装好了，一条只写到 stderr 的
         # 致命错误等于"进程为什么退出"永远进不了永久记录 —— 而那正是最该留下的一条。

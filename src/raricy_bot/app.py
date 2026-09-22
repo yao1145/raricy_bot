@@ -642,6 +642,10 @@ class BotApp:
             try:
                 self._blog_service = self._build_blog_service(user)
                 await self._blog_service.start()
+            except AssemblyError:
+                # 装配错位不受软故障兜底约束：工厂内部（如 L2 的发行能力策略）
+                # 抛出的装配失败必须让启动失败，不能记一条日志后静默置空子域。
+                raise
             except Exception as exc:
                 # 只用 `Exception`（不用 `BaseException`）：启动途中被取消时取消必须继续传播，
                 # 吞掉它会让关闭流程以为一切正常。子域失败不停聊天/评论，也不改变健康判定。
@@ -671,7 +675,10 @@ class BotApp:
         `mcp.features.blog_write` 取 `max_tool_calls_per_turn`（§8.1、D-110）。
         """
         factory = self._blog_service_factory
-        assert factory is not None  # 构造期已按 blog.enabled 校验
+        if factory is None:
+            # 构造期已按 blog.enabled 挡过一次；这里保留显式失败（不用 assert：
+            # `-O` 下会消失），模块被绕过构造顺序调用时也不能静默少一个子域。
+            raise AssemblyError("blog_service_factory_required")
         return factory(
             config=self._config,
             user=user,
