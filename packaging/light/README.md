@@ -10,10 +10,10 @@ staging，检查无 MCP 依赖后构建，不长期维护第二份业务代码�
   Light 专属依赖；本目录是 Light 的唯一构建描述。
 - Light 与完整版共享 `raricy_bot` 导入命名空间，**不得安装到同一 Python 环境**；
   开发、CI 与发行各自使用独立环境。
-- 运行依赖：Light 闭包用到的 `httpx`、`openai`、`PyYAML`、`aiohttp`（约束与根
-  pyproject 一致，**不**含 `mcp`）加平台层绑定 `pywin32`（L0 选定）。清单由测试
-  钉住：闭包里出现新的第三方导入而没有在此声明时直接失败。FastAPI/Uvicorn/keyring
-  在对应阶段进入本目录的清单，不进根 pyproject。
+- 运行依赖：Light 闭包用到的 `httpx`、`openai`、`PyYAML`、`aiohttp`，凭据库
+  `keyring`（只接受系统安全后端，§7）与平台层绑定 `pywin32`（约束与根 pyproject
+  一致，**不**含 `mcp`）。清单由测试钉住：闭包里出现新的第三方导入而没有在此
+  声明时直接失败。FastAPI/Uvicorn 在 L3 进入本目录的清单，不进根 pyproject。
 
 ## 构建
 

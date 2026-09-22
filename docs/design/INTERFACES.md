@@ -30,6 +30,11 @@ Python >=3.12，包根为 `src/raricy_bot/`。依赖和测试配置见 [pyprojec
 
 另有独立模块 [error_archive.py](../../src/raricy_bot/error_archive.py)（§2.1）。
 
+加载拆成三个入口：`read_config_yaml()`（有界读取与 YAML 解析）、`parse_config(raw, *,
+config_dir, secrets)`（唯一的字段/跨字段/URL 安全校验，GUI 与 CLI 共用）、以及组合凭据的
+`load_config()`（CLI：路径优先级 + 环境变量）。`ConfigError` 带 `field` 与 `kind`
+（`missing` = 还没填、`invalid` = 填错），供 Launcher 的草稿校验与结构化错误使用（D-124）。
+
 ## 2. `logging_setup.py`
 
 入口：[日志与白名单](../../src/raricy_bot/logging_setup.py)。`LOG_FIELDS` 由
@@ -276,7 +281,8 @@ resync 拉取按 message ID 去重，空 event ID 不抬水位。
 再运行 App。完整版在此注入 `ToolCallingModelClient`、`build_mcp_manager` 与
 `build_blog_service`（§56）；Light 走 launcher 入口，不经过本模块。
 退出码：配置错误 2（含装配接缝错位的 `AssemblyError`，只在 stderr 打一行类别码），
-归档已启用却打不开 3，运行期致命错误 1，其余 0；任何一条错误路径都不回显凭据。
+归档已启用却打不开 3，**数据目录被占用或不可用 4**（公共数据档案锁，D-125），运行期致命错误 1，
+其余 0；任何一条错误路径都不回显凭据。锁在打开归档与 Store **之前**取得，第二个写者不碰任何数据。
 停止须等待资源关闭，不能留下 pending task 或未关闭客户端；归档在 `finally` 里同步并关闭。
 
 「已启用但打不开」是致命的：继续跑只会让所有人以为永久记录正在工作。边界要说清楚 ——
@@ -811,3 +817,33 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   `stop()` 返回后留下无人回收的 Worker；Worker 由 Job 对象兜底回收（D-120）。
   L0 的拒绝只在日志里留痕（`worker.spawn status=refused`），可区分的操作结果属 L3；
   L3 若按 §9.2 用 `stop → start` 组合出 restart，必须先清除停止标志，否则重启永远被拒。
+
+## 58. `raricy_launcher` 的配置与凭据（L2）
+
+入口：[档案布局](../../src/raricy_launcher/paths.py)、[配置事务](../../src/raricy_launcher/config_service.py)、
+[凭据库](../../src/raricy_launcher/credential_store.py)、[数据档案锁](../../src/raricy_bot/data_lock.py)。
+
+- **档案布局**（§13.1）：`launcher.json` 只放活动档案指针与 schema；每个档案有
+  `config.yaml`、`draft.yaml`、`revisions/`、`data/`、`knowledge/`、`logs/{runtime,errors}/`。
+  路径判定一律先规范化（绝对、解析链接/重解析点、大小写）再做包含检查：档案内的存储、
+  记忆、知识与归档目录必须落在当前档案目录内（D-122 的路径口径见 §9.5）。
+- **配置三个对象**（§6.1）：`EditableConfig` 是表单可编辑字段的白名单（`EDITABLE_FIELDS`），
+  `CredentialUpdate` 是 keep/replace/delete 三种凭据操作，`Config` 仍是 Core 的冻结运行配置。
+  Launcher 掌控的字段（站点地址、档案内路径、探针监听、MCP/发文关闭）由基线映射提供，
+  不接受提交；不在白名单里的键**拒绝**而不是静默忽略。
+- **提交协议**（§6.4）：`expected_revision` 不符即 `ConfigConflict`；校验（字段 + Light 策略 +
+  凭据齐备）全部在写盘之前；替换凭据时先登记脱敏、写库、回读确认；随后写 `revisions/<rev>.yaml`
+  快照与同目录临时文件，fsync 后 `os.replace` 原子替换。任一步失败都保持旧版本，并清理
+  **本次新建且未被引用**的凭据；旧凭据不自动回收（运行实例与回退版本仍可能引用它们）。
+- **草稿**（§6.2）走同一套校验，只接受 `kind == missing` 类错误（"还没填"），
+  `invalid` 一律拒绝；草稿有自己的 revision，不改变正式配置，也不接触凭据库。
+- **凭据库**（§7）：引用是随机不透明标识，载荷 `{username, password, llm_api_key}` 只进后端；
+  `SystemKeyringStore` 惰性导入 `keyring`，明文/空/必然失败的后端**一律拒绝**，
+  不可用时由调用方降级到 `SessionMemoryStore` 并如实报告（重启后引用不可解析 →
+  `needs_credentials`，不假装已保存）。
+- **状态**（§9.1）：`needs_setup` / `needs_credentials` / `configured` / `invalid`；
+  `invalid` 覆盖版本、字段、能力策略与路径包含。`build_run_config()` 生成只含非敏感字段、
+  按 revision 命名的运行快照；`credentials_for()` 供入口把凭据注入子进程环境。
+- **数据档案锁**（§9.5）：锁标识由规范化后的**存储目录**（数据库文件所在目录）派生，
+  完整版 CLI 与 Light Worker 因此天然争用同一个标识；`acquire_data_lock()` 立即取得，
+  被占用时 CLI 以退出码 4 结束（§17）。锁文件里的 pid 只用于诊断，不是夺锁依据。
