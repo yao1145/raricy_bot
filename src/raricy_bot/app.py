@@ -793,6 +793,47 @@ class BotApp:
                 return False
         return True
 
+    def status_snapshot(self) -> dict[str, object]:
+        """只读状态快照（LIGHT_EDITION_DESIGN §10.2、§12），供 Worker 转成 IPC 上报。
+
+        与探针同一口径：区分「配置意图」「实际初始化」与「最近结果」，缺证据就
+        报 unknown / False，不从历史日志猜当前状态。字段只含计数与状态，不含
+        Cookie、正文、查询或路径；站点的模型测试结果由 Controller 侧持有，
+        这里只报告配置意图。
+        """
+        sse = self._sse
+        comments = self._comment_service
+        memory_service = self._memory_service
+        return {
+            "sampled_at": time.time(),
+            "live": self.live,
+            "ready": self.ready,
+            "site": {
+                "authenticated": self._client.logged_in,
+                "sse_connected": bool(sse is not None and sse.connected),
+                # 登录成功不等于可聊天：权限/禁言时 ready 为 False（D-4）。
+                "chat_ready": self.ready,
+                "unavailable": self._unavailable,
+            },
+            "model": {
+                "configured": bool(
+                    self._config.model.base_url and self._config.model.model
+                ),
+                "vision_enabled": self._config.model.vision_enabled,
+            },
+            "comments": {
+                "enabled": self._config.comments.enabled,
+                "running": bool(comments is not None and comments.alive),
+            },
+            "knowledge_base": self._kb.status_snapshot(),
+            "memory": {
+                "enabled": self._memory_enabled,
+                "armed": self._memory_armed,
+                "available": bool(memory_service is not None and memory_service.available),
+            },
+            "archive": self._archive_status() or {"enabled": False},
+        }
+
     # --- 长期记忆（§34.2 / §34.3 / §30.1） -----------------------------------
 
     async def _start_memory(self) -> None:

@@ -121,6 +121,34 @@ class KnowledgeService:
         """是否已有成功构建的快照。"""
         return self._state is not None
 
+    def status_snapshot(self) -> dict[str, object]:
+        """只读状态快照（LIGHT_EDITION_DESIGN §10.2）：只有计数与稳定原因。
+
+        不返回资料正文、路径、查询或标题 —— 这些都不属于「对外展示的事实」。
+        没有任何快照时如实报告未加载，而不是从日志或配置猜一个数字。
+        """
+        state = self._state
+        if state is None:
+            return {
+                "enabled": self._config.enabled,
+                "loaded": False,
+                "documents": 0,
+                "chunks": 0,
+                "skipped": 0,
+                "version": 0,
+                "skip_reasons": [],
+            }
+        snapshot, _index = state
+        return {
+            "enabled": self._config.enabled,
+            "loaded": True,
+            "documents": snapshot.document_count,
+            "chunks": snapshot.chunk_count,
+            "skipped": snapshot.skipped_files,
+            "version": snapshot.version,
+            "skip_reasons": list(snapshot.skip_reasons),
+        }
+
     def permits(self, *, channel_kind: str, user_id: str) -> bool:
         """访问策略：先看频道类型，再按 access_mode 判断用户（D-44）。"""
         config = self._config
