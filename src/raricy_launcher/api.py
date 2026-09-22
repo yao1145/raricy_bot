@@ -23,8 +23,6 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from starlette.datastructures import MutableHeaders
-
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -104,12 +102,13 @@ class _HostGuardMiddleware:
 
         async def _send(message):
             if message["type"] == "http.response.start":
-                headers = MutableHeaders(scope=message)
                 if is_api:
-                    headers["Cache-Control"] = "no-store"
-                if headers.get("content-type", "").startswith("text/html"):
-                    headers["Content-Security-Policy"] = CSP_POLICY
-                    headers["X-Content-Type-Options"] = "nosniff"
+                    _set_header(message, b"cache-control", "no-store")
+                for key, value in message.get("headers", []):
+                    if key.lower() == b"content-type" and value.startswith(b"text/html"):
+                        _set_header(message, b"content-security-policy", CSP_POLICY)
+                        _set_header(message, b"x-content-type-options", "nosniff")
+                        break
             await send(message)
 
         await self._app(scope, receive, _send)
@@ -808,6 +807,13 @@ class LocalApi:
         response = StreamingResponse(iter([target.read_bytes()]), media_type=media_type)
         response.headers["Cache-Control"] = "no-store"
         return response
+
+
+def _set_header(message: dict, name: bytes, value: str) -> None:
+    """在 ASGI 响应的原始头列表上替换/追加一个头（不引入额外的框架类型）。"""
+    headers = [pair for pair in message.get("headers", []) if pair[0].lower() != name]
+    headers.append((name, value.encode("latin-1")))
+    message["headers"] = headers
 
 
 def _get_path(document: Any, key: str) -> Any:

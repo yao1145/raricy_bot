@@ -18,6 +18,9 @@ dependencies = [
     # 系统凭据库（LIGHT_EDITION_DESIGN §7）：只接受系统安全后端，明文/空后端被拒。
     # 版本下限在 L5 打包时按实测锁定；这里只声明"必须存在且是安全后端"。
     "keyring>=24",
+    # 本机控制服务（§14）：FastAPI 的请求/响应合同、Uvicorn 的单进程 ASGI 服务。
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
     # 平台层绑定：Job/互斥体/管道 ACL；仅 Windows 需要（LIGHT_EDITION_DESIGN §14）
     "pywin32>=306; sys_platform == 'win32'",
 ]
