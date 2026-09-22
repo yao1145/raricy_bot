@@ -515,6 +515,22 @@ class ConfigService:
             self._write_document(paths.draft_path(profile), document)
             return revision
 
+    def validate_values(self, values: Mapping[str, Any]) -> None:
+        """静态校验：只走公共字段规则与 Light 能力策略，不写盘、不碰凭据（§11）。
+
+        与草稿同一口径：允许「还没填」，但**已填写项**必须合法。
+        """
+        with self._lock:
+            profile = self.profile()
+            base = light_base_mapping(profile)
+            current = self._read_formal()
+            if current is not None:
+                saved = self._to_saved(current)
+                base = _deep_merge(base, self._without_launcher_owned(saved.mapping))
+            merged = _merge_editable(base, values)
+            self._validate(merged, credentials=None, allow_missing_required=True)
+            self._validate_policy(merged, profile)
+
     # --- 正式提交（§6.4） --------------------------------------------------
 
     def commit(
