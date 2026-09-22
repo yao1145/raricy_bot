@@ -344,7 +344,10 @@ class ConfigService:
         self._root = Path(data_root)
         self._store = credential_store
         self._profile_id = profile_id
-        self._lock = threading.Lock()
+        self._bootstrap_lock = threading.Lock()
+        # 可重入：`require_profile()` 可能在已持锁的提交路径上建立第一个档案
+        # （§5.1 第 1 步），普通 Lock 会在那里自锁死（复审 N-1）。
+        self._lock = threading.RLock()
 
     # --- 档案指针 ---------------------------------------------------------
 
@@ -385,11 +388,18 @@ class ConfigService:
 
         向导的第一步是「读配置」（此时还没有任何档案），把它当错误会让首次启动
         直接失败；初始化数据目录本来就属于启动流程的一部分。
+
+        建立动作在专用锁内**重新检查**一次指针：并发首读如果各建一个档案，指针
+        只会认最后一个，先建立的那些档案里的写入就再也看不见了（复审 N-2）。
         """
         profile_id = self.profile_id()
-        if profile_id is None:
-            profile_id = paths.new_profile_id()
-            self.set_active_profile(profile_id)
+        if profile_id is not None:
+            return profile_id
+        with self._bootstrap_lock:
+            profile_id = self.profile_id()
+            if profile_id is None:
+                profile_id = paths.new_profile_id()
+                self.set_active_profile(profile_id)
         return profile_id
 
     def profile(self) -> Path:

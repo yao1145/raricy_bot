@@ -129,8 +129,10 @@ def _session_and_status(url: str):
         backend = (config.get("credentials") or {}).get("backend") or {}
         if not backend:
             raise SmokeError(f"配置接口没有返回凭据状态：{config}")
-        if not backend["available"]:
-            raise SmokeError(f"凭据后端不可用：{backend['name']}")
+        if backend.get("name") != "keyring" or not backend.get("available"):
+            # 会话内存模式是运行的降级形态，但发行包必须带上系统凭据库：
+            # 否则用户每次启动都要重填密码（复审 N-3）。
+            raise SmokeError(f"发行包没有可用的系统凭据后端：{backend}")
     return csrf, cookies
 
 

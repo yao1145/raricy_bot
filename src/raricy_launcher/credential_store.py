@@ -64,7 +64,12 @@ class SessionMemoryStore:
         self._values: dict[str, Secrets] = {}
 
     def describe(self) -> BackendStatus:
-        return BackendStatus(name="session", available=True)
+        """会话内存**不是持久后端**：`available=False`，界面据此说明重启后要重填。
+
+        这样「后端可用」就等于「有系统凭据库可用」，冒烟与界面都不会被降级模式
+        骗过去（复审 N-3）。
+        """
+        return BackendStatus(name="session", available=False)
 
     def put(self, reference: str, values: Secrets) -> None:
         self._values[reference] = values

@@ -531,6 +531,9 @@ class WorkerManager:
             if self._state == STATE_STOPPED:
                 # 停一个本来就停着的东西：不留「取消启动」意图，否则之后的
                 # restart 会把它当成「刚被停止取消」而静默不动（审查 I1）。
+                # 代次仍要推进：restart 的停止阶段里落下的这次 stop 必须让它放弃启动
+                # （复审 N-4）。
+                self._stop_epoch += 1
                 self._cancel_start.clear()
                 operation = self._new_operation("stop", None)
                 return self._finish(operation, OP_FINISHED, "stopped")
@@ -760,6 +763,8 @@ class WorkerManager:
             worker.terminate()
             forced = True
             code = worker.wait(self._stop_budget_ms)
+        # 退出瞬间可能刚送到最后一帧日志/状态：关句柄前收干净（复审 N-5）。
+        self.drain(worker)
         worker.close()
         if forced:
             self._forced_stop = True
@@ -817,6 +822,9 @@ class WorkerManager:
                     return
                 self._state = STATE_FAILED
                 self._exit_reason = f"exit_{code}"
+                # 进程没了：快照与运行版本不能再冒充当前事实（复审 N-5）。
+                self._last_status = None
+                self._running_revision = None
             self._on_event("worker.exited", {"reason": f"exit_{code}"}, "warning")
 
         with self._lock:
