@@ -56,7 +56,10 @@ class Controller:
         self._instance_id = uuid4().hex[:12]
         self._started_at = time.monotonic()
         self._worker: WorkerProcess | None = None
+        self._stopping: WorkerProcess | None = None
         self._worker_lock = threading.Lock()
+        # 生命周期锁串行化 start/stop 整段操作；锁顺序固定为先生命周期后 worker。
+        self._lifecycle_lock = threading.Lock()
         self._quit = threading.Event()
         self._ready = threading.Event()
         self._httpd: ThreadingHTTPServer | None = None
@@ -155,10 +158,12 @@ class Controller:
             return activation.encode_response(ok=True, url=self.admin_url)
         return activation.encode_response(ok=False, error="unknown_command")
 
-    # --- Worker 管理（原型状态：stopped/running/failed） ----------------------
+    # --- Worker 管理（原型状态：stopped/running/stopping/failed） --------------
 
     def _worker_state(self) -> str:
         with self._worker_lock:
+            if self._stopping is not None:
+                return "stopping"
             worker = self._worker
             if worker is None:
                 return "stopped"
@@ -178,13 +183,15 @@ class Controller:
             return "stopped" if exit_code == 0 else "failed"
 
     def start_worker(self) -> str:
-        with self._worker_lock:
-            if self._worker is not None and self._worker.wait(0) is None:
-                return "running"  # 重复 start 返回当前状态，不并行创建
-            if self._worker is not None:
-                self._worker.close()
-                self._worker = None
-            self._worker = WorkerProcess(self._platform, default_worker_spec())
+        # 与在途停止串行：确认旧进程退出并关闭后才允许创建新进程（§9.2）。
+        with self._lifecycle_lock:
+            with self._worker_lock:
+                if self._worker is not None and self._worker.wait(0) is None:
+                    return "running"  # 重复 start 返回当前状态，不并行创建
+                if self._worker is not None:
+                    self._worker.close()
+                    self._worker = None
+                self._worker = WorkerProcess(self._platform, default_worker_spec())
             log_event(
                 self._logger,
                 logging.INFO,
@@ -195,15 +202,24 @@ class Controller:
             return "running"
 
     def _stop_worker(self) -> None:
-        with self._worker_lock:
-            worker, self._worker = self._worker, None
-        if worker is None:
-            return
-        worker.request_stop()
-        if worker.wait(_STOP_BUDGET_MS) is None:
-            worker.terminate()
-            worker.wait(_STOP_BUDGET_MS)
-        worker.close()
+        with self._lifecycle_lock:
+            with self._worker_lock:
+                worker = self._worker
+                if worker is None:
+                    return
+                # 排空期间保留引用并暴露 stopping：确认退出前既不向状态查询
+                # 报告 stopped，也不放行新的 start。
+                self._stopping = worker
+            try:
+                worker.request_stop()
+                if worker.wait(_STOP_BUDGET_MS) is None:
+                    worker.terminate()
+                    worker.wait(_STOP_BUDGET_MS)
+            finally:
+                worker.close()
+                with self._worker_lock:
+                    self._stopping = None
+                    self._worker = None
 
     def stop_worker(self) -> str:
         self._stop_worker()
