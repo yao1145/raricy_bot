@@ -203,6 +203,7 @@ class BotApp:
         *,
         transport: httpx.AsyncBaseTransport | None = None,
         model_client: ModelClient | None = None,
+        model_client_cls: type[OpenAIModelClient] | None = None,
         mcp_manager: McpManager | None = None,
         knowledge_service: KnowledgeService | None = None,
         memory_service: MemoryService | None = None,
@@ -333,6 +334,9 @@ class BotApp:
         # 注入的假模型不归本对象关闭；内部构造的才需要 aclose。
         self._model = model_client
         self._owns_model = model_client is None
+        # 自建模型客户端时使用的实现类：完整版由入口注入带工具循环的
+        # `ToolCallingModelClient`，Light 版没有工具协议，退回纯文本实现。
+        self._model_client_cls = model_client_cls or OpenAIModelClient
         self._mcp_manager = (
             mcp_manager if mcp_manager is not None else self._build_mcp_manager()
         )
@@ -460,7 +464,7 @@ class BotApp:
         # 位置相对旧版上移了一格（原先在 Router 之后），构造失败时的行为不变：异常照常
         # 传播出 `start()`，同样不会留下比旧版更多的半初始化资源。
         if self._model is None:
-            self._model = OpenAIModelClient(
+            self._model = self._model_client_cls(
                 self._config.model,
                 self._config.secrets.llm_api_key,
                 redactor=self._redactor,

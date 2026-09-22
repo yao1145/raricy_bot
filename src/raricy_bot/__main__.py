@@ -25,6 +25,7 @@ import sys
 from .app import BotApp
 from .config import Config, ConfigError, load_config
 from .error_archive import ArchiveError, ArchiveHandler, ErrorArchive, iter_entries, verify_segments
+from .mcp.tool_client import ToolCallingModelClient
 from .logging_setup import (
     get_logger,
     install_archive,
@@ -150,7 +151,11 @@ def _close_archive(archive: ErrorArchive | object | None) -> None:
 
 async def _serve(config: Config, archive: ErrorArchive | object | None) -> None:
     """构造应用、安装信号处理并阻塞运行，直到收到停止信号。"""
-    app = BotApp(config, archive=archive if isinstance(archive, ErrorArchive) else None)
+    app = BotApp(
+        config,
+        archive=archive if isinstance(archive, ErrorArchive) else None,
+        model_client_cls=ToolCallingModelClient,
+    )
     loop = asyncio.get_running_loop()
     install_asyncio_exception_handler(loop)
 
