@@ -129,12 +129,18 @@ class _WinInstanceGuard:
 # 已连接客户端的请求等待上限：超过即丢弃该连接，沉默客户端不能占住服务线程。
 _SERVE_DEADLINE_MS = 10_000
 
+# 响应写出后等待客户端读走的窗口。激活客户端自身的等待上限是 2 秒
+# （main._activate_existing 的 timeout_ms），交付窗口超过它只会让后续激活排队
+# 等待一份已无人读取的响应；窗口内没被读走就丢弃该连接。
+_RESPONSE_DELIVERY_MS = 2_000
+
 
 class _WinActivationListener:
     """串行接受的激活管道服务端；一次只服务一个连接，队列由系统缓冲。
 
-    accept 与读取都走 overlapped I/O：close() 置位取消事件即可让服务线程
-    立刻退出，不依赖再建立一个唤醒连接（沉默客户端会把那种唤醒一起卡住）。
+    accept、读取与响应交付都走 overlapped I/O：close() 置位取消事件即可让
+    服务线程立刻退出，不依赖再建立一个唤醒连接（沉默客户端会把那种唤醒
+    一起卡住）。
     """
 
     def __init__(self, pipe_name: str, attrs) -> None:
@@ -167,7 +173,7 @@ class _WinActivationListener:
         if thread is not None:
             thread.join(timeout=2)
             if thread.is_alive():
-                # 只剩同步写/冲刷可能未退出；句柄留给 OS 随进程回收。
+                # 兜底：取消后仍未退出（如处理器自身阻塞）；句柄留给 OS 随进程回收。
                 return
         if cancel is not None:
             self._cancel = None
@@ -285,6 +291,30 @@ class _WinActivationListener:
         finally:
             win32api.CloseHandle(overlapped.hEvent)
 
+    def _await_response_read(self, pipe) -> None:
+        """等待客户端读走响应；等价于**有界、可取消**的 ``FlushFileBuffers``。
+
+        命名管道的 ``FlushFileBuffers`` 是同步调用，不受取消事件或截止时间控制：
+        客户端发来请求却不再读取响应时，它会永久阻塞服务线程，之后的激活请求
+        全部排队。这里改用 overlapped 读等待客户端关闭连接 —— 正常客户端读完
+        响应即关闭句柄，读立刻以 ``ERROR_BROKEN_PIPE`` 结束；一直不读的客户端由
+        ``_RESPONSE_DELIVERY_MS`` 与取消事件界定，之后丢弃该连接（客户端本来
+        也没在等这份响应）。同步完成（客户端已关闭）同样结束本次连接。
+        """
+        overlapped = pywintypes.OVERLAPPED()
+        overlapped.hEvent = win32event.CreateEvent(None, True, False, None)
+        try:
+            try:
+                hr = win32file.ReadFile(pipe, 1, overlapped)[0]
+            except pywintypes.error as exc:
+                hr = exc.winerror
+            if hr is None:
+                hr = 0
+            if hr == winerror.ERROR_IO_PENDING:
+                self._await_io(pipe, overlapped, _RESPONSE_DELIVERY_MS)
+        finally:
+            win32api.CloseHandle(overlapped.hEvent)
+
     def _loop(self, handler: Callable[[bytes], bytes]) -> None:
         pipe = self._pending
         self._pending = None
@@ -324,7 +354,7 @@ class _WinActivationListener:
                 response = activation.encode_response(ok=False, error="internal_error")
             if not self._write_response(pipe, response):
                 return
-            win32file.FlushFileBuffers(pipe)
+            self._await_response_read(pipe)
         except pywintypes.error:
             # 客户端在读写间隙消失：丢弃这次连接，不影响后续接受。
             pass
