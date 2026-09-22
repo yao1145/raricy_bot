@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'unsafe-inline' 'self'; script-src 'unsafe-inline' 'self'; img-src 'self' data:">
+<title>RARICY // LIGHT — 本地控制台</title>
+<style>
+:root {
+  --bg: #03060d;
+  --panel: rgba(8, 16, 30, 0.78);
+  --cyan: #3ee6ff;
+  --cyan-soft: rgba(62, 230, 255, 0.16);
+  --cyan-line: rgba(62, 230, 255, 0.45);
+  --magenta: #ff3ea5;
+  --ok: #4dffa6;
+  --warn: #ffc857;
+  --danger: #ff5d6c;
+  --text: #d9f3ff;
+  --muted: #68879f;
+  --mono: "Cascadia Mono", "JetBrains Mono", Consolas, "Courier New", monospace;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+/* 背景层：深空辉光 + 网格 + 扫描线 */
+.bg-glow {
+  position: fixed; inset: 0;
+  background:
+    radial-gradient(ellipse 70% 55% at 50% 118%, rgba(62, 230, 255, 0.14), transparent 60%),
+    radial-gradient(ellipse 55% 45% at 50% -15%, rgba(255, 62, 165, 0.08), transparent 60%),
+    var(--bg);
+}
+.bg-grid {
+  position: fixed; inset: 0;
+  background-image:
+    linear-gradient(rgba(62, 230, 255, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(62, 230, 255, 0.05) 1px, transparent 1px);
+  background-size: 44px 44px;
+  mask-image: radial-gradient(ellipse 75% 65% at 50% 50%, black 30%, transparent 78%);
+  animation: grid-drift 24s linear infinite;
+}
+@keyframes grid-drift {
+  from { background-position: 0 0, 0 0; }
+  to { background-position: 0 44px, 44px 0; }
+}
+.bg-scan {
+  position: fixed; inset: 0; pointer-events: none;
+  background: repeating-linear-gradient(
+    to bottom, transparent 0 2px, rgba(0, 0, 0, 0.16) 2px 4px);
+  mix-blend-mode: multiply;
+}
+/* 主面板与四角括号 */
+.deck {
+  position: relative;
+  width: min(680px, calc(100vw - 48px));
+  background: var(--panel);
+  border: 1px solid rgba(62, 230, 255, 0.28);
+  box-shadow: 0 0 42px rgba(62, 230, 255, 0.10), inset 0 0 60px rgba(3, 6, 13, 0.6);
+  backdrop-filter: blur(6px);
+  padding: 34px 38px 30px;
+}
+.corner { position: absolute; width: 14px; height: 14px; }
+.corner.tl { top: -2px; left: -2px; border-top: 2px solid var(--cyan); border-left: 2px solid var(--cyan); }
+.corner.tr { top: -2px; right: -2px; border-top: 2px solid var(--cyan); border-right: 2px solid var(--cyan); }
+.corner.bl { bottom: -2px; left: -2px; border-bottom: 2px solid var(--cyan); border-left: 2px solid var(--cyan); }
+.corner.br { bottom: -2px; right: -2px; border-bottom: 2px solid var(--cyan); border-right: 2px solid var(--cyan); }
+header { display: flex; justify-content: space-between; align-items: flex-start; }
+h1 {
+  font-size: 26px; letter-spacing: 0.32em; font-weight: 700; color: #eafcff;
+  text-shadow: 0 0 14px rgba(62, 230, 255, 0.75), 2px 0 0 rgba(255, 62, 165, 0.45);
+}
+.subtitle { margin-top: 8px; font-size: 11px; letter-spacing: 0.22em; color: var(--muted); }
+.subtitle em { color: var(--magenta); font-style: normal; }
+.link-indicators { display: flex; gap: 6px; padding-top: 6px; }
+.link-indicators span {
+  width: 8px; height: 8px; background: var(--cyan);
+  box-shadow: 0 0 8px var(--cyan); animation: pulse 1.6s infinite;
+}
+.link-indicators span:nth-child(2) { animation-delay: 0.35s; background: var(--magenta); box-shadow: 0 0 8px var(--magenta); }
+.link-indicators span:nth-child(3) { animation-delay: 0.7s; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.2; } }
+hr.sep { border: none; border-top: 1px dashed rgba(62, 230, 255, 0.25); margin: 22px 0; }
+/* 状态区 */
+.status-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px 28px; }
+.field label {
+  display: block; font-size: 10px; letter-spacing: 0.28em;
+  color: var(--cyan); margin-bottom: 5px;
+}
+.field .value { font-size: 14px; color: var(--text); word-break: break-all; }
+.field .value .dot {
+  display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+  margin-right: 8px; vertical-align: 1px;
+}
+.dot.st-running { background: var(--ok); box-shadow: 0 0 10px var(--ok); animation: pulse 1.4s infinite; }
+.dot.st-starting, .dot.st-stopping { background: var(--warn); box-shadow: 0 0 10px var(--warn); animation: pulse 0.8s infinite; }
+.dot.st-failed { background: var(--danger); box-shadow: 0 0 10px var(--danger); }
+.dot.st-stopped { background: var(--muted); }
+/* 按钮 */
+.controls { display: flex; gap: 14px; margin-top: 26px; }
+button {
+  flex: 1; padding: 12px 0; font-family: var(--mono); font-size: 12px;
+  letter-spacing: 0.24em; text-transform: uppercase; cursor: pointer;
+  color: var(--cyan); background: transparent; border: 1px solid var(--cyan-line);
+  transition: background 0.15s, box-shadow 0.15s, color 0.15s;
+}
+button:hover:not(:disabled) { background: var(--cyan-soft); box-shadow: 0 0 16px rgba(62, 230, 255, 0.35); }
+button:disabled { opacity: 0.35; cursor: not-allowed; }
+button.danger { color: var(--danger); border-color: rgba(255, 93, 108, 0.5); }
+button.danger:hover:not(:disabled) { background: rgba(255, 93, 108, 0.12); box-shadow: 0 0 16px rgba(255, 93, 108, 0.3); }
+/* 事件日志 */
+.log {
+  margin-top: 24px; height: 168px; overflow-y: auto;
+  border: 1px solid rgba(62, 230, 255, 0.18); background: rgba(2, 5, 10, 0.7);
+  padding: 10px 12px; font-size: 11.5px; line-height: 1.75;
+}
+.log::-webkit-scrollbar { width: 6px; }
+.log::-webkit-scrollbar-thumb { background: rgba(62, 230, 255, 0.3); }
+.log .ts { color: var(--muted); margin-right: 10px; }
+.log .lv-ok { color: var(--ok); }
+.log .lv-info { color: var(--cyan); }
+.log .lv-warn { color: var(--warn); }
+.log .lv-error { color: var(--danger); }
+/* 退出遮罩 */
+.overlay {
+  position: fixed; inset: 0; display: none;
+  align-items: center; justify-content: center; flex-direction: column; gap: 14px;
+  background: rgba(3, 6, 13, 0.92); z-index: 10;
+}
+.overlay.show { display: flex; }
+.overlay .code { font-size: 22px; letter-spacing: 0.4em; color: var(--danger); text-shadow: 0 0 18px rgba(255, 93, 108, 0.7); }
+.overlay .hint { font-size: 12px; letter-spacing: 0.2em; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="bg-glow"></div>
+<div class="bg-grid"></div>
+<div class="bg-scan"></div>
+
+<main class="deck">
+  <span class="corner tl"></span><span class="corner tr"></span>
+  <span class="corner bl"></span><span class="corner br"></span>
+
+  <header>
+    <div>
+      <h1>RARICY_LIGHT</h1>
+      <p class="subtitle">LOCAL CONTROL DECK // 本地控制台 · <em>L0 PROTOTYPE</em></p>
+    </div>
+    <div class="link-indicators"><span></span><span></span><span></span></div>
+  </header>
+
+  <hr class="sep">
+
+  <section class="status-grid">
+    <div class="field">
+      <label>INSTANCE // 实例</label>
+      <div class="value" id="f-instance">—</div>
+    </div>
+    <div class="field">
+      <label>UPTIME // 运行时长</label>
+      <div class="value" id="f-uptime">—</div>
+    </div>
+    <div class="field">
+      <label>WORKER // 机器人进程</label>
+      <div class="value"><span class="dot st-stopped" id="f-worker-dot"></span><span id="f-worker">—</span></div>
+    </div>
+    <div class="field">
+      <label>VERSION // 版本</label>
+      <div class="value" id="f-version">—</div>
+    </div>
+  </section>
+
+  <div class="controls">
+    <button id="btn-start">启动机器人</button>
+    <button id="btn-stop">停止机器人</button>
+    <button id="btn-quit" class="danger">退出 Light</button>
+  </div>
+
+  <div class="log" id="log"></div>
+</main>
+
+<div class="overlay" id="overlay">
+  <div class="code" id="overlay-code">LINK TERMINATED</div>
+  <div class="hint" id="overlay-hint">已退出，可以关闭本页。</div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var logEl = document.getElementById("log");
+  var overlay = document.getElementById("overlay");
+  var overlayCode = document.getElementById("overlay-code");
+  var overlayHint = document.getElementById("overlay-hint");
+  var quitRequested = false;
+  var MAX_LINES = 120;
+
+  function log(level, message) {
+    var line = document.createElement("div");
+    var ts = document.createElement("span");
+    ts.className = "ts";
+    ts.textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+    var body = document.createElement("span");
+    body.className = "lv-" + level;
+    body.textContent = message;
+    line.appendChild(ts);
+    line.appendChild(body);
+    logEl.appendChild(line);
+    while (logEl.childNodes.length > MAX_LINES) logEl.removeChild(logEl.firstChild);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function showOverlay(code, hint) {
+    overlayCode.textContent = code;
+    overlayHint.textContent = hint;
+    overlay.classList.add("show");
+  }
+
+  function setWorker(state, detail) {
+    var dot = document.getElementById("f-worker-dot");
+    dot.className = "dot st-" + (state || "stopped");
+    document.getElementById("f-worker").textContent = detail || state || "unknown";
+  }
+
+  function fmtUptime(seconds) {
+    var s = Math.max(0, Math.floor(seconds));
+    var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+    return (h > 0 ? h + "h " : "") + m + "m " + r + "s";
+  }
+
+  var stateText = {
+    stopped: "stopped // 已停止", starting: "starting // 启动中",
+    running: "running // 运行中", stopping: "stopping // 停止中",
+    failed: "failed // 故障"
+  };
+
+  function poll() {
+    fetch("/api/status", { headers: { "Accept": "application/json" } })
+      .then(function (res) { return res.ok ? res.json() : Promise.reject(res.status); })
+      .then(function (data) {
+        document.getElementById("f-instance").textContent = data.instance_id || "—";
+        document.getElementById("f-version").textContent = data.version || "—";
+        document.getElementById("f-uptime").textContent = fmtUptime(data.uptime_seconds || 0);
+        var w = data.worker || {};
+        setWorker(w.state, stateText[w.state] || w.state);
+        document.getElementById("btn-start").disabled = w.state === "running" || w.state === "starting";
+        document.getElementById("btn-stop").disabled = w.state !== "running" && w.state !== "starting";
+      })
+      .catch(function () {
+        if (quitRequested) return;
+        setWorker("failed", "link lost // 连接中断");
+        log("warn", "link lost, retrying…");
+      });
+  }
+
+  function action(path, label) {
+    fetch(path, { method: "POST", headers: { "Accept": "application/json" } })
+      .then(function (res) { return res.ok ? res.json() : Promise.reject(res.status); })
+      .then(function () { log("ok", label + " ok"); poll(); })
+      .then(function () { if (path === "/api/launcher/quit") { showOverlay("LINK TERMINATED", "已退出，可以关闭本页。"); } })
+      .catch(function () {
+        if (path === "/api/launcher/quit" && quitRequested) {
+          showOverlay("LINK TERMINATED", "已退出，可以关闭本页。");
+          return;
+        }
+        log("error", label + " failed");
+      });
+  }
+
+  document.getElementById("btn-start").addEventListener("click", function () {
+    log("info", "worker.start requested"); action("/api/bot/start", "worker.start");
+  });
+  document.getElementById("btn-stop").addEventListener("click", function () {
+    log("info", "worker.stop requested"); action("/api/bot/stop", "worker.stop");
+  });
+  document.getElementById("btn-quit").addEventListener("click", function () {
+    quitRequested = true;
+    log("warn", "launcher.quit requested"); action("/api/launcher/quit", "launcher.quit");
+  });
+
+  log("info", "link established // " + location.host);
+  poll();
+  setInterval(function () { if (!quitRequested) poll(); }, 2000);
+})();
+</script>
+</body>
+</html>
