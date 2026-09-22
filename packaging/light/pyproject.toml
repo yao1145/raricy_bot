@@ -15,6 +15,9 @@ dependencies = [
     "openai>=1.40",     # 无工具模型客户端（core/worker.py）
     "PyYAML>=6.0",      # 配置加载与记忆/稿库的 Markdown front matter
     "aiohttp>=3.9",     # 运维探针服务（ops.py）
+    # 系统凭据库（LIGHT_EDITION_DESIGN §7）：只接受系统安全后端，明文/空后端被拒。
+    # 版本下限在 L5 打包时按实测锁定；这里只声明"必须存在且是安全后端"。
+    "keyring>=24",
     # 平台层绑定：Job/互斥体/管道 ACL；仅 Windows 需要（LIGHT_EDITION_DESIGN §14）
     "pywin32>=306; sys_platform == 'win32'",
 ]
