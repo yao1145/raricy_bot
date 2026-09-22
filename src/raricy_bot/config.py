@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import logging
 import math
 import os
 import re
@@ -553,7 +554,7 @@ def parse_config(
         behavior=behavior,
         storage=storage,
         ops=ops,
-        log_level=_text_with_default(logging_raw, "level", "logging", "INFO"),
+        log_level=_log_level(logging_raw),
         system_prompt=system_prompt,
         system_prompt_sha256=hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()[:12],
         secrets=secrets,
@@ -678,9 +679,26 @@ def _section(raw: Mapping[str, Any], name: str) -> dict[str, Any]:
 def _required_text(container: Mapping[str, Any], key: str, path: str) -> str:
     """取必填文本；缺失或全为空白则报错。path 是用于报错的完整配置路径。"""
     value = container.get(key)
-    if not isinstance(value, str) or not value.strip():
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if value is None or (isinstance(value, str) and not value.strip()):
+        # 只有「没有这一项」或「空白」才算还没填；类型写错是取值问题（D-124）。
         raise ConfigError(f"缺少必填配置 {path}", field=path, kind=KIND_MISSING)
-    return value.strip()
+    raise ConfigError(f"配置 {path} 必须是文本", field=path)
+
+
+def _log_level(container: Mapping[str, Any]) -> str:
+    """日志级别：必须是 `logging` 已知的级别名（大小写不敏感）。
+
+    它会原样交给 `logging.Handler.setLevel`，写错一个字母的后果是进程在启动阶段
+    抛 `ValueError`；这里提前判掉，错误就落在字段上（D-124 的 kind=invalid）。
+    """
+    value = _text_with_default(container, "level", "logging", "INFO")
+    if value.upper() not in logging.getLevelNamesMapping():
+        raise ConfigError(
+            f"配置 logging.level 不是已知的日志级别：{value}", field="logging.level"
+        )
+    return value
 
 
 def _text_with_default(

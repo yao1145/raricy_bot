@@ -44,7 +44,14 @@ RUNTIME_LOGS_SUBDIR: str = "runtime"
 ERROR_LOGS_SUBDIR: str = "errors"
 
 # 档案 id 的字符集：随机生成，但 launcher.json 可能被手工编辑，读取时要再校验一次。
-_PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+# 档案 id：**只允许小写**（Windows 目录名不区分大小写，大小写混写会让同一个目录
+# 出现两个指针），并排除 Windows 保留设备名。
+_PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_RESERVED_STEMS: frozenset[str] = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{index}" for index in range(1, 10)}
+    | {f"lpt{index}" for index in range(1, 10)}
+)
 
 
 def default_data_root() -> Path:
@@ -82,6 +89,10 @@ def validate_profile_id(profile_id: str) -> str:
     """校验档案 id；不合格直接拒绝（不静默改写成一个「差不多」的目录名）。"""
     if not isinstance(profile_id, str) or not _PROFILE_ID_RE.match(profile_id):
         raise ValueError("invalid_profile_id")
+    if profile_id in _RESERVED_STEMS:
+        # CON/NUL/COM1 之类在 Windows 上不是普通目录名；launcher.json 可被手工编辑，
+        # 因此这里再挡一次，让失败是 invalid_profile_id 而不是系统调用报错。
+        raise ValueError("invalid_profile_id")
     return profile_id
 
 
@@ -115,6 +126,11 @@ def runtime_logs_dir(profile: Path) -> Path:
 
 def error_logs_dir(profile: Path) -> Path:
     return Path(profile) / LOGS_DIR / ERROR_LOGS_SUBDIR
+
+
+def profile_runtime_dir(profile: Path) -> Path:
+    """档案自己的运行快照目录（§6.5）：根 `runtime/` 只放实例元数据（§13.1）。"""
+    return Path(profile) / RUNTIME_DIR
 
 
 def normalize_path(path: str | Path) -> Path:

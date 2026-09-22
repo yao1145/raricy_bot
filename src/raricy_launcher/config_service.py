@@ -136,30 +136,48 @@ class ConfigConflict(ConfigServiceError):
 
 
 class ConfigInvalid(ConfigServiceError):
-    """字段或跨字段校验失败；`field` 与 `kind` 来自配置层，供 API 组成结构化错误。"""
+    """字段、跨字段或能力策略校验失败。
+
+    `code` 是**稳定类别码**（API 与状态里只出现它），`field` 与 `kind` 来自配置层，
+    `message` 是给人看的中文说明，三者不混用（§8.2 的结构化错误）。
+    """
 
     def __init__(
         self,
         message: str,
         *,
+        code: str = "invalid_value",
         field: str | None = None,
         kind: str = core_config.KIND_INVALID,
     ) -> None:
         super().__init__(message)
+        self.code = code
         self.field = field
         self.kind = kind
 
     @classmethod
     def from_config_error(cls, exc: ConfigError) -> ConfigInvalid:
-        return cls(str(exc), field=exc.field, kind=exc.kind)
+        return cls(str(exc), code=exc.kind, field=exc.field, kind=exc.kind)
 
 
 @dataclass(frozen=True)
 class CredentialUpdate:
-    """一次提交里对某个凭据槽位的操作：保持、替换或删除（§7）。"""
+    """一次提交里对某个凭据槽位的操作：保持、替换或删除（§7）。
+
+    动作取值与替换值在**构造时**校验：写错一个动作名不能悄悄变成「删除」，
+    那会把一次误操作变成「凭据没了」。
+    """
 
     action: str
     value: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.action not in (ACTION_KEEP, ACTION_REPLACE, ACTION_DELETE):
+            raise ValueError("invalid_credential_action")
+        if self.action == ACTION_REPLACE and (
+            not isinstance(self.value, str) or not self.value.strip()
+        ):
+            raise ValueError("credential_value_required")
 
     @classmethod
     def keep(cls) -> CredentialUpdate:
@@ -191,6 +209,15 @@ class SavedConfig:
     account: str | None
     start_bot_on_launch: bool
     schema_version: int
+
+
+@dataclass(frozen=True)
+class RunLaunch:
+    """一次启动需要的全部输入：版本、运行快照路径与凭据（§6.5）。"""
+
+    revision: int
+    config_path: Path
+    credentials: Secrets
 
 
 @dataclass(frozen=True)
@@ -230,6 +257,27 @@ def light_base_mapping(profile: Path) -> dict[str, Any]:
         "blog": {"enabled": False},
         "system_prompt": DEFAULT_SYSTEM_PROMPT,
     }
+
+
+# 草稿校验用的占位取值：把「还没填」的必填项补成合法值，公共校验才能一路走到
+# 已填项上。它们只存在于内存里，绝不落盘（§6.2）。
+_PROBE_VALUES: dict[str, Any] = {
+    "model": {"base_url": "https://draft.invalid/v1", "model": "draft-model"},
+    "system_prompt": "draft",
+}
+
+
+def _without_blanks(value: Any) -> Any:
+    """递归去掉空串与 None：空白字段等于「还没填」，不是「填了个空值」。"""
+    if isinstance(value, Mapping):
+        return {
+            key: _without_blanks(item)
+            for key, item in value.items()
+            if item not in ("", None)
+        }
+    if isinstance(value, list):
+        return [_without_blanks(item) for item in value]
+    return value
 
 
 def _set_path(document: dict[str, Any], key: str, value: Any) -> None:
@@ -289,12 +337,18 @@ class ConfigService:
     # --- 档案指针 ---------------------------------------------------------
 
     def read_launcher_metadata(self) -> dict[str, Any]:
-        """读取 Launcher 元数据；缺失或损坏时返回空映射（不猜、不修复）。"""
+        """读取 Launcher 元数据；不存在返回空映射，读不到则报稳定错误。
+
+        「不存在」与「读不到」必须分开：把权限/占用错误当成空元数据，会让管理页
+        走进首次设置流程并在界面之外丢掉活动档案（§13.3）。
+        """
         path = paths.launcher_json_path(self._root)
         try:
             raw = path.read_text(encoding="utf-8")
-        except OSError:
+        except FileNotFoundError:
             return {}
+        except OSError as exc:
+            raise ConfigServiceError("metadata_unreadable") from exc
         try:
             data = yaml.safe_load(raw)
         except yaml.YAMLError:
@@ -409,7 +463,7 @@ class ConfigService:
                 state=STATE_INVALID,
                 revision=saved.revision,
                 account=saved.account,
-                error=str(exc),
+                error=exc.code,
             )
         return ConfigStatus(
             state=STATE_CONFIGURED,
@@ -481,8 +535,19 @@ class ConfigService:
             merged = _merge_editable(base, values)
 
             # 2) 组合新凭据集合：keep 用旧值，replace 用新值，delete 置空。
+            #    账号名在第一次提交后固定：档案绑定的是站点账号（§13.3），换账号要
+            #    重新设置（新档案）。否则「界面显示的账号」与「凭据里的账号」会拆成
+            #    两个事实，状态显示 B 而实际仍以 A 登录（审查 F1）。
             old_credentials = self._resolve_credentials(saved)
-            new_account = (account or (saved.account if saved else None) or "").strip()
+            current_account = (saved.account if saved is not None else None) or ""
+            requested_account = (account or "").strip()
+            if requested_account and current_account and requested_account != current_account:
+                raise ConfigInvalid(
+                    "账号只能在重新设置流程里更换",
+                    code="account_locked",
+                    field="account",
+                )
+            new_account = requested_account or current_account
             new_secrets = Secrets(
                 username=new_account,
                 password=password.apply(old_credentials.password if old_credentials else None) or "",
@@ -527,47 +592,69 @@ class ConfigService:
                 },
                 **merged,
             }
+            snapshot_path = paths.revisions_dir(profile) / f"{revision}.yaml"
             try:
-                self._write_document(
-                    paths.revisions_dir(profile) / f"{revision}.yaml", document
-                )
+                self._write_document(snapshot_path, document)
                 self._write_document(paths.config_path(profile), document)
-            except (OSError, ConfigServiceError) as exc:
+            except ConfigServiceError:
+                # 这一版没有生效：快照也一起收回，否则它会引用一个刚被清理的凭据
+                # 引用（审查 F6）。清理失败只是留下垃圾。
+                self._discard_snapshot(snapshot_path)
                 if created_ref is not None:
                     self._discard_unreferenced(created_ref)
-                if isinstance(exc, ConfigServiceError):
-                    raise
-                raise ConfigServiceError("config_write_failed") from exc
+                raise
             return revision
 
     # --- 运行快照与凭据（§6.5） --------------------------------------------
 
-    def build_run_config(self, revision: int | None = None) -> Path:
-        """生成只含非敏感字段的运行配置文件并返回路径（Worker 用它启动，§6.5）。
+    def build_run_launch(self, revision: int) -> RunLaunch:
+        """在写锁内**一次**取到指定版本的运行快照与对应凭据（§6.5）。
 
-        运行快照按 revision 命名：同一份配置重启多次拿到同一路径，换版本就换路径，
-        因此启动与保存不可能拼出「旧模型地址 + 新 Key」的组合。
+        分开调用快照与凭据会有窗口：中途又提交了新版本时，就会拼出「旧模型地址 +
+        新 Key」的组合。入口启动 Worker 时只走这一个方法。
         """
-        saved = self.load_saved()
-        if saved is None:
-            raise ConfigServiceError("no_active_config")
-        if revision is not None and revision != saved.revision:
-            raise ConfigConflict("revision_conflict")
-        target = paths.runtime_dir(self._root) / f"run-{saved.revision}.yaml"
-        self._write_document(target, dict(saved.mapping))
-        return target
+        with self._lock:
+            saved = self._require_saved(revision)
+            if not saved.credentials_ref:
+                raise ConfigServiceError("credentials_unresolved")
+            credentials = self._store.get(saved.credentials_ref)
+            if credentials is None:
+                raise ConfigServiceError("credentials_unresolved")
+            path = self._write_run_config(saved)
+            return RunLaunch(
+                revision=saved.revision, config_path=path, credentials=credentials
+            )
 
-    def credentials_for(self, revision: int | None = None) -> Secrets:
-        """取指定 revision（默认当前）对应的凭据，供注入子进程环境（§7）。"""
-        saved = self.load_saved()
-        if saved is None:
-            raise ConfigServiceError("no_active_config")
-        if revision is not None and revision != saved.revision:
-            raise ConfigConflict("revision_conflict")
+    def build_run_config(self, revision: int) -> Path:
+        """生成只含非敏感字段的运行配置文件并返回路径（§6.5）。
+
+        **必须指定 revision**：不提供「当前版本」的默认值，是为了让调用方不得不
+        明确它启动的是哪一版（§6.5 的「重启绑定目标版本」）。快照写在档案自己的
+        `runtime/` 下，换档案不会互相覆盖。
+        """
+        saved = self._require_saved(revision)
+        return self._write_run_config(saved)
+
+    def credentials_for(self, revision: int) -> Secrets:
+        """取指定 revision 对应的凭据，供注入子进程环境（§7）。**必须指定 revision**。"""
+        saved = self._require_saved(revision)
         credentials = self._resolve_credentials(saved)
         if credentials is None:
             raise ConfigServiceError("credentials_unresolved")
         return credentials
+
+    def _require_saved(self, revision: int) -> SavedConfig:
+        saved = self.load_saved()
+        if saved is None:
+            raise ConfigServiceError("no_active_config")
+        if revision != saved.revision:
+            raise ConfigConflict("revision_conflict")
+        return saved
+
+    def _write_run_config(self, saved: SavedConfig) -> Path:
+        target = paths.profile_runtime_dir(self.profile()) / f"run-{saved.revision}.yaml"
+        self._write_document(target, dict(saved.mapping))
+        return target
 
     # --- 内部：读取与解析 --------------------------------------------------
 
@@ -576,8 +663,11 @@ class ConfigService:
         try:
             with path.open("rb") as handle:
                 raw = handle.read(core_config.MAX_CONFIG_BYTES + 1)
-        except OSError:
+        except FileNotFoundError:
             return None
+        except OSError as exc:
+            # 读不到不等于没有：当成「没有配置」会绕过 revision 冲突判定（§6.4）。
+            raise ConfigServiceError(broken_code) from exc
         if len(raw) > core_config.MAX_CONFIG_BYTES:
             # 与 Core 的 YAML 上限同一口径（§6.3）：手工编辑出巨型文件也不能读进来。
             raise ConfigServiceError("config_too_large")
@@ -642,36 +732,51 @@ class ConfigService:
     ) -> None:
         """统一走 `parse_config()`：GUI 与 CLI 因此只有一份字段规则（§6.1）。
 
-        草稿允许「还没填」：`KIND_MISSING` 类错误在草稿里可以接受，其余一律拒绝。
-        正式提交要求凭据齐备 —— 缺凭据不是字段没填，而是不能启动（§6.2、§7）。
+        草稿允许「还没填」，但**不允许填错**。`parse_config` 只报第一个错误，所以
+        不能按错误分类放行 —— 那会让「A 项没填 + B 项填错」整体过关。这里改为用
+        合法占位值补齐尚未填写的必填项后整体校验：剩下的任何错误都只可能来自
+        已填写的字段（类型、范围、跨字段、URL 安全策略），一律拒绝（§6.2）。
+        正式提交还要求凭据齐备 —— 缺凭据不是字段没填，而是不能启动（§7）。
         """
         if not allow_missing_required:
             if credentials is None or not (
                 credentials.username and credentials.password and credentials.llm_api_key
             ):
-                raise ConfigInvalid("credentials_required", kind=core_config.KIND_MISSING)
-        probe = credentials or Secrets(username="draft", password="draft", llm_api_key="draft")
+                raise ConfigInvalid(
+                    "credentials_required",
+                    code="credentials_required",
+                    kind=core_config.KIND_MISSING,
+                )
+            probe = credentials
+            document: Mapping[str, Any] = mapping
+        else:
+            probe = Secrets(username="draft", password="draft", llm_api_key="draft")
+            document = _deep_merge(_PROBE_VALUES, _without_blanks(mapping))
         try:
             core_config.parse_config(
-                mapping, config_dir=str(self.profile()), secrets=probe
+                document, config_dir=str(self.profile()), secrets=probe
             )
         except ConfigError as exc:
-            if allow_missing_required and exc.kind == KIND_MISSING:
-                return
             raise ConfigInvalid.from_config_error(exc) from exc
 
     def _validate_policy(self, mapping: Mapping[str, Any], profile: Path) -> None:
         """Light 能力策略（§4.2、§9.5）：不能靠「界面没提供开关」来保证。"""
         for key in ("mcp.enabled", "blog.enabled"):
             if _get_path(mapping, key):
-                raise ConfigInvalid(f"Light 不支持该能力：{key}", field=key)
+                raise ConfigInvalid(
+                    f"Light 不支持该能力：{key}",
+                    code="unsupported_capability",
+                    field=key,
+                )
         for key in _CONTAINED_PATH_FIELDS:
             value = _get_path(mapping, key)
             if value is None:
                 continue
             if not isinstance(value, str) or not paths.is_within(profile, value):
                 raise ConfigInvalid(
-                    f"配置 {key} 必须位于当前档案目录内", field=key
+                    f"配置 {key} 必须位于当前档案目录内",
+                    code="path_outside_profile",
+                    field=key,
                 )
 
     # --- 内部：落盘 --------------------------------------------------------
@@ -685,21 +790,39 @@ class ConfigService:
             raise ConfigServiceError("config_too_large")
         directory = path.parent
         directory.mkdir(parents=True, exist_ok=True)
-        handle_fd, tmp_name = tempfile.mkstemp(
-            prefix=f".{path.name}.", suffix=".tmp", dir=str(directory)
-        )
+        try:
+            handle_fd, tmp_name = tempfile.mkstemp(
+                prefix=f".{path.name}.", suffix=".tmp", dir=str(directory)
+            )
+        except OSError as exc:
+            raise ConfigServiceError("config_write_failed") from exc
         try:
             with os.fdopen(handle_fd, "wb") as handle:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp_name, path)
+        except OSError as exc:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            # 写盘失败只有一种对外语义：这一版没有生效（§6.4）。OSError 不再外泄，
+            # L3 因此只需要处理服务级错误。
+            raise ConfigServiceError("config_write_failed") from exc
         except BaseException:
             try:
                 os.unlink(tmp_name)
             except OSError:
                 pass
             raise
+
+    def _discard_snapshot(self, path: Path) -> None:
+        """删除未生效版本的快照；失败只是留下垃圾文件，不影响提交结果。"""
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def _discard_unreferenced(self, reference: str) -> None:
         """清理本次新建、但没能被配置引用的凭据；清理失败只是留下垃圾，不影响结果。"""
@@ -716,6 +839,8 @@ def _merge_editable(
     merged = copy.deepcopy(dict(base))
     for key, value in values.items():
         if not isinstance(key, str) or key not in EDITABLE_FIELDS:
-            raise ConfigInvalid(f"字段不可编辑：{key}", field=str(key))
+            raise ConfigInvalid(
+                f"字段不可编辑：{key}", code="field_not_editable", field=str(key)
+            )
         _set_path(merged, key, copy.deepcopy(value))
     return merged
