@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Sequence
 
 import pywintypes
@@ -129,9 +130,11 @@ class _WinInstanceGuard:
 # 已连接客户端的请求等待上限：超过即丢弃该连接，沉默客户端不能占住服务线程。
 _SERVE_DEADLINE_MS = 10_000
 
-# 响应写出后等待客户端读走的窗口。激活客户端自身的等待上限是 2 秒
-# （main._activate_existing 的 timeout_ms），交付窗口超过它只会让后续激活排队
-# 等待一份已无人读取的响应；窗口内没被读走就丢弃该连接。
+# 响应写出后等待客户端读走的窗口。激活客户端**没有**响应读取超时
+# （`CallNamedPipe` 的 timeout 只管等管道实例），所以这个窗口是慢读客户端
+# 唯一的硬边界：超过它就会拿到一次假的激活失败（服务端其实已经执行了动作）。
+# 取 2 秒是为了不让后续双击排在静默客户端后面 —— 正常客户端的读取在毫秒级完成，
+# 而 2 秒已经大于"等实例"阶段客户端自己愿意等待的时间。
 _RESPONSE_DELIVERY_MS = 2_000
 
 
@@ -297,23 +300,42 @@ class _WinActivationListener:
         命名管道的 ``FlushFileBuffers`` 是同步调用，不受取消事件或截止时间控制：
         客户端发来请求却不再读取响应时，它会永久阻塞服务线程，之后的激活请求
         全部排队。这里改用 overlapped 读等待客户端关闭连接 —— 正常客户端读完
-        响应即关闭句柄，读立刻以 ``ERROR_BROKEN_PIPE`` 结束；一直不读的客户端由
+        响应即关闭句柄，读立刻以 ``ERROR_BROKEN_PIPE`` 结束。
+
+        窗口内又读到客户端发来的数据（同一连接上的多余报文）说明连接还活着，
+        读掉继续等：响应可能还没被读走。一直不读的客户端由
         ``_RESPONSE_DELIVERY_MS`` 与取消事件界定，之后丢弃该连接（客户端本来
-        也没在等这份响应）。同步完成（客户端已关闭）同样结束本次连接。
+        也没在等这份响应）。
         """
-        overlapped = pywintypes.OVERLAPPED()
-        overlapped.hEvent = win32event.CreateEvent(None, True, False, None)
-        try:
+        deadline = time.monotonic() + _RESPONSE_DELIVERY_MS / 1000
+        while True:
+            remaining_ms = round((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                return
+            overlapped = pywintypes.OVERLAPPED()
+            overlapped.hEvent = win32event.CreateEvent(None, True, False, None)
             try:
-                hr = win32file.ReadFile(pipe, 1, overlapped)[0]
-            except pywintypes.error as exc:
-                hr = exc.winerror
-            if hr is None:
-                hr = 0
-            if hr == winerror.ERROR_IO_PENDING:
-                self._await_io(pipe, overlapped, _RESPONSE_DELIVERY_MS)
-        finally:
-            win32api.CloseHandle(overlapped.hEvent)
+                try:
+                    hr = win32file.ReadFile(pipe, 1, overlapped)[0]
+                except pywintypes.error:
+                    # 客户端已关闭（含 ERROR_BROKEN_PIPE）：交付结束。
+                    return
+                if hr is None:
+                    hr = 0
+                if hr == winerror.ERROR_IO_PENDING:
+                    if not self._await_io(pipe, overlapped, remaining_ms):
+                        return
+                    try:
+                        win32file.GetOverlappedResult(pipe, overlapped, False)
+                    except pywintypes.error:
+                        return  # 读到末尾：客户端已关闭
+                elif hr not in (0, winerror.ERROR_MORE_DATA):
+                    # 连接已断或读失败：本次交付到此为止。
+                    return
+                # 否则是读到了数据（含读取缓冲区不足的 ERROR_MORE_DATA）：
+                # 连接还活着，继续等它读走响应后关闭。
+            finally:
+                win32api.CloseHandle(overlapped.hEvent)
 
     def _loop(self, handler: Callable[[bytes], bytes]) -> None:
         pipe = self._pending
