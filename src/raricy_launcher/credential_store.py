@@ -76,6 +76,33 @@ class SessionMemoryStore:
         self._values.pop(reference, None)
 
 
+def _backend_is_safe(backend: object, *, depth: int = 0) -> bool:
+    """后端是否可信：必须是 keyring 自带的系统后端，且链上每一环都可信。
+
+    只看顶层名字不够：`ChainerBackend` 会把调用转交给链上的其它后端，其中可能
+    包含明文文件后端 —— 那等于把密码写进明文文件（§7）。因此这里
+
+    1. 要求后端来自 `keyring.backends`（系统后端都在那里，`keyrings.alt` 与自定义
+       后端一律不算）；
+    2. 名字里出现空/明文/必然失败的特征词就拒绝；
+    3. 链式后端（有 `backends`）递归检查每一环，深度仍有上限以防自引用。
+    """
+    if depth > 4:
+        return False
+    module_name = type(backend).__module__.lower()
+    full_name = f"{module_name}.{type(backend).__name__}".lower()
+    if not module_name.startswith("keyring.backends"):
+        return False
+    if any(token in full_name for token in _REFUSED_BACKEND_TOKENS):
+        return False
+    members = getattr(backend, "backends", None)
+    if isinstance(members, (list, tuple)):
+        return bool(members) and all(
+            _backend_is_safe(member, depth=depth + 1) for member in members
+        )
+    return True
+
+
 class SystemKeyringStore:
     """系统凭据库（`keyring`）；后端不合规时如实报告不可用。
 
@@ -87,7 +114,7 @@ class SystemKeyringStore:
         self._service = service
 
     def _backend(self):
-        """返回可用的 keyring 模块；导入失败或后端被拒时返回 None。"""
+        """返回可用的 keyring 模块；导入失败或后端链不合规时返回 None。"""
         try:
             import keyring
         except Exception:
@@ -97,8 +124,7 @@ class SystemKeyringStore:
             backend = keyring.get_keyring()
         except Exception:
             return None
-        name = f"{type(backend).__module__}.{type(backend).__name__}".lower()
-        if any(token in name for token in _REFUSED_BACKEND_TOKENS):
+        if not _backend_is_safe(backend):
             return None
         return keyring
 

@@ -97,7 +97,17 @@ def validate_profile_id(profile_id: str) -> str:
 
 
 def profile_dir(data_root: Path, profile_id: str) -> Path:
-    return profiles_root(data_root) / validate_profile_id(profile_id)
+    """档案目录：**以规范化后的数据根为锚点**校验它没有跑到根外。
+
+    只校验 id 不够：`profiles/<id>` 本身可能是指向外部的链接，此时后续所有以
+    「档案目录」为根的包含检查都会跟着解析到外部并放行，提交就会把配置与快照
+    写到数据根之外（§9.5、审查 P2）。
+    """
+    root = normalize_path(data_root)
+    profile = normalize_path(root / PROFILES_DIR / validate_profile_id(profile_id))
+    if not is_within(root, profile):
+        raise ValueError("profile_outside_data_root")
+    return profile
 
 
 def config_path(profile: Path) -> Path:

@@ -280,6 +280,18 @@ def _without_blanks(value: Any) -> Any:
     return value
 
 
+def _parse_revision(launcher: Mapping[str, Any], *, broken_code: str) -> int:
+    """读 `_launcher.revision`：类型不对时给稳定错误，而不是把 ValueError 漏给调用方。
+
+    `status()` 只捕获服务级错误；手工编辑出的 `revision: "abc"` 若直接 `int()`，
+    状态查询会以 `ValueError` 失败，而不是如实报告 `invalid`（审查 P2）。
+    """
+    raw = launcher.get("revision", 0)
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raise ConfigServiceError(broken_code)
+    return raw
+
+
 def _set_path(document: dict[str, Any], key: str, value: Any) -> None:
     parts = key.split(".")
     cursor = document
@@ -410,7 +422,7 @@ class ConfigService:
         launcher = data.get(LAUNCHER_SECTION)
         launcher = launcher if isinstance(launcher, dict) else {}
         return DraftConfig(
-            revision=int(launcher.get("revision", 0) or 0),
+            revision=_parse_revision(launcher, broken_code="draft_unreadable"),
             mapping={key: value for key, value in data.items() if key != LAUNCHER_SECTION},
         )
 
@@ -693,7 +705,7 @@ class ConfigService:
         reference = launcher.get("credentials_ref")
         account = launcher.get("account")
         return SavedConfig(
-            revision=int(launcher.get("revision", 0) or 0),
+            revision=_parse_revision(launcher, broken_code="config_unreadable"),
             mapping={key: value for key, value in document.items() if key != LAUNCHER_SECTION},
             credentials_ref=reference if isinstance(reference, str) and reference else None,
             account=account if isinstance(account, str) and account else None,

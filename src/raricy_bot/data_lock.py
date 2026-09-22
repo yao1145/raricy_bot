@@ -24,8 +24,13 @@ class DataLockError(Exception):
 
 
 def data_lock_dir(db_path: str | Path) -> Path:
-    """由数据库路径得到数据档案标识：它所在目录（规范化后的绝对路径）。"""
-    return _normalize(Path(db_path).parent)
+    """由数据库路径得到数据档案标识：**解析链接之后**它所在的目录。
+
+    必须先把整个数据库路径规范化再取父目录：只规范化父目录会丢掉数据库文件
+    自身的链接信息，两条指向同一个数据库文件的路径就能各拿一把锁，绕过单写者
+    约束（§9.5、审查 P2）。
+    """
+    return _normalize(Path(db_path)).parent
 
 
 def _normalize(path: Path) -> Path:
