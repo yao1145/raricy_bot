@@ -1,9 +1,15 @@
-"""L0 最小 Controller：单实例、静态页、假 Worker 启停、激活与退出。
+"""Light 桌面控制面：单实例、配置事务、进程管理、本地 API 与退出。
 
-这是平台原型的控制面，只证明 LIGHT_EDITION_DESIGN §16 L0 的四件事：
-无终端入口可运行、二次启动激活已有实例、Job 回收有效、静态资源可打开。
-正式的认证会话、配置事务、进程状态机与事件流在 L3 按 §8/§9/§11 重写；
-本阶段的安全边界只有回环监听与激活管道 ACL，没有会话认证。
+职责边界（LIGHT_EDITION_DESIGN §3.2）：
+
+- **不做业务**：站点、模型、数据库与记忆都在 Worker 子进程里；
+- **只做控制**：本机会话与 API、配置事务（§6）、凭据（§7）、进程状态机与 IPC
+  （§9、§10）、事件缓冲与状态聚合（§12）。
+- 长等待都在后台线程或后台操作里，HTTP 请求只返回 `operation_id`（§9.2）。
+
+控制服务只监听回环，端口由操作系统分配；监听成功之后才发布运行元数据与
+打开管理页（§9.4）。退出时先停 Worker（经私有控制管道请求优雅停止），再关
+HTTP 服务、激活管道与互斥体（§9.3）。
 """
 
 from __future__ import annotations
@@ -11,31 +17,39 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import threading
 import time
 import webbrowser
 from collections.abc import Callable
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from uuid import uuid4
 
 from raricy_bot.logging_setup import log_event
 
-from . import __version__, activation, texts
+from . import __version__, activation, paths, texts
 from .activation import ActivationError
+from .api import LocalApi
+from .config_service import ConfigService, ConfigServiceError
+from .credential_store import CredentialStore, SystemKeyringStore
+from .events import EventService
 from .platform import InstanceGuard, LauncherPlatform
-from .process_manager import WorkerProcess, default_worker_spec
+from .process_manager import (
+    START_TIMEOUT_SECONDS,
+    STOP_BUDGET_MS,
+    WorkerManager,
+    WorkerSpec,
+    default_worker_spec,
+)
+from .session import SessionManager
+from .status_service import StatusService
 
-# 原型停止预算：假 Worker 无清理工作，5 秒足够；L3 换成大于 Core 关闭预算的常量。
-_STOP_BUDGET_MS = 5000
-
-_RUNTIME_DIR = "runtime"
 _RUNTIME_FILE = "launcher-runtime.json"
 
 
 class Controller:
-    """桌面 Controller 原型；所有长时间等待都不占用 HTTP 请求线程。"""
+    """桌面 Controller；所有长时间等待都不占用 HTTP 请求线程。"""
 
     def __init__(
         self,
@@ -44,7 +58,12 @@ class Controller:
         guard: InstanceGuard,
         data_root: Path,
         logger: logging.Logger,
+        credential_store: CredentialStore | None = None,
+        profile_id: str | None = None,
         open_url: Callable[[str], None] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        start_timeout: float = START_TIMEOUT_SECONDS,
+        stop_budget_ms: int = STOP_BUDGET_MS,
     ) -> None:
         if not guard.owned():
             raise ValueError("guard_not_owned")
@@ -53,47 +72,71 @@ class Controller:
         self._data_root = Path(data_root)
         self._logger = logger
         self._open_url = open_url or (lambda url: webbrowser.open(url))
+        self._clock = clock
         self._instance_id = uuid4().hex[:12]
-        self._started_at = time.monotonic()
-        self._worker: WorkerProcess | None = None
-        self._stopping: WorkerProcess | None = None
-        self._worker_lock = threading.Lock()
-        # 生命周期锁串行化 start/stop 整段操作；锁顺序固定为先生命周期后 worker。
-        self._lifecycle_lock = threading.Lock()
+        self._started_at = clock()
         self._quit = threading.Event()
         self._ready = threading.Event()
-        self._httpd: ThreadingHTTPServer | None = None
-        self._http_thread: threading.Thread | None = None
+
+        self._credentials = credential_store or SystemKeyringStore()
+        self._config = ConfigService(
+            self._data_root, credential_store=self._credentials, profile_id=profile_id
+        )
+        self._events = EventService(instance_id=self._instance_id, clock=time.monotonic)
+        self._sessions = SessionManager(instance_id=self._instance_id, clock=time.monotonic)
+        self._manager = WorkerManager(
+            platform,
+            spec_factory=self._build_spec,
+            instance_id=self._instance_id,
+            clock=clock,
+            start_timeout=start_timeout,
+            stop_budget_ms=stop_budget_ms,
+            on_event=self._on_worker_event,
+        )
+        self._status = StatusService(
+            instance_id=self._instance_id,
+            config_service=self._config,
+            manager=self._manager,
+            clock=time.monotonic,
+        )
+        self._api: LocalApi | None = None
+        self._server = None
+        self._api_thread: threading.Thread | None = None
+        self._api_socket: socket.socket | None = None
+        self._port = 0
         self._listener = None
+
+    # --- 查询 -------------------------------------------------------------
 
     @property
     def instance_id(self) -> str:
         return self._instance_id
 
     @property
+    def port(self) -> int:
+        return self._port
+
+    @property
     def admin_url(self) -> str:
-        if self._httpd is None:
+        """管理页地址（不带引导令牌）；未启动时抛错。"""
+        if not self._port:
             raise RuntimeError("not_started")
-        return f"http://127.0.0.1:{self._httpd.server_address[1]}/"
+        return f"http://127.0.0.1:{self._port}/"
+
+    def entry_url(self) -> str:
+        """带一次性引导令牌的管理页地址（§8.1）：令牌只在 fragment 里。"""
+        token = self._sessions.issue_bootstrap()
+        return f"{self.admin_url}#token={token}"
 
     def wait_ready(self, timeout: float) -> bool:
-        """等待 run() 完成启动与首开页面；供调用方与测试对齐时序。"""
+        """等待 run() 完成启动；供调用方与测试对齐时序。"""
         return self._ready.wait(timeout)
 
-    # --- 生命周期 -----------------------------------------------------------
+    # --- 生命周期 ---------------------------------------------------------
 
     def start(self) -> None:
-        """绑定回环端口、发布运行元数据、启动激活管道与 HTTP 服务。"""
-        static_index = (Path(__file__).parent / "static" / "index.html").read_bytes()
-        handler = _make_handler(self, static_index)
-        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        self._httpd.daemon_threads = True
-        # 端口在监听成功后才发布（§9.4）；元数据不是锁，只是信息。
-        self._write_runtime_metadata()
-        self._http_thread = threading.Thread(
-            target=self._httpd.serve_forever, name="raricy-http", daemon=True
-        )
-        self._http_thread.start()
+        """绑定回环端口、启动 API 与激活管道、发布运行元数据。"""
+        self._start_api()
         self._listener = self._platform.create_activation_listener()
         self._listener.start(self._handle_activation)
         log_event(
@@ -105,26 +148,34 @@ class Controller:
         )
 
     def run(self) -> None:
-        """启动并阻塞到退出请求；返回时一切已回收。"""
+        """启动并按设计 §5.2 决定是否启动 Bot、是否打开浏览器。"""
         self.start()
         try:
-            self._open_url(self.admin_url)
+            self._auto_start()
             self._ready.set()
             self._quit.wait()
         finally:
             self.stop()
 
     def stop(self) -> None:
-        """停止 Worker、HTTP 服务与激活管道，释放互斥体；幂等。"""
+        """停止 Worker、API、激活管道与互斥体；幂等（§9.3）。"""
+        if self._quit.is_set() and self._api is None and self._listener is None:
+            return
         self._quit.set()
-        self._stop_worker()
-        if self._httpd is not None:
-            httpd, self._httpd = self._httpd, None
-            httpd.shutdown()
-            httpd.server_close()
-        if self._http_thread is not None:
-            self._http_thread.join(timeout=2)
-            self._http_thread = None
+        self._manager.shutdown()
+        self._sessions.revoke_all()
+        self._events.close()
+        if self._server is not None:
+            self._server.should_exit = True
+        if self._api_thread is not None:
+            self._api_thread.join(timeout=5)
+            self._api_thread = None
+        if self._api_socket is not None:
+            try:
+                self._api_socket.close()
+            except OSError:
+                pass
+            self._api_socket = None
         if self._listener is not None:
             listener, self._listener = self._listener, None
             listener.close()
@@ -140,7 +191,74 @@ class Controller:
             trace_id=self._instance_id,
         )
 
-    # --- 激活管道 -----------------------------------------------------------
+    def request_quit(self) -> None:
+        self._quit.set()
+
+    def _auto_start(self) -> None:
+        """首次进入：配置可用且偏好开启时静默启动；否则打开向导/修复页（§5.2）。"""
+        try:
+            status = self._config.status()
+        except ConfigServiceError:
+            status = None
+        configured = status is not None and status.state == "configured"
+        if configured and self._config.start_bot_on_launch():
+            self._manager.start(revision=status.revision)
+            return
+        self._open_url(self.entry_url())
+
+    # --- API --------------------------------------------------------------
+
+    def _start_api(self) -> None:
+        # 自己先绑定并 listen，再交给 uvicorn：端口在监听成功后才发布，
+        # 不存在「先选端口、释放套接字、等它启动」的竞态（§9.4）。
+        self._api_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._api_socket.bind(("127.0.0.1", 0))
+        self._api_socket.listen(64)
+        self._port = int(self._api_socket.getsockname()[1])
+        self._api = LocalApi(
+            instance_id=self._instance_id,
+            data_root=self._data_root,
+            config_service=self._config,
+            manager=self._manager,
+            status_service=self._status,
+            events=self._events,
+            sessions=self._sessions,
+            credential_store=self._credentials,
+            static_dir=Path(__file__).parent / "static",
+            port=self._port,
+            on_quit=self.request_quit,
+        )
+        self._api_thread = threading.Thread(
+            target=self._serve_api, name="raricy-api", daemon=True
+        )
+        self._api_thread.start()
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            server = self._server
+            if server is not None and getattr(server, "started", False):
+                break
+            time.sleep(0.02)
+        self._write_runtime_metadata()
+
+    def _serve_api(self) -> None:
+        import uvicorn
+
+        config = uvicorn.Config(
+            self._api.app,
+            log_level="warning",
+            access_log=False,
+            server_header=False,
+            date_header=False,
+            lifespan="off",
+        )
+        self._server = uvicorn.Server(config)
+        try:
+            self._server.run(sockets=[self._api_socket])
+        except OSError:
+            # 套接字被关掉（正常退出路径）不算错误。
+            pass
+
+    # --- 激活管道 ---------------------------------------------------------
 
     def _handle_activation(self, data: bytes) -> bytes:
         try:
@@ -155,112 +273,63 @@ class Controller:
                 status="ok",
                 trace_id=self._instance_id,
             )
-            return activation.encode_response(ok=True, url=self.admin_url)
+            return activation.encode_response(ok=True, url=self.entry_url())
         return activation.encode_response(ok=False, error="unknown_command")
 
-    # --- Worker 管理（原型状态：stopped/running/stopping/failed） --------------
+    # --- Worker -----------------------------------------------------------
 
-    def _worker_state(self) -> str:
-        with self._worker_lock:
-            if self._stopping is not None:
-                return "stopping"
-            worker = self._worker
-            if worker is None:
-                return "stopped"
-            exit_code = worker.wait(0)
-            if exit_code is None:
-                return "running"
-            worker.close()
-            self._worker = None
-            log_event(
-                self._logger,
-                logging.INFO,
-                "worker.exit",
-                exit_code=str(exit_code),
-                trace_id=self._instance_id,
-            )
-            # 原型简化：exit 0 视为已停止，其余为故障；L3 换完整状态机。
-            return "stopped" if exit_code == 0 else "failed"
+    def _build_spec(self, revision: int | None, run_id: str) -> WorkerSpec:
+        """构造一次启动的完整输入：运行快照与凭据在配置锁内一次取得（§6.5）。"""
+        saved = self._config.load_saved()
+        if saved is None:
+            raise ConfigServiceError("no_active_config")
+        target = saved.revision if revision is None else revision
+        launch = self._config.build_run_launch(target)
+        return default_worker_spec(
+            run_config=str(launch.config_path),
+            config_dir=str(self._config.profile()),
+            credentials=launch.credentials,
+            instance_id=self._instance_id,
+            run_id=run_id,
+        )
 
-    def start_worker(self) -> str:
-        # 与在途停止串行：确认旧进程退出并关闭后才允许创建新进程（§9.2）。
-        with self._lifecycle_lock:
-            # 退出标志必须在锁内判定：stop() 回收旧 Worker 后会释放生命周期锁，
-            # 此时它还要关闭 HTTP 服务；该窗口内到达的 start 若放行，就会在
-            # stop() 返回后留下一个无人回收的新进程。
-            if self._quit.is_set():
-                log_event(
-                    self._logger,
-                    logging.INFO,
-                    "worker.spawn",
-                    status="refused",
-                    reason="quitting",
-                    trace_id=self._instance_id,
+    def _on_worker_event(self, name: str, fields: dict) -> None:
+        """把进程阶段与 Worker 上报都放进事件缓冲（§12）。"""
+        worker = self._manager.worker
+        if worker is not None:
+            self._pump_worker_frames(worker)
+        self._events.publish(name, **fields)
+
+    def _pump_worker_frames(self, worker) -> None:
+        """把 Worker 已上报的帧转成事件与状态快照（非阻塞）。"""
+        while True:
+            frame = worker.next_frame(0)
+            if frame is None:
+                return
+            kind = frame.get("kind")
+            payload = frame.get("payload") or {}
+            if kind == "log":
+                self._events.publish(
+                    str(payload.get("event", "worker.log")),
+                    level=str(payload.get("level", "info")).lower(),
+                    **{k: v for k, v in (payload.get("fields") or {}).items()},
                 )
-                return "stopped"
-            with self._worker_lock:
-                if self._worker is not None and self._worker.wait(0) is None:
-                    return "running"  # 重复 start 返回当前状态，不并行创建
-                if self._worker is not None:
-                    self._worker.close()
-                    self._worker = None
-                self._worker = WorkerProcess(self._platform, default_worker_spec())
-            log_event(
-                self._logger,
-                logging.INFO,
-                "worker.spawn",
-                status="ok",
-                trace_id=self._instance_id,
-            )
-            return "running"
+            elif kind in ("ready", "status", "stopped"):
+                self._events.publish(f"worker.{kind}", status=kind)
 
-    def _stop_worker(self) -> None:
-        with self._lifecycle_lock:
-            with self._worker_lock:
-                worker = self._worker
-                if worker is None:
-                    return
-                # 排空期间保留引用并暴露 stopping：确认退出前既不向状态查询
-                # 报告 stopped，也不放行新的 start。
-                self._stopping = worker
-            try:
-                worker.request_stop()
-                if worker.wait(_STOP_BUDGET_MS) is None:
-                    worker.terminate()
-                    worker.wait(_STOP_BUDGET_MS)
-            finally:
-                worker.close()
-                with self._worker_lock:
-                    self._stopping = None
-                    self._worker = None
-
-    def stop_worker(self) -> str:
-        self._stop_worker()
-        return "stopped"
-
-    # --- 状态与元数据 ---------------------------------------------------------
-
-    def status(self) -> dict:
-        return {
-            "instance_id": self._instance_id,
-            "version": __version__,
-            "uptime_seconds": round(time.monotonic() - self._started_at, 1),
-            "worker": {"state": self._worker_state()},
-        }
-
-    def request_quit(self) -> None:
-        self._quit.set()
+    # --- 元数据 -----------------------------------------------------------
 
     def _write_runtime_metadata(self) -> None:
+        """发布运行元数据（端口已在监听）；它不是锁，只是信息（§9.4）。"""
         metadata = {
             "instance_id": self._instance_id,
             "pid": os.getpid(),
-            "port": self._httpd.server_address[1],
+            "port": self._port,
             "protocol_version": activation.PROTOCOL_VERSION,
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
         try:
-            directory = self._data_root / _RUNTIME_DIR
+            directory = paths.runtime_dir(self._data_root)
             directory.mkdir(parents=True, exist_ok=True)
             (directory / _RUNTIME_FILE).write_text(
                 json.dumps(metadata, ensure_ascii=False), encoding="utf-8"
@@ -271,61 +340,6 @@ class Controller:
 
     def _remove_runtime_metadata(self) -> None:
         try:
-            (self._data_root / _RUNTIME_DIR / _RUNTIME_FILE).unlink(missing_ok=True)
+            (paths.runtime_dir(self._data_root) / _RUNTIME_FILE).unlink(missing_ok=True)
         except OSError:
             pass
-
-
-# --- HTTP 原型面（L3 替换为认证 API） -----------------------------------------
-
-
-def _make_handler(controller: Controller, static_index: bytes):
-    class _Handler(BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
-
-        def log_message(self, *_args: object) -> None:
-            # 访问日志禁记 query/body；原型阶段整体静默（§12）。
-            return
-
-        def _send_json(self, status: int, payload: dict) -> None:
-            body = json.dumps(payload).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
-
-        def _send_html(self, body: bytes) -> None:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_GET(self) -> None:
-            if self.path == "/":
-                self._send_html(static_index)
-            elif self.path == "/api/status":
-                self._send_json(200, controller.status())
-            else:
-                self._send_json(404, {"ok": False, "error": "not_found"})
-
-        def do_POST(self) -> None:
-            length = int(self.headers.get("Content-Length") or 0)
-            if length:
-                self.rfile.read(min(length, 4096))
-            if self.path == "/api/bot/start":
-                state = controller.start_worker()
-                self._send_json(200, {"ok": True, "worker": {"state": state}})
-            elif self.path == "/api/bot/stop":
-                state = controller.stop_worker()
-                self._send_json(200, {"ok": True, "worker": {"state": state}})
-            elif self.path == "/api/launcher/quit":
-                self._send_json(200, {"ok": True, "message": texts.QUIT_ACKNOWLEDGED})
-                controller.request_quit()
-            else:
-                self._send_json(404, {"ok": False, "error": "not_found"})
-
-    return _Handler
