@@ -30,7 +30,31 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     # 发行包不含 MCP SDK 与工具实现（§4.2）；静态检查另有 staging 白名单把关。
-    excludes=["mcp", "raricy_bot.mcp", "raricy_bot.blog"],
+    # 其余排除项是**构建环境里存在、发行包不需要**的科学计算/GUI/测试栈：不排除
+    # 的话它们会被整包带走（实测 llvmlite 一项就有 100 MB，PyQt5 与 numpy/scipy
+    # 另占 70 MB 以上）。新增排除项前先确认没有运行时导入。
+    excludes=[
+        "mcp",
+        "raricy_bot.mcp",
+        "raricy_bot.blog",
+        "numpy",
+        "scipy",
+        "pandas",
+        "matplotlib",
+        "llvmlite",
+        "numba",
+        "PyQt5",
+        "PyQt6",
+        "PySide2",
+        "PySide6",
+        "tkinter",
+        "PIL",
+        "IPython",
+        "notebook",
+        "pytest",
+        "sphinx",
+        "docutils",
+    ],
     noarchive=False,
 )
 pyz = PYZ(a.pure)
