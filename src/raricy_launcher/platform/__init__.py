@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
 
@@ -34,11 +35,53 @@ class WorkerJob(Protocol):
 
 
 @runtime_checkable
+class InstanceGuard(Protocol):
+    """桌面单实例互斥体（LIGHT_EDITION_DESIGN §9.4）。
+
+    互斥体只决定 Controller 所有权；激活动作走受 ACL 保护的命名管道，
+    不是互斥体本身。
+    """
+
+    def owned(self) -> bool:
+        """本进程是否取得所有权；False 表示已有实例在运行。"""
+        ...
+
+    def close(self) -> None:
+        """释放所有权并关闭句柄；重复关闭是安全的。"""
+        ...
+
+
+@runtime_checkable
+class ActivationListener(Protocol):
+    """激活管道服务端：接受有限激活动作的字节级请求/响应。"""
+
+    def start(self, handler: Callable[[bytes], bytes]) -> None:
+        """后台线程接受连接；handler 抛异常时回固定错误响应。"""
+        ...
+
+    def close(self) -> None:
+        """停止接受并唤醒阻塞中的等待；重复关闭是安全的。"""
+        ...
+
+
+@runtime_checkable
 class LauncherPlatform(Protocol):
     """桌面入口依赖的平台能力集合；随 L0 阶段逐项补全。"""
 
     def create_worker_job(self) -> WorkerJob:
         """创建空 job；句柄不可继承，保证只有 Controller 持有。"""
+        ...
+
+    def acquire_instance_guard(self) -> InstanceGuard:
+        """取得当前用户范围的单实例互斥体。"""
+        ...
+
+    def create_activation_listener(self) -> ActivationListener:
+        """创建 ACL 保护、拒绝远程客户端的激活管道服务端。"""
+        ...
+
+    def request_activation(self, payload: bytes, *, timeout_ms: int) -> bytes:
+        """向已有实例的激活管道发一次请求；不可用抛 PlatformError。"""
         ...
 
 
