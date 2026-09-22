@@ -791,6 +791,11 @@ Light 闭包 = `raricy_bot` 整包 − `mcp/` − `blog/` − 完整版 CLI 入�
 [blog_records.py](../../src/raricy_bot/blog_records.py)（D-122），它不 import `blog/`。
 验证：`tests` 的无 MCP 导入测试在屏蔽 `mcp` SDK 的子进程里导入闭包全部模块。
 
+安装元数据见 [packaging/light/pyproject.toml](../../packaging/light/pyproject.toml)：
+闭包用到的第三方发行版（`httpx`、`openai`、`PyYAML`、`aiohttp`，约束与根
+pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与闭包导入由测试对照钉住 ——
+新增第三方导入必须同时更新元数据，否则干净环境安装后会缺件。
+
 ## 57. `raricy_launcher` 原型（激活、进程回收）
 
 入口：[激活协议](../../src/raricy_launcher/activation.py)、[Windows 平台层](../../src/raricy_launcher/platform/windows.py)、
