@@ -23,6 +23,8 @@ import json
 import shutil
 import subprocess
 import sys
+import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +51,9 @@ _PACKAGING_FILES: tuple[str, ...] = (
 
 # staging 目录标记：只有带此文件的已存在目录才允许清理重建。
 STAGING_MARKER_NAME = ".raricy-light-staging"
+
+# 构建信息文件名：版本、依赖清单与整包校验和（§15.1 第 5 步）。
+BUILD_INFO_NAME = "build-info.json"
 
 # 绝不允许作为 staging 目标的源码树。
 _SOURCE_DIRS: tuple[Path, ...] = (
@@ -221,7 +226,97 @@ def stage(staging_dir: Path) -> dict[str, str]:
     (staging_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
     )
+    (staging_dir / BUILD_INFO_NAME).write_text(
+        json.dumps(_build_info(staging_dir, manifest), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
     return manifest
+
+
+def _declared_dependencies() -> list[str]:
+    """Light 安装元数据里声明的依赖清单（构建产物要能回答「装了什么」）。"""
+    pyproject = PACKAGING_DIR / "pyproject.toml"
+    try:
+        text = pyproject.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    deps: list[str] = []
+    inside = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("dependencies = ["):
+            inside = True
+            continue
+        if inside and stripped.startswith("]"):
+            break
+        if inside and stripped.startswith('"'):
+            deps.append(stripped.split('"')[1])
+    return sorted(deps)
+
+
+def _build_info(staging_dir: Path, manifest: dict[str, str]) -> dict[str, object]:
+    """构建信息：版本、依赖清单与整包校验和（§15.1 第 5 步）。
+
+    只写可公开的信息：不含本机路径、账号或任何凭据；staging 目录本身是临时产物。
+    """
+    digest = hashlib.sha256()
+    for name in sorted(manifest):
+        digest.update(name.encode("utf-8"))
+        digest.update(manifest[name].encode("utf-8"))
+    total_bytes = sum(
+        path.stat().st_size for path in staging_dir.rglob("*") if path.is_file()
+    )
+    return {
+        "name": "raricy-bot-light",
+        "version": _packaging_version(),
+        "protocol_version": _launcher_protocol_version(),
+        "python": ".".join(str(part) for part in sys.version_info[:3]),
+        "dependencies": _declared_dependencies(),
+        "files": len(manifest),
+        "bytes": total_bytes,
+        "manifest_sha256": digest.hexdigest(),
+        "built_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _packaging_version() -> str:
+    pyproject = PACKAGING_DIR / "pyproject.toml"
+    try:
+        for line in pyproject.read_text(encoding="utf-8").splitlines():
+            if line.startswith("version"):
+                return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return "0.0.0"
+
+
+def _launcher_protocol_version() -> int:
+    """IPC 协议版本：从源码读，构建信息与代码不会各说各话。"""
+    source = REPO_ROOT / "src" / "raricy_launcher" / "ipc.py"
+    try:
+        for line in source.read_text(encoding="utf-8").splitlines():
+            if line.startswith("PROTOCOL_VERSION"):
+                return int(line.split(":", 1)[1].split("=", 1)[1].strip())
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def make_zip(staging_dir: Path, output: Path | None = None) -> Path:
+    """把冻结产物打成 ZIP 并附校验和（§15.1 第 6 步的首发交付形式）。"""
+    app_dir = staging_dir / "dist" / "RaricyBotLight"
+    if not app_dir.is_dir():
+        raise StagingError(f"没有找到冻结产物：{app_dir}")
+    target = output or (staging_dir / f"RaricyBotLight-{_packaging_version()}-win64.zip")
+    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(app_dir.rglob("*")):
+            if path.is_file():
+                archive.write(path, path.relative_to(app_dir.parent))
+    digest = hashlib.sha256(target.read_bytes()).hexdigest()
+    target.with_suffix(target.suffix + ".sha256").write_text(
+        f"{digest}  {target.name}\n", encoding="utf-8"
+    )
+    return target
 
 
 def _run_pyinstaller(staging_dir: Path) -> int:
@@ -239,6 +334,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="staging 后在 staging 内运行 PyInstaller（需已安装）",
     )
+    parser.add_argument(
+        "--zip",
+        action="store_true",
+        help="把已冻结的产物打成 ZIP 并写 .sha256（需先 --pyinstaller）",
+    )
     args = parser.parse_args(argv)
     try:
         manifest = stage(args.staging)
@@ -247,7 +347,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     print(f"staging 完成：{args.staging}（{len(manifest)} 个文件）")
     if args.pyinstaller:
-        return _run_pyinstaller(args.staging)
+        code = _run_pyinstaller(args.staging)
+        if code != 0:
+            return code
+    if args.zip:
+        try:
+            target = make_zip(args.staging)
+        except StagingError as exc:
+            print(f"打包失败：{exc}", file=sys.stderr)
+            return 2
+        print(f"ZIP 完成：{target}")
     return 0
 
 

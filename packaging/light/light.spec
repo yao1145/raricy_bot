@@ -1,14 +1,36 @@
-# Light 冻结配置原型：onedir + windowed（无终端，§15.1）。
+# Light 冻结配置（LIGHT_EDITION_DESIGN §15.1）：onedir + windowed（无终端）。
 # 由 tools/build_light.py 复制到 staging 根后执行；所有路径相对 staging。
+#
+# `hiddenimports` 只列运行时**动态导入**的模块：uvicorn 的协议/循环实现与
+# keyring 的系统后端都不是静态 import，PyInstaller 的静态分析看不到它们。
 a = Analysis(
     ["entry_light.py"],
     pathex=["src"],
     binaries=[],
+    # 静态资源随包：发行程序从包资源定位页面，不依赖运行期 Node 或 CDN（§3.1）。
     datas=[("src/raricy_launcher/static", "raricy_launcher/static")],
-    hiddenimports=["win32timezone"],
+    hiddenimports=[
+        "win32timezone",
+        "uvicorn.logging",
+        "uvicorn.loops",
+        "uvicorn.loops.auto",
+        "uvicorn.loops.asyncio",
+        "uvicorn.protocols",
+        "uvicorn.protocols.http",
+        "uvicorn.protocols.http.auto",
+        "uvicorn.protocols.http.h11_impl",
+        "uvicorn.protocols.websockets",
+        "uvicorn.protocols.websockets.auto",
+        "uvicorn.lifespan",
+        "uvicorn.lifespan.on",
+        "uvicorn.lifespan.off",
+        "keyring.backends.Windows",
+        "keyring.backends.null",
+    ],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["mcp"],
+    # 发行包不含 MCP SDK 与工具实现（§4.2）；静态检查另有 staging 白名单把关。
+    excludes=["mcp", "raricy_bot.mcp", "raricy_bot.blog"],
     noarchive=False,
 )
 pyz = PYZ(a.pure)
