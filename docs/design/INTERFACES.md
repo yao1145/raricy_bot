@@ -868,7 +868,8 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   窗口会滚动，本机他人刷满也不能把用户永久挡在门外。会话只存内存，Controller 重启即全部失效。
 - **请求门**（§8.1、§8.2）：每个请求校验精确 Host（含实际端口）；写请求还要 Origin /
   Fetch Metadata、CSRF 头与 JSON 内容类型三件齐备。请求体上限 256 KiB **在读取过程中**生效
-  （先缓冲再检查等于没有上限）。响应一律 `Cache-Control: no-store`，HTML 带 CSP 与
+  （先缓冲再检查等于没有上限）；知识库导入另有一个更宽的传输上限，让「单文件 1 MiB」
+  成为真正生效的那道门。响应一律 `Cache-Control: no-store`，HTML 带 CSP 与
   `X-Content-Type-Options`；静态路径拒绝穿越。
 - **配置面**（§11）：`GET/PUT /api/config`、`POST /api/config/validate`、草稿读写。
   读接口显式构造响应：只含可编辑字段、revision、账号与「凭据已配置/后端可用」三态，
@@ -899,5 +900,9 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 - 发行构建：`tools/build_light.py` 生成 staging（Light 闭包 + 静态资源 + 构建信息），
   `--pyinstaller` 用 `light.spec` 冻结为 onedir/windowed 应用，`--zip` 打出 ZIP 与 `.sha256`。
   `build-info.json` 记录版本、协议版本、Python 版本、依赖清单与整包校验和。
-- 验收边界：`tools/smoke_light.py` 覆盖「启动 → 激活 → 会话 → 状态 → 退出」；
-  **干净 Windows 清单（§17.2）与真实站点/模型验收仍未执行**，见使用手册 §7。
+- 首次启动路径：数据根还没有活动档案时，配置服务**按需建立第一个档案**（§5.1 第 1 步），
+  管理页因此读到 `needs_setup`、向导可以直接保存 —— 把「没有档案」当错误会让首次启动失败。
+- 验收边界：`tools/smoke_light.py` 覆盖「启动 → 激活 → 会话 → 状态 → 页面与构建产物 →
+  凭据后端可用 → 退出 → 元数据清理」，运行时本机不能再有另一个 Light 实例（激活通道与
+  互斥体按当前用户命名）。**干净 Windows 清单（§17.2）与真实站点/模型验收仍未执行**，
+  见使用手册 §7。

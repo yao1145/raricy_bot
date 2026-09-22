@@ -729,7 +729,8 @@ EOF 转成 `app.stop()`）、进程状态机（operation_id、starting 可被 st
 Simple/Advanced 配置与凭据操作、测试、状态与近期事件、KB 导入；构建产物落进
 `raricy_launcher/static/`，资源全部本地。**L5 发行** —— 冻结 onedir/windowed 应用、
 `build-info.json`（版本/依赖/校验和）、ZIP + `.sha256`、`tools/smoke_light.py` 覆盖
-「启动 → 激活 → 会话 → 状态 → 退出」，本机冒烟通过。
+「启动 → 激活 → 会话 → 状态 → 页面与构建产物 → 凭据后端可用 → 退出 → 元数据清理」，
+本机冒烟通过。
 
 两轮独立审查（L2、L3）的发现均已先写复现测试再修，其中 L3 审查抓到的最重一条是
 **真实 Worker 的上报句柄没有转成 CRT fd**：报错被静默吞掉，父端永远等不到 ready，
