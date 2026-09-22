@@ -41,9 +41,39 @@ _PACKAGING_FILES: tuple[str, ...] = (
     "light.spec",
 )
 
+# staging 目录标记：只有带此文件的已存在目录才允许清理重建。
+STAGING_MARKER_NAME = ".raricy-light-staging"
+
+# 绝不允许作为 staging 目标的源码树。
+_SOURCE_DIRS: tuple[Path, ...] = (
+    REPO_ROOT / "src",
+    REPO_ROOT / "tools",
+    REPO_ROOT / "packaging",
+)
+
 
 class StagingError(Exception):
     """staging 静态检查失败的固定错误。"""
+
+
+def _resolve_staging_dir(staging_dir: Path) -> Path:
+    """规范化 staging 路径并在必要时安全清理。
+
+    拒绝仓库根、仓库祖先目录与源码树；已存在的非空目录必须带 staging
+    标记才允许删除，防止 ``--staging .`` 之类的误用删掉用户文件。
+    """
+    resolved = Path(staging_dir).resolve()
+    if resolved == REPO_ROOT or resolved in REPO_ROOT.parents:
+        raise StagingError(f"refuse staging into repo root or ancestor: {resolved}")
+    if any(resolved == source or source in resolved.parents for source in _SOURCE_DIRS):
+        raise StagingError(f"refuse staging into source tree: {resolved}")
+    if resolved.exists():
+        if any(resolved.iterdir()) and not (resolved / STAGING_MARKER_NAME).is_file():
+            raise StagingError(f"refuse to clean unmarked directory: {resolved}")
+        shutil.rmtree(resolved)
+    resolved.mkdir(parents=True)
+    (resolved / STAGING_MARKER_NAME).write_text("raricy light staging\n", encoding="utf-8")
+    return resolved
 
 
 def _iter_python_files(root: Path) -> list[Path]:
@@ -87,9 +117,7 @@ def _check_imports(path: Path, *, is_core: bool) -> None:
 
 def stage(staging_dir: Path) -> dict[str, str]:
     """生成 staging 并返回 {相对路径: sha256} 清单；失败抛 StagingError。"""
-    staging_dir = Path(staging_dir)
-    if staging_dir.exists():
-        shutil.rmtree(staging_dir)
+    staging_dir = _resolve_staging_dir(staging_dir)
     src_out = staging_dir / "src"
     (src_out / "raricy_bot").mkdir(parents=True)
 
