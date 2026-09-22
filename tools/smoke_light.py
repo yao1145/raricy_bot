@@ -47,8 +47,14 @@ def _child_env(data_root: Path) -> dict[str, str]:
         if key in ("SYSTEMROOT", "WINDIR", "PATH", "PATHEXT", "TEMP", "TMP", "COMSPEC")
     }
     env["LOCALAPPDATA"] = str(data_root.parent)
-    # 首次启动会「打开管理页」：把浏览器换成一条无害命令，冒烟不弹窗。
-    env["BROWSER"] = "cmd /c exit 0"
+    # 首次启动会「打开管理页」：把浏览器换成一个只记录地址的批处理，冒烟不弹窗，
+    # 也避免真实浏览器把 profile 写进临时数据根（那会让清理失败）。
+    recorder = data_root.parent / "browser.cmd"
+    recorder.parent.mkdir(parents=True, exist_ok=True)
+    recorder.write_text(
+        '@echo off\r\necho %1 >> "%~dp0opened.txt"\r\n', encoding="utf-8"
+    )
+    env["BROWSER"] = str(recorder)
     return env
 
 
@@ -80,8 +86,8 @@ def _activate(port: int) -> str:
     return response["url"]
 
 
-def _session_and_status(url: str) -> str:
-    """用引导令牌换会话，再读一次状态与页面；返回 CSRF 值。"""
+def _session_and_status(url: str):
+    """用引导令牌换会话，再读一次状态与页面；返回 (CSRF 值, 会话 Cookie)。"""
     import httpx
 
     base = url.split("#", 1)[0].rstrip("/")
@@ -96,6 +102,7 @@ def _session_and_status(url: str) -> str:
             raise SmokeError(f"会话兑换失败：{exchanged.status_code}")
         csrf = exchanged.json()["csrf"]
         client.cookies.update(exchanged.cookies)
+        cookies = dict(client.cookies)
 
         status = client.get(f"{base}/api/status")
         if status.status_code != 200:
@@ -107,14 +114,14 @@ def _session_and_status(url: str) -> str:
         page = client.get(f"{base}/")
         if page.status_code != 200 or "RARICY_LIGHT" not in page.text:
             raise SmokeError("管理页没有正常返回")
-    return csrf
+    return csrf, cookies
 
 
-def _quit(url: str, csrf: str) -> None:
+def _quit(url: str, csrf: str, cookies: dict[str, str]) -> None:
     import httpx
 
     base = url.split("#", 1)[0].rstrip("/")
-    with httpx.Client(timeout=10) as client:
+    with httpx.Client(timeout=10, cookies=cookies) as client:
         response = client.post(
             f"{base}/api/launcher/quit",
             json={},
@@ -133,7 +140,7 @@ def run(app_dir: Path) -> int:
     if not exe.is_file():
         raise SmokeError(f"没有找到 {exe}；先跑 tools/build_light.py --pyinstaller")
 
-    with tempfile.TemporaryDirectory(prefix="light-smoke-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="light-smoke-", ignore_cleanup_errors=True) as tmp:
         data_root = Path(tmp) / "RaricyBotLight"
         process = subprocess.Popen(
             [str(exe)],
@@ -147,9 +154,9 @@ def run(app_dir: Path) -> int:
             print(f"[ok] 控制服务已监听 127.0.0.1:{port}")
             url = _activate(port)
             print("[ok] 激活返回带一次性令牌的入口地址")
-            csrf = _session_and_status(url)
+            csrf, cookies = _session_and_status(url)
             print("[ok] 会话兑换、状态接口与管理页都可用")
-            _quit(url, csrf)
+            _quit(url, csrf, cookies)
             deadline = time.monotonic() + EXIT_TIMEOUT_SECONDS
             while time.monotonic() < deadline and process.poll() is None:
                 time.sleep(0.2)
@@ -161,6 +168,9 @@ def run(app_dir: Path) -> int:
             if (data_root / "runtime" / "launcher-runtime.json").exists():
                 raise SmokeError("退出后运行元数据没有清理")
             print("[ok] 运行元数据已清理，互斥体已释放")
+            opened = data_root.parent / "opened.txt"
+            if opened.exists():
+                print(f"[ok] 首次启动按要求打开了管理页：{opened.read_text(encoding='utf-8').strip()[:60]}…")
         finally:
             if process.poll() is None:
                 process.kill()
