@@ -8,6 +8,13 @@ version = "0.1.0"
 description = "Raricy Bot Light 桌面发行版（Windows x64）"
 requires-python = ">=3.12"
 dependencies = [
+    # Light 闭包直接用到的第三方运行依赖，约束与根 pyproject 保持一致；
+    # 唯一**不**声明的是 mcp（§4.2 明确不打包）。清单由
+    # tests 的「闭包依赖必须在元数据里声明」测试钉住，新增导入必须同步这里。
+    "httpx>=0.27",      # 站点客户端、SSE 与聊天/评论的出站请求
+    "openai>=1.40",     # 无工具模型客户端（core/worker.py）
+    "PyYAML>=6.0",      # 配置加载与记忆/稿库的 Markdown front matter
+    "aiohttp>=3.9",     # 运维探针服务（ops.py）
     # 平台层绑定：Job/互斥体/管道 ACL；仅 Windows 需要（LIGHT_EDITION_DESIGN §14）
     "pywin32>=306; sys_platform == 'win32'",
 ]
