@@ -13,10 +13,10 @@ dependencies = [
 ]
 
 # 与完整版共享 raricy_bot 导入命名空间：两者不得安装到同一 Python 环境（§4.4）。
-# staging 里 raricy_bot 只含白名单模块，不包含任何 MCP/工具实现。
+# staging 里的 raricy_bot 只有 Light 闭包（整包减 mcp/ 与 blog/），不含任何 MCP/工具实现。
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["raricy_launcher*", "raricy_bot"]
+include = ["raricy_launcher*", "raricy_bot*"]
 
 [tool.setuptools.package-data]
 raricy_launcher = ["static/*"]

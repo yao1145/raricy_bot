@@ -1,8 +1,8 @@
 # Raricy Bot Light 打包
 
 Light 发行版的独立构建描述（LIGHT_EDITION_DESIGN §4.4、§14、§15）。仓库只维护
-一份源码：构建时由 `tools/build_light.py` 把 Launcher 整包与白名单核心模块
-复制进临时 staging，检查无 MCP 依赖后构建，不长期维护第二份业务代码。
+一份源码：构建时由 `tools/build_light.py` 把 Launcher 整包与 Light 闭包复制进临时
+staging，检查无 MCP 依赖后构建，不长期维护第二份业务代码。
 
 ## 隔离规则
 
@@ -23,9 +23,12 @@ python tools/build_light.py --pyinstaller        # staging 后冻结为 onedir �
 产物：`build/light-staging/`（staging）、`build/light-staging/dist/RaricyBotLight/`
 （冻结应用，onedir + windowed）。ZIP 与干净 Windows 验收属 L5，当前均未执行。
 
-## 当前状态（L0）
+## 当前状态（L1）
 
-- staging 白名单：`raricy_bot/__init__.py`、`logging_setup.py`、`redact.py`
-  （Launcher 的诊断出口依赖），随阶段推进按实际闭包扩充并同步本清单。
+- staging 闭包 = `raricy_bot` **整包减去** `mcp/`、`blog/` 与完整版 CLI 入口
+  `__main__.py`（§4.2、§4.3）。完整版专属的构造经工厂注入 App
+  （`assembly.py` 的接缝），Store 需要的发文记录与 UTC+8 日历在包外的
+  `blog_records.py`。闭包由 `tools/build_light.py` 从源码树现算，并有
+  「无 MCP SDK 环境导入全部模块」的验证测试。
 - 冻结入口 `entry_light.py` → `raricy_launcher.main:main`；`--worker` 复用同一
   可执行文件作为 Worker 入口（§10.1 首版选择）。
