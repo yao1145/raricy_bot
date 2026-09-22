@@ -1,4 +1,4 @@
-"""平台抽象边界：单实例、激活通道、Job 回收。
+"""平台抽象边界：单实例、激活通道、Job 回收与父子管道。
 
 业务模块只依赖这里的协议与错误类型，不直接 import pywin32 或其他系统
 绑定。首版只有 Windows 实现；其他平台拿到的是明确的不支持错误，而不是
@@ -87,6 +87,32 @@ class ControlPipe(Protocol):
 
 
 @runtime_checkable
+class ReportPipe(Protocol):
+    """Worker 上报通道：子端写入、父端只读；子端全部关闭即 EOF（§10.1）。
+
+    与控制通道**分向**：日志与状态挤慢上报也不会挡住停止指令 —— 后者走
+    另一个方向、另一根管道。
+    """
+
+    @property
+    def child_handle(self) -> int:
+        """子进程继承的只写端句柄值；经命令行参数传给 Worker。"""
+        ...
+
+    def detach_child_end(self) -> None:
+        """子进程创建成功后关闭父进程持有的子端副本，保证 EOF 能传播。"""
+        ...
+
+    def receive(self, size: int) -> bytes:
+        """读至多 `size` 字节；对端关闭返回空字节串（EOF）。"""
+        ...
+
+    def close(self) -> None:
+        """关闭父端；重复关闭是安全的。"""
+        ...
+
+
+@runtime_checkable
 class SuspendedProcess(Protocol):
     """以挂起主线程创建的子进程：assign Job 成功前不得 resume。"""
 
@@ -115,7 +141,7 @@ class SuspendedProcess(Protocol):
 
 @runtime_checkable
 class LauncherPlatform(Protocol):
-    """桌面入口依赖的平台能力集合；随 L0 阶段逐项补全。"""
+    """桌面入口依赖的平台能力集合。"""
 
     def create_worker_job(self) -> WorkerJob:
         """创建空 job；句柄不可继承，保证只有 Controller 持有。"""
@@ -137,35 +163,22 @@ class LauncherPlatform(Protocol):
         """创建父子控制通道；子端可继承、父端不可继承。"""
         ...
 
+    def create_report_pipe(self) -> ReportPipe:
+        """创建 Worker 上报通道；子端可继承、父端不可继承。"""
+        ...
+
     def spawn_suspended(
         self,
         argv: Sequence[str],
         *,
         env: dict[str, str],
         cwd: str,
+        stdout_handle: int | None = None,
     ) -> SuspendedProcess:
-        """以挂起主线程创建子进程；参数数组、明确 cwd、无控制台窗口。"""
-        ...
+        """以挂起主线程创建子进程；参数数组、明确 cwd、无控制台窗口。
 
-
-@runtime_checkable
-class LauncherPlatform(Protocol):
-    """桌面入口依赖的平台能力集合；随 L0 阶段逐项补全。"""
-
-    def create_worker_job(self) -> WorkerJob:
-        """创建空 job；句柄不可继承，保证只有 Controller 持有。"""
-        ...
-
-    def acquire_instance_guard(self) -> InstanceGuard:
-        """取得当前用户范围的单实例互斥体。"""
-        ...
-
-    def create_activation_listener(self) -> ActivationListener:
-        """创建 ACL 保护、拒绝远程客户端的激活管道服务端。"""
-        ...
-
-    def request_activation(self, payload: bytes, *, timeout_ms: int) -> bytes:
-        """向已有实例的激活管道发一次请求；不可用抛 PlatformError。"""
+        `stdout_handle` 非空时子进程的 stdout/stderr 都接到该句柄。
+        """
         ...
 
 

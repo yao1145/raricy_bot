@@ -35,6 +35,7 @@ from .. import activation
 from . import (
     ActivationListener,
     ControlPipe,
+    ReportPipe,
     InstanceGuard,
     LauncherPlatform,
     PlatformError,
@@ -391,28 +392,34 @@ class _WinActivationListener:
                 pass
 
 
-class _WinControlPipe:
-    """匿名管道控制通道：子端只读可继承，父端写入不可继承。"""
+class _WinPipe:
+    """匿名管道的一对句柄：子端可继承、父端不可继承；方向由构造参数决定。
 
-    def __init__(self, read_handle, write_handle) -> None:
+    控制通道让子进程读（父端写指令），上报通道让子进程写（父端读状态与事件）。
+    两端分向是刻意的：上报被日志挤满也不会挡住停止指令（§10.1）。
+    """
+
+    def __init__(self, read_handle, write_handle, *, child_reads: bool) -> None:
         self._read_handle = read_handle
         self._write_handle = write_handle
-        self._child_handle = int(read_handle)
+        self._child_reads = child_reads
+        self._child_handle = int(read_handle if child_reads else write_handle)
 
     @property
     def child_handle(self) -> int:
         return self._child_handle
 
     def detach_child_end(self) -> None:
-        handle, self._read_handle = self._read_handle, None
-        if handle is not None:
-            try:
-                win32api.CloseHandle(handle)
-            except pywintypes.error:
-                pass
+        """子进程创建成功后关闭父进程持有的子端副本，保证 EOF 能传播。"""
+        if self._child_reads:
+            handle, self._read_handle = self._read_handle, None
+        else:
+            handle, self._write_handle = self._write_handle, None
+        _close_handle(handle)
 
     def send(self, data: bytes) -> None:
-        if self._write_handle is None:
+        """写控制指令；只有控制通道有这一端。"""
+        if not self._child_reads or self._write_handle is None:
             return
         try:
             win32file.WriteFile(self._write_handle, data)
@@ -420,14 +427,29 @@ class _WinControlPipe:
             # Worker 已退出导致管道断裂：退出结果以 wait 为准，这里不抛出。
             pass
 
+    def receive(self, size: int) -> bytes:
+        """读上报数据；只有上报通道有这一端。对端关闭或断裂时返回空字节串。"""
+        if self._child_reads or self._read_handle is None:
+            return b""
+        try:
+            return bytes(win32file.ReadFile(self._read_handle, size)[1])
+        except pywintypes.error:
+            return b""
+
     def close(self) -> None:
+        """关闭父端；重复关闭是安全的。"""
         self.detach_child_end()
         handle, self._write_handle = self._write_handle, None
-        if handle is not None:
-            try:
-                win32api.CloseHandle(handle)
-            except pywintypes.error:
-                pass
+        _close_handle(handle)
+
+
+def _close_handle(handle) -> None:
+    if handle is None:
+        return
+    try:
+        win32api.CloseHandle(handle)
+    except pywintypes.error:
+        pass
 
 
 class _WinSuspendedProcess:
@@ -526,16 +548,26 @@ class WindowsPlatform:
             raise PlatformError("activation_unavailable") from exc
         return bytes(data)
 
-    def create_control_pipe(self) -> ControlPipe:
+    def _create_pipe(self, *, child_reads: bool) -> _WinPipe:
+        """创建一对匿名管道句柄；子端可继承，父端不可继承。"""
         try:
             attrs = win32security.SECURITY_ATTRIBUTES()
             attrs.bInheritHandle = True
             read_handle, write_handle = win32pipe.CreatePipe(attrs, 0)
-            # 父端不可继承：子进程只拿到只读端；父端关闭即 EOF。
-            win32api.SetHandleInformation(write_handle, win32con.HANDLE_FLAG_INHERIT, 0)
+            # 父端不可继承：子进程只拿到自己那一端；父端关闭即 EOF。
+            parent_end = write_handle if child_reads else read_handle
+            win32api.SetHandleInformation(parent_end, win32con.HANDLE_FLAG_INHERIT, 0)
         except pywintypes.error as exc:
             raise PlatformError("control_pipe_failed") from exc
-        return _WinControlPipe(read_handle, write_handle)
+        return _WinPipe(read_handle, write_handle, child_reads=child_reads)
+
+    def create_control_pipe(self) -> ControlPipe:
+        """父子控制通道：子端只读，父端写入。"""
+        return self._create_pipe(child_reads=True)
+
+    def create_report_pipe(self) -> ReportPipe:
+        """Worker 上报通道：子端只写，父端读取。"""
+        return self._create_pipe(child_reads=False)
 
     def spawn_suspended(
         self,
@@ -543,12 +575,22 @@ class WindowsPlatform:
         *,
         env: dict[str, str],
         cwd: str,
+        stdout_handle: int | None = None,
     ) -> SuspendedProcess:
         # bInheritHandles=True 只继承显式标记为可继承的句柄（PEP 446 下
         # Python 自己的文件/套接字默认不可继承），控制管道子端由此进入
         # 子进程并保持同一柄值。CREATE_NO_WINDOW 保证无终端窗口。
+        #
+        # `stdout_handle` 非空时把子进程的 stdout/stderr 都接到它上面：无终端
+        # 发行包里它们可能根本不存在，父进程持续排空并丢弃，只留下字节计数
+        # （§12：不把任意原始输出当作可展示内容）。
         try:
             startup = win32process.STARTUPINFO()
+            if stdout_handle is not None:
+                startup.dwFlags |= win32process.STARTF_USESTDHANDLES
+                startup.hStdOutput = stdout_handle
+                startup.hStdError = stdout_handle
+                startup.hStdInput = None
             process_handle, thread_handle, pid, _tid = win32process.CreateProcess(
                 None,
                 subprocess.list2cmdline(list(argv)),
