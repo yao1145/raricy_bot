@@ -34,6 +34,7 @@ from raricy_bot.site.client import SiteClient, SiteError
 from . import paths, texts
 from .config_service import (
     ACTION_DELETE,
+    light_base_mapping,
     ACTION_KEEP,
     ACTION_REPLACE,
     EDITABLE_FIELDS,
@@ -343,6 +344,13 @@ class LocalApi:
             "state": status.state,
             "account": saved.account if saved is not None else None,
             "values": values,
+            # 向导的初始值来自 Launcher 基线（含默认 System Prompt 模板），
+            # 只含非敏感字段，且与提交时的基线同源（§5.1 第 3 点）。
+            "defaults": {
+                key: _get_path(light_base_mapping(self._config.profile()), key)
+                for key in sorted(EDITABLE_FIELDS)
+                if key == "system_prompt"
+            },
             "editable": sorted(EDITABLE_FIELDS),
             "credentials": self._credential_view(saved),
             "start_bot_on_launch": bool(saved.start_bot_on_launch) if saved else False,

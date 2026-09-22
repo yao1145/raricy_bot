@@ -1,0 +1,18 @@
+{
+  "name": "raricy-bot-light-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Raricy Bot Light 的本地管理页：向导、Simple/Advanced 配置、状态与近期事件",
+  "scripts": {
+    "build": "vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^5.0.0",
+    "svelte": "^5.0.0",
+    "svelte-check": "^4.0.0",
+    "typescript": "^5.6.0",
+    "vite": "^6.0.0"
+  }
+}

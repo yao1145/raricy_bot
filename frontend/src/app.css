@@ -1,0 +1,273 @@
+/* 深色科幻基调：霓虹强调色 + 等宽字体，全部资源本地（设计 §5 的视觉方向）。 */
+:root {
+  color-scheme: dark;
+  --bg: #070b14;
+  --panel: #0d1424;
+  --panel-2: #111b2e;
+  --line: #1d2c47;
+  --text: #d7e3f4;
+  --muted: #7f93b3;
+  --accent: #35e0d0;
+  --accent-dim: #1d8f88;
+  --danger: #ff6b81;
+  --warn: #ffc46b;
+  --ok: #6ee7a8;
+  --mono: "Cascadia Mono", "JetBrains Mono", Consolas, "Courier New", monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(1200px 600px at 20% -10%, #12203a 0%, transparent 60%),
+    radial-gradient(900px 500px at 110% 10%, #102a2a 0%, transparent 55%),
+    var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.shell {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 24px 20px 64px;
+}
+
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.brand h1 {
+  font-size: 18px;
+  margin: 0;
+  color: var(--accent);
+}
+
+.brand .tag {
+  color: var(--muted);
+  font-size: 12px;
+  letter-spacing: 0.1em;
+}
+
+nav {
+  display: flex;
+  gap: 8px;
+  margin: 20px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+nav button {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 13px;
+  padding: 8px 14px;
+}
+
+nav button.active {
+  border-bottom-color: var(--accent);
+  color: var(--accent);
+}
+
+.panel {
+  background: linear-gradient(180deg, var(--panel), var(--panel-2));
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 18px 20px;
+  margin-bottom: 16px;
+}
+
+.panel h2 {
+  font-size: 14px;
+  letter-spacing: 0.12em;
+  margin: 0 0 14px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.grid {
+  display: grid;
+  gap: 12px 18px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+input,
+textarea,
+select {
+  background: #0a1120;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  padding: 8px 10px;
+  width: 100%;
+}
+
+input:focus,
+textarea:focus,
+select:focus {
+  border-color: var(--accent-dim);
+  outline: none;
+}
+
+textarea {
+  min-height: 120px;
+  resize: vertical;
+}
+
+button.action {
+  background: transparent;
+  border: 1px solid var(--accent-dim);
+  border-radius: 6px;
+  color: var(--accent);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 13px;
+  padding: 8px 16px;
+}
+
+button.action:hover:not(:disabled) {
+  background: rgba(53, 224, 208, 0.1);
+}
+
+button.action:disabled {
+  border-color: var(--line);
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+button.danger {
+  border-color: #7a2733;
+  color: var(--danger);
+}
+
+button.ghost {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-family: inherit;
+  text-decoration: underline;
+}
+
+.row {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  gap: 6px 16px;
+  margin: 0;
+}
+
+.kv dt {
+  color: var(--muted);
+}
+
+.kv dd {
+  margin: 0;
+}
+
+.state {
+  border-radius: 4px;
+  font-size: 12px;
+  padding: 2px 8px;
+}
+
+.state.ok {
+  background: rgba(110, 231, 168, 0.12);
+  color: var(--ok);
+}
+
+.state.warn {
+  background: rgba(255, 196, 107, 0.12);
+  color: var(--warn);
+}
+
+.state.bad {
+  background: rgba(255, 107, 129, 0.14);
+  color: var(--danger);
+}
+
+.notice {
+  border-left: 3px solid var(--accent-dim);
+  color: var(--muted);
+  margin: 12px 0;
+  padding: 6px 12px;
+}
+
+.error {
+  border-left: 3px solid var(--danger);
+  color: var(--danger);
+  margin: 12px 0;
+  padding: 6px 12px;
+}
+
+.log {
+  background: #060a13;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 12px;
+  max-height: 320px;
+  overflow: auto;
+  padding: 10px 12px;
+}
+
+.log div {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.log .time {
+  color: var(--muted);
+}
+
+.log .warn {
+  color: var(--warn);
+}
+
+.log .error {
+  border: none;
+  color: var(--danger);
+  margin: 0;
+  padding: 0;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.checkbox {
+  align-items: center;
+  flex-direction: row;
+  gap: 8px;
+}
+
+.checkbox input {
+  width: auto;
+}
