@@ -15,14 +15,14 @@ from typing import Any
 
 import yaml
 
-from ..redact import Redactor
-from .models import (
+from ..blog_records import (
     HASH_VERSION,
     REASON_DRAFT_EMPTY,
     REASON_DRAFT_INVALID,
     Draft,
     PreparedDraft,
 )
+from ..redact import Redactor
 
 # 长度口径与上游 `.length` 一致：JavaScript 数的是 UTF-16 code unit，不是码点。
 # 一个非 BMP 字符（emoji、部分生僻字）在这里算 2，而 Python 的 len() 算 1。

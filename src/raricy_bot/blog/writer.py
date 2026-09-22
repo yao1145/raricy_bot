@@ -24,6 +24,7 @@ from contextlib import nullcontext
 from typing import Any
 
 from .. import texts
+from ..blog_records import Draft
 from ..core.worker import (
     KIND_STRICT_UNSUPPORTED,
     KIND_TIMEOUT,
@@ -33,7 +34,6 @@ from ..logging_setup import get_logger, log_event
 from ..mcp.contracts import ToolCall, ToolDefinition, ToolExecution
 from ..time_context import append_current_time
 from .codec import parse_draft
-from .models import Draft
 
 _logger = get_logger("blog.writer")
 

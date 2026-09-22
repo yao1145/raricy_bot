@@ -3,36 +3,19 @@
 时间语义固定为 **UTC+8**，不跟系统时区：站方的日限额按 UTC+8 零点切（`dayStart`），
 本地若按服务器本地时区切，在 TZ=UTC 的机器上会把头 8 小时发的东西算进前一天。
 
-本模块同时是本子域**唯一**的 UTC+8 日历实现：`store.py` 推导 `retry_after_day` 与计费日期时
-import 这里的 `utc8_day` / `utc8_next_day`，不另写一份。
+日历本身（`UTC8`、`utc8_day`、`utc8_next_day`、`SCAN_WINDOW_SECONDS`）定义在
+`raricy_bot/blog_records.py`：Store 也要用它，而 Store 不能依赖 `blog/`（设计 §4.3）。
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 
+from ..blog_records import SCAN_WINDOW_SECONDS, UTC8, RunCandidate
 from ..config import TIER_MAYBE, BlogTaskConfig
-from .models import RunCandidate
-
-# 固定东八区。不用 zoneinfo：那会依赖宿主机的时区数据库，而这里要的就是一个死数。
-UTC8 = timezone(timedelta(hours=8))
-
-# 枚举窗口的硬上限（秒）。积压超过这个跨度还没开始的点不再补发 ——
-# 停机一整天后一次性生成几十篇文章，比漏发危险得多。
-SCAN_WINDOW_SECONDS: float = 300.0
 
 _SECONDS_PER_MINUTE: int = 60
-
-
-def utc8_day(now: float) -> str:
-    """把 epoch 秒转成 UTC+8 的 `YYYY-MM-DD`。"""
-    return datetime.fromtimestamp(now, UTC8).strftime("%Y-%m-%d")
-
-
-def utc8_next_day(day: str) -> str:
-    """`YYYY-MM-DD` 的次日。"""
-    return (date.fromisoformat(day) + timedelta(days=1)).isoformat()
 
 
 def scheduled_epoch(day: date, hhmm: str) -> float:

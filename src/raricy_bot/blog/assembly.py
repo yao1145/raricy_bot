@@ -13,13 +13,13 @@ import random as random_module
 import time
 from collections.abc import Awaitable, Callable
 
+from ..blog_records import BlogScope
 from ..config import Config
 from ..core.worker import ModelClient
 from ..redact import Redactor
 from ..site.client import SiteClient
 from ..site.models import Author
 from ..store import Store
-from .models import BlogScope
 from .publisher import BlogPublisher
 from .service import BlogService
 from .writer import BlogWriter

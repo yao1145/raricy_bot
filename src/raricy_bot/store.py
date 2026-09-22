@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
 
-from .blog.models import (
+from .blog_records import (
     MAX_POST_ATTEMPTS,
     MAX_RECONCILE_ATTEMPTS,
     POST_HOLDING_STATUSES,
@@ -43,6 +43,7 @@ from .blog.models import (
     RUN_RUNNING,
     RUN_SKIPPED,
     RUN_TERMINAL_STATUSES,
+    SCAN_WINDOW_SECONDS,
     STATUS_ABANDONED,
     STATUS_INFLIGHT,
     STATUS_PUBLISHED,
@@ -55,8 +56,9 @@ from .blog.models import (
     BlogRun,
     BlogScope,
     RunCandidate,
+    utc8_day,
+    utc8_next_day,
 )
-from .blog.planner import SCAN_WINDOW_SECONDS, utc8_day, utc8_next_day
 from .config import StorageConfig
 
 _T = TypeVar("_T")
@@ -2068,7 +2070,7 @@ class Store:
     # --- 定时发文：调度执行与投递（INTERFACES §53.4）------------------------
     #
     # 这一组的 `now` 一律由调用方传入，SQL 里不读真实时钟；UTC+8 日期只从
-    # `blog.planner` 取，不在这里另写一份日历。所有多步骤写操作都是显式事务，
+    # `blog_records` 取，不在这里另写一份日历。所有多步骤写操作都是显式事务，
     # 整体在一次 `_execute()` 里跑完，因此天然串行、天然原子（D-90）。
 
     async def get_blog_run(

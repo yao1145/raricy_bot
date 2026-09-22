@@ -1,8 +1,14 @@
-"""定时发文子域的基础 DTO 与常量。
+"""定时发文的共享记录、状态常量与 UTC+8 日历（原 `blog/models.py` 与 `blog/planner.py` 的日历部分）。
 
-**本模块只含纯数据类型与常量**：不 import config、Store、SiteClient、MCP 或 App。
-`blog/__init__.py` 必须保持为空，`config.py` 才能安全地 import 这里而不成环
-（理由同 `capabilities.py` 顶上那段：`mcp/__init__.py` 会拉起 registry，registry 又依赖 config）。
+**本模块只含纯数据类型、常量与纯函数**：不 import config、Store、SiteClient、MCP 或 App，
+也不在任何地方 import `blog/`。放在 `blog/` **之外**是因为它有两个消费者：`blog/` 子域
+（完整版）与 `store.py`（两版共享的持久层）—— 追加式建表、额度与对账查询都按这里的
+状态常量与日期口径走，而 Light 发行包不含 `blog/`（设计 §4.2、§4.3）。
+
+日期语义固定为 **UTC+8**，不跟系统时区：站方的日限额按 UTC+8 零点切（`dayStart`），
+本地若按服务器本地时区切，在 TZ=UTC 的机器上会把头 8 小时发的东西算进前一天。
+本模块同时是这个子域**唯一**的 UTC+8 日历实现：`store.py` 推导 `retry_after_day`
+与计费日期时用这里的 `utc8_day` / `utc8_next_day`，不另写一份。
 
 两份「状态」常量与设计 §11 的 CHECK 约束是同一份取值，改动必须两边一起改。
 """
@@ -10,6 +16,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
 
 # 内容指纹版本。只有算法本身改变时才递增。
 #
@@ -246,3 +253,23 @@ class BlogRecoverySummary:
 
     unconfirmed: int = 0
     interrupted: int = 0
+
+
+# --- UTC+8 日历（唯一的实现；`blog/planner.py` 的调度决策与 `store.py` 的日界都取这里）---
+
+# 固定东八区。不用 zoneinfo：那会依赖宿主机的时区数据库，而这里要的就是一个死数。
+UTC8 = timezone(timedelta(hours=8))
+
+# 枚举窗口的硬上限（秒）。积压超过这个跨度还没开始的点不再补发 ——
+# 停机一整天后一次性生成几十篇文章，比漏发危险得多。
+SCAN_WINDOW_SECONDS: float = 300.0
+
+
+def utc8_day(now: float) -> str:
+    """把 epoch 秒转成 UTC+8 的 `YYYY-MM-DD`。"""
+    return datetime.fromtimestamp(now, UTC8).strftime("%Y-%m-%d")
+
+
+def utc8_next_day(day: str) -> str:
+    """`YYYY-MM-DD` 的次日。"""
+    return (date.fromisoformat(day) + timedelta(days=1)).isoformat()
