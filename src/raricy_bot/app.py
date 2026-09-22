@@ -38,18 +38,19 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-import random
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 import httpx
 
 from . import texts
-from .blog.models import BlogScope
-from .blog.publisher import BlogPublisher
-from .blog.service import BlogService
-from .blog.writer import BlogWriter
+from .assembly import (
+    AssemblyError,
+    BlogServiceLike,
+    McpManagerLike,
+    NoToolMcpManager,
+)
 from .capabilities import CAPABILITIES, Capability
 from .comments.quota import CommentQuotaGuard
 from .comments.router import CommentRouter
@@ -89,8 +90,6 @@ from .logging_setup import (
     observe_task,
     secret_registry,
 )
-from .mcp.adapters import build_adapters
-from .mcp.runtime import McpManager
 from .memory.access import MemoryAccessPolicy
 from .memory.commands import MemoryCommandRequest
 from .memory.controller import MemoryController
@@ -204,7 +203,9 @@ class BotApp:
         transport: httpx.AsyncBaseTransport | None = None,
         model_client: ModelClient | None = None,
         model_client_cls: type[OpenAIModelClient] | None = None,
-        mcp_manager: McpManager | None = None,
+        mcp_manager: McpManagerLike | None = None,
+        mcp_manager_factory: Callable[..., McpManagerLike] | None = None,
+        blog_service_factory: Callable[..., BlogServiceLike] | None = None,
         knowledge_service: KnowledgeService | None = None,
         memory_service: MemoryService | None = None,
         memory_writer: MemoryWriter | None = None,
@@ -337,9 +338,13 @@ class BotApp:
         # 自建模型客户端时使用的实现类：完整版由入口注入带工具循环的
         # `ToolCallingModelClient`，Light 版没有工具协议，退回纯文本实现。
         self._model_client_cls = model_client_cls or OpenAIModelClient
-        self._mcp_manager = (
-            mcp_manager if mcp_manager is not None else self._build_mcp_manager()
-        )
+        # 装配接缝（设计 §4.3）：MCP 与发文都从工厂进入。没有 MCP 工厂时落到
+        # 无工具实现（Light 的正常形态）；发文没有无工具形态，配置启用却没有
+        # 工厂就在构造期报错，绝不静默跳过。
+        self._mcp_manager = self._resolve_mcp_manager(mcp_manager, mcp_manager_factory)
+        self._blog_service_factory = blog_service_factory
+        if config.blog.enabled and blog_service_factory is None:
+            raise AssemblyError("blog_service_factory_required")
         # 知识库是本地只读能力：构造它不做任何 I/O，`enabled=false` 时连目录都不会被扫。
         self._kb = (
             knowledge_service
@@ -405,7 +410,7 @@ class BotApp:
         self._probe_task: asyncio.Task[None] | None = None
         self._cleanup_task: asyncio.Task[None] | None = None
         # 定时发文同样默认关闭；启用时由独立服务托管扫描/消费/对账三个后台任务（§53.12）。
-        self._blog_service: BlogService | None = None
+        self._blog_service: BlogServiceLike | None = None
         # 评论功能默认关闭；启用时由独立服务托管自己的队列与轮询任务。
         self._comment_service: CommentService | None = None
         self._comment_router: CommentRouter | None = None
@@ -423,13 +428,27 @@ class BotApp:
         self._unavailable = False  # 403 权限/禁言导致的不就绪状态（D-4）
         self._shutdown_event = asyncio.Event()
 
-    def _build_mcp_manager(self) -> McpManager:
-        """装配各 feature 的适配器；Provider/Registry 本身保持通用。"""
-        return McpManager(
-            self._config.mcp,
+    def _resolve_mcp_manager(
+        self,
+        injected: McpManagerLike | None,
+        factory: Callable[..., McpManagerLike] | None,
+    ) -> McpManagerLike:
+        """解析 MCP Manager：显式实例 > 注入工厂 > 无工具默认实现。
+
+        配置启用 MCP 却没有工厂是装配错位（Light 不含 MCP 实现），必须显式报错；
+        `mcp.enabled=false` 时无工具实现与真实 Manager 的行为一致：生命周期为空
+        操作、任何 feature 都不可用（设计 §4.2）。
+        """
+        if injected is not None:
+            return injected
+        if factory is None:
+            if self._config.mcp.enabled:
+                raise AssemblyError("mcp_manager_factory_required")
+            return NoToolMcpManager()
+        return factory(
+            config=self._config.mcp,
             redactor=self._redactor,
             registry=self._registry,
-            adapters=build_adapters(self._config.mcp),
         )
 
     # --- 生命周期 -----------------------------------------------------------
@@ -643,41 +662,25 @@ class BotApp:
         self._started = True
         log_event(_logger, logging.INFO, "app.started")
 
-    def _build_blog_service(self, user) -> BlogService:
-        """构造发文子域（§53.11 / §53.12）：共享客户端、Store、模型 gate 与 MCP Registry。
+    def _build_blog_service(self, user) -> BlogServiceLike:
+        """经注入的工厂构造发文子域（§53.11 / §53.12）。
 
-        **不在这里创建或持有** SiteClient、模型客户端的关闭权限 —— 它们属于 App，
-        子域只是借用。工具预算不新增配置项：`BlogWriter` 从
+        工厂（完整版的 `blog.assembly.build_blog_service`）共享 App 的客户端、
+        Store、模型门与 MCP Registry，**不在这里创建或持有**它们的关闭权限 ——
+        它们属于 App，子域只是借用。工具预算不新增配置项：`BlogWriter` 从
         `mcp.features.blog_write` 取 `max_tool_calls_per_turn`（§8.1、D-110）。
         """
-        scope = BlogScope(
-            site_base_url=self._config.site.base_url, self_user_id=user.id
-        )
-        writer = BlogWriter(
-            model=self._model,
-            registry=self._mcp_manager.registry,
-            feature=self._config.mcp.features.get("blog_write"),
-            mcp_enabled=self._config.mcp.enabled,
-            max_input_tokens=self._config.behavior.context_input_tokens,
-            model_gate=self._model_gate,
-        )
-        publisher = BlogPublisher(
+        factory = self._blog_service_factory
+        assert factory is not None  # 构造期已按 blog.enabled 校验
+        return factory(
             config=self._config,
-            scope=scope,
+            user=user,
             store=self._store,
             client=self._client,
-            clock=time.time,
-        )
-        return BlogService(
-            config=self._config,
-            scope=scope,
-            store=self._store,
-            writer=writer,
-            publisher=publisher,
+            model=self._model,
+            mcp_registry=self._mcp_manager.registry,
+            model_gate=self._model_gate,
             redactor=self._redactor,
-            clock=time.time,
-            sleep=asyncio.sleep,
-            random=random.random,
         )
 
     def _observe_health(self, kind: str, healthy: bool) -> bool:

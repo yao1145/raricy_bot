@@ -23,8 +23,10 @@ import signal
 import sys
 
 from .app import BotApp
+from .blog.assembly import build_blog_service
 from .config import Config, ConfigError, load_config
 from .error_archive import ArchiveError, ArchiveHandler, ErrorArchive, iter_entries, verify_segments
+from .mcp.assembly import build_mcp_manager
 from .mcp.tool_client import ToolCallingModelClient
 from .logging_setup import (
     get_logger,
@@ -151,10 +153,14 @@ def _close_archive(archive: ErrorArchive | object | None) -> None:
 
 async def _serve(config: Config, archive: ErrorArchive | object | None) -> None:
     """构造应用、安装信号处理并阻塞运行，直到收到停止信号。"""
+    # 完整版装配（§4.3）：工具客户端、MCP Manager 与发文子域都从这里注入；
+    # Light 走 launcher 入口，不经过本模块，也就不导入 mcp/ 与 blog/。
     app = BotApp(
         config,
         archive=archive if isinstance(archive, ErrorArchive) else None,
         model_client_cls=ToolCallingModelClient,
+        mcp_manager_factory=build_mcp_manager,
+        blog_service_factory=build_blog_service,
     )
     loop = asyncio.get_running_loop()
     install_asyncio_exception_handler(loop)
