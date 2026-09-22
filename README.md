@@ -336,6 +336,7 @@ docker compose logs -f bot
 | 想了解 | 读 |
 |---|---|
 | 全部文档的索引 | [`docs/README.md`](docs/README.md) |
+| Light 独立发行版与静默运行设计（待实施，完整版继续保留） | [`docs/design/LIGHT_EDITION_DESIGN.md`](docs/design/LIGHT_EDITION_DESIGN.md) |
 | 怎么部署、升级、排障 | [`docs/usage/DEPLOYMENT.md`](docs/usage/DEPLOYMENT.md) |
 | 站内用户会看到什么、怎么跟他们解释 | [`docs/usage/USAGE.md`](docs/usage/USAGE.md) |
 | Exa 多 Key 池与本地知识库怎么配、怎么看日志、怎么排障 | [`docs/usage/EXA_POOL_AND_KB.md`](docs/usage/EXA_POOL_AND_KB.md) |
