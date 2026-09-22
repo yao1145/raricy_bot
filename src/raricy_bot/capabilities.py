@@ -80,9 +80,11 @@ class Capability:
         return self.command is not None
 
 
+# 工具能力（完整版专属，Light 不注册）与本地能力（两个版本共享）分组声明，
+# 完整版装配结果 CAPABILITIES 由两组拼接而成（设计 §4.3）。
 # 声明顺序即 Router 的判定顺序与帮助文案的出现顺序。当前没有任何一条命令是另一条的前缀，
 # 所以顺序不影响正确性 —— 解析器要求命令后必须是空白或正文结束（见 text_utils）。
-CAPABILITIES: tuple[Capability, ...] = (
+TOOL_CAPABILITIES: tuple[Capability, ...] = (
     Capability(
         feature="search",
         command="/search",
@@ -135,21 +137,6 @@ CAPABILITIES: tuple[Capability, ...] = (
         max_query_chars=300,
     ),
     Capability(
-        feature="kb",
-        command="/kb",
-        source=SOURCE_LOCAL,
-        usage_text=texts.KB_USAGE_TEXT,
-        # 本地能力的访问门、无结果与关闭提示在 app._prepare_kb 各自收口（三种原因三种文案）。
-        unavailable_text=None,
-        # /kb 的数据块自带 KB_SYSTEM_ADDENDUM，由 app 按既有分支追加。
-        system_addendum=None,
-        allowed_tools=frozenset(),
-        max_bindings=0,
-        result_shape=SHAPE_LIST,
-        # 本地能力不经过 MCP，没有上游查询串上限。
-        max_query_chars=0,
-    ),
-    Capability(
         # 定时发文子域的一轮生成（设计 §8）。它**没有命令字面量**：用户敲不出来，
         # 由 BlogService 到点自己发起，因此 command=None，也就没有占用文案与 system 追加。
         # 它仍然是一条 MCP 能力，因为要复用 Registry 的白名单、限流、超时与故障转移。
@@ -178,6 +165,29 @@ CAPABILITIES: tuple[Capability, ...] = (
         fixed_result_count=1,
     ),
 )
+
+# 本地能力：不经过 MCP，两个版本共享；Light 的能力装配只取这一组（设计 §4.2）。
+LOCAL_CAPABILITIES: tuple[Capability, ...] = (
+    Capability(
+        feature="kb",
+        command="/kb",
+        source=SOURCE_LOCAL,
+        usage_text=texts.KB_USAGE_TEXT,
+        # 本地能力的访问门、无结果与关闭提示在 app._prepare_kb 各自收口（三种原因三种文案）。
+        unavailable_text=None,
+        # /kb 的数据块自带 KB_SYSTEM_ADDENDUM，由 app 按既有分支追加。
+        system_addendum=None,
+        allowed_tools=frozenset(),
+        max_bindings=0,
+        result_shape=SHAPE_LIST,
+        # 本地能力不经过 MCP，没有上游查询串上限。
+        max_query_chars=0,
+    ),
+)
+
+# 完整版装配结果。命令顺序保持 search/zhihu/map/wolfram/kb：blog_write 没有命令，
+# 任何按 has_command 过滤的消费方拿到的相对顺序与拆分前逐字节一致。
+CAPABILITIES: tuple[Capability, ...] = TOOL_CAPABILITIES + LOCAL_CAPABILITIES
 
 # 已经接了适配器的 MCP 能力。声明在这里而不是 `mcp/adapters.py`，是因为 `config.py`
 # 要在**加载期**用它挡住「能力表里有、但还没实现」的能力 —— 而 config 不能 import mcp
