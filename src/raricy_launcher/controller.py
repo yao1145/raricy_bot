@@ -185,6 +185,19 @@ class Controller:
     def start_worker(self) -> str:
         # 与在途停止串行：确认旧进程退出并关闭后才允许创建新进程（§9.2）。
         with self._lifecycle_lock:
+            # 退出标志必须在锁内判定：stop() 回收旧 Worker 后会释放生命周期锁，
+            # 此时它还要关闭 HTTP 服务；该窗口内到达的 start 若放行，就会在
+            # stop() 返回后留下一个无人回收的新进程。
+            if self._quit.is_set():
+                log_event(
+                    self._logger,
+                    logging.INFO,
+                    "worker.spawn",
+                    status="refused",
+                    reason="quitting",
+                    trace_id=self._instance_id,
+                )
+                return "stopped"
             with self._worker_lock:
                 if self._worker is not None and self._worker.wait(0) is None:
                     return "running"  # 重复 start 返回当前状态，不并行创建
