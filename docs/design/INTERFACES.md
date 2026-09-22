@@ -855,3 +855,49 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   规范化要**先解析数据库文件自身的链接**再取父目录 —— 否则指向同一个数据库的两条路径
   会各拿一把锁。完整版 CLI 与 Light Worker 因此天然争用同一个标识；`acquire_data_lock()`
   立即取得，被占用时 CLI 以退出码 4 结束（§17）。锁文件里的 pid 只用于诊断，不是夺锁依据。
+
+## 59. Light 控制面（会话、API、进程与事件）
+
+入口：[会话](../../src/raricy_launcher/session.py)、[API](../../src/raricy_launcher/api.py)、
+[进程管理](../../src/raricy_launcher/process_manager.py)、[IPC 协议](../../src/raricy_launcher/ipc.py)、
+[事件](../../src/raricy_launcher/events.py)、[状态聚合](../../src/raricy_launcher/status_service.py)、
+[控制器](../../src/raricy_launcher/controller.py)。
+
+- **会话**（§8.1）：引导令牌单次、限时（120 秒），经 URL fragment 交付；兑换成功即发放
+  HttpOnly + SameSite=Strict 的会话 Cookie，并回一个会话绑定的 CSRF 值。兑换按 60 秒窗口限次，
+  窗口会滚动，本机他人刷满也不能把用户永久挡在门外。会话只存内存，Controller 重启即全部失效。
+- **请求门**（§8.1、§8.2）：每个请求校验精确 Host（含实际端口）；写请求还要 Origin /
+  Fetch Metadata、CSRF 头与 JSON 内容类型三件齐备。请求体上限 256 KiB **在读取过程中**生效
+  （先缓冲再检查等于没有上限）。响应一律 `Cache-Control: no-store`，HTML 带 CSP 与
+  `X-Content-Type-Options`；静态路径拒绝穿越。
+- **配置面**（§11）：`GET/PUT /api/config`、`POST /api/config/validate`、草稿读写。
+  读接口显式构造响应：只含可编辑字段、revision、账号与「凭据已配置/后端可用」三态，
+  不返回凭据取值，也不返回可用于读取凭据的引用。校验失败回 422（`field` + 稳定码），
+  revision 冲突回 409。
+- **进程面**（§9.2）：`POST /api/bot/{start,stop,restart}` 立刻返回 `operation_id`（202），
+  长等待在后台操作里；`GET /api/operations/{id}` 查固定阶段与结果码。指定版本必须是当前
+  已保存的版本，否则立刻 409。退出流程开始后拒绝一切启动。
+- **IPC**（§10.1）：控制通道（父→子：`stop`、`status_request`）与上报通道（子→父：
+  `ready`、`status`、`log`、`stopped`）分向；帧有长度前缀与上限，信封固定携带协议版本、
+  实例 ID、运行 ID 与序号，身份不符即终止会话。日志帧只承载 `log_event` 的白名单事件。
+- **状态与事件**（§10.2、§12）：Worker 的 `status` 帧是状态快照的唯一来源，带采样时间；
+  过期或缺失如实报 `stale` / `unknown`，不从日志猜。显式测试结果绑定 revision，配置一变
+  即标为过期。事件环形缓冲 500 条、订阅者有上限；游标过旧或来自别的实例时发 `gap` 提示；
+  SSE 心跳 15 秒、慢消费者丢帧而不拖住发布方。
+
+## 60. 管理页与发行（`frontend/`、`packaging/light/`）
+
+入口：[前端工程](../../frontend/package.json)、[发行元数据](../../packaging/light/pyproject.toml)、
+[冻结配置](../../packaging/light/light.spec)、[staging 与打包](../../tools/build_light.py)、
+[冻结冒烟](../../tools/smoke_light.py)、[使用手册](../usage/LIGHT.md)。
+
+- 前端是 Svelte + Vite 的单页应用，**资源全部本地**：构建产物直接落进
+  `src/raricy_launcher/static/`（`index.html` + 带哈希的 `assets/`），由 Controller 同源提供，
+  不依赖 CDN、远程字体或运行期 Node。改前端后必须重新 `npm run build` 再提交。
+- 页面只用会话 Cookie 与内存里的 CSRF 值：引导令牌从 fragment 取出后立即清掉地址栏，
+  密码与模型 Key 从不写进 LocalStorage / SessionStorage。
+- 发行构建：`tools/build_light.py` 生成 staging（Light 闭包 + 静态资源 + 构建信息），
+  `--pyinstaller` 用 `light.spec` 冻结为 onedir/windowed 应用，`--zip` 打出 ZIP 与 `.sha256`。
+  `build-info.json` 记录版本、协议版本、Python 版本、依赖清单与整包校验和。
+- 验收边界：`tools/smoke_light.py` 覆盖「启动 → 激活 → 会话 → 状态 → 退出」；
+  **干净 Windows 清单（§17.2）与真实站点/模型验收仍未执行**，见使用手册 §7。
