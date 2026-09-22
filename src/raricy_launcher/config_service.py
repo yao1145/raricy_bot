@@ -78,7 +78,15 @@ EDITABLE_FIELDS: frozenset[str] = frozenset(
         "comments.context_turns",
         "comments.context_input_tokens",
         "knowledge_base.enabled",
+        # KB 的「使用范围」：§13.2 要求启用前必须选定授权范围，不能只给一个开关。
+        "knowledge_base.access_mode",
+        "knowledge_base.allowed_channel_kinds",
+        "knowledge_base.allowed_user_ids",
         "memory.enabled",
+        # 记忆的允许使用者与共同记忆管理员分开（§5.3、§13.2）。
+        "memory.access_mode",
+        "memory.allow_user_list",
+        "memory.admin_user_list",
         "logging.level",
         "system_prompt",
     }
@@ -340,17 +348,11 @@ class ConfigService:
 
     def load_draft(self) -> DraftConfig | None:
         profile = self.profile()
-        path = paths.draft_path(profile)
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except OSError:
+        data = self._read_document(
+            paths.draft_path(profile), broken_code="draft_unreadable"
+        )
+        if data is None:
             return None
-        try:
-            data = yaml.safe_load(raw)
-        except yaml.YAMLError as exc:
-            raise ConfigServiceError("draft_unreadable") from exc
-        if not isinstance(data, dict):
-            raise ConfigServiceError("draft_unreadable")
         launcher = data.get(LAUNCHER_SECTION)
         launcher = launcher if isinstance(launcher, dict) else {}
         return DraftConfig(
@@ -569,20 +571,27 @@ class ConfigService:
 
     # --- 内部：读取与解析 --------------------------------------------------
 
-    def _read_formal(self) -> dict[str, Any] | None:
-        """读正式配置的原始文档；不存在返回 None，损坏则报稳定错误。"""
-        path = paths.config_path(self.profile())
+    def _read_document(self, path: Path, *, broken_code: str) -> dict[str, Any] | None:
+        """有界读取一份 Launcher 文档；不存在返回 None，超限或损坏报稳定错误。"""
         try:
-            raw = path.read_text(encoding="utf-8")
+            with path.open("rb") as handle:
+                raw = handle.read(core_config.MAX_CONFIG_BYTES + 1)
         except OSError:
             return None
+        if len(raw) > core_config.MAX_CONFIG_BYTES:
+            # 与 Core 的 YAML 上限同一口径（§6.3）：手工编辑出巨型文件也不能读进来。
+            raise ConfigServiceError("config_too_large")
         try:
-            data = yaml.safe_load(raw)
-        except yaml.YAMLError as exc:
-            raise ConfigServiceError("config_unreadable") from exc
+            data = yaml.safe_load(raw.decode("utf-8"))
+        except (UnicodeDecodeError, yaml.YAMLError) as exc:
+            raise ConfigServiceError(broken_code) from exc
         if not isinstance(data, dict):
-            raise ConfigServiceError("config_unreadable")
+            raise ConfigServiceError(broken_code)
         return data
+
+    def _read_formal(self) -> dict[str, Any] | None:
+        """读正式配置的原始文档；不存在返回 None，损坏则报稳定错误。"""
+        return self._read_document(paths.config_path(self.profile()), broken_code="config_unreadable")
 
     def _to_saved(self, document: Mapping[str, Any]) -> SavedConfig:
         launcher = document.get(LAUNCHER_SECTION)
