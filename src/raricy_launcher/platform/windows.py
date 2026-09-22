@@ -15,8 +15,9 @@
 
 from __future__ import annotations
 
+import subprocess
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import pywintypes
 import win32api
@@ -25,11 +26,20 @@ import win32event
 import win32file
 import win32job
 import win32pipe
+import win32process
 import win32security
 import winerror
 
 from .. import activation
-from . import ActivationListener, InstanceGuard, LauncherPlatform, PlatformError, WorkerJob
+from . import (
+    ActivationListener,
+    ControlPipe,
+    InstanceGuard,
+    LauncherPlatform,
+    PlatformError,
+    SuspendedProcess,
+    WorkerJob,
+)
 
 # 拒绝远程客户端的 NETWORK 主体与本地 SYSTEM 主体的公认 SID。
 _SID_NETWORK = "S-1-5-2"
@@ -220,6 +230,89 @@ class _WinActivationListener:
                 pass
 
 
+class _WinControlPipe:
+    """匿名管道控制通道：子端只读可继承，父端写入不可继承。"""
+
+    def __init__(self, read_handle, write_handle) -> None:
+        self._read_handle = read_handle
+        self._write_handle = write_handle
+        self._child_handle = int(read_handle)
+
+    @property
+    def child_handle(self) -> int:
+        return self._child_handle
+
+    def detach_child_end(self) -> None:
+        handle, self._read_handle = self._read_handle, None
+        if handle is not None:
+            try:
+                win32api.CloseHandle(handle)
+            except pywintypes.error:
+                pass
+
+    def send(self, data: bytes) -> None:
+        if self._write_handle is None:
+            return
+        try:
+            win32file.WriteFile(self._write_handle, data)
+        except pywintypes.error:
+            # Worker 已退出导致管道断裂：退出结果以 wait 为准，这里不抛出。
+            pass
+
+    def close(self) -> None:
+        self.detach_child_end()
+        handle, self._write_handle = self._write_handle, None
+        if handle is not None:
+            try:
+                win32api.CloseHandle(handle)
+            except pywintypes.error:
+                pass
+
+
+class _WinSuspendedProcess:
+    def __init__(self, process_handle, thread_handle, pid: int) -> None:
+        self._process_handle = process_handle
+        self._thread_handle = thread_handle
+        self._pid = pid
+
+    @property
+    def pid(self) -> int:
+        return self._pid
+
+    @property
+    def process_handle(self) -> int:
+        return int(self._process_handle)
+
+    def resume(self) -> None:
+        try:
+            win32process.ResumeThread(self._thread_handle)
+        except pywintypes.error as exc:
+            raise PlatformError("process_resume_failed") from exc
+
+    def wait(self, timeout_ms: int) -> int | None:
+        result = win32event.WaitForSingleObject(self._process_handle, timeout_ms)
+        if result == win32event.WAIT_TIMEOUT:
+            return None
+        return win32process.GetExitCodeProcess(self._process_handle)
+
+    def terminate(self) -> None:
+        try:
+            win32process.TerminateProcess(self._process_handle, 1)
+        except pywintypes.error:
+            # 进程已退出：终止是幂等意图，不抛出。
+            pass
+
+    def close_handles(self) -> None:
+        for attr in ("_process_handle", "_thread_handle"):
+            handle = getattr(self, attr)
+            setattr(self, attr, None)
+            if handle is not None:
+                try:
+                    win32api.CloseHandle(handle)
+                except pywintypes.error:
+                    pass
+
+
 class WindowsPlatform:
     """Windows 上的 LauncherPlatform 实现。"""
 
@@ -271,4 +364,42 @@ class WindowsPlatform:
         except pywintypes.error as exc:
             raise PlatformError("activation_unavailable") from exc
         return bytes(data)
+
+    def create_control_pipe(self) -> ControlPipe:
+        try:
+            attrs = win32security.SECURITY_ATTRIBUTES()
+            attrs.bInheritHandle = True
+            read_handle, write_handle = win32pipe.CreatePipe(attrs, 0)
+            # 父端不可继承：子进程只拿到只读端；父端关闭即 EOF。
+            win32api.SetHandleInformation(write_handle, win32con.HANDLE_FLAG_INHERIT, 0)
+        except pywintypes.error as exc:
+            raise PlatformError("control_pipe_failed") from exc
+        return _WinControlPipe(read_handle, write_handle)
+
+    def spawn_suspended(
+        self,
+        argv: Sequence[str],
+        *,
+        env: dict[str, str],
+        cwd: str,
+    ) -> SuspendedProcess:
+        # bInheritHandles=True 只继承显式标记为可继承的句柄（PEP 446 下
+        # Python 自己的文件/套接字默认不可继承），控制管道子端由此进入
+        # 子进程并保持同一柄值。CREATE_NO_WINDOW 保证无终端窗口。
+        try:
+            startup = win32process.STARTUPINFO()
+            process_handle, thread_handle, pid, _tid = win32process.CreateProcess(
+                None,
+                subprocess.list2cmdline(list(argv)),
+                None,
+                None,
+                True,
+                win32process.CREATE_SUSPENDED | win32process.CREATE_NO_WINDOW,
+                env,
+                cwd,
+                startup,
+            )
+        except pywintypes.error as exc:
+            raise PlatformError("process_create_failed") from exc
+        return _WinSuspendedProcess(process_handle, thread_handle, pid)
 
