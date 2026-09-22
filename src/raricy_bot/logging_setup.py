@@ -92,6 +92,8 @@ FIELD_KINDS: dict[str, str] = {
     "run_id": TOKEN,
     "day": TOKEN,
     "chars": TOKEN,
+    # 进程诊断（LIGHT_EDITION_DESIGN §10.2）：只放 pid，不放命令行或路径。
+    "pid": TOKEN,
     # --- 安全诊断（计划 §4）新增字段 -----------------------------------------
     # 本地随机关联标识：只编码随机数，不编码任何用户数据。
     "trace_id": TOKEN,

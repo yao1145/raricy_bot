@@ -17,6 +17,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    # Light 控制面测试需要（raricy_launcher/api.py 用 FastAPI，Controller 跑 Uvicorn）；
+    # 发行依赖仍在 packaging/light/pyproject.toml，完整版运行时不引入它们。
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
     "pytest>=8",
     "pytest-asyncio>=0.23",
     # Launcher 平台层绑定（仅 Light 使用；开发环境跑平台集成测试需要）

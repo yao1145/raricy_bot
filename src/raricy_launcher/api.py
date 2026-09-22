@@ -22,6 +22,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -234,9 +235,21 @@ class LocalApi:
             raise ApiError(415, "unsupported_media_type")
 
     async def _json_body(self, request: Request) -> dict:
-        raw = await request.body()
-        if len(raw) > MAX_JSON_BYTES:
-            raise ApiError(413, "request_too_large")
+        declared = request.headers.get("content-length")
+        if declared is not None:
+            try:
+                declared_bytes = int(declared)
+            except ValueError as exc:
+                raise ApiError(400, "bad_request") from exc
+            if declared_bytes > MAX_JSON_BYTES:
+                raise ApiError(413, "request_too_large")
+        # 边读边判上限：ASGI 服务器不限制请求体，先整体缓冲再检查等于没有上限（审查 I6）。
+        chunks = bytearray()
+        async for chunk in request.stream():
+            chunks.extend(chunk)
+            if len(chunks) > MAX_JSON_BYTES:
+                raise ApiError(413, "request_too_large")
+        raw = bytes(chunks)
         if not raw:
             return {}
         try:
@@ -481,6 +494,8 @@ class LocalApi:
         if session is None:
             return self._json(401, {"ok": False, "code": "unauthenticated"})
         try:
+            # 先把 Worker 已上报的帧折进管理器（最近快照的来源），再聚合状态。
+            await asyncio.to_thread(self._manager.drain)
             snapshot = await asyncio.to_thread(self._status.snapshot)
         except Exception as exc:
             mapped = self._handle(exc)
@@ -524,12 +539,18 @@ class LocalApi:
         return self._json(202, {"ok": True, "operation_id": operation.operation_id})
 
     def _target_revision(self, body: dict) -> int | None:
-        """启动/重启的目标版本：请求指定优先，否则用当前已保存版本（§6.5）。"""
-        requested = body.get("revision")
-        if isinstance(requested, int) and not isinstance(requested, bool) and requested >= 0:
-            return requested
+        """启动/重启的目标版本：请求指定优先，否则用当前已保存版本（§6.5）。
+
+        指定的版本必须是当前已保存的那一版：别的版本没有可用的运行快照，
+        应当立刻回 409，而不是先答应再异步失败（审查 M8）。
+        """
         saved = self._config.load_saved()
-        return saved.revision if saved is not None else None
+        if saved is None:
+            return None
+        requested = body.get("revision")
+        if isinstance(requested, int) and not isinstance(requested, bool):
+            return requested if requested == saved.revision else None
+        return saved.revision
 
     async def _get_operation(self, request: Request, operation_id: str):
         session = self._session(request)
@@ -570,28 +591,36 @@ class LocalApi:
 
     def _run_site_test(self) -> tuple[dict, int]:
         try:
+            status = self._config.status()
             saved = self._config.load_saved()
-            if saved is None:
+            if saved is None or status.state != STATE_CONFIGURED:
+                # 配置无效时连测试都不做：地址规则与凭据都没通过校验（审查 I7）。
                 return {"ok": False, "code": "config_not_ready"}, 409
             credentials = self._config.credentials_for(saved.revision)
+            config = parse_config(
+                saved.mapping,
+                config_dir=str(self._config.profile()),
+                secrets=credentials,
+            )
         except Exception as exc:
             mapped = self._handle(exc)
             return mapped.payload(), mapped.status
         started = self._clock()
-        outcome, detail = asyncio.run(self._probe_site(saved, credentials))
+        outcome, detail = asyncio.run(self._probe_site(config, credentials))
         elapsed = int((self._clock() - started) * 1000)
         self._status.record_test("site", ok=outcome, detail=detail, revision=saved.revision)
         return {"ok": outcome, "detail": detail, "elapsed_ms": elapsed}, 200
 
-    async def _probe_site(self, saved, credentials: Secrets) -> tuple[bool, str]:
-        """登录并探测聊天权限；任何失败只回固定类别码（§8.2）。"""
+    async def _probe_site(self, config, credentials: Secrets) -> tuple[bool, str]:
+        """登录并探测聊天权限；任何失败只回固定类别码（§8.2）。
+
+        地址取自**公共校验后的** `config.site.base_url`：站点密码只会发往通过了
+        HTTPS/userinfo/query 规则（D-113）的地址，而不是 YAML 里的原始字符串。
+        """
         client = SiteClient(
-            saved.mapping.get("site", {}).get("base_url", ""),
+            config.site.base_url,
             Redactor(),
-            timeout=min(
-                float(saved.mapping.get("site", {}).get("request_timeout_seconds", 20.0)),
-                MODEL_TEST_TIMEOUT_SECONDS,
-            ),
+            timeout=min(config.site.request_timeout_seconds, MODEL_TEST_TIMEOUT_SECONDS),
             username=credentials.username,
             password=credentials.password,
             transport=self._site_transport,
@@ -685,11 +714,16 @@ class LocalApi:
             return self._json(401, {"ok": False, "code": "unauthenticated"})
         if request.headers.get("sec-fetch-site") not in (None, "same-origin", "none"):
             return self._json(403, {"ok": False, "code": "bad_origin"})
+        if not self._origin_allowed(request):
+            return self._json(403, {"ok": False, "code": "bad_origin"})
         after = request.headers.get("last-event-id")
-        replayed, gap = self._events.replay(after)
+        # 先订阅再回放：两步之间到达的事件不会丢；回放里已有的帧在下面的
+        # 循环里按序号跳过，因此也不会重复投递（审查 M4）。
         subscriber = self._events.subscribe()
         if subscriber is None:
             return self._json(503, {"ok": False, "code": "too_many_subscribers"})
+        replayed, gap = self._events.replay(after)
+        replayed_seq = replayed[-1].seq if replayed else 0
 
         async def _stream():
             try:
@@ -715,6 +749,8 @@ class LocalApi:
                     idle = 0.0
                     if event is None:
                         return
+                    if event.seq <= replayed_seq:
+                        continue  # 回放里已经发过
                     yield _sse_frame(event)
             finally:
                 self._events.unsubscribe(subscriber)
@@ -775,7 +811,7 @@ class LocalApi:
             raise ApiError(500, "path_outside_profile")
         directory.mkdir(parents=True, exist_ok=True)
         target = directory / safe
-        temp = directory / f".{safe}.tmp"
+        temp = directory / f".{safe}.{uuid4().hex[:8]}.tmp"
         temp.write_bytes(payload)
         temp.replace(target)
         return target

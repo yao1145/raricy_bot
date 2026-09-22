@@ -141,11 +141,17 @@ def _load_run_config(path: str, *, config_dir: str | None) -> Config:
     return config
 
 
-def _open_control_fd(handle: int) -> int:
+def _open_handle_fd(handle: int, mode: int) -> int:
+    """把继承来的 Windows 句柄转成 CRT 文件描述符。
+
+    控制与上报两条通道都要转：`os.read`/`os.write` 只认 CRT fd，直接拿原始
+    HANDLE 调用会以 EBADF 失败 —— 而上报侧是「静默失败」的写法，父端因此永远
+    等不到 ready（审查 C1）。
+    """
     if sys.platform == "win32":
         import msvcrt
 
-        return msvcrt.open_osfhandle(handle, os.O_RDONLY)
+        return msvcrt.open_osfhandle(handle, mode)
     return handle
 
 
@@ -289,8 +295,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--report-handle", type=int, required=True, help="继承的上报管道只写端")
     args = parser.parse_args(argv)
 
+    try:
+        report_fd = _open_handle_fd(args.report_handle, os.O_WRONLY)
+    except OSError:
+        # 上报通道都打不开时不再继续：父端收不到任何状态，继续跑只会让用户看到超时。
+        return EXIT_RUNTIME
     reporter = _Reporter(
-        args.report_handle,
+        report_fd,
         instance_id=os.environ.get(INSTANCE_ID_ENV, ""),
         run_id=os.environ.get(RUN_ID_ENV, ""),
     )
@@ -330,7 +341,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_DATA_LOCKED
 
     try:
-        fd = _open_control_fd(args.control_handle)
+        fd = _open_handle_fd(args.control_handle, os.O_RDONLY)
         try:
             return _run(config, reporter, control_fd=fd)
         finally:

@@ -40,7 +40,7 @@ class StatusService:
     因此调用方必须在工作线程里调用它（§7）。
     """
 
-    def __init__(self, *, instance_id: str, config_service, manager, clock=time.monotonic) -> None:
+    def __init__(self, *, instance_id: str, config_service, manager, clock=time.time) -> None:
         self._instance_id = instance_id
         self._config = config_service
         self._manager = manager
@@ -62,7 +62,10 @@ class StatusService:
             result = self._tests.get(kind)
         if result is None:
             return {"state": UNKNOWN}
-        if revision is not None and result.revision is not None and result.revision != revision:
+        if revision is None:
+            # 没有可用的正式配置：任何测试结果都不能算「当前有效」（审查 M3）。
+            return {"state": STALE, "ok": result.ok, "detail": result.detail, "at": result.at}
+        if result.revision is not None and result.revision != revision:
             # 配置或凭据已经变了：旧结果不再代表当前配置（§10.2）。
             return {"state": STALE, "ok": result.ok, "detail": result.detail, "at": result.at}
         return {"state": FRESH, "ok": result.ok, "detail": result.detail, "at": result.at}

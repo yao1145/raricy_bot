@@ -130,13 +130,23 @@ class WorkerProcess:
         self._platform = platform
         self._instance_id = instance_id
         self._run_id = run_id
-        self._job: WorkerJob | None = platform.create_worker_job()
-        self._control = platform.create_control_pipe()
-        self._report: ReportPipe | None = platform.create_report_pipe()
-        self._drain: ReportPipe | None = platform.create_report_pipe()
+        self._job: WorkerJob | None = None
+        self._control = None
+        self._report: ReportPipe | None = None
+        self._drain: ReportPipe | None = None
+        try:
+            # Job 与管道都在 try 内：任何一步失败都要走 close() 回收已建的句柄（审查 M6）。
+            self._job = platform.create_worker_job()
+            self._control = platform.create_control_pipe()
+            self._report = platform.create_report_pipe()
+            self._drain = platform.create_report_pipe()
+        except Exception:
+            self.close()
+            raise
         self._process: SuspendedProcess | None = None
         self._forced_stop = False
         self._seq = 0
+        self._seq_lock = threading.Lock()
         self._frames: queue.Queue[dict | None] = queue.Queue(maxsize=256)
         self.report_closed = threading.Event()
         self.drained_bytes = 0
@@ -210,16 +220,18 @@ class WorkerProcess:
         """
         if self._control is None:
             return 0
-        self._seq += 1
+        with self._seq_lock:
+            self._seq += 1
+            seq = self._seq
         frame = ipc.encode_frame(
             kind,
             instance_id=self._instance_id,
             run_id=self._run_id,
-            seq=self._seq,
+            seq=seq,
             payload=payload,
         )
         self._control.send(frame)
-        return self._seq
+        return seq
 
     def next_frame(self, timeout: float) -> dict | None:
         """取一条上报帧；超时返回 None。EOF 后队列会立刻排空并由 `report_closed` 标记。"""
@@ -434,7 +446,7 @@ class WorkerManager:
         self._clock = clock
         self._start_timeout = start_timeout
         self._stop_budget_ms = stop_budget_ms
-        self._on_event = on_event or (lambda kind, fields: None)
+        self._on_event = on_event or (lambda kind, fields, level='info': None)
         self._lock = threading.RLock()
         self._state = STATE_STOPPED
         self._worker: WorkerProcess | None = None
@@ -508,10 +520,13 @@ class WorkerManager:
     def stop(self) -> Operation:
         """停止 Worker；已停止时返回一个立即完成的 finished 操作（幂等）。"""
         with self._lock:
-            self._cancel_start.set()  # 抢占 starting（§9.2）
             if self._state == STATE_STOPPED:
+                # 停一个本来就停着的东西：不留「取消启动」意图，否则之后的
+                # restart 会把它当成「刚被停止取消」而静默不动（审查 I1）。
+                self._cancel_start.clear()
                 operation = self._new_operation("stop", None)
                 return self._finish(operation, OP_FINISHED, "stopped")
+            self._cancel_start.set()  # 抢占 starting（§9.2）
             if self._state == STATE_STOPPING and self._operation is not None:
                 return self._operation
             operation = self._new_operation("stop", None)
@@ -549,8 +564,13 @@ class WorkerManager:
 
     def _do_start(self, operation: Operation) -> None:
         revision = operation.target_revision
-        self._on_event("worker.starting", {"revision": revision})
+        self._on_event("worker.starting", {"revision": revision}, "info")
         with self._lock:
+            if self._quitting or self._cancel_start.is_set():
+                # 等待期间到达的退出/取消意图：不再创建新进程（§9.2、审查 I2）。
+                self._state = STATE_STOPPED
+                self._finish(operation, OP_FINISHED, "cancelled")
+                return
             self._run_seq += 1
             run_id = f"{self._instance_id}-{self._run_seq}"
         try:
@@ -567,8 +587,18 @@ class WorkerManager:
             return
         with self._lock:
             self._worker = worker
-        if not self._wait_ready(worker):
-            reason = "cancelled" if self._cancel_start.is_set() else "start_timeout"
+        outcome = self._wait_ready(worker)
+        if outcome != "ready":
+            if outcome == "cancelled":
+                reason = "cancelled"
+            elif outcome == "exited":
+                code = worker.wait(0)
+                # 启动阶段就退出：把退出码说清楚，而不是一律报「超时」（审查 I4）。
+                reason = f"exit_{code}" if code is not None else "exit_unknown"
+            else:
+                reason = "start_timeout"
+            # 死掉的 Worker 已经留下了诊断帧（配置无效、数据被占用）：先排空再回收。
+            self.drain(worker)
             with self._lock:
                 if self._worker is worker:
                     self._worker = None
@@ -577,28 +607,76 @@ class WorkerManager:
                 self._state = STATE_STOPPED if reason == "cancelled" else STATE_FAILED
                 self._exit_reason = None if reason == "cancelled" else reason
             self._finish(operation, OP_FINISHED if reason == "cancelled" else OP_FAILED, reason)
+            if reason != "cancelled":
+                self._on_event("worker.start_failed", {"reason": reason}, "warning")
             return
+        self.drain(worker)
         with self._lock:
             self._state = STATE_RUNNING
             self._exit_reason = None
             self._forced_stop = False
-            self._last_status = worker.ready_payload.get("status")
         self._start_monitor(worker)
         self._finish(operation, OP_FINISHED, "running")
-        self._on_event("worker.started", {"revision": revision, "pid": worker.pid})
+        self._on_event("worker.started", {"revision": revision, "pid": worker.pid}, "info")
 
-    def _wait_ready(self, worker: WorkerProcess) -> bool:
-        """等 ready；期间轮询取消事件，让 stop 能抢占启动等待（§9.2）。"""
+    def _wait_ready(self, worker: WorkerProcess) -> str:
+        """等 ready；返回 `ready` / `cancelled` / `exited` / `timeout`（§9.2）。
+
+        期间的每一帧都折进事件与最近状态：`status` 帧是快照的唯一来源，
+        `log` 帧是启动失败时用户能看到的唯一诊断（审查 I3/I4）。
+        """
         deadline = self._clock() + self._start_timeout
         while self._clock() < deadline:
-            if self._cancel_start.is_set():
-                return False
+            if self._cancel_start.is_set() or self._quitting:
+                return "cancelled"
             frame = worker.next_frame(0.2)
-            if frame is not None and frame["kind"] == "ready":
-                return True
+            if frame is not None:
+                self._consume(frame)
+                if frame["kind"] == "ready":
+                    return "ready"
             if worker.wait(0) is not None:
-                return False
-        return False
+                return "exited"
+        return "timeout"
+
+    def _consume(self, frame: dict) -> None:
+        """把一帧上报折进事件与最近状态。"""
+        kind = frame.get("kind")
+        payload = frame.get("payload") or {}
+        if kind in ("ready", "status"):
+            status = payload.get("status")
+            if isinstance(status, dict):
+                self._last_status = status
+            if kind == "ready":
+                self._on_event("worker.ready", {}, "info")
+        elif kind == "log":
+            level = str(payload.get("level", "info")).lower()
+            fields = payload.get("fields")
+            self._on_event(
+                str(payload.get("event", "worker.log")),
+                dict(fields) if isinstance(fields, dict) else {},
+                level,
+            )
+        elif kind == "stopped":
+            status = payload.get("status")
+            if isinstance(status, dict):
+                self._last_status = status
+            self._on_event("worker.stopped", {}, "info")
+
+    def drain(self, worker: WorkerProcess | None = None) -> None:
+        """排空 Worker 已上报但还没消费的帧（状态查询与关闭路径都用它）。"""
+        target = worker if worker is not None else self._worker
+        if target is None:
+            return
+        while True:
+            frame = target.next_frame(0)
+            if frame is None:
+                return
+            self._consume(frame)
+
+    def record_status(self, status: dict) -> None:
+        """外部（Controller 的帧泵）折进来的状态快照。"""
+        if isinstance(status, dict):
+            self._last_status = status
 
     def _do_stop(self, operation: Operation) -> None:
         with self._lock:
@@ -608,7 +686,7 @@ class WorkerManager:
             self._state = STATE_STOPPING
         result = self._stop_synchronously(cancelled_start=cancelled_start)
         self._finish(operation, OP_FINISHED, result)
-        self._on_event("worker.stopped", {"result": result})
+        self._on_event("worker.stopped", {"result": result}, "info")
 
     def _do_restart(self, operation: Operation, revision: int | None) -> None:
         with self._lock:
@@ -651,6 +729,7 @@ class WorkerManager:
         if worker is None:
             with self._lock:
                 self._state = STATE_STOPPED
+                self._cancel_start.clear()
             return "stopped"
         worker.request_stop()
         code = worker.wait(self._stop_budget_ms)
@@ -712,7 +791,7 @@ class WorkerManager:
                     return
                 self._state = STATE_FAILED
                 self._exit_reason = f"exit_{code}"
-            self._on_event("worker.exited", {"reason": f"exit_{code}"})
+            self._on_event("worker.exited", {"reason": f"exit_{code}"}, "warning")
 
         with self._lock:
             previous = self._monitor

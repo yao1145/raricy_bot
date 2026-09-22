@@ -24,7 +24,10 @@ BOOTSTRAP_TTL_SECONDS: float = 120.0
 SESSION_IDLE_SECONDS: float = 1800.0
 
 # 兑换接口的尝试上限：令牌本身就是高熵随机串，次数上限只挡住明显的暴力尝试。
+# 按**时间窗**计而不是永久锁死：本机任何进程都能把窗口刷满，不能让它把用户
+# 永久挡在自己的管理页之外（审查 M7）。
 EXCHANGE_MAX_ATTEMPTS: int = 10
+EXCHANGE_WINDOW_SECONDS: float = 60.0
 
 
 @dataclass
@@ -60,7 +63,7 @@ class SessionManager:
         self._bootstraps: list[_Bootstrap] = []
         self._sessions: dict[str, Session] = {}
         self._exchange_attempts = 0
-        self._exhausted = False
+        self._window_start: float | None = None
 
     # --- 引导令牌 ---------------------------------------------------------
 
@@ -71,18 +74,18 @@ class SessionManager:
             _Bootstrap(token=token, expires_at=self._clock() + BOOTSTRAP_TTL_SECONDS)
         ]
         self._exchange_attempts = 0
-        self._exhausted = False
+        self._window_start = None
         return token
 
     def exchange(self, token: str) -> Session | None:
         """兑换引导令牌；失败返回 None（令牌不对、已用过、已过期或次数用尽）。"""
-        if self._exhausted:
-            return None
+        now = self._clock()
+        if self._window_start is None or now - self._window_start >= EXCHANGE_WINDOW_SECONDS:
+            self._window_start = now
+            self._exchange_attempts = 0
         self._exchange_attempts += 1
         if self._exchange_attempts > EXCHANGE_MAX_ATTEMPTS:
-            self._exhausted = True
             return None
-        now = self._clock()
         for candidate in self._bootstraps:
             if candidate.used or candidate.expires_at <= now:
                 continue

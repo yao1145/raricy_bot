@@ -437,10 +437,17 @@ class _WinPipe:
             return b""
 
     def close(self) -> None:
-        """关闭父端；重复关闭是安全的。"""
+        """关闭父端的两端（父端句柄 + 子端在本进程的副本）；重复关闭是安全的。
+
+        上报/排水通道的父端是**读**句柄：只关写句柄会让每次启停泄漏两个句柄
+        （审查 I5）。
+        """
+        if self._child_reads:
+            parent_handle, self._write_handle = self._write_handle, None
+        else:
+            parent_handle, self._read_handle = self._read_handle, None
+        _close_handle(parent_handle)
         self.detach_child_end()
-        handle, self._write_handle = self._write_handle, None
-        _close_handle(handle)
 
 
 def _close_handle(handle) -> None:

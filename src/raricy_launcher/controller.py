@@ -97,7 +97,6 @@ class Controller:
             instance_id=self._instance_id,
             config_service=self._config,
             manager=self._manager,
-            clock=time.monotonic,
         )
         self._api: LocalApi | None = None
         self._server = None
@@ -162,6 +161,7 @@ class Controller:
         if self._quit.is_set() and self._api is None and self._listener is None:
             return
         self._quit.set()
+        self._api = None  # 置空后重复 stop() 走上面的幂等早退（审查 M1）
         self._manager.shutdown()
         self._sessions.revoke_all()
         self._events.close()
@@ -293,29 +293,13 @@ class Controller:
             run_id=run_id,
         )
 
-    def _on_worker_event(self, name: str, fields: dict) -> None:
-        """把进程阶段与 Worker 上报都放进事件缓冲（§12）。"""
-        worker = self._manager.worker
-        if worker is not None:
-            self._pump_worker_frames(worker)
-        self._events.publish(name, **fields)
+    def _on_worker_event(self, name: str, fields: dict, level: str = "info") -> None:
+        """把进程阶段与 Worker 上报折进事件缓冲（§12）。
 
-    def _pump_worker_frames(self, worker) -> None:
-        """把 Worker 已上报的帧转成事件与状态快照（非阻塞）。"""
-        while True:
-            frame = worker.next_frame(0)
-            if frame is None:
-                return
-            kind = frame.get("kind")
-            payload = frame.get("payload") or {}
-            if kind == "log":
-                self._events.publish(
-                    str(payload.get("event", "worker.log")),
-                    level=str(payload.get("level", "info")).lower(),
-                    **{k: v for k, v in (payload.get("fields") or {}).items()},
-                )
-            elif kind in ("ready", "status", "stopped"):
-                self._events.publish(f"worker.{kind}", status=kind)
+        帧本身由管理器消费（它负责最近状态快照）；控制器只把事件转发出去，
+        不再自己抽帧 —— 两边都抽会让快照永远空着（审查 I3）。
+        """
+        self._events.publish(name, level=level, **fields)
 
     # --- 元数据 -----------------------------------------------------------
 
