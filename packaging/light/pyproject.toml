@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "raricy-bot-light"
+version = "0.1.0"
+description = "Raricy Bot Light 桌面发行版（Windows x64）"
+requires-python = ">=3.12"
+dependencies = [
+    # 平台层绑定：Job/互斥体/管道 ACL；仅 Windows 需要（LIGHT_EDITION_DESIGN §14）
+    "pywin32>=306; sys_platform == 'win32'",
+]
+
+# 与完整版共享 raricy_bot 导入命名空间：两者不得安装到同一 Python 环境（§4.4）。
+# staging 里 raricy_bot 只含白名单模块，不包含任何 MCP/工具实现。
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["raricy_launcher*", "raricy_bot"]
+
+[tool.setuptools.package-data]
+raricy_launcher = ["static/*"]

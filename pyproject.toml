@@ -19,6 +19,8 @@ dependencies = [
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
+    # Launcher 平台层绑定（仅 Light 使用；开发环境跑平台集成测试需要）
+    "pywin32>=306; sys_platform == 'win32'",
 ]
 
 [tool.setuptools.packages.find]
