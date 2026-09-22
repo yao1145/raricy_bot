@@ -26,6 +26,7 @@ from .app import BotApp
 from .assembly import AssemblyError
 from .blog.assembly import build_blog_service
 from .config import Config, ConfigError, load_config
+from .data_lock import DataLockError, acquire_data_lock, data_lock_dir
 from .error_archive import ArchiveError, ArchiveHandler, ErrorArchive, iter_entries, verify_segments
 from .mcp.assembly import build_mcp_manager
 from .mcp.tool_client import ToolCallingModelClient
@@ -42,11 +43,13 @@ from .logging_setup import (
 
 _logger = get_logger("main")
 
-# 退出码：0 正常，1 运行期致命错误，2 配置错误，3 归档已启用却打不开。
+# 退出码：0 正常，1 运行期致命错误，2 配置错误，3 归档已启用却打不开，
+# 4 数据目录不可用或已有写者（§9.5 的公共数据锁）。
 EXIT_OK = 0
 EXIT_RUNTIME = 1
 EXIT_CONFIG = 2
 EXIT_ARCHIVE = 3
+EXIT_DATA_LOCKED = 4
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -77,29 +80,39 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging(config.log_level)
     install_exception_hooks()
 
-    archive = _open_archive(config)
-    if archive is _ARCHIVE_FAILED:
-        shutdown_logging()
-        return EXIT_ARCHIVE
-
+    # 公共数据锁（§9.5）：完整版 CLI 与 Light Worker 争用同一个数据档案标识。
+    # 必须在打开归档与 Store **之前**取得 —— 第二个写者不允许动任何数据。
     try:
-        asyncio.run(_serve(config, archive))
-    except KeyboardInterrupt:
-        return EXIT_OK
-    except AssemblyError as exc:
-        # 装配接缝错位（配置要求某个子域、完整版入口本该给出实现）：与配置错误
-        # 同等对待 —— 一行原因加退出码 2。`exc` 的文案是稳定类别码，不含任何取值。
-        print(f"装配错误：{exc}", file=sys.stderr)
-        return EXIT_CONFIG
-    except Exception as exc:  # 运行期致命错误：只报类型，不泄露任何取值
-        # 走 `log_event` 而不是 `print`：归档这时已经装好了，一条只写到 stderr 的
-        # 致命错误等于"进程为什么退出"永远进不了永久记录 —— 而那正是最该留下的一条。
-        # 控制台照样看得到它（同一个根 logger 也有 stderr handler）。
-        _fatal(exc)
-        return EXIT_RUNTIME
-    finally:
-        _close_archive(archive)
+        lock = acquire_data_lock(data_lock_dir(config.storage.db_path))
+    except DataLockError as exc:
+        print(f"数据目录不可用：{exc}", file=sys.stderr)
         shutdown_logging()
+        return EXIT_DATA_LOCKED
+
+    with lock:
+        archive = _open_archive(config)
+        if archive is _ARCHIVE_FAILED:
+            shutdown_logging()
+            return EXIT_ARCHIVE
+
+        try:
+            asyncio.run(_serve(config, archive))
+        except KeyboardInterrupt:
+            return EXIT_OK
+        except AssemblyError as exc:
+            # 装配接缝错位（配置要求某个子域、完整版入口本该给出实现）：与配置错误
+            # 同等对待 —— 一行原因加退出码 2。`exc` 的文案是稳定类别码，不含任何取值。
+            print(f"装配错误：{exc}", file=sys.stderr)
+            return EXIT_CONFIG
+        except Exception as exc:  # 运行期致命错误：只报类型，不泄露任何取值
+            # 走 `log_event` 而不是 `print`：归档这时已经装好了，一条只写到 stderr 的
+            # 致命错误等于"进程为什么退出"永远进不了永久记录 —— 而那正是最该留下的一条。
+            # 控制台照样看得到它（同一个根 logger 也有 stderr handler）。
+            _fatal(exc)
+            return EXIT_RUNTIME
+        finally:
+            _close_archive(archive)
+            shutdown_logging()
     return EXIT_OK
 
 
