@@ -252,6 +252,12 @@ resync 拉取按 message ID 去重，空 event ID 不抬水位。
 结束，再关 `Store`，避免它们撞上已关闭的连接。`wait_settled()` 有界（超时放弃等待、让关闭
 继续，见 §13 / D-117）。
 
+装配接缝（`app.py` 不 import `mcp/` 与 `blog/`，见 §56）：MCP Manager 与发文子域都经
+`BotApp(..., mcp_manager_factory=, blog_service_factory=)` 注入；没有 MCP 工厂且
+`mcp.enabled=false` 时使用无工具默认实现（生命周期空操作、任何 feature 不可用），
+没有工厂而配置启用了对应子域则在**构造期**抛 `AssemblyError`（消息是稳定类别码），
+不进 `start()` 的软故障兜底。显式传入的 `mcp_manager` 实例优先于工厂。
+
 ## 16.1 评论子系统
 
 入口：[发现器](../../src/raricy_bot/comments/discovery.py)、[路由](../../src/raricy_bot/comments/router.py)、
@@ -267,9 +273,11 @@ resync 拉取按 message ID 去重，空 event ID 不抬水位。
 
 入口：[启动与退出码](../../src/raricy_bot/__main__.py)。
 解析配置路径、校验配置、初始化脱敏日志、安装未捕获异常兜底、按需打开永久归档，
-再运行 App。退出码：配置错误 2，归档已启用却打不开 3，运行期致命错误 1，其余 0；
-任何一条错误路径都不回显凭据。停止须等待资源关闭，不能留下 pending task 或未关闭
-客户端；归档在 `finally` 里同步并关闭。
+再运行 App。完整版在此注入 `ToolCallingModelClient`、`build_mcp_manager` 与
+`build_blog_service`（§56）；Light 走 launcher 入口，不经过本模块。
+退出码：配置错误 2（含装配接缝错位的 `AssemblyError`，只在 stderr 打一行类别码），
+归档已启用却打不开 3，运行期致命错误 1，其余 0；任何一条错误路径都不回显凭据。
+停止须等待资源关闭，不能留下 pending task 或未关闭客户端；归档在 `finally` 里同步并关闭。
 
 「已启用但打不开」是致命的：继续跑只会让所有人以为永久记录正在工作。边界要说清楚 ——
 **配置解析成功、归档初始化完成之前**的启动错误只能安全写 stderr，仍依赖宿主保存；
@@ -591,8 +599,9 @@ memory off 只关私有读取与自动提取，公开副本不变；自动更新
 
 ### 53.1 基础类型
 
-[blog/models.py](../../src/raricy_bot/blog/models.py) 定义 Draft、PreparedDraft、BlogScope、
-运行状态与投递状态，两套状态不可混用。hash_version=1 与 SQLite CHECK 一起维护，变更须处理旧行。
+[blog_records.py](../../src/raricy_bot/blog_records.py)（包外的中立模块，见 §56）定义 Draft、
+PreparedDraft、BlogScope、运行状态与投递状态，两套状态不可混用。hash_version=1 与 SQLite
+CHECK 一起维护，变更须处理旧行。
 
 ### 53.2 配置
 
@@ -630,7 +639,9 @@ memory off 只关私有读取与自动提取，公开副本不变；自动更新
 
 ### 53.8 调度
 
-[blog/planner.py](../../src/raricy_bot/blog/planner.py) 为纯函数与 UTC+8 日界线唯一实现。
+[blog/planner.py](../../src/raricy_bot/blog/planner.py) 为纯函数；UTC+8 日历（`utc8_day` /
+`utc8_next_day` / `SCAN_WINDOW_SECONDS`）在 [blog_records.py](../../src/raricy_bot/blog_records.py)，
+Store 与子域取同一份（§56）。
 扫描领取与串行生成/发送分离；执行键持久化后不重掷概率，不因长生成漏领后续分钟点。
 
 ### 53.9 生成
@@ -760,3 +771,38 @@ PublishOutcome.post_id 是否为 None 决定 status 是运行态还是投递态�
 同一个 token 可能既被计为 `kept`，又被计为 `dropped_for_secret`，因此实际发出的 token 数是
 `kept + fixed - dropped_for_secret`，不是 `candidates - dropped`。功能关闭（`table is None`）
 时不记该事件；**不记正文，也不记具体名字**。
+
+## 56. 装配接缝与 Light 闭包（`assembly.py`、`tools/build_light.py`）
+
+入口：[装配接缝](../../src/raricy_bot/assembly.py)、[staging 构建](../../tools/build_light.py)。
+完整版与 Light 共用一份 App：`app.py` 不 import `mcp/` 与 `blog/`，完整版的构造经
+[mcp/assembly.py](../../src/raricy_bot/mcp/assembly.py) 的 `build_mcp_manager` 与
+[blog/assembly.py](../../src/raricy_bot/blog/assembly.py) 的 `build_blog_service` 注入
+（`__main__.py` 装配，见 §17）。没有 MCP 工厂时 App 用 `NoToolMcpManager`：生命周期空操作、
+任何 feature 不可用，与 `mcp.enabled=false` 的真实 Manager 行为一致；配置启用却没有工厂是
+装配错位，构造期抛 `AssemblyError`（`mcp_manager_factory_required` /
+`blog_service_factory_required`），**不**降级、不被 `start()` 的软故障兜底吞掉（D-121）。
+接缝类型只声明 App 真正使用的成员，不复制完整版接口。
+
+Light 闭包 = `raricy_bot` 整包 − `mcp/` − `blog/` − 完整版 CLI 入口 `__main__.py`，
+由 staging 构建现算：禁止出现 `mcp` / `raricy_bot.mcp` / `raricy_bot.blog` 导入，且任何
+指向 `raricy_bot` 的导入都必须落在闭包内（源码树里存在、staging 里不存在 = 越界）。
+共享持久层需要的发文记录与 UTC+8 日历放在包外的
+[blog_records.py](../../src/raricy_bot/blog_records.py)（D-122），它不 import `blog/`。
+验证：`tests` 的无 MCP 导入测试在屏蔽 `mcp` SDK 的子进程里导入闭包全部模块。
+
+## 57. `raricy_launcher` 原型（激活、进程回收）
+
+入口：[激活协议](../../src/raricy_launcher/activation.py)、[Windows 平台层](../../src/raricy_launcher/platform/windows.py)、
+[控制器](../../src/raricy_launcher/controller.py)。这是 L0 原型控制面：**没有**会话认证与
+配置事务，§8/§9/§11 的正式实现（L3）整体替换它。
+
+- 激活管道只承载固定动作（当前 `open_admin`）：单连接一条请求（客户端用 `CallNamedPipe`），
+  请求 ≤512 B、响应 ≤4096 B，未知命令与多余键一律拒绝；管道 ACL 拒绝 NETWORK 主体。
+- 响应写出后等待客户端读走再断开，这段等待**有界且可取消**（D-123）：窗口内客户端再发
+  数据只说明连接还活着，读掉继续等；一直不读的客户端由窗口与取消事件界定。
+  `close()` 必须能取消全部在途等待，不留下存活的服务线程。
+- 启停：退出流程开始后（停止标志已置位）到达的 start 一律在生命周期锁内拒绝，避免
+  `stop()` 返回后留下无人回收的 Worker；Worker 由 Job 对象兜底回收（D-120）。
+  L0 的拒绝只在日志里留痕（`worker.spawn status=refused`），可区分的操作结果属 L3；
+  L3 若按 §9.2 用 `stop → start` 组合出 restart，必须先清除停止标志，否则重启永远被拒。

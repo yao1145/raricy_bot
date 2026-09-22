@@ -9,10 +9,10 @@
 |---|---|
 | 快速启动、功能概览 | [根 README](../README.md)、[配置示例](../config.example.yaml) |
 | 开发约定 | [AGENTS.md](../AGENTS.md) |
-| Light 独立发行版、首次配置与后台静默运行（L0 原型已实现） | [LIGHT_EDITION_DESIGN.md](design/LIGHT_EDITION_DESIGN.md)：完整版保留，包含架构、配置/凭据、进程控制、API、打包与验收设计 |
+| Light 独立发行版、首次配置与后台静默运行（L0/L1 已实现） | [LIGHT_EDITION_DESIGN.md](design/LIGHT_EDITION_DESIGN.md)：完整版保留，包含架构、配置/凭据、进程控制、API、打包与验收设计 |
 | 跨模块行为与代码入口 | [INTERFACES.md](design/INTERFACES.md) |
 | 本次代码审查四项修复的问题、理由与替代关系 | [DESIGN_DECISIONS.md](design/DESIGN_DECISIONS.md) 的 D-115–D-118；已实施，一次性计划见[归档索引](ARCHIVE.md) |
-| 行为的理由、例外与取舍 | [DESIGN_DECISIONS.md](design/DESIGN_DECISIONS.md)（D-1–D-119） |
+| 行为的理由、例外与取舍 | [DESIGN_DECISIONS.md](design/DESIGN_DECISIONS.md)（D-1–D-123） |
 | 系统提示词规范 | [SYSTEM_PROMPTS.md](design/SYSTEM_PROMPTS.md)；文档不参与运行，配置提示词须同步到部署配置，静态附加说明须同步 `texts.py`；第三类静态来源（表情包，由已校验的部署配置渲染）见 §1.10、D-119 |
 | 用户命令、隐私说明、定时发文操作与待验收项 | [USAGE.md](usage/USAGE.md) |
 | 部署、升级、恢复、排障 | [DEPLOYMENT.md](usage/DEPLOYMENT.md) |

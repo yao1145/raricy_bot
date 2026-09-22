@@ -297,11 +297,11 @@
 | 发文走的是普通用户接口，不是站方机器人契约 | INTERFACES §53 与 D-106；上游依据是 `raricycms/raricy.com@5eace12` 的 `src/app/api/blogs/route.ts` |
 | 调度点、本地日预算都按 UTC+8 切 | `blog/planner.py` 的 `UTC8` / `utc8_day`；站方 `dayStart` 同口径（D-108） |
 | 停机期间不补发、只处理 5 分钟窗口内的点 | `blog/planner.py` 的 `SCAN_WINDOW_SECONDS`（300）与 `due_runs(startup=...)`；超过 5 分钟未开始的 `queued` 行由 `store.take_blog_run` 转 `skipped`/`misfire` |
-| 结果不确定的行持续占额、不自动重投 | `blog/models.py` 的 `POST_HOLDING_STATUSES` 与 `blog/publisher.py`；D-108、D-109 |
+| 结果不确定的行持续占额、不自动重投 | `blog_records.py` 的 `POST_HOLDING_STATUSES` 与 `blog/publisher.py`；D-108、D-109 |
 | 只有完整搜索且唯一匹配才补记已发布 | `blog/publisher.py` 的 `reconcile_once`；`blog/codec.py` 的 `content_hash` 重算指纹（INTERFACES §53.10） |
-| 单条对账查 12 次后停止自动查询但保持占额 | `blog/models.py` 的 `MAX_RECONCILE_ATTEMPTS`；`store.blog_posts_to_reconcile` 排除已查满的行 |
-| 稿库同指纹累计投递上限 3 次、只允许确定的 429 重试 | `blog/models.py` 的 `MAX_POST_ATTEMPTS` 与 `blog/drafts.py` 的 `_retry_ready`（D-109） |
-| 发文不落正文、不落模型请求与响应 | `blog/models.py` 的 `Draft`/`PreparedDraft` 把 `description`/`content` 排除出 `repr`；D-107 与 §53.13 |
+| 单条对账查 12 次后停止自动查询但保持占额 | `blog_records.py` 的 `MAX_RECONCILE_ATTEMPTS`；`store.blog_posts_to_reconcile` 排除已查满的行 |
+| 稿库同指纹累计投递上限 3 次、只允许确定的 429 重试 | `blog_records.py` 的 `MAX_POST_ATTEMPTS` 与 `blog/drafts.py` 的 `_retry_ready`（D-109） |
+| 发文不落正文、不落模型请求与响应 | `blog_records.py` 的 `Draft`/`PreparedDraft` 把 `description`/`content` 排除出 `repr`；D-107 与 §53.13 |
 | 发文日志只多五个字段 | `logging_setup.LOG_FIELDS` 新增 `task_name`/`post_id`/`run_id`/`day`/`chars`，其中 `chars` 只是**标题**的 UTF-16 长度 |
 | 发文工具预算不新增配置项 | 直接用 `mcp.features.blog_write.max_tool_calls_per_turn`；能力表用 `fixed_result_count=1` 钉死 `result_count`（D-110） |
 | 聊天与发文共用同一个上游工具时互不串策略 | 适配器键是 `(feature_name, model_tool_name)`；D-110，`mcp/registry.py` |
