@@ -233,3 +233,32 @@ docker compose exec bot python -m raricy_bot archive read \
 **仍然查不到的**：控制台与归档都不保存消息正文、模型请求/响应与工具参数 —— 这套改动
 加的是**诊断信息**，不是现场回放。第 8 节列的三个环境未知项照旧要在下次事发前确认，
 归档不会替它们作答。
+
+---
+
+## 事件二：Light 登录成功后 Worker 启动失败（2026-09-23，已定案）
+
+### 现象与证据
+
+用户的冻结版在 `worker.starting`、`app.cleanup_done`、`site.login status=200` 后，
+于 13:17:04 上报 `worker.start_failed error=RuntimeError`；控制端直到 13:18:02
+才上报 `worker.start_failed reason=start_timeout`。站点登录成功只证明账号可用，
+不能证明后续账号锁和 BotApp 装配成功。
+
+### 根因
+
+`process_manager.build_worker_env()` 只传少数系统变量，没有传 Windows 的
+`LOCALAPPDATA` / `USERPROFILE`。登录后 `BotApp.start()` 调用
+`acquire_account_lock()`，其默认锁目录在缺少 `LOCALAPPDATA` 时退到
+`Path.home()`；在同一份精简 Worker 环境里，Windows Python 抛出
+`RuntimeError: Could not determine home directory.`。用精简环境启动独立
+Python 进程已离线复现这条异常。Worker 已上报启动失败，但管理器只等待 `ready`
+或进程退出，导致后续 `start_timeout` 掩盖首因。
+
+### 修复与复验
+
+Worker 环境白名单加入 `LOCALAPPDATA` / `USERPROFILE`，使账号锁与完整版共用
+同一个本机状态目录；管理器收到 `worker.start_failed` 上报后立即回收并返回
+`startup_failed`。两条回归测试均先失败后通过；Worker 进程、入口、状态机、
+账号锁和 BotApp 生命周期相关 233 项离线测试通过。新冻结包已构建并校验 ZIP
+的 SHA-256。旧冻结包不包含修复；真实账号启动仍需用新包复验。

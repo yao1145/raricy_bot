@@ -165,8 +165,9 @@ def run(app_dir: Path) -> int:
             [str(exe)],
             env=_child_env(data_root),
             cwd=str(app_dir),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            # 双击 windowed EXE 时没有标准输出。重定向到 DEVNULL 会给它有效
+            # 的 stdout/stderr，掩盖依赖 sys.stdout.isatty() 的启动故障。
+            creationflags=subprocess.DETACHED_PROCESS if os.name == "nt" else 0,
         )
         try:
             port = _wait_for_port(data_root, START_TIMEOUT_SECONDS)

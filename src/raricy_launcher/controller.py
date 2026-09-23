@@ -293,26 +293,41 @@ class Controller:
             server = self._server
             if server is not None and getattr(server, "started", False):
                 break
+            if not self._api_thread.is_alive():
+                raise RuntimeError("api_server_failed")
             time.sleep(0.02)
+        else:
+            raise RuntimeError("api_server_timeout")
         self._write_runtime_metadata()
 
     def _serve_api(self, api: LocalApi) -> None:
         import uvicorn
 
-        config = uvicorn.Config(
-            api.app,
-            log_level="warning",
-            access_log=False,
-            server_header=False,
-            date_header=False,
-            lifespan="off",
-        )
-        self._server = uvicorn.Server(config)
         try:
+            # PyInstaller windowed 入口没有 stdout/stderr。Uvicorn 的默认日志
+            # 格式器会访问 sys.stdout.isatty()，从而在服务启动前直接抛错。
+            config = uvicorn.Config(
+                api.app,
+                log_config=None,
+                log_level="warning",
+                access_log=False,
+                server_header=False,
+                date_header=False,
+                lifespan="off",
+            )
+            self._server = uvicorn.Server(config)
             self._server.run(sockets=[self._api_socket])
         except OSError:
             # 套接字被关掉（正常退出路径）不算错误。
-            pass
+            if not self._quit.is_set():
+                log_event(self._logger, logging.WARNING, "launcher.api_failed", error="OSError")
+        except Exception as exc:
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "launcher.api_failed",
+                error=type(exc).__name__,
+            )
 
     # --- 激活管道 ---------------------------------------------------------
 

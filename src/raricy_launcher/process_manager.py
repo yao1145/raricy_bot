@@ -43,6 +43,9 @@ _SYSTEM_ENV_KEYS: tuple[str, ...] = (
     "TEMP",
     "TMP",
     "COMSPEC",
+    # 登录后的公共账号锁使用 LOCALAPPDATA；Path.home() 在 Windows 依赖 USERPROFILE。
+    "LOCALAPPDATA",
+    "USERPROFILE",
 )
 
 # 上报读取的单次块大小：帧头只有 4 字节，读得比它大不改变语义。
@@ -707,6 +710,8 @@ class WorkerManager:
                 code = worker.wait(0)
                 # 启动阶段就退出：把退出码说清楚，而不是一律报「超时」（审查 I4）。
                 reason = f"exit_{code}" if code is not None else "exit_unknown"
+            elif outcome == "startup_failed":
+                reason = "startup_failed"
             else:
                 reason = "start_timeout"
             # 死掉的 Worker 已经留下了诊断帧（配置无效、数据被占用）：先排空再回收。
@@ -751,7 +756,7 @@ class WorkerManager:
             self._exit_reason = None
 
     def _wait_ready(self, worker: WorkerProcess) -> str:
-        """等 ready；返回 `ready` / `cancelled` / `exited` / `timeout`（§9.2）。
+        """等 ready；返回 `ready` / `cancelled` / `exited` / `startup_failed` / `timeout`（§9.2）。
 
         期间的每一帧都折进事件与最近状态：`status` 帧是快照的唯一来源，
         `log` 帧是启动失败时用户能看到的唯一诊断（审查 I3/I4）。
@@ -765,6 +770,11 @@ class WorkerManager:
                 self._consume(frame)
                 if frame["kind"] == "ready":
                     return "ready"
+                if (
+                    frame["kind"] == "log"
+                    and frame.get("payload", {}).get("event") == "worker.start_failed"
+                ):
+                    return "startup_failed"
             if worker.wait(0) is not None:
                 return "exited"
         return "timeout"
