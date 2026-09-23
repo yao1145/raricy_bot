@@ -12,11 +12,16 @@ POSIX 用 `fcntl.flock`。两种锁都随进程退出（含崩溃）由操作系
 from __future__ import annotations
 
 import os
+import hashlib
+import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 # 锁文件名：与数据档案内的其他文件区分开，`bot.db -wal/-shm` 之外单列。
 DATA_LOCK_FILE: str = ".raricy-data.lock"
+ACCOUNT_LOCK_EXTENSION: str = ".lock"
 
 
 class DataLockError(Exception):
@@ -31,6 +36,85 @@ def data_lock_dir(db_path: str | Path) -> Path:
     约束（§9.5、审查 P2）。
     """
     return _normalize(Path(db_path)).parent
+
+
+def account_lock_dir(site_url: str, account_id: str | int) -> Path:
+    """按规范化站点与稳定账号 ID 生成跨版本公共锁文件路径。
+
+    文件名只暴露不可逆摘要；站点路径与账号 ID 不写进锁文件或诊断日志。
+    Light 与完整版在同一 OS 用户下使用相同用户状态根，因此即使 DB 不同也互斥。
+    """
+    site = _normalize_site_url(site_url)
+    if isinstance(account_id, bool) or not isinstance(account_id, (str, int)):
+        raise DataLockError("account_lock_invalid_identity")
+    stable_id = str(account_id).strip()
+    if not stable_id:
+        raise DataLockError("account_lock_invalid_identity")
+    digest = hashlib.sha256(
+        json.dumps([site, stable_id], ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return _normalize(_default_account_lock_root() / f"{digest}{ACCOUNT_LOCK_EXTENSION}")
+
+
+def acquire_account_lock(site_url: str, account_id: str | int) -> DataLock:
+    """立即取得本机站点账号锁；重复实例收到稳定的 `account_in_use` 错误。"""
+    lock_path = account_lock_dir(site_url, account_id)
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise DataLockError("account_lock_unavailable") from exc
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+    except OSError as exc:
+        raise DataLockError("account_lock_unavailable") from exc
+    try:
+        _lock_file(fd)
+    except OSError as exc:
+        os.close(fd)
+        raise DataLockError("account_in_use") from exc
+    _write_owner(fd)
+    return DataLock(fd, lock_path)
+
+
+def _normalize_site_url(site_url: str) -> str:
+    """规范化已校验的站点地址，统一 scheme/host 大小写和末尾斜杠。"""
+    if not isinstance(site_url, str) or not site_url.strip():
+        raise DataLockError("account_lock_invalid_identity")
+    try:
+        parsed = urlsplit(site_url.strip())
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise DataLockError("account_lock_invalid_identity") from exc
+    if scheme not in ("http", "https") or not hostname or parsed.query or parsed.fragment:
+        raise DataLockError("account_lock_invalid_identity")
+    if parsed.username is not None or parsed.password is not None:
+        raise DataLockError("account_lock_invalid_identity")
+    try:
+        host = hostname.encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise DataLockError("account_lock_invalid_identity") from exc
+    if ":" in host:
+        host = f"[{host}]"
+    if port == (443 if scheme == "https" else 80):
+        port = None
+    netloc = host if port is None else f"{host}:{port}"
+    path = parsed.path.rstrip("/")
+    return urlunsplit((scheme, netloc, path, "", ""))
+
+
+def _default_account_lock_root() -> Path:
+    """返回当前 OS 用户共享状态目录，完整版与 Light 共用。"""
+    if os.name == "nt":
+        root = os.environ.get("LOCALAPPDATA")
+        base = Path(root) if root else Path.home() / "AppData" / "Local"
+        return base / "RaricyBot" / "account-locks"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "RaricyBot" / "account-locks"
+    root = os.environ.get("XDG_STATE_HOME")
+    base = Path(root) if root else Path.home() / ".local" / "state"
+    return base / "raricy_bot" / "account-locks"
 
 
 def _normalize(path: Path) -> Path:
@@ -71,13 +155,14 @@ def _unlock_file(fd: int) -> None:
 
 
 def _write_owner(fd: int) -> None:
-    """把占用者信息写进锁文件：只用于诊断，失败不影响持锁。"""
+    """尽力写入诊断信息；锁本身由 OS 文件锁实现，与该元数据无关。"""
     try:
         os.lseek(fd, 0, os.SEEK_SET)
         os.truncate(fd, 0)
         stamp = datetime.now(timezone.utc).isoformat()
         os.write(fd, f"pid={os.getpid()}\nstarted={stamp}\n".encode("utf-8"))
     except OSError:
+        # owner 内容只用于诊断；不能让磁盘写入失败破坏有效的互斥锁。
         pass
 
 

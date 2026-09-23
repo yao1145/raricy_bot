@@ -582,35 +582,68 @@ class LocalApi:
         try:
             session = self._require_session(request)
             self._require_write(request, session)
-            await self._json_body(request)
+            body = await self._json_body(request)
         except ApiError as exc:
             return self._json(exc.status, exc.payload())
         if self._manager.state not in ("stopped", "failed"):
             return self._json(409, {"ok": False, "code": "bot_running"})
-        result, status = await asyncio.to_thread(self._run_site_test)
+        credentials = None
+        if body:
+            username = body.get("username")
+            password = body.get("password")
+            if (
+                set(body) != {"username", "password"}
+                or not isinstance(username, str)
+                or not username.strip()
+                or len(username) > 256
+                or not isinstance(password, str)
+                or not password
+                or len(password) > 4096
+            ):
+                return self._json(422, {"ok": False, "code": "invalid_test_input"})
+            credentials = Secrets(username=username, password=password, llm_api_key="")
+        result, status = await asyncio.to_thread(self._run_site_test, credentials)
         return self._json(status, result)
 
-    def _run_site_test(self) -> tuple[dict, int]:
+    def _run_site_test(self, credentials_override: Secrets | None = None) -> tuple[dict, int]:
         try:
-            status = self._config.status()
-            saved = self._config.load_saved()
-            if saved is None or status.state != STATE_CONFIGURED:
-                # 配置无效时连测试都不做：地址规则与凭据都没通过校验（审查 I7）。
-                return {"ok": False, "code": "config_not_ready"}, 409
-            credentials = self._config.credentials_for(saved.revision)
-            config = parse_config(
-                saved.mapping,
-                config_dir=str(self._config.profile()),
-                secrets=credentials,
-            )
+            if credentials_override is None:
+                status = self._config.status()
+                saved = self._config.load_saved()
+                if saved is None or status.state != STATE_CONFIGURED:
+                    # 配置无效时连测试都不做：地址规则与凭据都没通过校验（审查 I7）。
+                    return {"ok": False, "code": "config_not_ready"}, 409
+                credentials = self._config.credentials_for(saved.revision)
+                mapping = saved.mapping
+                revision = saved.revision
+            else:
+                # 向导测试仅在内存中构造一次性配置；站点 URL 仍来自 Light 固定基线。
+                mapping = light_base_mapping(self._config.profile())
+                mapping["model"] = {
+                    "base_url": "https://draft.invalid/v1",
+                    "model": "draft-model",
+                }
+                credentials = credentials_override
+                revision = None
+            config = parse_config(mapping, config_dir=str(self._config.profile()), secrets=credentials)
         except Exception as exc:
             mapped = self._handle(exc)
             return mapped.payload(), mapped.status
         started = self._clock()
-        outcome, detail = asyncio.run(self._probe_site(config, credentials))
+        account_id = None
+        if credentials_override is None:
+            outcome, detail = asyncio.run(self._probe_site(config, credentials))
+        else:
+            outcome, detail, account_id = asyncio.run(
+                self._probe_site_identity(config, credentials)
+            )
         elapsed = int((self._clock() - started) * 1000)
-        self._status.record_test("site", ok=outcome, detail=detail, revision=saved.revision)
-        return {"ok": outcome, "detail": detail, "elapsed_ms": elapsed}, 200
+        if revision is not None:
+            self._status.record_test("site", ok=outcome, detail=detail, revision=revision)
+        result = {"ok": outcome, "detail": detail, "elapsed_ms": elapsed}
+        if account_id is not None:
+            result["account_id"] = account_id
+        return result, 200
 
     async def _probe_site(self, config, credentials: Secrets) -> tuple[bool, str]:
         """登录并探测聊天权限；任何失败只回固定类别码（§8.2）。
@@ -639,43 +672,117 @@ class LocalApi:
         finally:
             await client.aclose()
 
+    async def _probe_site_identity(self, config, credentials: Secrets) -> tuple[bool, str, str | None]:
+        """向导站点测试同时确认稳定 user.id；聊天权限失败也保留已验证 ID。"""
+        client = SiteClient(
+            config.site.base_url,
+            Redactor(),
+            timeout=min(config.site.request_timeout_seconds, MODEL_TEST_TIMEOUT_SECONDS),
+            username=credentials.username,
+            password=credentials.password,
+            transport=self._site_transport,
+        )
+        try:
+            await client.start()
+            try:
+                user = await client.login()
+            except SiteError as exc:
+                return False, exc.reason, None
+            account_id = str(user.id)
+            try:
+                await client.probe_chat()
+            except SiteError as exc:
+                return False, exc.reason, account_id
+            return True, "chat_ready", account_id
+        except Exception as exc:
+            return False, type(exc).__name__, None
+        finally:
+            await client.aclose()
+
     async def _test_model(self, request: Request):
         """模型测试：单次在途、固定样例、小输出，不返回生成内容（§8.2）。"""
         try:
             session = self._require_session(request)
             self._require_write(request, session)
-            await self._json_body(request)
+            body = await self._json_body(request)
         except ApiError as exc:
             return self._json(exc.status, exc.payload())
+        transient_values = None
+        if body:
+            base_url = body.get("base_url")
+            model = body.get("model")
+            api_key = body.get("api_key")
+            if (
+                set(body) != {"base_url", "model", "api_key"}
+                or not isinstance(base_url, str)
+                or not base_url.strip()
+                or len(base_url) > 2048
+                or not isinstance(model, str)
+                or not model.strip()
+                or len(model) > 256
+                or not isinstance(api_key, str)
+                or not api_key.strip()
+                or len(api_key) > 4096
+            ):
+                return self._json(422, {"ok": False, "code": "invalid_test_input"})
+            transient_values = {
+                "base_url": base_url.strip(),
+                "model": model.strip(),
+                "api_key": api_key,
+            }
         if not self._model_test_lock.acquire(blocking=False):
             return self._json(409, {"ok": False, "code": "test_in_progress"})
         try:
-            result, status = await asyncio.to_thread(self._run_model_test)
+            result, status = await asyncio.to_thread(self._run_model_test, transient_values)
         finally:
             self._model_test_lock.release()
         return self._json(status, result)
 
-    def _run_model_test(self) -> tuple[dict, int]:
+    def _run_model_test(self, transient_values: dict[str, str] | None = None) -> tuple[dict, int]:
         try:
-            saved = self._config.load_saved()
-            if saved is None:
-                return {"ok": False, "code": "config_not_ready"}, 409
-            credentials = self._config.credentials_for(saved.revision)
+            if transient_values is None:
+                saved = self._config.load_saved()
+                if saved is None:
+                    return {"ok": False, "code": "config_not_ready"}, 409
+                credentials = self._config.credentials_for(saved.revision)
+                mapping = saved.mapping
+                revision = saved.revision
+            else:
+                mapping = light_base_mapping(self._config.profile())
+                mapping["model"] = {
+                    "base_url": transient_values["base_url"],
+                    "model": transient_values["model"],
+                }
+                credentials = Secrets(
+                    username="draft", password="", llm_api_key=transient_values["api_key"]
+                )
+                revision = None
         except Exception as exc:
             mapped = self._handle(exc)
             return mapped.payload(), mapped.status
         started = self._clock()
-        outcome, detail = asyncio.run(self._probe_model(saved, credentials))
+        outcome, detail = asyncio.run(
+            self._probe_model_mapping(mapping, self._config.profile(), credentials)
+        )
         elapsed = int((self._clock() - started) * 1000)
-        self._status.record_test("model", ok=outcome, detail=detail, revision=saved.revision)
+        if revision is not None:
+            self._status.record_test("model", ok=outcome, detail=detail, revision=revision)
         return {"ok": outcome, "detail": detail, "elapsed_ms": elapsed}, 200
 
     async def _probe_model(self, saved, credentials: Secrets) -> tuple[bool, str]:
         """固定样例、短超时、小输出；只回分类，不回生成内容（§8.2）。"""
+        return await self._probe_model_mapping(
+            saved.mapping, self._config.profile(), credentials
+        )
+
+    async def _probe_model_mapping(
+        self, mapping: dict, config_dir: Path, credentials: Secrets
+    ) -> tuple[bool, str]:
+        """测试已保存或向导临时映射；两条路径共用同一限时模型探测。"""
         try:
             config = parse_config(
-                saved.mapping,
-                config_dir=str(self._config.profile()),
+                mapping,
+                config_dir=str(config_dir),
                 secrets=credentials,
             )
         except ConfigError:

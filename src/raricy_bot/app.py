@@ -82,6 +82,7 @@ from .core.worker import (
     ToolGenerationCancelled,
     WorkerPool,
 )
+from .data_lock import DataLock, acquire_account_lock
 from .diag import describe_error
 from .kb.service import KnowledgeService
 from .logging_setup import (
@@ -425,6 +426,7 @@ class BotApp:
 
         self._started = False
         self._stopped = False
+        self._account_lock: DataLock | None = None
         self._unavailable = False  # 403 权限/禁言导致的不就绪状态（D-4）
         self._shutdown_event = asyncio.Event()
 
@@ -479,6 +481,27 @@ class BotApp:
             await self._store.close()
             raise
 
+        # 完整版 CLI 与 Light Worker 共用本锁。只在身份登录成功后取得，且早于
+        # SSE、评论、记忆等账号消费路径；锁标识只使用站点地址与稳定 user.id。
+        try:
+            self._account_lock = acquire_account_lock(self._config.site.base_url, user.id)
+        except BaseException:
+            await self._client.aclose()
+            await self._store.close()
+            raise
+
+        try:
+            await self._start_after_login(user)
+        except BaseException:
+            # 任何登录后装配异常/取消都走统一关闭，先停已启动的组件再释放账号锁。
+            try:
+                await self.stop()
+            except BaseException:
+                pass
+            raise
+
+    async def _start_after_login(self, user) -> None:
+        """登录且取得公共账号锁之后装配账号级组件。"""
         # 主模型必须早于记忆撰写器构造：`MemoryWriter` 绑定的是这一个客户端（§34.2 第 2 步）。
         # 位置相对旧版上移了一格（原先在 Router 之后），构造失败时的行为不变：异常照常
         # 传播出 `start()`，同样不会留下比旧版更多的半初始化资源。
@@ -753,8 +776,10 @@ class BotApp:
         if self._stopped:
             return  # 幂等：重复调用安全
         self._stopped = True
+        shutdown_complete = False
         try:
             await asyncio.wait_for(self._shutdown(), timeout=_SHUTDOWN_TIMEOUT_SECONDS)
+            shutdown_complete = True
         except asyncio.TimeoutError:
             log_event(_logger, logging.WARNING, "app.shutdown_timeout")
         except Exception as exc:
@@ -762,8 +787,18 @@ class BotApp:
             # 各组件都已被 stop() 设计成幂等 no-op，这里只兜底记录。
             log_event(_logger, logging.WARNING, "app.shutdown_error", error=type(exc).__name__)
         finally:
+            # 只有确认所有子组件完成关闭后才释放账号锁。超时或关闭异常时，
+            # 仍可能有 SSE/评论任务在访问账号；保留 OS 锁至进程退出以 fail-closed。
+            if shutdown_complete:
+                self._release_account_lock()
             self._shutdown_event.set()
         log_event(_logger, logging.INFO, "app.stopped")
+
+    def _release_account_lock(self) -> None:
+        """释放登录后取得的公共账号锁；stop 与启动失败路径共用。"""
+        lock, self._account_lock = self._account_lock, None
+        if lock is not None:
+            lock.release()
 
     @property
     def ready(self) -> bool:

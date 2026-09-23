@@ -172,12 +172,21 @@ export function getOperation(id: string): Promise<{ operation: OperationView }> 
   return apiGet(`/api/operations/${encodeURIComponent(id)}`);
 }
 
-export function testSite(): Promise<{ ok: boolean; detail: string; elapsed_ms: number }> {
-  return apiWrite("/api/test/site", {}, "POST");
+export function testSite(payload: Record<string, unknown> = {}): Promise<{
+  ok: boolean;
+  detail: string;
+  elapsed_ms: number;
+  account_id?: string;
+}> {
+  return apiWrite("/api/test/site", payload, "POST");
 }
 
-export function testModel(): Promise<{ ok: boolean; detail: string; elapsed_ms: number }> {
-  return apiWrite("/api/test/model", {}, "POST");
+export function testModel(payload: Record<string, unknown> = {}): Promise<{
+  ok: boolean;
+  detail: string;
+  elapsed_ms: number;
+}> {
+  return apiWrite("/api/test/model", payload, "POST");
 }
 
 export function kbStatus(): Promise<{ ok: true; files: number; worker: unknown }> {

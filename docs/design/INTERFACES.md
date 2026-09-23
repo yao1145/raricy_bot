@@ -897,6 +897,14 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   不依赖 CDN、远程字体或运行期 Node。改前端后必须重新 `npm run build` 再提交。
 - 页面只用会话 Cookie 与内存里的 CSRF 值：引导令牌从 fragment 取出后立即清掉地址栏，
   密码与模型 Key 从不写进 LocalStorage / SessionStorage。
+- 向导临时测试接口沿用会话 Cookie 与 CSRF：`POST /api/test/site` 可带恰好
+  `{"username": string, "password": string}`，`POST /api/test/model` 可带恰好
+  `{"base_url": string, "model": string, "api_key": string}`；空对象或无字段仍测试已保存配置。
+  临时站点测试的 URL 取 Light 固定基线，不接受调用方传站点地址；站点登录成功时响应可含稳定
+  `account_id`（即使后续聊天权限探测失败），仅此临时路径返回。响应只含 `ok`、固定类别
+  `detail`、`elapsed_ms`，不返回生成内容或凭据。测试输入只在本次调用内使用，不写入正式/草稿配置，
+  也不更新 revision 绑定的测试状态；已保存配置测试仍按原规则记录 revision 结果。模型测试仍受
+  单次并发、固定样例、输出 token 上限和超时约束。
 - 发行构建：`tools/build_light.py` 生成 staging（Light 闭包 + 静态资源 + 构建信息），
   `--pyinstaller` 用 `light.spec` 冻结为 onedir/windowed 应用，`--zip` 打出 ZIP 与 `.sha256`。
   `build-info.json` 记录版本、协议版本、Python 版本、依赖清单与整包校验和。

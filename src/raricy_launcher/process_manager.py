@@ -52,6 +52,49 @@ _REPORT_CHUNK_BYTES: int = 8 * 1024
 _DRAIN_CHUNK_BYTES: int = 4 * 1024
 
 
+def _enqueue_report_frame(frames: queue.Queue, frame: dict) -> bool:
+    """非阻塞保留最近状态；队列满时只淘汰可替代的帧。"""
+    kind = frame.get("kind")
+    with frames.mutex:
+        items = frames.queue
+        if len(items) < frames.maxsize:
+            frames._put(frame)
+            frames.unfinished_tasks += 1
+            frames.not_empty.notify()
+            return True
+
+        # 状态快照只需要最新一份；事件日志可丢弃。ready/stopped 是生命周期
+        # 帧，除替换同类重复帧外优先保留。
+        if kind == "status":
+            candidates = ("status", "log")
+        elif kind == "log":
+            candidates = ("log",)
+        elif kind in {"ready", "stopped"}:
+            candidates = (kind, "log", "status")
+        else:
+            candidates = ("log", "status")
+
+        evict_index = None
+        for candidate in candidates:
+            for index, existing in enumerate(items):
+                if isinstance(existing, dict) and existing.get("kind") == candidate:
+                    evict_index = index
+                    break
+            if evict_index is not None:
+                break
+        if evict_index is None:
+            return False
+
+        del items[evict_index]
+        frames.unfinished_tasks -= 1
+        if frames.unfinished_tasks == 0:
+            frames.all_tasks_done.notify_all()
+        frames._put(frame)
+        frames.unfinished_tasks += 1
+        frames.not_empty.notify()
+        return True
+
+
 def build_worker_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     """系统必需变量白名单 + 显式额外项；不透传完整宿主环境（§7）。"""
     env = {key: os.environ[key] for key in _SYSTEM_ENV_KEYS if key in os.environ}
@@ -362,14 +405,7 @@ class WorkerProcess:
                     break
                 if frame is None:
                     break
-                try:
-                    self._frames.put(frame, timeout=1)
-                except queue.Full:
-                    # 消费者太慢：丢弃最旧的非关键帧，保留最新状态。
-                    try:
-                        self._frames.get_nowait()
-                    except queue.Empty:
-                        pass
+                _enqueue_report_frame(self._frames, frame)
         finally:
             try:
                 self._frames.put_nowait(None)
@@ -406,6 +442,9 @@ START_TIMEOUT_SECONDS: float = 60.0
 
 # 停止预算必须大于 Core 的 10 秒关闭预算，并给归档关闭与进程退出留余量（§9.3）。
 STOP_BUDGET_MS: int = 20_000
+
+# 启动期 stop 要等构造线程看到取消并回收子进程；至少覆盖 `_reap()` 的两轮等待。
+START_CANCEL_JOIN_SECONDS: float = 5.0
 
 
 @dataclass(frozen=True)
@@ -455,6 +494,12 @@ class WorkerManager:
         self._operation: Operation | None = None
         self._operations: dict[str, Operation] = {}
         self._cancel_start = threading.Event()
+        # 启动操作只由自己的线程清理；stop 在启动期只发取消信号并等待该操作收尾。
+        self._start_complete = threading.Event()
+        self._start_complete.set()
+        self._active_start_operation_id: str | None = None
+        self._restart_in_progress = False
+        self._restart_operation_id: str | None = None
         # 停止请求的“代次”：restart 在停止阶段前记下它，停止后若变过就放弃启动阶段
         # —— 否则停止阶段的 stop 会被自己的清理动作抹掉（复审 MEDIUM）。
         self._stop_epoch = 0
@@ -515,6 +560,10 @@ class WorkerManager:
         with self._lock:
             if self._quitting:
                 return self._refused("start", revision, "quitting")
+            if self._restart_in_progress:
+                active = self._operations.get(self._restart_operation_id or "")
+                if active is not None:
+                    return active
             if self._state in (STATE_STARTING, STATE_RUNNING, STATE_STOPPING):
                 in_flight = self._operation
                 if in_flight is not None:
@@ -522,12 +571,20 @@ class WorkerManager:
             self._cancel_start.clear()
             operation = self._new_operation("start", revision)
             self._state = STATE_STARTING
-            self._spawn(self._do_start, operation)
+            self._start_complete.clear()
+            self._active_start_operation_id = operation.operation_id
+            self._spawn(self._run_start, operation)
             return operation
 
     def stop(self) -> Operation:
         """停止 Worker；已停止时返回一个立即完成的 finished 操作（幂等）。"""
         with self._lock:
+            if self._restart_in_progress:
+                self._cancel_start.set()
+                self._stop_epoch += 1
+                active = self._operations.get(self._restart_operation_id or "")
+                if active is not None:
+                    return active
             if self._state == STATE_STOPPED:
                 # 停一个本来就停着的东西：不留「取消启动」意图，否则之后的
                 # restart 会把它当成「刚被停止取消」而静默不动（审查 I1）。
@@ -537,12 +594,15 @@ class WorkerManager:
                 self._cancel_start.clear()
                 operation = self._new_operation("stop", None)
                 return self._finish(operation, OP_FINISHED, "stopped")
+            cancelled_start = self._state == STATE_STARTING
             self._cancel_start.set()  # 抢占 starting（§9.2）
             self._stop_epoch += 1
             if self._state == STATE_STOPPING and self._operation is not None:
                 return self._operation
             operation = self._new_operation("stop", None)
-            self._spawn(self._do_stop, operation)
+            # 在返回前发布 stopping，避免 start/restart 趁清理线程尚未调度而并行启动。
+            self._state = STATE_STOPPING
+            self._spawn(self._do_stop, operation, cancelled_start)
             return operation
 
     def restart(self, *, revision: int | None) -> Operation:
@@ -550,8 +610,19 @@ class WorkerManager:
         with self._lock:
             if self._quitting:
                 return self._refused("restart", revision, "quitting")
+            if self._restart_in_progress:
+                active = self._operations.get(self._restart_operation_id or "")
+                if active is not None:
+                    return active
+            if self._state in (STATE_STARTING, STATE_STOPPING):
+                # 不和其他生命周期操作并行；调用方可在当前操作完成后再次重启。
+                return self._refused("restart", revision, "operation_in_progress")
+            self._restart_in_progress = True
             operation = self._new_operation("restart", revision)
-            self._spawn(self._do_restart, operation, revision)
+            self._restart_operation_id = operation.operation_id
+            epoch = self._stop_epoch
+            self._state = STATE_STOPPING
+            self._spawn(self._do_restart, operation, revision, epoch)
             return operation
 
     def begin_quit(self) -> None:
@@ -564,6 +635,9 @@ class WorkerManager:
     def shutdown(self) -> None:
         """退出收尾：停掉 Worker 并等所有在途操作结束。"""
         self.begin_quit()
+        # 启动中的线程拥有尚未挂接 Worker 的构造与清理权；等它因 quitting
+        # 取消并回收后再做统一收尾，避免 shutdown 返回后留下新进程。
+        self._start_complete.wait()
         self._stop_synchronously()
         monitors = []
         with self._lock:
@@ -575,13 +649,23 @@ class WorkerManager:
 
     # --- 内部：操作实现 ---------------------------------------------------
 
+    def _run_start(self, operation: Operation) -> None:
+        """运行一次启动，并在所有取消/失败路径后通知等待中的 stop。"""
+        try:
+            self._do_start(operation)
+        finally:
+            with self._lock:
+                if self._active_start_operation_id == operation.operation_id:
+                    self._active_start_operation_id = None
+                    self._start_complete.set()
+
     def _do_start(self, operation: Operation) -> None:
         revision = operation.target_revision
         self._on_event("worker.starting", {"revision": revision}, "info")
         with self._lock:
             if self._quitting or self._cancel_start.is_set():
                 # 等待期间到达的退出/取消意图：不再创建新进程（§9.2、审查 I2）。
-                self._state = STATE_STOPPED
+                self._mark_start_cancelled()
                 self._finish(operation, OP_FINISHED, "cancelled")
                 return
             self._run_seq += 1
@@ -592,6 +676,10 @@ class WorkerManager:
                 self._platform, spec, instance_id=self._instance_id, run_id=run_id
             )
         except Exception as exc:
+            if self._cancel_start.is_set() or self._quitting:
+                self._mark_start_cancelled()
+                self._finish(operation, OP_FINISHED, "cancelled")
+                return
             self._finish(operation, OP_FAILED, _worker_failure_code(exc))
             with self._lock:
                 self._state = STATE_FAILED
@@ -608,8 +696,7 @@ class WorkerManager:
             # 创建进程的这段时间里来了退出/取消：就地回收，不放进运行态。
             self.drain(worker)
             self._reap(worker)
-            with self._lock:
-                self._state = STATE_STOPPED
+            self._mark_start_cancelled()
             self._finish(operation, OP_FINISHED, "cancelled")
             return
         outcome = self._wait_ready(worker)
@@ -628,22 +715,40 @@ class WorkerManager:
                 if self._worker is worker:
                     self._worker = None
             self._reap(worker)
-            with self._lock:
-                self._state = STATE_STOPPED if reason == "cancelled" else STATE_FAILED
-                self._exit_reason = None if reason == "cancelled" else reason
+            if reason == "cancelled":
+                self._mark_start_cancelled()
+            else:
+                with self._lock:
+                    self._state = STATE_FAILED
+                    self._exit_reason = reason
             self._finish(operation, OP_FINISHED if reason == "cancelled" else OP_FAILED, reason)
             if reason != "cancelled":
                 self._on_event("worker.start_failed", {"reason": reason}, "warning")
             return
         self.drain(worker)
         with self._lock:
-            self._state = STATE_RUNNING
-            self._exit_reason = None
-            self._forced_stop = False
-            self._running_revision = revision
+            cancelled = self._quitting or self._cancel_start.is_set()
+            if not cancelled:
+                self._state = STATE_RUNNING
+                self._exit_reason = None
+                self._forced_stop = False
+                self._running_revision = revision
+        if cancelled:
+            self._reap(worker)
+            with self._lock:
+                self._worker = None
+            self._mark_start_cancelled()
+            self._finish(operation, OP_FINISHED, "cancelled")
+            return
         self._start_monitor(worker)
         self._finish(operation, OP_FINISHED, "running")
         self._on_event("worker.started", {"revision": revision, "pid": worker.pid}, "info")
+
+    def _mark_start_cancelled(self) -> None:
+        """取消启动后先保留生命周期门槛，等 stop/restart 操作完成再开放新启动。"""
+        with self._lock:
+            self._state = STATE_STOPPED if self._quitting else STATE_STOPPING
+            self._exit_reason = None
 
     def _wait_ready(self, worker: WorkerProcess) -> str:
         """等 ready；返回 `ready` / `cancelled` / `exited` / `timeout`（§9.2）。
@@ -699,52 +804,81 @@ class WorkerManager:
                 return
             self._consume(frame)
 
-    def _do_stop(self, operation: Operation) -> None:
+    def _do_stop(self, operation: Operation, cancelled_start: bool = False) -> None:
+        if cancelled_start:
+            # Worker 构造期间 `_worker` 尚未挂接。启动线程持有创建与回收所有权，
+            # stop 只等它观察取消、回收半初始化进程，避免清除信号或双重 close。
+            if not self._start_complete.wait(
+                max(self._stop_budget_ms / 1000, START_CANCEL_JOIN_SECONDS)
+            ):
+                # 保持 stopping 状态，禁止并发启动；启动线程若稍后完成会自行回收并转 stopped。
+                self._finish(operation, OP_FAILED, "start_cleanup_timeout")
+                self._on_event(
+                    "worker.stop_failed", {"reason": "start_cleanup_timeout"}, "warning"
+                )
+                return
+            with self._lock:
+                self._state = STATE_STOPPED
+                self._exit_reason = None
+                self._running_revision = None
+            self._finish(operation, OP_FINISHED, "cancelled")
+            self._on_event("worker.stopped", {"result": "cancelled"}, "info")
+            return
         with self._lock:
-            # 停止落在 starting 上等于「取消这次启动」：进程还没进入运行态，
-            # 因此强制结束也不算「在处理中被打断」（§9.2）。
-            cancelled_start = self._state == STATE_STARTING
             self._state = STATE_STOPPING
         result = self._stop_synchronously(cancelled_start=cancelled_start)
         self._finish(operation, OP_FINISHED, result)
         self._on_event("worker.stopped", {"result": result}, "info")
 
-    def _do_restart(self, operation: Operation, revision: int | None) -> None:
+    def _do_restart(self, operation: Operation, revision: int | None, epoch: int) -> None:
         with self._lock:
-            cancelled_start = self._state == STATE_STARTING
-            epoch = self._stop_epoch
+            cancelled_start = False
             self._state = STATE_STOPPING
-        self._stop_synchronously(cancelled_start=cancelled_start)
-        with self._lock:
-            superseded = self._quitting or self._stop_epoch != epoch
-        if superseded:
-            # 停止阶段里又来了一个 stop/退出：重启意图作废，不再起新进程。
-            self._finish(operation, OP_FINISHED, "stopped")
-            return
-        with self._lock:
-            self._state = STATE_STARTING
-        start_op = Operation(
-            operation_id=operation.operation_id,
-            kind="start",
-            state=OP_RUNNING,
-            result=None,
-            target_revision=revision,
-            started_at=operation.started_at,
-        )
-        self._do_start(start_op)
-        with self._lock:
-            finished = self._operations[operation.operation_id]
-            final = Operation(
-                operation_id=finished.operation_id,
-                kind="restart",
-                state=finished.state,
-                result=finished.result,
+        try:
+            self._stop_synchronously(cancelled_start=cancelled_start)
+            with self._lock:
+                superseded = self._quitting or self._stop_epoch != epoch
+            if superseded:
+                # 停止阶段里又来了一个 stop/退出：重启意图作废，不再起新进程。
+                self._finish(operation, OP_FINISHED, "stopped")
+                return
+            with self._lock:
+                self._cancel_start.clear()
+                self._state = STATE_STARTING
+                self._start_complete.clear()
+                self._active_start_operation_id = operation.operation_id
+            start_op = Operation(
+                operation_id=operation.operation_id,
+                kind="start",
+                state=OP_RUNNING,
+                result=None,
                 target_revision=revision,
                 started_at=operation.started_at,
-                finished_at=finished.finished_at,
             )
-            self._operations[operation.operation_id] = final
-            self._operation = final
+            self._run_start(start_op)
+            with self._lock:
+                finished = self._operations[operation.operation_id]
+                if finished.result == "cancelled":
+                    # 手动 stop 在 restart 的新 Worker 启动期间取消了它；门槛
+                    # 直到组合操作完成前一直保持关闭，此处再落到 stopped。
+                    self._state = STATE_STOPPED
+                    self._exit_reason = None
+                final = Operation(
+                    operation_id=finished.operation_id,
+                    kind="restart",
+                    state=finished.state,
+                    result=finished.result,
+                    target_revision=revision,
+                    started_at=operation.started_at,
+                    finished_at=finished.finished_at,
+                )
+                self._operations[operation.operation_id] = final
+                self._operation = final
+        finally:
+            with self._lock:
+                if self._restart_operation_id == operation.operation_id:
+                    self._restart_in_progress = False
+                    self._restart_operation_id = None
 
     def _stop_synchronously(self, *, cancelled_start: bool = False) -> str:
         """停止并回收当前 Worker；返回固定结果码（stopped / cancelled / forced_stop / failed）。"""
@@ -754,7 +888,6 @@ class WorkerManager:
         if worker is None:
             with self._lock:
                 self._state = STATE_STOPPED
-                self._cancel_start.clear()
             return "stopped"
         worker.request_stop()
         code = worker.wait(self._stop_budget_ms)
@@ -787,7 +920,6 @@ class WorkerManager:
                 self._state = STATE_STOPPED
                 self._exit_reason = None
                 result = "stopped"
-        self._cancel_start.clear()
         self._last_status = None
         self._running_revision = None
         return result
@@ -823,8 +955,13 @@ class WorkerManager:
                 self._state = STATE_FAILED
                 self._exit_reason = f"exit_{code}"
                 # 进程没了：快照与运行版本不能再冒充当前事实（复审 N-5）。
+                self._worker = None
                 self._last_status = None
                 self._running_revision = None
+            # 已退出的 Worker 不再有其它线程负责回收；不要让后续 start 覆盖掉最后
+            # 一个引用而泄漏 Job、进程与管道句柄。
+            self.drain(worker)
+            worker.close()
             self._on_event("worker.exited", {"reason": f"exit_{code}"}, "warning")
 
         with self._lock:
@@ -884,6 +1021,9 @@ def _worker_failure_code(exc: BaseException) -> str:
     if isinstance(exc, WorkerError):
         return str(exc)
     if name == "DataLockError":
+        code = str(exc)
+        if code in {"account_in_use", "account_lock_unavailable", "account_lock_invalid_identity"}:
+            return code
         return "data_in_use"
     if name == "ConfigServiceError" or name == "ConfigConflict":
         return "config_unavailable"

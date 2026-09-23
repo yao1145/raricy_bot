@@ -38,6 +38,7 @@ from .platform import InstanceGuard, LauncherPlatform
 from .process_manager import (
     START_TIMEOUT_SECONDS,
     STOP_BUDGET_MS,
+    OP_FAILED,
     WorkerManager,
     WorkerSpec,
     default_worker_spec,
@@ -77,6 +78,7 @@ class Controller:
         self._started_at = clock()
         self._quit = threading.Event()
         self._ready = threading.Event()
+        self._auto_start_watcher: threading.Thread | None = None
 
         # 没有显式注入时按 §7 选择后端：系统凭据库不可用就退到**会话内存**，
         # 并在日志里说明（界面另会显示后端名与可用性）。绝不落到明文文件。
@@ -189,6 +191,9 @@ class Controller:
     def _stop_locked(self) -> None:
         """真正的关闭步骤；只在 `stop()` 的关闭锁里执行。"""
         self._manager.shutdown()
+        watcher, self._auto_start_watcher = self._auto_start_watcher, None
+        if watcher is not None and watcher is not threading.current_thread():
+            watcher.join(timeout=2)
         self._sessions.revoke_all()
         self._events.close()
         if self._server is not None:
@@ -230,9 +235,31 @@ class Controller:
             status = None
         configured = status is not None and status.state == "configured"
         if configured and self._config.start_bot_on_launch():
-            self._manager.start(revision=status.revision)
+            operation = self._manager.start(revision=status.revision)
+            watcher = threading.Thread(
+                target=self._watch_auto_start,
+                args=(operation.operation_id,),
+                name="raricy-auto-start-watch",
+                daemon=True,
+            )
+            self._auto_start_watcher = watcher
+            watcher.start()
             return
         self._open_url(self.entry_url())
+
+    def _watch_auto_start(self, operation_id: str) -> None:
+        """静默自启动失败时只打开一次管理页，让用户看到可恢复入口。"""
+        while not self._quit.is_set():
+            operation = self._manager.operation(operation_id)
+            if operation is None:
+                return
+            if operation.state == OP_FAILED:
+                if not self._quit.is_set():
+                    self._open_url(self.entry_url())
+                return
+            if operation.finished_at is not None:
+                return
+            self._quit.wait(0.1)
 
     # --- API --------------------------------------------------------------
 
