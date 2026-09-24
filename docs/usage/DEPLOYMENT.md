@@ -92,7 +92,10 @@ MCP 服务器：`exa-mcp-server@3.4.1`、`@amap/amap-maps-mcp-server@0.0.8`、`w
 （知乎不进镜像，它没有子进程）。运行阶段只使用镜像内的 Node 与这三个包，不执行 `npx`、
 `npm install` 或访问 npm registry。Compose 同时启用只读根文件系统，运行状态只写入
 `/app/data` 命名卷；三个包在运行期**不写任何文件**（静态核对：只有 wolfram 用了一次只读的
-`fs.realpathSync`），所以 `read_only: true` 与它们兼容。
+`fs.realpathSync`），所以 `read_only: true` 与它们兼容。登录成功后的公共账号锁也属于这类
+运行状态：compose 把 `XDG_STATE_HOME` 指向卷内的 `/app/data/state`，否则只读根文件系统
+加无家目录的 uid 10001 没有任何可写的默认状态目录，取锁会以 `account_lock_unavailable`
+失败。
 
 包与版本写在仓库根目录的 `mcp-tools.package.json` 里，Dockerfile 只负责
 `npm install` 它。**不要退回 `npm install <包名>` 那种写法**：一条命令装三个包时，amap 精确
@@ -1022,6 +1025,10 @@ docker compose exec bot rm /app/data/backup.db
 > 备份里**没有**对话正文——数据库本来就不存正文。但也别把备份随手放到公开的地方，
 > 里面含机器人账号的会话状态。
 
+卷里另有 `/app/data/state`（compose 用 `XDG_STATE_HOME` 指到那里，见 §2.2），存放登录后的
+公共账号锁。它只有 pid 与启动时间，锁本身由操作系统维护、随进程退出释放，因此不必单独备份，
+备份里带上的陈旧文件也无需人工清理。
+
 若启用了长期记忆（§4.2.2），卷里还多一个 `/app/data/memory` 目录，上面两种方式都会把它一起
 备走。它**含有用户私有内容**，按敏感数据管理；单独备份与恢复的步骤（停服务、先用 codec 离线
 校验、不进公开制品）见 §4.2.2。
@@ -1292,6 +1299,11 @@ Group=raricybot
 WorkingDirectory=/opt/raricy_bot
 EnvironmentFile=/etc/raricy-bot.env
 Environment=BOT_CONFIG_PATH=/opt/raricy_bot/config.yaml
+# 登录后的公共账号锁写在 OS 用户状态根下（$XDG_STATE_HOME/raricy_bot/account-locks）。
+# 必须显式设置：ProtectHome=true 与 ProtectSystem=strict 让默认的 ~/.local/state 不可写，
+# 不设就会在登录成功后以 account_lock_unavailable 失败。取值落在本单元
+# ReadWritePaths=/var/lib/raricy_bot 之内，服务用户可自行建出子目录。
+Environment=XDG_STATE_HOME=/var/lib/raricy_bot/state
 # 仅 mcp.enabled=true 时需要：stdio MCP 命令由这里的 .bin 提供（见本节开头）
 Environment=PATH=/opt/mcp-tools/node_modules/.bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/opt/raricy_bot/.venv/bin/python -m raricy_bot

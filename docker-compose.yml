@@ -1,4 +1,4 @@
-# 单副本部署（设计文档 §2.2：仅运行一个机器人实例）。
+# 单副本部署（仅运行一个机器人实例，见 docs/usage/DEPLOYMENT.md §1 第 3 条）。
 # 密钥一律通过环境变量传入，本文件不得出现任何真实取值。
 # 使用前：
 #   export RARICY_USERNAME=...
@@ -23,6 +23,13 @@ services:
     environment:
       # 容器内固定读取只读挂载的配置。
       BOT_CONFIG_PATH: /app/config.yaml
+      # 登录成功后取的公共账号锁写在 OS 用户状态根下（$XDG_STATE_HOME/raricy_bot/account-locks）。
+      # 只读根文件系统加非 root 的 uid 10001（无家目录）没有任何可写的默认位置，落不到
+      # 默认的 ~/.local/state，启动会以 account_lock_unavailable 失败；必须显式指向
+      # bot-data 卷内，才能保持上面「运行状态只写入 /app/data 命名卷」这条不变量。
+      # Docker 是单副本部署（本文件第 1 行），锁的机器级互斥在容器里
+      # 收敛为这一个卷；换成多副本或加锁的其它写者时，这条互斥不再成立。
+      XDG_STATE_HOME: /app/data/state
       # 站点与模型凭据只从宿主环境透传，缺省为空由程序以配置错误退出。
       RARICY_USERNAME: ${RARICY_USERNAME}
       RARICY_PASSWORD: ${RARICY_PASSWORD}

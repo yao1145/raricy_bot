@@ -303,15 +303,28 @@ def _launcher_protocol_version() -> int:
 
 
 def make_zip(staging_dir: Path, output: Path | None = None) -> Path:
-    """把冻结产物打成 ZIP 并附校验和（§15.1 第 6 步的首发交付形式）。"""
+    """把冻结产物打成 ZIP 并附校验和（§15.1 第 6 步的首发交付形式）。
+
+    冻结出的应用目录整体成包，条目都落在 `RaricyBotLight/` 之下；staging 根下
+    的 `build-info.json`（版本、依赖与 staging 源码树清单的校验和）额外收录为
+    `RaricyBotLight/build-info.json` —— 用户按使用手册保留并在升级时整体替换的
+    就是这个目录，构建信息随它一起走。缺这份信息时直接失败，不发不合格的包。
+
+    该清单校验和只覆盖 staging 源码树，不含冻结产物与 ZIP 自身；交付物完整性
+    以旁挂的同名 `.sha256` 为准。
+    """
     app_dir = staging_dir / "dist" / "RaricyBotLight"
     if not app_dir.is_dir():
         raise StagingError(f"没有找到冻结产物：{app_dir}")
+    build_info = staging_dir / BUILD_INFO_NAME
+    if not build_info.is_file():
+        raise StagingError(f"没有找到构建信息：{build_info}")
     target = output or (staging_dir / f"RaricyBotLight-{_packaging_version()}-win64.zip")
     with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(app_dir.rglob("*")):
             if path.is_file():
                 archive.write(path, path.relative_to(app_dir.parent))
+        archive.write(build_info, f"{app_dir.name}/{BUILD_INFO_NAME}")
     digest = hashlib.sha256(target.read_bytes()).hexdigest()
     target.with_suffix(target.suffix + ".sha256").write_text(
         f"{digest}  {target.name}\n", encoding="utf-8"

@@ -582,7 +582,23 @@ class WorkerManager:
     def stop(self) -> Operation:
         """停止 Worker；已停止时返回一个立即完成的 finished 操作（幂等）。"""
         with self._lock:
-            if self._restart_in_progress:
+            # restart 的停止/启动阶段以及之后的空档里，这次 stop 取消的是它尚未成立的
+            # 新 Worker，直接复用组合操作。但新 Worker 已经 running 时（`_restart_in_progress`
+            # 要到 `_do_restart` 的 finally 才清）取消已没有消费者，此时必须按普通 running
+            # Worker 走下面的停止路径，否则这次停止会被丢掉。
+            if self._restart_in_progress and self._state != STATE_RUNNING:
+                in_flight = self._operation
+                if (
+                    self._state == STATE_STOPPING
+                    and in_flight is not None
+                    and in_flight.kind == "stop"
+                    and in_flight.finished_at is None
+                ):
+                    # 新 Worker 已进入停止流程（例如 running 时到达的第一次 stop）：
+                    # 第二次 stop 复用那个真正的停止操作，而不是返回 restart 的组合
+                    # 快照（它到这里为止恒为 running，反映不了这次停止）。
+                    self._stop_epoch += 1
+                    return in_flight
                 self._cancel_start.set()
                 self._stop_epoch += 1
                 active = self._operations.get(self._restart_operation_id or "")
@@ -847,12 +863,12 @@ class WorkerManager:
         try:
             self._stop_synchronously(cancelled_start=cancelled_start)
             with self._lock:
-                superseded = self._quitting or self._stop_epoch != epoch
-            if superseded:
-                # 停止阶段里又来了一个 stop/退出：重启意图作废，不再起新进程。
-                self._finish(operation, OP_FINISHED, "stopped")
-                return
-            with self._lock:
+                if self._quitting or self._stop_epoch != epoch:
+                    # 停止阶段里又来了一个 stop/退出：重启意图作废，不再起新进程。
+                    # 复核与清取消必须同处一个临界区，否则两者之间到达的 stop 会被
+                    # 下面这行 clear() 抹掉，新 Worker 照样起来。
+                    self._finish(operation, OP_FINISHED, "stopped")
+                    return
                 self._cancel_start.clear()
                 self._state = STATE_STARTING
                 self._start_complete.clear()
@@ -883,7 +899,13 @@ class WorkerManager:
                     finished_at=finished.finished_at,
                 )
                 self._operations[operation.operation_id] = final
-                self._operation = final
+                # 收尾期间可能已发布了新操作（例如新 Worker 刚 running 就到达的 stop）：
+                # 只写回自己的键，不能覆盖当前在途操作（与 `_finish` 同一克落保护）。
+                if (
+                    self._operation is None
+                    or self._operation.operation_id == operation.operation_id
+                ):
+                    self._operation = final
         finally:
             with self._lock:
                 if self._restart_operation_id == operation.operation_id:
