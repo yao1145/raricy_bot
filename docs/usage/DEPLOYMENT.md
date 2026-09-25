@@ -104,11 +104,33 @@ MCP 服务器：`exa-mcp-server@3.4.1`、`@amap/amap-maps-mcp-server@0.0.8`、`w
 退出（2026-09-16）。清单里的 `overrides` 为 wolfram 单独钉一份可用的 SDK，同时不动 amap。
 换版本要同步改清单、`src/raricy_bot/capabilities.py` 的白名单和 `config.example.yaml` 的注释。
 
-国内网络可能很慢或超时。两个不改逻辑的缓解办法：
+国内网络可能很慢或超时。Dockerfile 已经为此固定了两处**构建期**下载源，不需要手工再补：
 
-- 配 `/etc/docker/daemon.json` 的 `registry-mirrors`（可用镜像站变动频繁，自行确认）；
-- 或在 `Dockerfile` 的 `RUN pip install --no-cache-dir .` 后补 `-i <可用的 PyPI 镜像>`。
-- 如果 npm registry 访问不稳定，应在 Docker 构建网络层解决；不要把运行时下载改回 `npx`。
+- PyPI：`pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple`；
+- npm：`npm config set registry https://registry.npmmirror.com`（只在 mcp-tools 阶段，
+  npm 与它写下的配置都不进最终镜像）。
+
+这两处只换下载来源，不改版本口径：装什么版本仍然只由 `mcp-tools.package.json` 与
+`overrides` 决定（D-92）。**镜像站有同步延迟**——升级包时若钉死的版本还没同步过来，
+`npm install` 会以 `ETARGET` 明确失败，不会悄悄装成另一个版本，所以看到该错误先查镜像站，
+不要直接改清单。离线或内网构建要换成自己的源时，改这两处即可。
+
+拉基础镜像仍走 Docker Hub，慢的话再配 `/etc/docker/daemon.json` 的 `registry-mirrors`
+（可用镜像站变动频繁，自行确认）。**不要把运行期的下载改回 `npx`**：镜像内不含 npm，
+运行阶段不访问任何 registry。
+
+> 现象提示：`npm install` 在非 TTY 的构建里要到依赖解析结束才打印第一行，网络慢时整步
+> 长时间没有任何输出，看起来像卡死。要在构建之外确认是「慢」还是「不通」，把清单拷到
+> 临时目录、用同一条命令加 `--loglevel=http` 复跑，它会逐个打印请求的 URL 与耗时：
+>
+> ```bash
+> mkdir -p /tmp/mcp-probe && cp mcp-tools.package.json /tmp/mcp-probe/package.json
+> docker run --rm -v /tmp/mcp-probe:/probe -w /probe node:22-bookworm-slim \
+>   sh -c 'timeout 180 npm install --omit=dev --no-audit --no-fund --loglevel=http; echo exit=$?'
+> ```
+>
+> 若它停在某个 `GET https://registry.npmjs.org/...` 不动，就是 registry 到这台机器不通；
+> 若请求都很快，问题不在网络。
 
 ---
 
@@ -1216,6 +1238,10 @@ sudo cp mcp-tools.package.json /opt/mcp-tools/package.json
 cd /opt/mcp-tools && sudo npm install --omit=dev --no-audit --no-fund
 ls /opt/mcp-tools/node_modules/.bin/   # 应有 exa-mcp-server、mcp-amap、wolfram-mcp
 ```
+
+> 这条 `npm install` 与镜像构建遇到的是同一件事：国内主机上可能长时间没有任何输出，
+> 看起来像卡住。慢的话先 `npm config set registry https://registry.npmmirror.com`
+> 再重跑，理由与限制见 §2.2。
 
 只启用的部分不必删：`config.yaml` 里没配的服务器根本不会被启动。三个命令通过
 `node_modules/.bin` 提供，所以要把它加进服务进程的 `PATH`（下面的单元文件已加）：

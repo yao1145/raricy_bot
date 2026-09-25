@@ -23,7 +23,14 @@ WORKDIR /opt/mcp-tools
 #
 # 知乎不进这个镜像：它只有远程 MCP-over-SSE，没有子进程（见 mcp/sse.py）。
 COPY mcp-tools.package.json ./package.json
-RUN npm install --omit=dev --no-audit --no-fund
+# 构建期走 npmmirror，与下面 PyPI 的清华源同理：国内构建机直连 registry.npmjs.org
+# 经常慢到没有进展 —— npm 在非 TTY 的构建里要到依赖解析结束才打印第一行，
+# 一旦网络慢，整步看起来就是卡死，并不是死锁。此配置只作用于构建期：
+# npm 与这里写下的 ~/.npmrc 都不进最终镜像（只复制 node 与 /opt/mcp-tools）。
+# 镜像站有同步延迟：按 DEPLOYMENT.md「上游取样」升级时，若钉死的版本还没同步过来，
+# install 会以 ETARGET 明确失败，不会悄悄装成另一个版本。
+RUN npm config set registry https://registry.npmmirror.com \
+    && npm install --omit=dev --no-audit --no-fund
 
 FROM python:3.12-slim-bookworm
 
