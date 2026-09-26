@@ -9,7 +9,8 @@
   管理页；静默启动与凭据检查在 L2/L3 接入。
 
 ``--startup`` 只是来源提示，不是权限边界：互斥体、生命周期门与授权偏好的
-判定都不因它而放宽。
+判定都不因它而放宽。``--no-tray`` 只关掉托盘装配（诊断与无通知区域环境用），
+其余行为与权限判定不变，管理页仍是入口。
 """
 
 from __future__ import annotations
@@ -35,18 +36,22 @@ EXIT_UNSUPPORTED = 2
 # 登录自启动入口的固定参数（INTERFACES §59）：只是来源提示，不携带任何凭据或目标。
 STARTUP_FLAG = "--startup"
 
+# 显式关闭托盘（INTERFACES §59、§61）：不建托盘，控制面与管理页照常可用。
+NO_TRAY_FLAG = "--no-tray"
+
 
 @dataclass(frozen=True)
 class EntryArgs:
     """一次入口调用的解析结果。
 
     `kind` 取 `worker` / `controller`；`startup` 只表示「由登录启动拉起」这一
-    来源事实。`worker_argv` 仅在 `kind == "worker"` 时有内容，是 `--worker`
-    之后的原样参数。
+    来源事实；`no_tray` 表示显式要求不建托盘（`--no-tray`，无托盘仍可用管理页）。
+    `worker_argv` 仅在 `kind == "worker"` 时有内容，是 `--worker` 之后的原样参数。
     """
 
     kind: str
     startup: bool
+    no_tray: bool = False
     worker_argv: tuple[str, ...] = ()
 
 
@@ -54,12 +59,16 @@ def parse_entry_args(argv: list[str]) -> EntryArgs:
     """纯函数：只看字面量，不读环境、不打印。
 
     首个参数为 `--worker` 时优先按 Worker 分派，其余参数原样透传（保持现状）；
-    否则按 Controller 分派，`--startup` 可出现在任意位置，其余未知参数照旧
-    忽略 —— 不为它们新增失败模式。
+    否则按 Controller 分派，`--startup` 与 `--no-tray` 可出现在任意位置，其余
+    未知参数照旧忽略 —— 不为它们新增失败模式。
     """
     if argv and argv[0] == "--worker":
         return EntryArgs(kind="worker", startup=False, worker_argv=tuple(argv[1:]))
-    return EntryArgs(kind="controller", startup=STARTUP_FLAG in argv)
+    return EntryArgs(
+        kind="controller",
+        startup=STARTUP_FLAG in argv,
+        no_tray=NO_TRAY_FLAG in argv,
+    )
 
 
 def _console_line(text: str) -> None:
@@ -142,6 +151,8 @@ def main(
             logger=logger,
             open_url=open_url,
             startup_launch=entry.startup,
+            # `--no-tray` 只影响托盘装配；控制面、激活与退出路径都不变（§61）。
+            use_tray=not entry.no_tray,
         )
         try:
             controller.run()

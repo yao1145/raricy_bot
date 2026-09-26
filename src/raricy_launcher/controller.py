@@ -1,15 +1,19 @@
-"""Light 桌面控制面：单实例、配置事务、进程管理、本地 API 与退出。
+"""Light 桌面控制面：单实例、配置事务、进程管理、本地 API、托盘与退出。
 
 职责边界（LIGHT_EDITION_DESIGN §3.2）：
 
 - **不做业务**：站点、模型、数据库与记忆都在 Worker 子进程里；
 - **只做控制**：本机会话与 API、配置事务（§6）、凭据（§7）、进程状态机与 IPC
-  （§9、§10）、事件缓冲与状态聚合（§12）。
+  （§9、§10）、事件缓冲与状态聚合（§12）、托盘命令端口（§61.2）。
 - 长等待都在后台线程或后台操作里，HTTP 请求只返回 `operation_id`（§9.2）。
 
 控制服务只监听回环，端口由操作系统分配；监听成功之后才发布运行元数据与
 打开管理页（§9.4）。退出时先停 Worker（经私有控制管道请求优雅停止），再关
 HTTP 服务、激活管道与互斥体（§9.3）。
+
+托盘的启停命令**不经过 HTTP**：`Controller` 自己实现 `DesktopCommands`，与
+`/api/bot/*` 走同一把生命周期门、同一个管理器、同一套稳定错误码；窗口回调只把
+结构化命令投进 `TrayCoordinator` 的队列，耗时动作在协调器线程里执行（§7.2）。
 """
 
 from __future__ import annotations
@@ -35,7 +39,7 @@ from .config_service import ConfigService, ConfigServiceError
 from .credential_store import CredentialStore, SessionMemoryStore, SystemKeyringStore
 from .events import EventService
 from .lifecycle_gate import LifecycleGate
-from .platform import InstanceGuard, LauncherPlatform
+from .platform import InstanceGuard, LauncherPlatform, PlatformError, TrayError, TrayIcon
 from .process_manager import (
     START_TIMEOUT_SECONDS,
     STOP_BUDGET_MS,
@@ -46,8 +50,39 @@ from .process_manager import (
 )
 from .session import SessionManager
 from .status_service import StatusService
+from .tray_model import TrayView
+from .tray_service import CODE_CONFIG_NOT_READY, CODE_LIFECYCLE_BUSY, CODE_QUITTING
+from .tray_service import TrayCommandError, TrayCoordinator
 
 _RUNTIME_FILE = "launcher-runtime.json"
+
+
+def _default_open_path(path: Path) -> None:
+    """用系统 shell 打开一个目录；不支持的平台抛 OSError（降级路径记类别码）。"""
+    opener = getattr(os, "startfile", None)
+    if opener is None:
+        raise OSError("open_path_unsupported")
+    opener(str(path))
+
+
+class _TraySurface:
+    """把协调器的渲染转给托盘图标；图标在创建后挂上（工厂需要协调器的 submit）。
+
+    协调器先构造、图标后创建：`on_message` 与 `surface` 互为对方的构造输入，
+    这里用一个可后挂的转发槽解开这个环。挂上之前不允许启动协调器，因此不会
+    丢掉任何一帧。
+    """
+
+    def __init__(self) -> None:
+        self._icon: TrayIcon | None = None
+
+    def attach(self, icon: TrayIcon) -> None:
+        self._icon = icon
+
+    def present(self, view: TrayView) -> None:
+        icon = self._icon
+        if icon is not None:
+            icon.present(view)
 
 
 class Controller:
@@ -63,7 +98,10 @@ class Controller:
         credential_store: CredentialStore | None = None,
         profile_id: str | None = None,
         open_url: Callable[[str], None] | None = None,
+        open_path: Callable[[Path], None] | None = None,
         startup_launch: bool = False,
+        use_tray: bool = True,
+        tray_factory: Callable[[Callable[[str], None]], TrayIcon] | None = None,
         clock: Callable[[], float] = time.monotonic,
         start_timeout: float = START_TIMEOUT_SECONDS,
         stop_budget_ms: int = STOP_BUDGET_MS,
@@ -75,8 +113,17 @@ class Controller:
         self._data_root = Path(data_root)
         self._logger = logger
         self._open_url = open_url or (lambda url: webbrowser.open(url))
+        # 打开诊断目录：默认交给系统 shell；非 Windows 明确不可用而不是静默失败。
+        self._open_path = open_path or _default_open_path
         # 登录自启动来源提示（INTERFACES §59）：本任务只保存，自动运行解析在 N4 Task 5。
         self._startup_launch = startup_launch
+        # 托盘装配（§61）：`use_tray=False` 是 `--no-tray`；工厂只服务测试注入。
+        self._use_tray = use_tray
+        self._tray_factory = tray_factory
+        self._tray: TrayIcon | None = None
+        self._coordinator: TrayCoordinator | None = None
+        # 本次退出是否由注销/关机触发：只影响 launcher.quit 事件的 status（§61）。
+        self._session_end = False
         self._clock = clock
         self._instance_id = uuid4().hex[:12]
         self._started_at = clock()
@@ -174,14 +221,36 @@ class Controller:
         )
 
     def run(self) -> None:
-        """启动并按设计 §5.2 决定是否启动 Bot、是否打开浏览器。"""
+        """启动、装配托盘、按设计 §5.2 决定是否启动 Bot，然后阻塞到退出。"""
         self.start()
         try:
+            # 托盘（含消息循环窗口）必须由当前线程拥有：窗口创建在 `_start_tray()`
+            # 的工厂里，消息循环在下面的 `_run_message_loop()` 里（§61）。
+            self._start_tray()
             self._auto_start()
             self._ready.set()
-            self._quit.wait()
+            self._run_message_loop()
         finally:
             self.stop()
+
+    def _run_message_loop(self) -> None:
+        """有托盘就占住当前线程跑消息循环，无托盘就退到退出事件上等。"""
+        tray = self._tray
+        if tray is None:
+            self._quit.wait()
+            return
+        try:
+            tray.run()
+        except (PlatformError, TrayError, OSError) as exc:
+            # 窗口/图标建不起来也要继续运行：管理页仍是可见入口，这就是降级路径。
+            self._report_tray_failure(exc)
+            try:
+                tray.close()  # 幂等；窗口本身已由 run() 的 finally 释放
+            except Exception:
+                # 兜底清理失败不改变结论：托盘已经不可用，继续走无托盘路径。
+                pass
+            self._stop_coordinator()
+            self._quit.wait()
 
     def stop(self) -> None:
         """停止 Worker、API、激活管道与互斥体；幂等（§9.3）。
@@ -198,6 +267,16 @@ class Controller:
     def _stop_locked(self) -> None:
         """真正的关闭步骤；只在 `stop()` 的关闭锁里执行。"""
         self._manager.shutdown()
+        # 停托盘协调器（有界等待），再关图标：窗口与图标的真正释放在拥有它的
+        # 线程上完成（Task 4），这里只登记关闭意图。
+        self._stop_coordinator()
+        tray, self._tray = self._tray, None
+        if tray is not None:
+            try:
+                tray.close()
+            except Exception:
+                # 收尾路径不因托盘释放失败而中断：Job 与互斥体仍要按序关闭。
+                pass
         watcher, self._auto_start_watcher = self._auto_start_watcher, None
         if watcher is not None and watcher is not threading.current_thread():
             watcher.join(timeout=2)
@@ -225,14 +304,19 @@ class Controller:
             self._logger,
             logging.INFO,
             "launcher.quit",
-            status="ok",
+            # 注销/关机触发的退出必须如实记为 session_end，不能写成优雅完成（§61）。
+            status="session_end" if self._session_end else "ok",
             trace_id=self._instance_id,
         )
         # 最后一步才置空：API 线程已经退出，重复 stop() 由此走幂等早退。
         self._api = None
 
     def request_quit(self) -> None:
+        """请求退出；有托盘就同时请它关闭消息循环（线程安全，幂等）。"""
         self._quit.set()
+        tray = self._tray
+        if tray is not None:
+            tray.request_close()
 
     def _auto_start(self) -> None:
         """首次进入：配置可用且偏好开启时静默启动；否则打开向导/修复页（§5.2）。"""
@@ -354,6 +438,133 @@ class Controller:
             )
             return activation.encode_response(ok=True, url=self.entry_url())
         return activation.encode_response(ok=False, error="unknown_command")
+
+    # --- 托盘命令端口（§61.2） --------------------------------------------
+
+    def start_bot(self) -> str:
+        """托盘入口：启动已保存版本；没有已保存配置就是 `config_not_ready`。"""
+        saved = self._load_saved_for_operation()
+        return self._dispatch_bot_operation("start", saved)
+
+    def stop_bot(self) -> str:
+        """托盘入口：停止 Worker；不要求已保存配置（与 `/api/bot/stop` 一致）。"""
+        return self._dispatch_bot_operation("stop", None)
+
+    def restart_bot(self) -> str:
+        """托盘入口：重启到已保存版本；没有已保存配置就是 `config_not_ready`。"""
+        saved = self._load_saved_for_operation()
+        return self._dispatch_bot_operation("restart", saved)
+
+    def _load_saved_for_operation(self) -> int:
+        """启停要的目标版本；读不到已保存配置时抛稳定码，不把原文带出去。"""
+        try:
+            saved = self._config.load_saved()
+        except ConfigServiceError:
+            # 元数据损坏与「还没配置」在托盘这一侧都是「配置不可用」。
+            raise TrayCommandError(CODE_CONFIG_NOT_READY) from None
+        if saved is None:
+            raise TrayCommandError(CODE_CONFIG_NOT_READY)
+        return saved.revision
+
+    def _dispatch_bot_operation(self, kind: str, revision: int | None) -> str:
+        """先取生命周期租约再派发，`finally` 释放：与 `api.py` 的 HTTP 路径完全同形。
+
+        租约只覆盖派发本身，不跨长等待；取不到门就是 `lifecycle_busy`，绝不另开
+        一条不过门的控制路径（D-132、§59）。
+        """
+        ticket = self._lifecycle.begin_operation(kind)
+        if ticket is None:
+            raise TrayCommandError(CODE_LIFECYCLE_BUSY)
+        try:
+            if kind == "start":
+                operation = self._manager.start(revision=revision)
+            elif kind == "stop":
+                operation = self._manager.stop()
+            else:
+                operation = self._manager.restart(revision=revision)
+        finally:
+            self._lifecycle.end(ticket)
+        if operation.result == "quitting":  # 管理器的结果码：退出流程已经开始
+            raise TrayCommandError(CODE_QUITTING)
+        if operation.state == OP_FAILED:  # 例如上一次重启还在途，管理器拒绝这一次
+            raise TrayCommandError(CODE_LIFECYCLE_BUSY)
+        return operation.operation_id
+
+    def status_snapshot(self) -> dict:
+        """完整状态快照；可能阻塞（读凭据库），退出流程开始后抛 `quitting`。"""
+        if self._quit.is_set():
+            raise TrayCommandError(CODE_QUITTING)
+        return self._status.snapshot()
+
+    def process_view(self) -> dict:
+        """廉价视图：只读管理器内存，无 I/O（托盘 tick 用）。"""
+        return {"process": self._manager.status(), "worker": self._manager.last_status}
+
+    def diagnostics_dir(self) -> Path:
+        """诊断日志目录（与 `diagnostics.install()` 同一个落点，§11）。"""
+        return paths.diagnostics_dir(self._data_root)
+
+    def begin_session_end(self) -> None:
+        """注销/关机：拒绝新启动、请求退出，并把本次退出记为 `session_end`。"""
+        self._session_end = True
+        self._manager.begin_quit()
+        self.request_quit()
+
+    # --- 托盘装配 ---------------------------------------------------------
+
+    def _start_tray(self) -> None:
+        """在当前线程创建托盘与协调器；失败降级为「无托盘但继续运行」（§61）。"""
+        if not self._use_tray:
+            # `--no-tray`：明确要求不建托盘，只记一条信息，不是失败。
+            log_event(self._logger, logging.INFO, "launcher.tray_disabled", status="ok")
+            return
+        surface = _TraySurface()
+        coordinator = TrayCoordinator(
+            surface=surface,
+            commands=self,
+            logger=self._logger,
+            open_url=self._open_url,
+            open_path=self._open_path,
+            events=self._events,
+        )
+        factory = self._tray_factory or self._create_platform_tray
+        try:
+            tray = factory(coordinator.submit)
+        except (PlatformError, TrayError, OSError) as exc:
+            # 托盘建不起来不影响控制面：管理页仍会按 §8.1 打开（本轮可见的修复入口）。
+            self._report_tray_failure(exc)
+            return
+        surface.attach(tray)
+        self._tray = tray
+        self._coordinator = coordinator
+        coordinator.start()
+
+    def _create_platform_tray(self, on_message: Callable[[str], None]) -> TrayIcon:
+        """默认托盘工厂：图标资源取包目录下的 assets/（与 static/ 同法，§60）。"""
+        return self._platform.create_tray(
+            icon_dir=Path(__file__).parent / "assets", on_message=on_message
+        )
+
+    def _report_tray_failure(self, exc: Exception) -> None:
+        """托盘不可用：日志与页面事件用同一个稳定码，然后继续运行。"""
+        message = str(exc)
+        stable = isinstance(exc, (PlatformError, TrayError)) and bool(message)
+        error = message if stable else type(exc).__name__
+        self._tray = None
+        log_event(
+            self._logger,
+            logging.WARNING,
+            "launcher.tray_failed",
+            status="failed",
+            error=error,
+        )
+        self._events.publish("launcher.tray_failed", level="warning", error=error)
+
+    def _stop_coordinator(self) -> None:
+        """停掉协调器线程并丢弃引用；有界等待，幂等。"""
+        coordinator, self._coordinator = self._coordinator, None
+        if coordinator is not None:
+            coordinator.stop(timeout=2)
 
     # --- Worker -----------------------------------------------------------
 

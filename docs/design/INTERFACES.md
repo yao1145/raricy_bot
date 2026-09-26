@@ -907,10 +907,14 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 [生命周期门](../../src/raricy_launcher/lifecycle_gate.py)、[控制器](../../src/raricy_launcher/controller.py)。
 
 - **入口参数与来源提示**（§9.4）：`--worker` 仍优先按 Worker 分派，其后参数原样透传；
-  否则按 Controller 入口解析，只识别字面量 `--startup`（可出现在任意位置），其余参数
-  照旧忽略。`--startup` 只是来源提示、**不是权限边界**（互斥体、生命周期门与授权偏好
-  的判定都不放宽）；已有实例时静默去重退出并记一条 `launcher.startup_deduped`，
-  不沿用 `open_admin` 激活分支、不打开浏览器，激活协议与命令集合不变。
+  否则按 Controller 入口解析，只识别字面量 `--startup` 与 `--no-tray`（都可出现在任意
+  位置），其余参数照旧忽略。`--startup` 只是来源提示、**不是权限边界**（互斥体、生命周期门
+  与授权偏好的判定都不放宽）；已有实例时静默去重退出并记一条 `launcher.startup_deduped`，
+  不沿用 `open_admin` 激活分支、不打开浏览器，激活协议与命令集合不变。`--no-tray` 只关掉
+  托盘装配（记一条 `launcher.tray_disabled`），控制面、激活与退出路径都不变。
+- **托盘命令入口**（§61.2、D-140）：托盘的命令**不经过 HTTP** —— `Controller` 自己实现
+  `tray_service.DesktopCommands`，与 `/api/bot/*` 共用同一把生命周期门、同一个管理器与
+  同一套稳定码；窗口回调只投递结构化命令，耗时动作在协调器线程里执行（§7.2）。
 - **会话**（§8.1）：引导令牌单次、限时（120 秒），经 URL fragment 交付；兑换成功即发放
   HttpOnly + SameSite=Strict 的会话 Cookie，并回一个会话绑定的 CSRF 值。兑换按 60 秒窗口限次，
   窗口会滚动，本机他人刷满也不能把用户永久挡在门外。会话只存内存，Controller 重启即全部失效。
@@ -999,10 +1003,11 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 
 ## 61. Windows 托盘
 
-入口：[视图模型](../../src/raricy_launcher/tray_model.py)、[文案](../../src/raricy_launcher/texts.py)、
-[状态聚合](../../src/raricy_launcher/status_service.py)。协调器的命令端口与降级路径、
-窗口层的系统事件合同随对应实现补入本节；本节的词表是这些实现共用的唯一来源，
-窗口层不认识别的字符串，未列入词表的命令与事件一律忽略。
+入口：[视图模型](../../src/raricy_launcher/tray_model.py)、[协调器](../../src/raricy_launcher/tray_service.py)、
+[文案](../../src/raricy_launcher/texts.py)、[状态聚合](../../src/raricy_launcher/status_service.py)、
+[平台协议](../../src/raricy_launcher/platform/__init__.py)、[控制器](../../src/raricy_launcher/controller.py)。
+本节的词表是这些实现共用的唯一来源，窗口层不认识别的字符串，未列入词表的命令与事件
+一律忽略。窗口层（隐藏窗口、图标、系统事件）的合同随 Task 4 的实现补入本节。
 
 ### 61.1 状态与图标
 
@@ -1045,3 +1050,67 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   `session_end` 定义在 `tray_model.py`；配置与进程状态字面量（`configured`、`needs_setup`、
   `needs_credentials`、`recovery`、`invalid`；`stopped`、`starting`、`running`、`stopping`、
   `failed`）与该模块的本地常量必须与 ConfigService / WorkerManager（§59）逐字一致。
+
+### 61.2 协调器与命令端口（`tray_service.py`）
+
+- **线程归属**（§7.2）：`submit()` 只把词表里的字符串放进 `queue.SimpleQueue` —— 不阻塞、
+  不做 I/O，窗口回调与 HTTP 线程都可安全调用；`start_bot` / `stop_bot` / `restart_bot` /
+  `status_snapshot` / `process_view` / `entry_url` / `diagnostics_dir` / `open_url` /
+  `open_path` / `begin_session_end` / `request_quit` **只允许在派发线程**（daemon，命名
+  `raricy-tray`）里出现。窗口层方法（`run` / `present` / `request_close` / `close`）的
+  线程归属见 §61.3 最后两条。
+- **命令端口**：协调器只依赖 `DesktopCommands` 协议（`start_bot` / `stop_bot` /
+  `restart_bot` / `status_snapshot` / `process_view` / `entry_url` / `diagnostics_dir` /
+  `begin_session_end` / `request_quit`），`Controller` 自己实现它。命令 → 动作：
+  `open_admin` → `open_url(entry_url())`（带一次性引导令牌，§8.1）；`start` / `stop` /
+  `restart` → 对应 `Controller.*_bot`，命令完成后立即完整刷新并渲染；`open_diagnostics` →
+  `open_path(diagnostics_dir())`；`quit` → `request_quit()`；`session_end` →
+  `begin_session_end()`；`taskbar_created` / `session_query` 只重画一次（任务栏重建不重启
+  任何东西；关机询问可能被取消，所以不声明正在退出）。未识别消息忽略并记
+  `launcher.tray_message_ignored`（只有类别码，不带消息原文）。
+- **与 HTTP 同门同码**：三个启停方法先 `begin_operation("start"|"stop"|"restart")`，取不到门
+  抛 `TrayCommandError("lifecycle_busy")`，再调管理器，`finally` 里 `end(ticket)` —— 与
+  §59 的 `/api/bot/*` 完全同形；租约只覆盖派发，不跨长等待。`start` / `restart` 要求
+  `load_saved()` 非空并用它的 `revision` 作为目标版本，否则 `config_not_ready`；
+  `stop` 不要求已保存配置。管理器回 `result == "quitting"` 或 `state == failed` 时，
+  分别抛 `quitting` / `lifecycle_busy`。
+- **稳定码**：`TrayCommandError.code` 只有 `config_not_ready` / `lifecycle_busy` /
+  `quitting` / `tray_internal` 四种。被拒绝的命令只记类别码：日志与页面事件都用
+  `launcher.tray_command_failed`（`status="rejected"`、`error=<码>`），原始异常正文不进
+  日志、不进事件；**不弹任何对话框**。`status_snapshot()` 在退出流程开始后抛 `quitting`，
+  协调器据此把图标切到「正在退出」并不再读凭据库。
+- **刷新节流**（保护凭据库）：每个 tick（`TICK_SECONDS`，默认 1 秒）只用 `process_view()`
+  重算进程状态与 `snapshot_freshness(...)`（无 I/O）；完整 `status_snapshot()` 只在四种
+  时机调用 —— 协调器启动、任何命令执行完成、收到 `power_resume`、`FULL_REFRESH_SECONDS`
+  （30 秒）边界到期。订阅了事件服务时，只有 `REFRESH_EVENTS` 那六个生命周期事件
+  （`worker.starting` / `worker.started` / `worker.ready` / `worker.stopped` /
+  `worker.exited` / `worker.start_failed`）额外触发完整刷新；聊天/日志类事件一律不触发，
+  否则每条消息都会读一次凭据库。`events.subscribe()` 返回 `None`（订阅者已满）不算失败，
+  `_run()` 的 `finally` 必然 `unsubscribe`。
+- **电源与渲染**：`power_suspend` → 电源 `suspended`（睡眠前不声明在线）；`power_resume` →
+  `awaiting_report` 并记下发时刻，之后每个 tick 用廉价视图等到一条
+  `sampled_at >= 恢复时刻` 的上报才回到 `active`（Core 的重连能力不动，托盘只如实显示）。
+  视图与上次相同就不重复 `present()`；`present()` 抛异常记 `launcher.tray_present_failed`
+  （`error=<类型名>`）并继续，绝不退出派发线程。
+
+### 61.3 装配、降级与退出顺序（`controller.py`）
+
+- **装配**（`Controller.run()`）：`start()`（API 与激活管道，后台线程）→ `_start_tray()`
+  （**当前线程**创建托盘与协调器）→ `_auto_start()` → `ready` → 有托盘跑 `tray.run()`
+  消息循环，无托盘退回退出事件 → `finally: stop()`。默认托盘工厂用包目录下的
+  `assets/` 建图标（与 `static/` 同法，§60）；`tray_factory` / `open_path` / `use_tray`
+  是测试与 `--no-tray` 的注入缝。
+- **降级**：托盘创建失败或消息循环启动失败（`PlatformError` / `TrayError` / `OSError`）时
+  记 `launcher.tray_failed` 并发布同码（`error` 是稳定类别码），置空托盘后**继续运行** ——
+  管理页仍会按 §8.1 打开，这是没有托盘时的可见入口。`--no-tray` 只记一条
+  `launcher.tray_disabled`（info），不算失败。两条路径都不新建第二条控制路径。
+- **退出顺序**：`request_quit()` 置退出事件后，若托盘在则再 `tray.request_close()`；
+  `_stop_locked()` 的顺序是 `manager.shutdown()` → `coordinator.stop(timeout=2)` →
+  `tray.close()` → 其余收尾（会话、事件、HTTP、激活管道、元数据、互斥体）不变。
+  `coordinator.stop()` 有界等待派发线程，超时也继续收尾。`launcher.quit` 在本次退出
+  由 `begin_session_end()`（注销/关机）触发时用 `status="session_end"`，不得写成优雅完成。
+- **`present()` 的窗口未就绪语义**：首帧可能在消息循环开始前就呈现（`run()` 还在当前
+  线程里排队），窗口层必须把视图**存下来**，并在图标加入通知区域后应用它，不能把这一帧
+  当空操作丢掉。真正的窗口与图标释放在拥有窗口的线程上完成，`close()` 幂等。
+  `TrayIcon` 协议与 `TrayError` 定义在 `platform/__init__.py`（非 Windows 平台仍由
+  `get_platform()` 的既有 `PlatformError("unsupported_platform")` 拦住，不新增平台分支）。

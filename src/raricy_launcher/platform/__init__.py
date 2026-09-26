@@ -1,4 +1,4 @@
-"""平台抽象边界：单实例、激活通道、Job 回收与父子管道。
+"""平台抽象边界：单实例、激活通道、Job 回收、父子管道与托盘图标。
 
 业务模块只依赖这里的协议与错误类型，不直接 import pywin32 或其他系统
 绑定。首版只有 Windows 实现；其他平台拿到的是明确的不支持错误，而不是
@@ -9,11 +9,22 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Callable, Sequence
-from typing import Protocol, runtime_checkable
+from pathlib import Path
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+if TYPE_CHECKING:  # 只在类型标注里用，平台层不在 import 期依赖托盘视图模型
+    from ..tray_model import TrayView
 
 
 class PlatformError(Exception):
     """平台能力不可用的固定错误；消息是稳定类别，不拼接系统原始错误文本。"""
+
+
+class TrayError(Exception):
+    """托盘窗口或图标不可用的固定错误；消息是稳定类别码（如 `tray_window_failed`）。
+
+    与 `PlatformError` 同一条口径：绝不拼接系统原始错误文本，调用方按码降级。
+    """
 
 
 @runtime_checkable
@@ -140,6 +151,31 @@ class SuspendedProcess(Protocol):
 
 
 @runtime_checkable
+class TrayIcon(Protocol):
+    """通知区域图标（N3；契约见 INTERFACES §61）。
+
+    一个图标 = 一个隐藏的顶层窗口 + 消息循环：窗口必须在**创建它的线程**上跑
+    `run()`，其余方法线程安全，不要求同线程调用。
+    """
+
+    def run(self) -> None:
+        """在调用线程创建窗口与图标并跑消息循环；窗口不可用抛 TrayError。"""
+        ...
+
+    def present(self, view: TrayView) -> None:
+        """呈现视图（图标、tooltip、菜单）；线程安全，窗口销毁后是空操作。"""
+        ...
+
+    def request_close(self) -> None:
+        """请求关闭消息循环；线程安全，未创建/已销毁是空操作。"""
+        ...
+
+    def close(self) -> None:
+        """幂等释放；真正的窗口与图标释放在拥有窗口的线程上完成。"""
+        ...
+
+
+@runtime_checkable
 class LauncherPlatform(Protocol):
     """桌面入口依赖的平台能力集合。"""
 
@@ -178,6 +214,17 @@ class LauncherPlatform(Protocol):
         """以挂起主线程创建子进程；参数数组、明确 cwd、无控制台窗口。
 
         `stdout_handle` 非空时子进程的 stdout/stderr 都接到该句柄。
+        """
+        ...
+
+    def create_tray(
+        self, *, icon_dir: Path, on_message: Callable[[str], None]
+    ) -> TrayIcon:
+        """创建托盘图标对象；窗口在 `run()` 里才真正建立。
+
+        `icon_dir` 是含三个 `.ico` 的目录（§60）；`on_message` 只接受
+        `tray_model` 词表里的命令/事件字符串，由它投递给协调器。能力不可用
+        抛 TrayError（非 Windows 平台由 `get_platform()` 的既有 PlatformError 拦住）。
         """
         ...
 
