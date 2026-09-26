@@ -17,3 +17,10 @@ ENTRY_INTERNAL_ERROR: str = "启动失败，请查看诊断日志后重试。"
 
 # 管理页原型（L0）的退出结果。
 QUIT_ACKNOWLEDGED: str = "已退出，可以关闭本页。"
+
+# 凭据删除（F1）：N2 交付完整清除前，配置页与接口都只支持保持不变/替换。
+# 接口用这条固定文案说明「暂不支持」及当下的替代做法，避免把它读成「缺凭据」。
+CREDENTIAL_DELETE_UNAVAILABLE: str = (
+    "当前版本暂不支持删除已保存的凭据，清除功能将在后续版本提供；"
+    "需要立即撤销时，请在 Windows「凭据管理器」中删除 RaricyBotLight 的条目。"
+)

@@ -70,18 +70,32 @@ CSP_POLICY: str = (
 
 
 class ApiError(Exception):
-    """把服务层异常映射成 HTTP 状态与稳定码（§11）。"""
+    """把服务层异常映射成 HTTP 状态与稳定码（§11）。
 
-    def __init__(self, status: int, code: str, *, field: str | None = None) -> None:
+    `message` 只在稳定码本身不足以说明用户能做什么时附带，取值来自
+    `texts.py` 的固定文案；它不是第二种信封，也不透传服务层异常文本。
+    """
+
+    def __init__(
+        self,
+        status: int,
+        code: str,
+        *,
+        field: str | None = None,
+        message: str | None = None,
+    ) -> None:
         super().__init__(code)
         self.status = status
         self.code = code
         self.field = field
+        self.message = message
 
     def payload(self) -> dict:
         body: dict[str, Any] = {"ok": False, "code": self.code}
         if self.field:
             body["field"] = self.field
+        if self.message:
+            body["message"] = self.message
         return body
 
 
@@ -307,7 +321,17 @@ class LocalApi:
                     raise ApiError(422, "credential_value_required", field=name)
                 updates[name] = CredentialUpdate.replace(value)
             elif action == ACTION_DELETE:
-                updates[name] = CredentialUpdate.delete()
+                # F1：配置页与接口都只支持保持不变/替换，完整清除在 N2 交付。这里
+                # 如实回「暂不支持」，而不是转成 CredentialUpdate.delete() 让提交在
+                # 置空后撞上必填校验、把原因误报成 `credentials_required`
+                # （用户会以为只是没填凭据，也看不出功能本来就不存在）。
+                # 动作常量与该分支保留在 config_service，供后续阶段复用。
+                raise ApiError(
+                    409,
+                    "credential_delete_unavailable",
+                    field=name,
+                    message=texts.CREDENTIAL_DELETE_UNAVAILABLE,
+                )
             else:
                 raise ApiError(422, "invalid_credential_action", field=name)
         return updates

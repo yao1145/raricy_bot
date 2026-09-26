@@ -828,7 +828,8 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   路径判定一律先规范化（绝对、解析链接/重解析点、大小写）再做包含检查：档案内的存储、
   记忆、知识与归档目录必须落在当前档案目录内（D-122 的路径口径见 §9.5）。
 - **配置三个对象**（§6.1）：`EditableConfig` 是表单可编辑字段的白名单（`EDITABLE_FIELDS`），
-  `CredentialUpdate` 是 keep/replace/delete 三种凭据操作，`Config` 仍是 Core 的冻结运行配置。
+  `CredentialUpdate` 是 keep/replace/delete 三种凭据操作（delete 目前只保留在服务层，
+  API 入口会拒绝，见 §59 的「凭据删除」），`Config` 仍是 Core 的冻结运行配置。
   Launcher 掌控的字段（站点地址、档案内路径、探针监听、MCP/发文关闭）由基线映射提供，
   不接受提交；不在白名单里的键**拒绝**而不是静默忽略。
 - **提交协议**（§6.4）：`expected_revision` 不符即 `ConfigConflict`；校验（字段 + Light 策略 +
@@ -888,9 +889,17 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   读接口显式构造响应：只含可编辑字段、revision、账号与「凭据已配置/后端可用」三态，
   不返回凭据取值，也不返回可用于读取凭据的引用。校验失败回 422（`field` + 稳定码），
   revision 冲突回 409。
+- **凭据删除**（§7，D-131）：提交只接受 `keep` / `replace`；凭据项写成
+  `{"action": "delete"}` 时，在任何写入之前立即回 409 `credential_delete_unavailable`，
+  `field` 是该凭据名，响应另带 `message`（`texts.py` 的固定文案）说明暂不可用与手工撤销
+  步骤。删除入口也不在页面上。不得把该动作继续转成 `CredentialUpdate.delete()` 后让提交
+  撞上必填校验 —— 那样用户看到的 `credentials_required` 把「功能未交付」说成了「凭据没填」。
+  配置页与服务层仍保留 delete 动作本身（`ACTION_DELETE`、`CredentialUpdate.delete()`、
+  `commit()` 的置空分支），完整清除在 N2 交付（D-131）。
 - **服务层错误边界**（§11）：`ConfigServiceError` 及其子类由**应用级处理器**兜底，任何
   路由（包括在 `except ApiError` 之外调用服务层的启动/重启与知识库导入）都回同一套 JSON
-  信封 `{"ok": false, "code": <稳定码>}`：冲突与配置服务态 409、字段校验 422；不能落成
+  信封 `{"ok": false, "code": <稳定码>}`：冲突与配置服务态 409、字段校验 422；个别稳定码
+  另带 `message`（`texts.py` 的固定文案，如 `credential_delete_unavailable`）。不能落成
   Starlette 的纯文本 500，否则恢复态下用户看不到诊断码。新增调用点自动被覆盖，不靠逐处
   包 try。
 - **进程面**（§9.2）：`POST /api/bot/{start,stop,restart}` 立刻返回 `operation_id`（202），

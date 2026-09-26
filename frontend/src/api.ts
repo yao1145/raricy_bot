@@ -7,18 +7,23 @@ export interface ApiFailure {
   ok: false;
   code: string;
   field?: string;
+  /** 服务端 `texts.py` 的固定文案；只有稳定码不足以说明时才出现。 */
+  message?: string;
 }
 
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
   readonly field: string | null;
+  /** 服务端固定文案；不覆盖 Error.message（那里放稳定码，便于日志定位）。 */
+  readonly detail: string | null;
 
-  constructor(status: number, code: string, field: string | null) {
+  constructor(status: number, code: string, field: string | null, detail: string | null = null) {
     super(code);
     this.status = status;
     this.code = code;
     this.field = field;
+    this.detail = detail;
   }
 }
 
@@ -89,7 +94,8 @@ function failure(status: number, body: unknown): ApiError {
   const payload = (body ?? {}) as Partial<ApiFailure>;
   const code = typeof payload.code === "string" ? payload.code : "request_failed";
   const field = typeof payload.field === "string" ? payload.field : null;
-  return new ApiError(status, code, field);
+  const detail = typeof payload.message === "string" ? payload.message : null;
+  return new ApiError(status, code, field, detail);
 }
 
 export interface StatusSnapshot {

@@ -1,6 +1,7 @@
 <script lang="ts">
   // Simple / Advanced 配置与凭据状态（设计 §5.3、§6、§7）。
-  // 保存走同一个配置事务；凭据用 keep / replace / delete 三种操作表达。
+  // 保存走同一个配置事务；凭据只提供 keep / replace 两种操作（删除暂不可用，
+  // 服务端对 delete 一律回 409 `credential_delete_unavailable`，见 D-131）。
   import * as api from "./api";
   import { FIELDS, LEVELS, fromInput, toInput, type FieldSpec } from "./fields";
 
@@ -17,8 +18,8 @@
   let account = $state("");
   let password = $state("");
   let apiKey = $state("");
-  let passwordAction = $state<"keep" | "replace" | "delete">("keep");
-  let apiKeyAction = $state<"keep" | "replace" | "delete">("keep");
+  let passwordAction = $state<"keep" | "replace">("keep");
+  let apiKeyAction = $state<"keep" | "replace">("keep");
   let startOnLaunch = $state(false);
 
   let kbFile = $state("knowledge.md");
@@ -155,7 +156,10 @@
   function describe(error: unknown): string {
     if (error instanceof api.ApiError) {
       if (error.status === 401) return "会话已失效，请从桌面图标重新打开管理页。";
-      if (error.status === 409) return CONFLICT_TEXT[error.code] ?? `操作冲突：${error.code}`;
+      // 无本地条目的稳定码用服务端固定文案（例如删除凭据暂不可用），页面不自行翻译。
+      if (error.status === 409)
+        return CONFLICT_TEXT[error.code] ?? error.detail ?? `操作冲突：${error.code}`;
+      if (error.detail) return error.detail;
       if (error.field) return `字段有问题：${error.field}（${error.code}）`;
       return `操作失败：${error.code}`;
     }
@@ -227,7 +231,6 @@
         <select bind:value={passwordAction}>
           <option value="keep">保持不变</option>
           <option value="replace">替换为新值</option>
-          <option value="delete">删除</option>
         </select>
       </label>
       {#if passwordAction === "replace"}
@@ -237,7 +240,6 @@
         <select bind:value={apiKeyAction}>
           <option value="keep">保持不变</option>
           <option value="replace">替换为新值</option>
-          <option value="delete">删除</option>
         </select>
       </label>
       {#if apiKeyAction === "replace"}
