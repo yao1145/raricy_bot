@@ -852,14 +852,40 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   （返回空映射，首次运行要靠它）、`OSError`（`metadata_unreadable`，权限/占用错误不得当成
   空元数据）与「读到了但不能用」。后者再分三码：`metadata_corrupt`（非 UTF-8 字节、YAML
   语法错误、顶层不是映射、`schema_version` 类型不对）、`metadata_unsupported_version`
-  （`schema_version` 大于本程序的 `SCHEMA_VERSION`）、`metadata_pointer_invalid`（文件可读
-  且是映射，但 `active_profile` 缺失或不是合法档案 ID；元数据文件缺失但 `profiles/` 下已有
-  档案目录同样按此处理，因为指针无从解析）。缺 `schema_version` 是既有文件的正常形态，
-  不算版本未知。四种码互相可区分，经 `status()` 映射为 `recovery`（`error` 承载具体码，
-  不抛异常），不是 `needs_setup`。**查询不修复、不创建、不覆盖**：只有「元数据文件不存在
-  **且** `profiles/` 下没有任何既有档案目录」才允许 `require_profile()` 建立第一个档案；
+  （`schema_version` 大于本程序的 `LAUNCHER_SCHEMA_VERSION`）、`metadata_pointer_invalid`
+  （文件可读且是映射，但 `active_profile` 缺失或不是合法档案 ID；元数据文件缺失但
+  `profiles/` 下已有档案目录同样按此处理，因为指针无从解析）。缺 `schema_version` 是
+  既有文件的正常形态，不算版本未知。四种码互相可区分，经 `status()` 映射为
+  `recovery`（`error` 承载具体码，不抛异常），不是 `needs_setup`。**查询不修复、不创建、
+  不覆盖**：只有「元数据文件不存在
+  **且** `profiles/` 下没有任何既有档案目录」才允许 `ensure_first_profile()` 建立第一个
+  档案（`require_profile()` 保留并委托给它，既有调用方行为不变）；
   读取路径（`status()`、`load_saved()`、`load_draft()`）不改文件、不建目录、不改指针；
   `set_active_profile()` 与提交在读元数据失败时直接失败，损坏现场字节不变。
+- **固定档案绑定与查询不创建**（N1、D-133）：查询路径一律经只读的 `profile_or_none()`
+  解析档案目录（无档案返回 `None`），`load_saved()`、`load_draft()`、`validate_values()`、
+  `status()` 因此都不建目录、不写指针 —— 真正空的根目录上 `status()` 报 `needs_setup`
+  且根目录不出现任何新文件。唯一创建入口是写路径的 `ensure_first_profile()`：条件与
+  D-130 相同，且在同一次写入里落 `active_profile`、`active_epoch`（`(既有值 or 0) + 1`）
+  与 `catalog_revision`（同式），不产生「指针有了但目录字段没写」的中间态。
+  `ConfigService.for_profile(profile_id)` 返回绑定实例：共享数据根、凭据库与**同一把
+  进程内写锁**（构造参数 `lock=` 可注入，缺省自建）；绑定实例的 `profile()` 直接由
+  `profile_id` 求目录、完全不读 `launcher.json`，`status()` 只报该档案自身的状态。
+  目录字段的窄写入口是 `update_catalog(changes)`：写锁内「读—改—原子写」且先读后写
+  （读失败直接抛、绝不覆盖现场），只接受 `active_profile`（`validate_profile_id` 校验）、
+  `active_epoch` / `catalog_revision`（非负整数，拒绝 `bool`）与 `schema_version`
+  （只允许升到 `LAUNCHER_SCHEMA_VERSION`，当前值必须更小；降级与同级都报
+  `invalid_catalog_change`）。
+- **launcher schema 与档案内 schema 分开**（N1、D-133）：`CONFIG_SCHEMA_VERSION = 1` 仍是
+  档案内 `config.yaml` / `draft.yaml` 的 `_launcher.schema_version`，取值与校验口径不变
+  （`_to_saved()` 仍要求相等）；`LAUNCHER_SCHEMA_VERSION = 2` 是 `launcher.json` 本次写入的
+  版本，读取侧接受 1 与 2（缺字段按旧文件）。**不得隐式升级**：`set_active_profile()`
+  写指针时原样保留已有 `schema_version`，只有文件不存在的新根目录才写
+  `LAUNCHER_SCHEMA_VERSION`；升级只经 `update_catalog()` 的显式入口。
+  `light_base_mapping(profile=None)` 省略四个档案内路径字段
+  （`storage.db_path`、`knowledge_base.root_dir`、`memory.root_dir`、
+  `logging.archive.directory`），其余取值不变，仅供「还没有档案」的查询与向导临时校验；
+  正式提交路径始终传真实档案目录。
 - **运行快照**（§6.5）：`build_run_launch(revision)` 在写锁内**一次**取到「指定版本的运行
   快照 + 对应凭据」（分开调用会拼出旧配置配新 Key）；`build_run_config()` / `credentials_for()`
   都**必须显式给 revision**，快照写在档案自己的 `runtime/` 下，换档案不会互相覆盖。
@@ -945,8 +971,11 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 - 发行构建：`tools/build_light.py` 生成 staging（Light 闭包 + 静态资源 + 构建信息），
   `--pyinstaller` 用 `light.spec` 冻结为 onedir/windowed 应用，`--zip` 打出 ZIP 与 `.sha256`。
   `build-info.json` 记录版本、协议版本、Python 版本、依赖清单与整包校验和。
-- 首次启动路径：数据根还没有活动档案时，配置服务**按需建立第一个档案**（§5.1 第 1 步），
-  管理页因此读到 `needs_setup`、向导可以直接保存 —— 把「没有档案」当错误会让首次启动失败。
+- 首次启动路径（N1、D-133）：查询路径**不再创建**首个档案 —— 数据根还没有活动档案时，
+  管理页读到 `needs_setup`、`GET /api/config` 只回默认 System Prompt 模板，根目录不出现
+  任何新文件。首个档案只由写接口（`PUT /api/config`、`PUT /api/config/draft`）经
+  `ProfileService.ensure_first_profile()` 建立（§5.1 第 1 步），向导因此仍可直接保存 ——
+  把「没有档案」当错误会让首次启动失败，而把查询当写路径会让只读访问留下档案。
 - 验收边界：`tools/smoke_light.py` 覆盖「启动 → 激活 → 会话 → 状态 → 页面与构建产物 →
   凭据后端可用 → 退出 → 元数据清理」，运行时本机不能再有另一个 Light 实例（激活通道与
   互斥体按当前用户命名）。**干净 Windows 清单（§17.2）与真实站点/模型验收仍未执行**，

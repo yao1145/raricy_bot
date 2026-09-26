@@ -1,6 +1,6 @@
 # 设计决策摘要
 
-保留 D-1–D-132 的稳定编号，只维护仍影响实现的规则、理由及替代关系。
+保留 D-1–D-133 的稳定编号，只维护仍影响实现的规则、理由及替代关系。
 签名与代码入口见 [INTERFACES.md](INTERFACES.md)。旧设计中的原文引述、实施分工和逐项讨论见
 [2026-09-20 完整快照](../archive/2026-09-20/DESIGN_DECISIONS.md)，Git 恢复方式见
 [归档索引](../ARCHIVE.md)。归档里的旧规则不能覆盖本文件或上游契约。
@@ -15,7 +15,8 @@ D-122 发文记录与 UTC+8 日历移出 `blog/`，D-123 激活管道响应交�
 D-124 配置校验接缝与错误分类，D-125 数据档案锁的标识与取得点，D-126 凭据库后端策略与引用不透明，
 D-127 配置提交的字段白名单、原子替换与凭据清理，D-128 控制面的会话与 IPC 取舍，
 D-129 前端本地打包与冻结发行，D-130 配置元数据的恢复状态（查询不修复、不创建、不覆盖），
-D-131 凭据删除先摘入口（N2 再交付完整清除），D-132 Light 控制面的站点测试与启停共用生命周期门。
+D-131 凭据删除先摘入口（N2 再交付完整清除），D-132 Light 控制面的站点测试与启停共用生命周期门，
+D-133 固定档案的 ConfigService（查询不创建、显式创建入口与分离的 launcher schema）。
 后续变更沿用编号注明替代关系，不叠加互相矛盾的补丁段落。
 
 <a id="d-1"></a>
@@ -1158,6 +1159,47 @@ F3 的落地口径（[下一代设计](LIGHT_NEXT_GENERATION.md) §1.3、§11 N0
   「跨入口（测试 vs 启停）此刻谁在跑」。租约只在 `Ticket` 上记 `kind`（`site_test` /
   `start` / `stop` / `restart`）作为互斥判据，并为 N2 的操作记录与诊断留下「当时持门的是
   谁」；N0 不引入操作日志、持久化或跨进程锁，也不改页面按钮的禁用状态。
+
+<a id="d-133"></a>
+
+## D-133 固定档案的 ConfigService：查询不创建、显式创建入口与分离的 launcher schema
+
+N1 的落地口径（[下一代设计](LIGHT_NEXT_GENERATION.md) §4.1、§5.1、§11）。修复前
+`ConfigService` 虽然支持 `profile_id=` 绑定，但查询路径仍会落回可变活动指针：
+`_config_view`（`GET /api/config`）为了取 System Prompt 默认值、`validate_values()` 与
+`GET /api/kb/status` 都会经 `profile()` → `require_profile()` 在真正空的根目录上建立首个
+档案并写指针。结果是一次纯查询留下了 `launcher.json` 与 `profiles/`，与 §4.1 末句
+「API 查询不得再隐式调用『创建首个档案』」直接冲突。
+
+- **为什么把创建改成显式入口**：读与写在磁盘上必须可区分 —— 查询（`load_saved()`、
+  `load_draft()`、`validate_values()`、`status()`）一律走只读解析 `profile_or_none()`
+  （无档案返回 `None`），只有 `ensure_first_profile()` 会建立首个档案；`require_profile()`
+  保留并委托给它，既有写路径调用方行为不变。创建条件仍是 D-130 的那一条（元数据文件
+  不存在且 `profiles/` 下没有任何既有档案目录），四类元数据故障的稳定码与语义不改；
+  指针、`active_epoch`、`catalog_revision` 在同一次写入里落盘，避免「指针有了但目录
+  字段没写」的中间态。把「没有档案」当错误会让首次启动失败，把查询当写路径则会让
+  只读访问改变现场，两种偏差都不允许。
+- **为什么绑定实例共享写锁**：`for_profile(profile_id)` 让一次请求只解析一次档案上下文，
+  后续读写都用同一实例（§4.1），因此实例数目随请求增长。若每个实例各建一把
+  `RLock`，「同一数据根只有一把进程内写锁」这条既有前提就不成立：两个请求可以同时
+  改同一份 `launcher.json` / `config.yaml`，原子替换保得住单文件完整，却保不住读—改—写
+  的串行性。锁因此作为构造参数 `lock=` 可注入，工厂把父实例的锁传给绑定实例；绑定
+  实例的读路径由 `profile_id` 直接求目录、完全不读 `launcher.json`，`status()` 只报该
+  档案自身的状态，同号 revision 不跨档案。
+- **为什么 launcher schema 与档案内 schema 分开**：两个文档的生命周期不同。档案内
+  `config.yaml` / `draft.yaml` 的 `_launcher.schema_version` 是 Core 解析契约的一部分
+  （`_to_saved()` 要求等于 `CONFIG_SCHEMA_VERSION = 1`），不能因为目录结构多了一个字段
+  就要求所有档案重写配置；`launcher.json` 则承载活动指针、`active_epoch`、
+  `catalog_revision` 与迁移状态，N1 起写入 `LAUNCHER_SCHEMA_VERSION = 2`，读取侧接受
+  1 与 2（缺字段按旧文件）。共用一个数字会让「升级目录元数据」与「升级档案内配置」
+  被迫同时发生，而没有这种依赖。**不得隐式升级**：`set_active_profile()` 写指针时原样
+  保留已有版本，v1 根目录不会因为一次指针写入变成 v2；版本变化只经 `update_catalog()`
+  这个窄写入口（四个键、先读后写、只升不降），迁移流程才能在受控的时点做出显式动作。
+- **边界**：`light_base_mapping(profile=None)` 只是在「还没有档案」时省略四个档案内路径
+  字段（`storage.db_path`、`knowledge_base.root_dir`、`memory.root_dir`、
+  `logging.archive.directory`），供查询与向导临时校验使用；正式提交路径始终传真实档案
+  目录，取值逐字节不变。`update_catalog()` 先读后写在读失败时直接抛出，绝不覆盖损坏
+  现场 —— 与 D-130 的「查询不修复」是同一条原则的写入口版本。
 
 ## 实施期编号兼容
 
