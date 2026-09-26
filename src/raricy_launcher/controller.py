@@ -224,8 +224,8 @@ class Controller:
         """启动、装配托盘、按设计 §5.2 决定是否启动 Bot，然后阻塞到退出。"""
         self.start()
         try:
-            # 托盘（含消息循环窗口）必须由当前线程拥有：窗口创建在 `_start_tray()`
-            # 的工厂里，消息循环在下面的 `_run_message_loop()` 里（§61）。
+            # 托盘对象由当前线程的 `_start_tray()` 工厂创建；窗口与图标在下面
+            # `_run_message_loop()` 的 `tray.run()` 里才建立，消息循环因此属于当前线程（§61）。
             self._start_tray()
             self._auto_start()
             self._ready.set()

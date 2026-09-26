@@ -163,7 +163,11 @@ class TrayIcon(Protocol):
         ...
 
     def present(self, view: TrayView) -> None:
-        """呈现视图（图标、tooltip、菜单）；线程安全，窗口销毁后是空操作。"""
+        """呈现视图（图标、tooltip、菜单）；线程安全，窗口销毁后是空操作。
+
+        窗口尚未创建时（`run()` 之前的首帧，协调器常先于窗口启动）**先存下视图**，
+        在图标加入通知区域后套用，不能把这一帧当空操作丢掉（§61.3）。
+        """
         ...
 
     def request_close(self) -> None:
