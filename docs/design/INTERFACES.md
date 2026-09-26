@@ -1048,17 +1048,22 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
      `Path.is_dir()`，正是因为它会把 `OSError` 吞成 `False`，把「读不到」说成「不存在」。
   3. 目标**暂时不完整**（`needs_credentials` / `invalid` / `recovery` / 读不出来）：保留目标与
      偏好，不启动、不自动清除（凭据可以再填、配置可以再修）。
-  4. 目标可用：先把选中指针设为该目标（§5.2 切换事务的退化形态：本次没有运行中的 Worker，
-     事务就是「校验目标 → 提交选中指针 → 启动」）。这一步调用选中服务入口，**控制器不自行
-     写 `launcher.json`**；选中无法确认时本次不启动，不允许页面显示 A 而后台自动运行 B。
+  4. 目标可用：先把选中指针设为该目标（§5.2 切换事务的退化形态：本次没有运行中的 Worker
+     —— 自动启动发生在启动机器人**之前**，所以没有停机步骤；事务就是「校验目标 → 提交选中
+     指针 → 启动」）。这一步经 `ProfileService.activate()` 提交，**控制器不自行写
+     `launcher.json`**；epoch 冲突或其它档案故障不重试、不覆盖，选中无法确认时本次不启动，
+     不允许页面显示 A 而后台自动运行 B。
   5. 只有走到这里才启动一次，且仍先取 `LifecycleGate` 租约 —— `--startup` 不绕过并发门，
      派发返回后立刻释放（与 §9.2 的启停入口同一口径）。
   手动启动保持原行为：偏好开且当前档案可用就用**当前选中档案**启动，否则打开向导/恢复页；
-  登录启动没有明确目标时不启动（不猜档案），默认不打开浏览器（托盘落地前降级为最多打开一次
-  管理页，接缝见 `Controller._tray_available()`）。目标的状态按**目标档案自己**读
-  （`_profile_status()`：带显式档案 id 的只读查询，不建立档案、不写指针）。
-  尚未并入的依赖：N1/N2 的选中服务入口落地前 `_select_startup_profile()` 一律返回 False
-  （有目标但选不了时本次不启动、只给提示）；N3 的托盘落地前 `_tray_available()` 恒为 False。
+  登录启动没有明确目标时不启动（不猜档案），默认不打开浏览器；托盘不可用（`--no-tray` 或
+  装配失败，`Controller._tray_available()` 如实报告 `_tray` 是否装配成功）时降级为最多打开
+  一次管理页。目标的状态按**目标档案自己**读（`_profile_status()`：带显式档案 id 的只读查询，
+  不建立档案、不写指针）。
+  接缝已接通（N1、N3 已并入）：`_select_startup_profile()` 经 `ProfileService.activate()`
+  提交活动指针（`launcher.json` 归档案服务写，控制器不自行落盘）；epoch 冲突或其它档案故障
+  不重试、不覆盖，本次不启动（fail-closed）。`run()` 先 `_start_tray()` 再 `_auto_start()`，
+  托盘可用性判据因此读到的是本次运行真实装起来的结果。
   用户退出 Light 后本次会话不自动复活；已有实例的重复入口（含 `--startup`）在入口层静默去重。
 - **登录启动项**（§8、D-148）：只碰当前用户 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
   下本产品自己的值名 `RaricyBotLight`（`REG_SZ`），值内容固定为
@@ -1273,8 +1278,9 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   「Windows 可能延迟执行，或按你在系统设置里的选择跳过；本程序不修改该选择」，**不得**出现
   「下次登录必定启动」一类承诺。启动目标档案在档案列表接口（N2）交付前只显示当前值并说明
   由账号页管理，页面不自行列出档案。设置页移除原复选框并指向桌面页；向导保存成功后改用
-  `PUT /api/desktop-settings` 写 `start_bot_on_launch=true`（`expected_settings_revision` 取当前值），
-  `startup_profile_id` 的接线等 N1 的档案状态 DTO 落地后再补。
+  `PUT /api/desktop-settings` 写 `start_bot_on_launch=true` 与从 `GET /api/config` 读回的
+  `profile_id`（写进 `startup_profile_id`；`profile_id` 为 null 时不写该字段、不猜），
+  `expected_settings_revision` 取当前值。
 - 发行构建：`tools/build_light.py` 生成 staging（Light 闭包 + 静态资源 + 构建信息），
   `--pyinstaller` 用 `light.spec` 冻结为 onedir/windowed 应用，`--zip` 打出 ZIP 与 `.sha256`。
   `build-info.json` 记录版本、协议版本、Python 版本、依赖清单与整包校验和。

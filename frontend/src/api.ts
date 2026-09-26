@@ -117,6 +117,8 @@ export interface StatusSnapshot {
 
 export interface ConfigView {
   ok: true;
+  /** 视图所属的档案 id；还没有档案时是 null（服务端 `_config_view()`）。 */
+  profile_id: string | null;
   revision: number | null;
   state: string;
   account: string | null;

@@ -231,14 +231,18 @@
 
   async function saveLaunchPreference(): Promise<boolean> {
     // 桌面偏好（§58、§60）：启动偏好归 desktop.json，不再随配置提交。
-    // `startup_profile_id` 的接线要等 N1 的档案状态 DTO（active_profile_id）落地，
-    // 现在不猜档案 id；这一步只写 `start_bot_on_launch`。
+    // 配置保存成功后档案已经存在：从 `/api/config` 读回 `profile_id`，连同
+    // `start_bot_on_launch` 一起把启动目标写进 desktop.json（N1 起档案 id 可查）。
+    // 读不到档案 id（仍是 null）时不写该字段，不猜。
     try {
       const current = await api.getDesktopSettings();
-      await api.saveDesktopSettings({
+      const payload: Record<string, unknown> = {
         expected_settings_revision: current.settings_revision,
         start_bot_on_launch: true,
-      });
+      };
+      const view = await api.getConfig();
+      if (view.profile_id) payload.startup_profile_id = view.profile_id;
+      await api.saveDesktopSettings(payload);
       return true;
     } catch {
       // 配置已经保存：偏好没写进去只影响下次自动启动，不能把保存说成失败。

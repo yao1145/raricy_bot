@@ -415,8 +415,8 @@ class Controller:
         1. 读 `desktop.json`（桌面偏好的**唯一来源**，顺带完成升级用户的一次性导入）；
         2. 校验启动目标 —— 目标档案已被移除就清空目标并关掉机器人自动启动偏好，
            保留 `launch_at_sign_in` 与注册项；目标暂时不完整则保留目标与偏好；
-        3. 把选中指针设为启动目标（`_select_startup_profile()`；N1/N2 的服务入口
-           尚未并入，见该方法）；
+        3. 把选中指针设为启动目标（`_select_startup_profile()` 经 N1 的
+           `ProfileService.activate()` 提交；失败即本次不启动）；
         4. 只有「偏好开 + 目标可用 + 选中成功」才启动机器人。
 
         `--startup` 只是来源提示：授权偏好、档案状态与恢复记录一概重新读取，启停
@@ -555,8 +555,9 @@ class Controller:
         """没有自动启动机器人时的一次可见提示（§8.1）。
 
         手动启动沿用原行为：打开向导/恢复/管理页。登录启动默认只进托盘、不打开
-        浏览器、不重复弹窗；托盘不可用（N3 尚未并入，见 `_tray_available()`）时
-        按降级路径最多打开一次管理页，让用户仍看得到提示与恢复入口。
+        浏览器、不重复弹窗；托盘不可用（`--no-tray` 或装配失败，见
+        `_tray_available()`）时按降级路径最多打开一次管理页，让用户仍看得到
+        提示与恢复入口。
         """
         if self._startup_launch and self._tray_available():
             return
@@ -565,28 +566,39 @@ class Controller:
     def _select_startup_profile(self, profile_id: str) -> bool:
         """把选中指针切到启动目标档案并发布新上下文（§5.2）。
 
-        本次没有运行中的 Worker，切换事务退化为「校验目标 → 提交选中指针 → 启动」；
-        目标校验由调用方完成。返回 True 表示「可以确认选中的就是目标」，只有这时
-        才允许自动启动 —— 页面显示 A 而后台运行 B 是不允许的。
+        本次没有运行中的 Worker —— 自动启动发生在启动机器人**之前**（`run()` 里
+        `_start_tray()` 之后、任何 `WorkerManager.start()` 之前），所以切换事务
+        退化为「校验目标 → 提交选中指针 → 启动」，没有停机步骤；目标校验由调用方
+        完成。返回 True 表示已确认选中的就是目标，只有这时才允许自动启动 ——
+        页面显示 A 而后台运行 B 是不允许的。
 
-        **N1/N2 的选中/切换服务入口尚未并入本分支**（`ProfileService.activate()`
-        之类还不存在）：这里只留接缝、一律返回 False，于是「有目标但选不了」时本次
-        不启动、只给提示，而不是拿当前选中的档案凑数。服务落地后在这里调用选中
-        服务（提交指针 + 发布新上下文）；**不自行写 `launcher.json`，也不在这里
-        实现事务**（§5.2 的事务归档案服务）。
+        提交经 N1 的 `ProfileService.activate()`（提交指针 + 发布新上下文），
+        **控制器不自行写 `launcher.json`，也不在这里实现事务**（§5.2 的事务归
+        档案服务）。epoch 冲突或其它档案故障一律不重试、不覆盖，记一条可区分的
+        日志状态后保持 fail-closed：本次不启动。
         """
-        # TODO(N1/N2)：调用选中服务（如 profiles.activate(profile_id)）提交指针并
-        # 发布新上下文；失败或服务未落地时继续保持 False。
-        return False
+        try:
+            self._profiles.activate(profile_id)
+        except ConfigServiceError as exc:
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "launcher.startup_profile_select_failed",
+                status="activate_failed",
+                error=type(exc).__name__,
+            )
+            return False
+        return True
 
     def _tray_available(self) -> bool:
         """登录启动时是否已有可见控制入口（N3 的托盘）。
 
-        N3 的托盘尚未并入本分支，因此这里恒为 False：登录启动按降级路径「最多
-        打开一次管理页」。接线位置就是本方法 —— N3 落地后改成报告托盘可用性
-        （初始化失败即 False），上层分支不必再改。
+        如实报告 `_tray` 是否装配成功，不看平台也不猜：`--no-tray` 与托盘创建
+        失败（`_report_tray_failure()` 已把它置空）都返回 False，登录启动按降级
+        路径「最多打开一次管理页」。顺序前提：`run()` 先 `_start_tray()` 再
+        `_auto_start()`，所以自动运行解析读到的就是本次运行真实装起来的结果。
         """
-        return False
+        return self._tray is not None
 
     def _profile_exists(self, profile_id: str) -> bool:
         """目标档案目录是否真的**不存在**（查询路径：不建目录、不写指针）。
