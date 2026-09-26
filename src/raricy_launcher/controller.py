@@ -353,6 +353,9 @@ class Controller:
 
     def _stop_locked(self) -> None:
         """真正的关闭步骤；只在 `stop()` 的关闭锁里执行。"""
+        # 拆机路径也要关闭协调器的启动入口（`stop()` 可以直接被调用、不经过
+        # `request_quit()`）：先提高取消代次、置 `_quitting`，再回收 Worker（§5.1 第 1 条）。
+        self._lifecycle_service.request_quit()
         self._manager.shutdown()
         # 停托盘协调器（有界等待），再关图标：窗口与图标的真正释放在拥有它的
         # 线程上完成（Task 4），这里只登记关闭意图。

@@ -1360,7 +1360,9 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
     `submit()` 回 `lifecycle_busy`、`start_bot` / `restart_bot` 回 `quitting`），但它**不**调
     `manager.begin_quit()` —— `WorkerManager.shutdown()` 已经会调。每个操作在预留时记下代次
     基线，在**提交指针之前**与**启动 B 之前**各比较一次；本操作自己派发的停止会把基线推进
-    一格（外部停止因此不会被自己的 `+1` 吞掉）。代次变了就按位置落
+    一格，**但只在预留之后没有别的停止到达时才推进**（从预留到派停之间有落盘与线程启动，
+    外部停止完全可能落在这一段；无条件推进会把那次意图抹掉，让事务照常提交并启动 B）。
+    代次变了就按位置落
     `cancelled_by_stop`（提交前，保留 A）或 `selected_only`（提交后，保留 B），**两种情况都不
     启动 Worker**（§5.2 故障表第 5 行）。所有影响活动 Worker 的命令都带代次：
     `start_bot` / `restart_bot` 的 `expected_epoch` 与 `catalog().active_epoch` 不符时抛
@@ -1389,8 +1391,9 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
     超时（`EXIT_CONFIRM_TIMEOUT_SECONDS = 2 × STOP_BUDGET_MS + 5 秒 = 45`，可注入）或结果不在
     集合内都算未确认。目标与当前活动档案是同一个时跳过停与提交，退化成一次普通启动
     （不写指针、不 bump epoch，结果码仍用 `started` / `selected`）。`invalidate_old_views`
-    发布事件 **`launcher.profile_activated`**（字段 `profile_id` 与代次；N1 的测试结果按身份键
-    自然过期），不重写任何状态。
+    发布事件 **`launcher.profile_activated`**（**Task 4 起**字段 `profile_id` 与代次随
+    `FIELD_KINDS` 的登记进事件 —— 登记之前 `build_event` 会静默丢弃这两个字段，所以本阶段
+    不声称它们已经可见；N1 的测试结果按身份键自然过期），不重写任何状态。
   - **幂等键**（§4.2、总表）：形状 `[A-Za-z0-9_-]{8,64}`（`IDEMPOTENCY_KEY_MIN_CHARS` /
     `_MAX_CHARS`），摘要 = 规范化请求字段的 JSON 排序键 + sha256，**输入不含秘密、摘要不落盘**。
     内存表保留最近 50 个键；服务重启后回落到记录级比较（同一键、同一 `kind`、同一目标档案、

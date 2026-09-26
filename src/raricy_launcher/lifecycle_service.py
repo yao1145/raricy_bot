@@ -130,6 +130,11 @@ CODE_QUITTING: str = "quitting"
 # 「停止已确认」只认这三种管理器结果；`failed` 与在途都不算确认退出（§5.1 第 2 条）。
 STOP_CONFIRMED_RESULTS: frozenset[str] = frozenset({"stopped", "cancelled", "forced_stop"})
 
+# 管理器**拒绝派发**一次启动时给出的结果码：`quitting` 是退出流程已开始，
+# `operation_in_progress` 是重启仍在途。两种都没有拉起 Worker，绝不能记成 `started`
+# （否则页面会显示「已启动」而实际没有进程）。
+START_REFUSED_RESULTS: frozenset[str] = frozenset({"quitting", "operation_in_progress"})
+
 # 确认 A 的进程已回收的上限：2 × 停止预算 + 5 秒余量（＝ 45 秒）。构造参数可注入，
 # 测试传小值，不做真实等待。
 EXIT_CONFIRM_TIMEOUT_SECONDS: float = 2 * STOP_BUDGET_MS / 1000 + 5.0
@@ -733,10 +738,18 @@ class LifecycleService:
     def dispatch_stop(self, operation_id: str) -> Any:
         """在门租约内派发一次停止，并把这次代次变化计入该操作的基线。
 
-        先读代次再派发：期间到达的外部停止不会被自己的 `+1` 吞掉（§5.1 第 1 条）。
+        **只有预留之后没有别的停止到达时才吸收自己的 `+1`**：从「记下基线」到「派发
+        自己的停止」之间有落盘（fsync）与线程启动，托盘「停止」、`request_quit()` 或
+        `begin_session_end()` 完全可能落在这段里；无条件吸收会把那次外部停止抹掉，
+        事务随后照常提交指针并启动 B —— 与故障表第 5/6 行相反。判据放在锁内一次取齐：
+        当前代次已经不等于预留基线，就说明来过了，本次不吸收（`operation_cancelled()`
+        因此保持为真，事务在提交前落 `cancelled_by_stop`）。
         """
         with self._lock:
+            reserved = self._current == operation_id
+            baseline = self._current_generation if reserved else self._generation
             before = self._generation
+            absorb = reserved and before == baseline
         ticket = self._acquire_gate(KIND_ACTIVATE)
         if ticket is None:
             raise ConfigServiceError(ERROR_LIFECYCLE_BUSY)
@@ -744,9 +757,10 @@ class LifecycleService:
             operation = self.request_stop()
         finally:
             self._gate.end(ticket)
-        with self._lock:
-            if self._current == operation_id:
-                self._current_generation = before + 1
+        if absorb:
+            with self._lock:
+                if self._current == operation_id:
+                    self._current_generation = before + 1
         return operation
 
     def operation_cancelled(self, operation_id: str) -> bool:
@@ -907,7 +921,11 @@ class LifecycleService:
     def _start_target(
         self, context: OperationContext, target: str | None, target_revision: int | None
     ) -> None:
-        """start_B：在门租约内启动目标；失败不改指针、不回退到 A（故障表第 4 行）。"""
+        """start_B：在门租约内启动目标；失败不改指针、不回退到 A（故障表第 4 行）。
+
+        管理器「拒绝派发」（退出流程、重启在途）与「启动失败」都记 `start_failed`：
+        没有 Worker 被拉起时绝不写 `started`。
+        """
         with context.stage(STAGE_START_B):
             ticket = self._acquire_gate(KIND_ACTIVATE)
             if ticket is None:
@@ -918,7 +936,13 @@ class LifecycleService:
                 )
             finally:
                 self._gate.end(ticket)
-        start_failed = getattr(operation, "state", None) == OP_FAILED
+        # 只有「真的派发出去」才写 `started`：`state="failed"` 是启动失败，结果码
+        # ∈ START_REFUSED_RESULTS（`quitting` / `operation_in_progress`）是管理器
+        # **拒绝派发**（返回 OP_FINISHED 而不是失败）—— 两种都没有 Worker 被拉起。
+        start_failed = (
+            getattr(operation, "state", None) == OP_FAILED
+            or getattr(operation, "result", None) in START_REFUSED_RESULTS
+        )
         context.finish(
             state=OP_STATE_FINISHED,
             result=RESULT_START_FAILED if start_failed else RESULT_STARTED,
