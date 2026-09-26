@@ -120,6 +120,23 @@ STATE_NEEDS_SETUP: str = "needs_setup"
 STATE_NEEDS_CREDENTIALS: str = "needs_credentials"
 STATE_CONFIGURED: str = "configured"
 STATE_INVALID: str = "invalid"
+# 元数据故障的稳定恢复状态（F2）：坏元数据不是「首次运行」，不进入向导。
+STATE_RECOVERY: str = "recovery"
+
+# 元数据故障码（`ConfigStatus.error`）：四种互相可区分，恢复面板按码给文案。
+METADATA_CORRUPT: str = "metadata_corrupt"
+METADATA_UNREADABLE: str = "metadata_unreadable"
+METADATA_UNSUPPORTED_VERSION: str = "metadata_unsupported_version"
+METADATA_POINTER_INVALID: str = "metadata_pointer_invalid"
+
+_METADATA_FAULT_CODES: frozenset[str] = frozenset(
+    {
+        METADATA_CORRUPT,
+        METADATA_UNREADABLE,
+        METADATA_UNSUPPORTED_VERSION,
+        METADATA_POINTER_INVALID,
+    }
+)
 
 # 凭据操作（§7 的三种语义）。
 ACTION_KEEP: str = "keep"
@@ -352,10 +369,11 @@ class ConfigService:
     # --- 档案指针 ---------------------------------------------------------
 
     def read_launcher_metadata(self) -> dict[str, Any]:
-        """读取 Launcher 元数据；不存在返回空映射，读不到则报稳定错误。
+        """读取 Launcher 元数据；不存在返回空映射，读到了但不能用则报稳定错误。
 
-        「不存在」与「读不到」必须分开：把权限/占用错误当成空元数据，会让管理页
-        走进首次设置流程并在界面之外丢掉活动档案（§13.3）。
+        「不存在」「读不到」「读到了但不能用」必须分开：把权限/占用错误或损坏的
+        YAML 当成空元数据，会让管理页走进首次设置流程并在界面之外覆盖活动档案指针
+        （§13.3、F2）。四种故障各有一个稳定码，装载进 `status()` 的恢复状态。
         """
         path = paths.launcher_json_path(self._root)
         try:
@@ -363,15 +381,34 @@ class ConfigService:
         except FileNotFoundError:
             return {}
         except OSError as exc:
-            raise ConfigServiceError("metadata_unreadable") from exc
+            raise ConfigServiceError(METADATA_UNREADABLE) from exc
+        except UnicodeDecodeError as exc:
+            # 字节不是 UTF-8：读到了但不能用，与 YAML 语法错误同一类。
+            # `UnicodeDecodeError` 不是 `OSError`，漏接会让 `status()` 抛出（F2）。
+            raise ConfigServiceError(METADATA_CORRUPT) from exc
         try:
             data = yaml.safe_load(raw)
-        except yaml.YAMLError:
-            return {}
-        return data if isinstance(data, dict) else {}
+        except yaml.YAMLError as exc:
+            raise ConfigServiceError(METADATA_CORRUPT) from exc
+        if not isinstance(data, dict):
+            # 顶层不是映射：合法 YAML 但读不出元数据，同样不能当成首次运行。
+            raise ConfigServiceError(METADATA_CORRUPT)
+        version = data.get("schema_version")
+        if version is not None:
+            if isinstance(version, bool) or not isinstance(version, int):
+                # 版本字段类型不对：无法比较，按损坏处理（缺字段才等于「旧文件」）。
+                raise ConfigServiceError(METADATA_CORRUPT)
+            if version > SCHEMA_VERSION:
+                # 版本比本程序新就不猜：宁可停在恢复状态，也不按未知格式解释（§6.5）。
+                raise ConfigServiceError(METADATA_UNSUPPORTED_VERSION)
+        return data
 
     def active_profile(self) -> str | None:
-        """活动档案 id；没有或不合格时为 None（不把损坏的指针当成有效档案）。"""
+        """活动档案 id；没有指针时为 None，元数据故障则抛稳定错误。
+
+        「没有指针」与「指针读不出来」不能混为一谈：后者要停在恢复状态，
+        不能悄悄退回 None 让调用方以为这是首次运行（F2）。
+        """
         value = self.read_launcher_metadata().get("active_profile")
         if not isinstance(value, str):
             return None
@@ -383,20 +420,47 @@ class ConfigService:
     def profile_id(self) -> str | None:
         return self._profile_id or self.active_profile()
 
-    def require_profile(self) -> str:
-        """当前档案 id；全新实例上**建立第一个档案**并落指针（§5.1 第 1 步）。
+    def _has_existing_profiles(self) -> bool:
+        """`profiles/` 下是否已有档案目录；读不了就当作有（宁可拒绝初始化）。"""
+        try:
+            entries = list(paths.profiles_root(self._root).iterdir())
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        return any(entry.is_dir() for entry in entries)
 
-        向导的第一步是「读配置」（此时还没有任何档案），把它当错误会让首次启动
-        直接失败；初始化数据目录本来就属于启动流程的一部分。
+    def _resolve_pointer(self) -> str | None:
+        """解析当前档案指针；**不建立**任何档案（查询路径专用，F2）。
 
-        建立动作在专用锁内**重新检查**一次指针：并发首读如果各建一个档案，指针
-        只会认最后一个，先建立的那些档案里的写入就再也看不见了（复审 N-2）。
+        没有可用指针且「元数据文件存在」或「已有档案目录」时，这属于元数据故障：
+        抛 `metadata_pointer_invalid`，不能退化成首次运行 —— 首次初始化只允许在
+        「元数据文件不存在且 `profiles/` 下没有任何既有档案目录」时发生（要求 2）。
         """
         profile_id = self.profile_id()
         if profile_id is not None:
             return profile_id
+        if paths.launcher_json_path(self._root).exists() or self._has_existing_profiles():
+            raise ConfigServiceError(METADATA_POINTER_INVALID)
+        return None
+
+    def require_profile(self) -> str:
+        """当前档案 id；仅首次初始化时**建立第一个档案**并落指针（§5.1 第 1 步）。
+
+        向导的第一步是「读配置」（此时还没有任何档案），把它当错误会让首次启动
+        直接失败；初始化数据目录本来就属于启动流程的一部分。但只有「元数据文件
+        不存在且 `profiles/` 下没有任何既有档案目录」才是首次初始化：元数据损坏、
+        不可读、版本不支持或指针非法/缺失时一律不创建、不写指针，向上抛稳定错误
+        （F2：自动新建会把损坏现场当成首次运行并覆盖它）。
+
+        建立动作在专用锁内**重新检查**一次指针：并发首读如果各建一个档案，指针
+        只会认最后一个，先建立的那些档案里的写入就再也看不见了（复审 N-2）。
+        """
+        profile_id = self._resolve_pointer()
+        if profile_id is not None:
+            return profile_id
         with self._bootstrap_lock:
-            profile_id = self.profile_id()
+            profile_id = self._resolve_pointer()
             if profile_id is None:
                 profile_id = paths.new_profile_id()
                 self.set_active_profile(profile_id)
@@ -406,7 +470,11 @@ class ConfigService:
         return paths.profile_dir(self._root, self.require_profile())
 
     def set_active_profile(self, profile_id: str) -> None:
-        """原子切换活动档案指针（§13.3：切换前必须确认旧 Worker 已退出，由调用方保证）。"""
+        """原子切换活动档案指针（§13.3：切换前必须确认旧 Worker 已退出，由调用方保证）。
+
+        先读后写：读失败（损坏/不可读/版本不支持）必须直接失败，绝不把覆盖当成
+        「修复」，损坏现场保持字节不变（F2）。
+        """
         paths.validate_profile_id(profile_id)
         with self._lock:
             metadata = self.read_launcher_metadata()
@@ -422,14 +490,20 @@ class ConfigService:
     # --- 读取 -------------------------------------------------------------
 
     def load_saved(self) -> SavedConfig | None:
-        """读正式配置；不存在返回 None（`needs_setup`）。"""
+        """读正式配置；不存在返回 None（`needs_setup`）。
+
+        读是查询路径：不建立首个档案，也不写指针（F2）。首个档案只在写路径上由
+        `require_profile()` 建立。
+        """
         document = self._read_formal()
         if document is None:
             return None
         return self._to_saved(document)
 
     def load_draft(self) -> DraftConfig | None:
-        profile = self.profile()
+        profile = self._profile_for_read()
+        if profile is None:
+            return None
         data = self._read_document(
             paths.draft_path(profile), broken_code="draft_unreadable"
         )
@@ -443,11 +517,18 @@ class ConfigService:
         )
 
     def status(self) -> ConfigStatus:
-        """配置就绪状态（§9.1）。凭据库可能阻塞，调用方应在工作线程里调用。"""
+        """配置就绪状态（§9.1）。凭据库可能阻塞，调用方应在工作线程里调用。
+
+        元数据故障落进稳定恢复状态，而不是 `needs_setup`；查询只报告，不修复、
+        不创建、不覆盖，也不抛异常（F2）。
+        """
         try:
             saved = self.load_saved()
         except ConfigServiceError as exc:
-            return ConfigStatus(state=STATE_INVALID, error=str(exc))
+            code = str(exc)
+            if code in _METADATA_FAULT_CODES:
+                return ConfigStatus(state=STATE_RECOVERY, error=code)
+            return ConfigStatus(state=STATE_INVALID, error=code)
         if saved is None:
             return ConfigStatus(state=STATE_NEEDS_SETUP)
         if not saved.credentials_ref:
@@ -723,9 +804,23 @@ class ConfigService:
             raise ConfigServiceError(broken_code)
         return data
 
+    def _profile_for_read(self) -> Path | None:
+        """查询路径用的档案目录；没有档案时返回 None，绝不建立首个档案（F2）。"""
+        profile_id = self._resolve_pointer()
+        if profile_id is None:
+            return None
+        return paths.profile_dir(self._root, profile_id)
+
     def _read_formal(self) -> dict[str, Any] | None:
-        """读正式配置的原始文档；不存在返回 None，损坏则报稳定错误。"""
-        return self._read_document(paths.config_path(self.profile()), broken_code="config_unreadable")
+        """读正式配置的原始文档；不存在返回 None，损坏则报稳定错误。
+
+        查询路径不得建立首个档案：没有指针就没有正式配置，交给 `status()` 报
+        `needs_setup`（F2 的「查询不创建」）。
+        """
+        profile = self._profile_for_read()
+        if profile is None:
+            return None
+        return self._read_document(paths.config_path(profile), broken_code="config_unreadable")
 
     def _to_saved(self, document: Mapping[str, Any]) -> SavedConfig:
         launcher = document.get(LAUNCHER_SECTION)

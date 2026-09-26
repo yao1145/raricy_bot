@@ -842,10 +842,23 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   名字里出现空/明文/必然失败的特征词一律拒绝，**链式后端逐环递归检查**（`ChainerBackend`
   可以把写入转交给明文后端）；不可用时由调用方降级到 `SessionMemoryStore` 并如实报告
   （重启后引用不可解析 → `needs_credentials`，不假装已保存）。
-- **状态**（§9.1）：`needs_setup` / `needs_credentials` / `configured` / `invalid`；
-  `invalid` 覆盖版本、字段、能力策略与路径包含，`error` 一律是稳定类别码（不是中文文案）。
+- **状态**（§9.1）：`needs_setup` / `needs_credentials` / `configured` / `invalid` / `recovery`；
+  `invalid` 覆盖版本、字段、能力策略与路径包含，`recovery` 专指元数据故障（见下一条），
+  `error` 一律是稳定类别码（不是中文文案）。
   账号名在档案内**不可变**（§13.3：换账号走重新设置），因此界面显示的账号与实际登录凭据
   不会拆成两个事实。
+- **元数据状态与恢复**（§9.1、§13.3，D-130）：`read_launcher_metadata()` 区分「文件不存在」
+  （返回空映射，首次运行要靠它）、`OSError`（`metadata_unreadable`，权限/占用错误不得当成
+  空元数据）与「读到了但不能用」。后者再分三码：`metadata_corrupt`（非 UTF-8 字节、YAML
+  语法错误、顶层不是映射、`schema_version` 类型不对）、`metadata_unsupported_version`
+  （`schema_version` 大于本程序的 `SCHEMA_VERSION`）、`metadata_pointer_invalid`（文件可读
+  且是映射，但 `active_profile` 缺失或不是合法档案 ID；元数据文件缺失但 `profiles/` 下已有
+  档案目录同样按此处理，因为指针无从解析）。缺 `schema_version` 是既有文件的正常形态，
+  不算版本未知。四种码互相可区分，经 `status()` 映射为 `recovery`（`error` 承载具体码，
+  不抛异常），不是 `needs_setup`。**查询不修复、不创建、不覆盖**：只有「元数据文件不存在
+  **且** `profiles/` 下没有任何既有档案目录」才允许 `require_profile()` 建立第一个档案；
+  读取路径（`status()`、`load_saved()`、`load_draft()`）不改文件、不建目录、不改指针；
+  `set_active_profile()` 与提交在读元数据失败时直接失败，损坏现场字节不变。
 - **运行快照**（§6.5）：`build_run_launch(revision)` 在写锁内**一次**取到「指定版本的运行
   快照 + 对应凭据」（分开调用会拼出旧配置配新 Key）；`build_run_config()` / `credentials_for()`
   都**必须显式给 revision**，快照写在档案自己的 `runtime/` 下，换档案不会互相覆盖。

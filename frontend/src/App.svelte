@@ -2,6 +2,7 @@
   import { onDestroy, onMount } from "svelte";
   import * as api from "./api";
   import Events from "./Events.svelte";
+  import Recovery from "./Recovery.svelte";
   import Settings from "./Settings.svelte";
   import Status from "./Status.svelte";
   import Wizard from "./Wizard.svelte";
@@ -63,6 +64,9 @@
   });
 
   const configState = $derived(status?.config.state ?? "unknown");
+  // 恢复状态不是向导入口：坏元数据只给只读提示，绝不把用户带进空向导（F2）。
+  const showRecovery = $derived(configState === "recovery");
+  const recoveryCode = $derived(status?.config.error ?? null);
   const showWizard = $derived(configState === "needs_setup" || configState === "needs_credentials");
 </script>
 
@@ -93,7 +97,9 @@
     {#if notice}<div class="notice">{notice}</div>{/if}
 
     {#if tab === "status"}
-      {#if showWizard}
+      {#if showRecovery}
+        <Recovery code={recoveryCode} />
+      {:else if showWizard}
         <Wizard ondone={refresh} />
       {:else if status}
         <Status {status} onchanged={refresh} />
