@@ -187,6 +187,14 @@ class StartupService:
         """
         return self._observe(apply=True)
 
+    def precheck(self) -> str | None:
+        """开启登录启动之前的写前判定：返回稳定结果码或 None（不写任何东西）。
+
+        控制面用它先把「做不到的偏好」挡在写盘之前（命令超 260、路径不可用）：
+        判定与 `apply()` 里的写前判定共用同一段实现，两处规则不会漂移。
+        """
+        return self._rejection(self._expected_command())
+
     def repair(self, expected_revision: int) -> StartupFacts:
         """按当前意图与**当前** EXE 路径重新生成命令并执行。
 

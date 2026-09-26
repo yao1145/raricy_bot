@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import socket
+import sys
 import threading
 import time
 import webbrowser
@@ -33,9 +34,15 @@ from .activation import ActivationError
 from .api import LocalApi
 from .config_service import ConfigService, ConfigServiceError
 from .credential_store import CredentialStore, SessionMemoryStore, SystemKeyringStore
+from .desktop_settings import DesktopSettingsService
 from .events import EventService
 from .lifecycle_gate import LifecycleGate
-from .platform import InstanceGuard, LauncherPlatform
+from .platform import (
+    InstanceGuard,
+    LauncherPlatform,
+    PlatformError,
+    get_startup_registry,
+)
 from .process_manager import (
     START_TIMEOUT_SECONDS,
     STOP_BUDGET_MS,
@@ -45,6 +52,7 @@ from .process_manager import (
     default_worker_spec,
 )
 from .session import SessionManager
+from .startup_service import StartupService
 from .status_service import StatusService
 
 _RUNTIME_FILE = "launcher-runtime.json"
@@ -104,6 +112,10 @@ class Controller:
         self._config = ConfigService(
             self._data_root, credential_store=self._credentials, profile_id=profile_id
         )
+        # 桌面偏好与登录启动项（§58、§59）：装配一次，API 与后续的自动运行解析共用；
+        # 注册表适配器在这里惰性取得，测试用替身注入 `LocalApi`，不碰真实注册表。
+        self._desktop_settings = DesktopSettingsService(self._data_root)
+        self._startup_service = self._build_startup_service()
         # 事件时间要与管理页显示的墙钟一致（同一处时钟时基缺陷，复审指出）。
         self._events = EventService(instance_id=self._instance_id, clock=time.time)
         self._sessions = SessionManager(instance_id=self._instance_id, clock=time.monotonic)
@@ -131,6 +143,30 @@ class Controller:
         self._api_socket: socket.socket | None = None
         self._port = 0
         self._listener = None
+
+    def _build_startup_service(self) -> StartupService | None:
+        """装配登录启动项服务；取不到本机注册表通道时返回 None（端点回稳定失败）。
+
+        `executable` 只有冻结发行形态才给出：开发形态是 `python.exe` 加源码目录，
+        登记进 Run 在登录时跑不起来，服务层也会拒绝（`path_unusable`）。
+        """
+        try:
+            registry = get_startup_registry()
+        except PlatformError:
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "launcher.startup_unavailable",
+                error="PlatformError",
+            )
+            return None
+        frozen = bool(getattr(sys, "frozen", False))
+        return StartupService(
+            self._desktop_settings,
+            registry,
+            executable=sys.executable if frozen else None,
+            frozen=frozen,
+        )
 
     # --- 查询 -------------------------------------------------------------
 
@@ -290,6 +326,8 @@ class Controller:
             port=self._port,
             on_quit=self.request_quit,
             lifecycle_gate=self._lifecycle,
+            desktop_settings=self._desktop_settings,
+            startup_service=self._startup_service,
         )
         api = self._api  # 线程只认这个局部引用：stop() 会先把 self._api 置空
         self._api_thread = threading.Thread(

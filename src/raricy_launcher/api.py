@@ -46,8 +46,25 @@ from .config_service import (
     CredentialUpdate,
 )
 from .credential_store import CredentialStoreError
+from .desktop_settings import (
+    DESKTOP_SETTINGS_CONFLICT,
+    INVALID_DESKTOP_SETTINGS,
+    DesktopSettingsConflict,
+    DesktopSettingsError,
+    DesktopSettingsService,
+)
 from .lifecycle_gate import LifecycleGate, Ticket
 from .session import CSRF_HEADER, SESSION_COOKIE, Session, SessionManager
+from .startup_service import (
+    RESULT_APPLY_FAILED,
+    RESULT_COMMAND_TOO_LONG,
+    RESULT_OK,
+    RESULT_PATH_UNUSABLE,
+    RESULT_READ_FAILED,
+    RESULT_REGISTRATION_CONFLICT,
+    StartupFacts,
+    StartupService,
+)
 
 # 请求体上限：配置表单很小；知识库导入文件另有自己的上限（§13.2）。
 MAX_JSON_BYTES: int = 256 * 1024
@@ -68,6 +85,34 @@ CSP_POLICY: str = (
     "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
     "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
 )
+
+# 桌面设置写请求的严格白名单（§59）：`expected_settings_revision` 必填，三个开关可省。
+_DESKTOP_SETTING_KEYS: frozenset[str] = frozenset(
+    {
+        "expected_settings_revision",
+        "launch_at_sign_in",
+        "start_bot_on_launch",
+        "startup_profile_id",
+    }
+)
+# 修复请求只接受版本守卫，绝不接受任意执行命令（§59）。
+_REPAIR_KEYS: frozenset[str] = frozenset({"expected_settings_revision"})
+
+# 启动项结果码 → 控制面稳定码与固定文案。`read_failed` 没有专属码，归入操作失败
+# （读不到等于这次操作无法确认），不假装成功。
+_STARTUP_REJECTION_CODES: dict[str, str] = {
+    RESULT_COMMAND_TOO_LONG: "startup_command_too_long",
+    RESULT_PATH_UNUSABLE: "startup_path_unusable",
+    RESULT_REGISTRATION_CONFLICT: "startup_registration_conflict",
+    RESULT_APPLY_FAILED: "startup_apply_failed",
+    RESULT_READ_FAILED: "startup_apply_failed",
+}
+_STARTUP_REJECTION_MESSAGES: dict[str, str] = {
+    "startup_command_too_long": texts.STARTUP_COMMAND_TOO_LONG,
+    "startup_path_unusable": texts.STARTUP_PATH_UNUSABLE,
+    "startup_registration_conflict": texts.STARTUP_REGISTRATION_CONFLICT,
+    "startup_apply_failed": texts.STARTUP_APPLY_FAILED,
+}
 
 
 class ApiError(Exception):
@@ -152,6 +197,8 @@ class LocalApi:
         on_quit: Callable[[], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
         lifecycle_gate: LifecycleGate | None = None,
+        desktop_settings: DesktopSettingsService | None = None,
+        startup_service: StartupService | None = None,
     ) -> None:
         self._instance_id = instance_id
         self._data_root = Path(data_root)
@@ -171,6 +218,15 @@ class LocalApi:
         self._on_quit = on_quit
         self._clock = clock
         self._model_test_lock = threading.Lock()
+        # 桌面偏好与登录启动项（§58、§59）：一律由控制器装配注入。没注入时
+        # 桌面设置仍可用（数据根下就是唯一来源），但启动项端点宁可直接失败，
+        # 也**不自行打开真实注册表** —— 离线测试与缺注入的调用方不该碰系统。
+        self._desktop = (
+            desktop_settings
+            if desktop_settings is not None
+            else DesktopSettingsService(self._data_root)
+        )
+        self._startup_service = startup_service
         self.app = self._build()
 
     def set_port(self, port: int) -> None:
@@ -197,6 +253,14 @@ class LocalApi:
         app.add_api_route("/api/config/draft", self._get_draft, methods=["GET"])
         app.add_api_route("/api/config/draft", self._put_draft, methods=["PUT"])
         app.add_api_route("/api/status", self._get_status, methods=["GET"])
+        app.add_api_route("/api/desktop-settings", self._get_desktop_settings, methods=["GET"])
+        app.add_api_route("/api/desktop-settings", self._put_desktop_settings, methods=["PUT"])
+        app.add_api_route(
+            "/api/desktop/startup-status", self._get_startup_status, methods=["GET"]
+        )
+        app.add_api_route(
+            "/api/desktop/startup-repair", self._startup_repair, methods=["POST"]
+        )
         app.add_api_route("/api/bot/start", self._bot_start, methods=["POST"])
         app.add_api_route("/api/bot/stop", self._bot_stop, methods=["POST"])
         app.add_api_route("/api/bot/restart", self._bot_restart, methods=["POST"])
@@ -297,6 +361,16 @@ class LocalApi:
             return ApiError(409, str(exc))
         if isinstance(exc, CredentialStoreError):
             return ApiError(503, str(exc))
+        if isinstance(exc, DesktopSettingsConflict):
+            # revision 不符：页面拿的是过期意图，先刷新（§58）。
+            return ApiError(409, DESKTOP_SETTINGS_CONFLICT)
+        if isinstance(exc, DesktopSettingsError):
+            # 参数非法是 422，其余（不可读、损坏、版本不认识、写盘失败）都是
+            # 「当前状态不允许这次操作」的 409，且必须显式映射 —— 包括
+            # `desktop_settings_write_failed`（一次性导入落盘失败也会走这里）。
+            code = str(exc)
+            status = 422 if code == INVALID_DESKTOP_SETTINGS else 409
+            return ApiError(status, code)
         if isinstance(exc, ConfigError):
             return ApiError(422, exc.kind, field=exc.field)
         return ApiError(500, "internal_error")
@@ -406,7 +480,6 @@ class LocalApi:
             },
             "editable": sorted(EDITABLE_FIELDS),
             "credentials": self._credential_view(saved),
-            "start_bot_on_launch": bool(saved.start_bot_on_launch) if saved else False,
         }
 
     def _credential_view(self, saved) -> dict:
@@ -440,6 +513,15 @@ class LocalApi:
         return self._json(200, {"ok": True, "revision": revision})
 
     def _commit_config(self, body: dict) -> int:
+        if "start_bot_on_launch" in body:
+            # 桌面偏好已移出配置面（§58）：如实回稳定码与去向，而不是静默忽略
+            # 或多写一份会与 desktop.json 打架的副本。
+            raise ApiError(
+                422,
+                "desktop_setting_moved",
+                field="start_bot_on_launch",
+                message=texts.DESKTOP_SETTING_MOVED,
+            )
         expected = body.get("expected_revision")
         if not isinstance(expected, int) or isinstance(expected, bool) or expected < 0:
             raise ApiError(422, "invalid_revision", field="expected_revision")
@@ -450,16 +532,12 @@ class LocalApi:
         account = body.get("account")
         if account is not None and not isinstance(account, str):
             raise ApiError(400, "bad_request")
-        start_bot = body.get("start_bot_on_launch")
-        if start_bot is not None and not isinstance(start_bot, bool):
-            raise ApiError(400, "bad_request")
         return self._config.commit(
             values,
             expected_revision=expected,
             password=updates.get("password", CredentialUpdate.keep()),
             llm_api_key=updates.get("llm_api_key", CredentialUpdate.keep()),
             account=account,
-            start_bot_on_launch=start_bot,
         )
 
     async def _validate_config(self, request: Request):
@@ -526,6 +604,132 @@ class LocalApi:
             mapped = self._handle(exc)
             return self._json(mapped.status, mapped.payload())
         return self._json(200, {"ok": True, "revision": revision})
+
+    # --- 桌面设置与登录启动（§8、§58、§59） --------------------------------
+
+    async def _get_desktop_settings(self, request: Request):
+        session = self._session(request)
+        if session is None:
+            return self._json(401, {"ok": False, "code": "unauthenticated"})
+        try:
+            body = await asyncio.to_thread(self._desktop_view)
+        except Exception as exc:
+            mapped = self._handle(exc)
+            return self._json(mapped.status, mapped.payload())
+        return self._json(200, body)
+
+    def _desktop_view(self) -> dict:
+        """桌面偏好的读视图：只有三个开关与它自己的 revision（§58）。"""
+        settings = self._desktop.read()
+        return {
+            "ok": True,
+            "settings_revision": settings.settings_revision,
+            "launch_at_sign_in": settings.launch_at_sign_in,
+            "start_bot_on_launch": settings.start_bot_on_launch,
+            "startup_profile_id": settings.startup_profile_id,
+        }
+
+    async def _put_desktop_settings(self, request: Request):
+        try:
+            session = self._require_session(request)
+            self._require_write(request, session)
+            body = await self._json_body(request)
+        except ApiError as exc:
+            return self._json(exc.status, exc.payload())
+        try:
+            payload = await asyncio.to_thread(self._update_desktop_settings, body)
+        except Exception as exc:
+            mapped = self._handle(exc)
+            return self._json(mapped.status, mapped.payload())
+        return self._json(200, payload)
+
+    def _update_desktop_settings(self, body: dict) -> dict:
+        """写意图 → 按当前意图应用 → 回读并把事实一起回给页面（§59）。
+
+        应用失败**不回滚意图**：`applied=false` 加事实如实说明系统侧没做到什么，
+        由页面显示差异。开启登录启动前先做写前判定，做不到的偏好不落盘。
+        """
+        intent = _desktop_intent(body)
+        startup = self._startup_service_or_error()
+        if intent.get("launch_at_sign_in") is True:
+            rejection = startup.precheck()
+            if rejection is not None:
+                raise _startup_rejection(rejection, field="launch_at_sign_in")
+        expected = intent.pop("expected_settings_revision")
+        revision = self._desktop.update(expected, **intent)
+        facts = startup.apply()
+        return {
+            "ok": True,
+            "settings_revision": revision,
+            "applied": facts.last_apply_result == RESULT_OK,
+            "startup": _facts_payload(facts),
+        }
+
+    async def _get_startup_status(self, request: Request):
+        session = self._session(request)
+        if session is None:
+            return self._json(401, {"ok": False, "code": "unauthenticated"})
+        try:
+            body = await asyncio.to_thread(self._startup_view)
+        except Exception as exc:
+            mapped = self._handle(exc)
+            return self._json(mapped.status, mapped.payload())
+        return self._json(200, body)
+
+    def _startup_view(self) -> dict:
+        """一次观测：只看不写。
+
+        `status()` 的 `last_apply_result` 是**本次观测**的结论（读不到或同名值非本
+        产品持有时是 `read_failed` / `registration_conflict`），不写回设置文件、
+        也不得当作持久值回用（文件里保留上一次真实应用的结果）。
+        """
+        startup = self._startup_service_or_error()
+        settings = self._desktop.read()
+        return {
+            "ok": True,
+            "settings_revision": settings.settings_revision,
+            **_facts_payload(startup.status()),
+        }
+
+    async def _startup_repair(self, request: Request):
+        try:
+            session = self._require_session(request)
+            self._require_write(request, session)
+            body = await self._json_body(request)
+        except ApiError as exc:
+            return self._json(exc.status, exc.payload())
+        try:
+            payload = await asyncio.to_thread(self._repair_startup, body)
+        except Exception as exc:
+            # 两个来源都在这里汇合：过期 revision 由 `repair()` 抛
+            # `DesktopSettingsConflict`（409 desktop_settings_conflict），
+            # 登记冲突/权限失败则以事实返回，由 `_startup_rejection` 映射成 409。
+            mapped = self._handle(exc)
+            return self._json(mapped.status, mapped.payload())
+        return self._json(200, payload)
+
+    def _repair_startup(self, body: dict) -> dict:
+        """按当前 EXE 路径重新生成命令并执行；不接受任何调用方给的命令。"""
+        guard = _desktop_intent(body, keys=_REPAIR_KEYS)
+        startup = self._startup_service_or_error()
+        settings = self._desktop.read()
+        facts = startup.repair(guard["expected_settings_revision"])
+        if facts.last_apply_result != RESULT_OK:
+            raise _startup_rejection(facts.last_apply_result, field=None)
+        return {
+            "ok": True,
+            "settings_revision": settings.settings_revision,
+            "applied": True,
+            "startup": _facts_payload(facts),
+        }
+
+    def _startup_service_or_error(self) -> StartupService:
+        """取装配注入的启动项服务；没有注入就没有可用的注册表通道。"""
+        if self._startup_service is None:
+            # 防御性分支：控制面只在 Windows 上装配（其他平台在入口就退出），
+            # 这里绝不自行创建注册表适配器。
+            raise ApiError(409, "startup_apply_failed", message=texts.STARTUP_APPLY_FAILED)
+        return self._startup_service
 
     # --- 状态与进程 -------------------------------------------------------
 
@@ -1067,6 +1271,63 @@ class LocalApi:
         response = StreamingResponse(iter([target.read_bytes()]), media_type=media_type)
         response.headers["Cache-Control"] = "no-store"
         return response
+
+
+def _desktop_intent(
+    body: dict, *, keys: frozenset[str] = _DESKTOP_SETTING_KEYS
+) -> dict[str, Any]:
+    """桌面设置写请求的解析与白名单（§59）：多余键、缺版本守卫、类型不对都 422。
+
+    只有**出现过的**开关才进返回值：省略表示本次不改它，`startup_profile_id=None`
+    才是显式清空（`DesktopSettingsService.update()` 的 `_UNSET` 语义）。档案 id 的
+    形态校验交给设置服务（非法即 `invalid_desktop_settings`），目标是否真的存在
+    属于档案服务的判定，本阶段尚未落地。
+    """
+    extra = sorted(set(body) - keys)
+    if extra:
+        raise ApiError(422, INVALID_DESKTOP_SETTINGS, field=extra[0])
+    expected = body.get("expected_settings_revision")
+    if isinstance(expected, bool) or not isinstance(expected, int) or expected < 0:
+        raise ApiError(422, INVALID_DESKTOP_SETTINGS, field="expected_settings_revision")
+    intent: dict[str, Any] = {"expected_settings_revision": expected}
+    for key in ("launch_at_sign_in", "start_bot_on_launch"):
+        if key in body:
+            if not isinstance(body[key], bool):
+                raise ApiError(422, INVALID_DESKTOP_SETTINGS, field=key)
+            intent[key] = body[key]
+    if "startup_profile_id" in body:
+        target = body["startup_profile_id"]
+        if target is not None and not isinstance(target, str):
+            raise ApiError(422, INVALID_DESKTOP_SETTINGS, field="startup_profile_id")
+        intent["startup_profile_id"] = target
+    return intent
+
+
+def _facts_payload(facts: StartupFacts) -> dict:
+    """启动项事实的显式响应形状（§59）：只给本程序算出的命令与布尔事实。
+
+    不返回注册表里读到的原始命令内容 —— 那可能是别的应用写在同一值名下的命令行。
+    """
+    pending = facts.pending_apply
+    return {
+        "requested_enabled": facts.requested_enabled,
+        "registration_present": facts.registration_present,
+        "command_matches": facts.command_matches,
+        "executable_exists": facts.executable_exists,
+        "effective_state": facts.effective_state,
+        "divergence": facts.divergence,
+        "last_apply_result": facts.last_apply_result,
+        "pending_apply": (
+            None if pending is None else {"action": pending.action, "command": pending.command}
+        ),
+        "expected_command": facts.expected_command,
+    }
+
+
+def _startup_rejection(result: str, *, field: str | None) -> ApiError:
+    """启动项结果码 → 409 与固定文案；没有专属码的结果归入 `startup_apply_failed`。"""
+    code = _STARTUP_REJECTION_CODES.get(result, "startup_apply_failed")
+    return ApiError(409, code, field=field, message=_STARTUP_REJECTION_MESSAGES[code])
 
 
 def _set_header(message: dict, name: bytes, value: str) -> None:

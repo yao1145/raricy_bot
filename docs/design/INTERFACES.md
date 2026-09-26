@@ -890,7 +890,13 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   ...)` 仍然成立），写完即不再回退到档案；**N1 的 `migration.py` 落地后，这条回退仍是升级
   用户的唯一导入路径**。查询不修复、不创建、不覆盖（与 D-130 同口径）：只有这一次导入会创建
   文件，损坏、版本不认识或不支持时只报码、不动现场；全新实例（没有 `launcher.json`）连默认值
-  也不落盘。
+  也不落盘。**配置面不再承载该偏好**（N4 Task 4）：`GET /api/config` 不再返回
+  `start_bot_on_launch`；`PUT /api/config` 收到该键时在任何写入之前回 422
+  `desktop_setting_moved`（`field=start_bot_on_launch`，`message=texts.DESKTOP_SETTING_MOVED`
+  指向「桌面」页），不静默忽略、也不写第二份副本；`ConfigService.commit()` 不再接受该参数、
+  不再写入 `_launcher.start_bot_on_launch`。档案里的同名字段只在**历史快照与迁移的只读口径**
+  里保留（`SavedConfig.start_bot_on_launch`、`ConfigService.start_bot_on_launch()`、
+  一次性导入），新提交不再产生它。
 - **桌面设置的稳定码**（§8、§11）：`desktop_settings_conflict`（revision 不符）、
   `invalid_desktop_settings`（参数类型/取值非法）、`desktop_unreadable`（读不到：权限、占用）、
   `desktop_corrupt`（JSON 解析失败、顶层非映射、`settings_revision` 不是非负整数、布尔字段
@@ -962,6 +968,38 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   单独记录）。`repair()` 一律按**当前** EXE 路径重新生成命令，**永不重放**
   `pending_startup_apply`：它只是「上次想写什么」的诊断记录，重放会把搬目录前的旧路径
   写回注册表。
+- **桌面设置与启动项端点**（§8、§58、D-149）：三个端点都要求已认证会话，写请求另走
+  Origin / Fetch Metadata / CSRF / JSON 内容类型与请求体上限。
+  - `GET /api/desktop-settings` → `{"ok": true, "settings_revision", "launch_at_sign_in",
+    "start_bot_on_launch", "startup_profile_id"}`；失败按稳定码映射（`desktop_unreadable` /
+    `desktop_corrupt` / `desktop_unsupported_version` / `desktop_settings_write_failed` 都是 409，
+    **必须显式映射**，否则一次性导入落盘失败会变成 500）。
+  - `PUT /api/desktop-settings`：body 严格白名单 `{"expected_settings_revision": int,
+    "launch_at_sign_in"?: bool, "start_bot_on_launch"?: bool, "startup_profile_id"?: str|null}`。
+    缺版本守卫、多余键、类型不对 → 422 `invalid_desktop_settings`（`field` 指到具体键）；
+    revision 不符 → 409 `desktop_settings_conflict`；`startup_profile_id` 形态非法同样 422
+    （目标是否真的存在由档案服务判定，本阶段尚未落地）。开启 `launch_at_sign_in` 之前先做
+    写前判定：命令超 260 → 409 `startup_command_too_long`、路径不可用/非冻结形态 → 409
+    `startup_path_unusable`（`field=launch_at_sign_in`，带 `texts.py` 的固定文案），**且不写意图**
+    ——做不到的偏好不落盘。成功 → 200 `{"ok": true, "settings_revision", "applied": bool,
+    "startup": {…事实…}}`：写意图（revision +1）→ 按意图应用 → 回读 → 记录结果。应用失败
+    **不回滚意图**，`applied=false` 加事实由页面显示差异。
+  - `GET /api/desktop/startup-status` → `{"ok": true, "settings_revision", "requested_enabled",
+    "registration_present", "command_matches", "executable_exists", "effective_state",
+    "divergence", "last_apply_result", "pending_apply": obj|null, "expected_command"}`。
+    **只读自有值、不回显原始命令**：不返回注册表里读到的内容（可能是别的应用写的），只给
+    本程序算出的 `expected_command` 与布尔事实；不枚举其他启动项。这里的 `last_apply_result`
+    是**本次观测**的结论（读不到或同名值非本产品持有时是 `read_failed` /
+    `registration_conflict`），不写回设置文件、也不得当作持久值回用 —— 文件里保留上一次
+    真实应用的结果。查询路径同样不落盘。
+  - `POST /api/desktop/startup-repair`：body 只接受 `expected_settings_revision`（任何
+    `command` 之类的键 → 422 `invalid_desktop_settings`，**不接受任意执行命令**）。按**当前**
+    EXE 路径重新生成命令并执行，成功 → 200 同 `PUT` 的成功形状。**两个冲突来源都要映射**：
+    revision 过期由服务层抛 `DesktopSettingsConflict` → 409 `desktop_settings_conflict`；
+    同名值非本产品持有**不抛异常**、以事实返回 → 409 `startup_registration_conflict`；
+    `apply_failed` / 读不到（`read_failed`，没有专属码）→ 409 `startup_apply_failed`，
+    `command_too_long` / `path_unusable` → 各自的稳定码，都带 `texts.py` 的固定文案。
+    启动时**不重放** `pending_startup_apply`：系统偏好只由用户在页面上按修复时改写。
 - **会话**（§8.1）：引导令牌单次、限时（120 秒），经 URL fragment 交付；兑换成功即发放
   HttpOnly + SameSite=Strict 的会话 Cookie，并回一个会话绑定的 CSRF 值。兑换按 60 秒窗口限次，
   窗口会滚动，本机他人刷满也不能把用户永久挡在门外。会话只存内存，Controller 重启即全部失效。
@@ -1029,6 +1067,17 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   `detail`、`elapsed_ms`，不返回生成内容或凭据。测试输入只在本次调用内使用，不写入正式/草稿配置，
   也不更新 revision 绑定的测试状态；已保存配置测试仍按原规则记录 revision 结果。模型测试仍受
   单次并发、固定样例、输出 token 上限和超时约束。
+- **桌面页签与文案约定**（§8、D-149）：导航在既有三页之后新增「桌面」页签（不重排现有页面），
+  由 `frontend/src/DesktopSettings.svelte` 承载三个开关（「登录 Windows 时启动 Light」「打开 Light
+  时启动机器人」「启动目标档案」）、启动项事实、差异提示与「修复启动项」。机器码 → 固定中文
+  文案映射放 `frontend/src/texts.ts`：`STARTUP_STATUS_NOTICES`（按 `effective_state`，与
+  `RECOVERY_NOTICES` 同构）、`STARTUP_RESULT_NOTICES`（按 `last_apply_result`），
+  `desktop_settings_conflict` 进既有 `CONFLICT_NOTICES`。`enabled` 的文案必须写明
+  「Windows 可能延迟执行，或按你在系统设置里的选择跳过；本程序不修改该选择」，**不得**出现
+  「下次登录必定启动」一类承诺。启动目标档案在档案列表接口（N2）交付前只显示当前值并说明
+  由账号页管理，页面不自行列出档案。设置页移除原复选框并指向桌面页；向导保存成功后改用
+  `PUT /api/desktop-settings` 写 `start_bot_on_launch=true`（`expected_settings_revision` 取当前值），
+  `startup_profile_id` 的接线等 N1 的档案状态 DTO 落地后再补。
 - 发行构建：`tools/build_light.py` 生成 staging（Light 闭包 + 静态资源 + 构建信息），
   `--pyinstaller` 用 `light.spec` 冻结为 onedir/windowed 应用，`--zip` 打出 ZIP 与 `.sha256`。
   `build-info.json` 记录版本、协议版本、Python 版本、依赖清单与整包校验和。

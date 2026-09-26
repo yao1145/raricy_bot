@@ -128,7 +128,40 @@ export interface ConfigView {
     llm_api_key: { configured: boolean };
     backend: { name: string; available: boolean };
   };
+}
+
+/** 桌面偏好（§58）：`desktop.json` 的三个开关与它自己的 revision。 */
+export interface DesktopSettingsView {
+  ok: true;
+  settings_revision: number;
+  launch_at_sign_in: boolean;
   start_bot_on_launch: boolean;
+  startup_profile_id: string | null;
+}
+
+/** 登录启动项的一次观测事实（§59）：只含布尔事实与本程序算出的命令。 */
+export interface StartupFacts {
+  requested_enabled: boolean;
+  registration_present: boolean;
+  command_matches: boolean;
+  executable_exists: boolean;
+  effective_state: string;
+  divergence: boolean;
+  last_apply_result: string;
+  pending_apply: { action: string; command: string } | null;
+  expected_command: string;
+}
+
+export interface StartupStatusView extends StartupFacts {
+  ok: true;
+  settings_revision: number;
+}
+
+export interface DesktopSettingsSaveResult {
+  ok: true;
+  settings_revision: number;
+  applied: boolean;
+  startup: StartupFacts;
 }
 
 export interface OperationView {
@@ -146,6 +179,30 @@ export function getStatus(): Promise<{ status: StatusSnapshot }> {
 
 export function getConfig(): Promise<ConfigView> {
   return apiGet("/api/config");
+}
+
+export function getDesktopSettings(): Promise<DesktopSettingsView> {
+  return apiGet("/api/desktop-settings");
+}
+
+/** 写桌面偏好；`expected_settings_revision` 由调用方取当前值（§58）。 */
+export function saveDesktopSettings(
+  payload: Record<string, unknown>,
+): Promise<DesktopSettingsSaveResult> {
+  return apiWrite("/api/desktop-settings", payload);
+}
+
+export function getStartupStatus(): Promise<StartupStatusView> {
+  return apiGet("/api/desktop/startup-status");
+}
+
+/** 修复启动项：只带版本守卫，服务端按当前程序路径重新生成命令（§59）。 */
+export function repairStartup(expectedSettingsRevision: number): Promise<DesktopSettingsSaveResult> {
+  return apiWrite(
+    "/api/desktop/startup-repair",
+    { expected_settings_revision: expectedSettingsRevision },
+    "POST",
+  );
 }
 
 export function saveConfig(payload: Record<string, unknown>): Promise<{ revision: number }> {

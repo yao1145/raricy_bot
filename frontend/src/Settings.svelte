@@ -21,7 +21,6 @@
   let apiKey = $state("");
   let passwordAction = $state<"keep" | "replace">("keep");
   let apiKeyAction = $state<"keep" | "replace">("keep");
-  let startOnLaunch = $state(false);
 
   let kbFile = $state("knowledge.md");
   let kbContent = $state("");
@@ -42,7 +41,6 @@
       texts = nextTexts;
       flags = nextFlags;
       account = loaded.account ?? "";
-      startOnLaunch = loaded.start_bot_on_launch;
       try {
         kbFiles = (await api.kbStatus()).files;
       } catch {
@@ -94,7 +92,6 @@
         expected_revision: view.revision ?? 0,
         values: collect(),
         credentials,
-        start_bot_on_launch: startOnLaunch,
       };
       if (!view.account && account.trim() !== "") body.account = account.trim();
       const result = await api.saveConfig(body);
@@ -316,10 +313,9 @@
         {/each}
       </div>
     {/if}
-    <label class="checkbox" style="margin-top:12px">
-      <input type="checkbox" bind:checked={startOnLaunch} />
-      打开程序时自动启动机器人（只影响新的启动会话）
-    </label>
+    <p class="hint" style="margin-top:12px">
+      「打开 Light 时启动机器人」与「登录 Windows 时启动 Light」都已移到「桌面」页的桌面设置。
+    </p>
   </div>
 
   {#if message}<div class="notice">{message}</div>{/if}
