@@ -8,7 +8,13 @@ a = Analysis(
     pathex=["src"],
     binaries=[],
     # 静态资源随包：发行程序从包资源定位页面，不依赖运行期 Node 或 CDN（§3.1）。
-    datas=[("src/raricy_launcher/static", "raricy_launcher/static")],
+    # 托盘图标同法随包（N3）：PyInstaller 只收集这里列出的路径，缺一项发行包就少一个
+    # 文件（staging 里有、冻结产物里没有）。此列表与 packaging/light/pyproject.toml 的
+    # package-data 必须同步，见 INTERFACES.md §60。
+    datas=[
+        ("src/raricy_launcher/static", "raricy_launcher/static"),
+        ("src/raricy_launcher/assets", "raricy_launcher/assets"),
+    ],
     hiddenimports=[
         "win32timezone",
         "uvicorn.logging",

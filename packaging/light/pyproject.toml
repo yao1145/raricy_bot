@@ -32,4 +32,6 @@ where = ["src"]
 include = ["raricy_launcher*", "raricy_bot*"]
 
 [tool.setuptools.package-data]
-raricy_launcher = ["static/*"]
+# static/ 是管理页构建产物，assets/ 是托盘图标（N3）；两者都要同时出现在这里与
+# light.spec 的 datas 里，缺一边就会有一种安装方式少文件（INTERFACES.md §60）。
+raricy_launcher = ["static/*", "assets/*.ico"]

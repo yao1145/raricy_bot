@@ -953,6 +953,15 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 - 发行构建：`tools/build_light.py` 生成 staging（Light 闭包 + 静态资源 + 构建信息），
   `--pyinstaller` 用 `light.spec` 冻结为 onedir/windowed 应用，`--zip` 打出 ZIP 与 `.sha256`。
   `build-info.json` 记录版本、协议版本、Python 版本、依赖清单与整包校验和。
+- 托盘图标资源（N3）：`src/raricy_launcher/assets/` 下三个多尺寸 ICO —— `tray-normal.ico`
+  （实心圆）、`tray-stopped.ico`（空心圆环）、`tray-attention.ico`（实心三角），尺寸集合固定
+  `16/20/24/32/48/256`，背景透明，三个**形状本身**不同而不只靠颜色区分（无障碍要求）。
+  资源由 `tools/make_tray_icons.py` 生成，该工具只用标准库、输出确定性（重复运行字节一致），
+  并且**不进 staging、不进冻结包、运行时不导入**；不要手改 `.ico` 字节，改样式请改生成器再重跑。
+  运行期按包目录下的 `assets/` 定位（与 `static/` 同法，PyInstaller 6.x onedir 下即
+  `_internal/raricy_launcher/assets/`）；`packaging/light/light.spec` 的 `datas` 与
+  `packaging/light/pyproject.toml` 的 `[tool.setuptools.package-data]` **必须同步**，
+  缺一处就会有一种安装形态少图标。取舍理由见 [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) D-138。
 - 首次启动路径：数据根还没有活动档案时，配置服务**按需建立第一个档案**（§5.1 第 1 步），
   管理页因此读到 `needs_setup`、向导可以直接保存 —— 把「没有档案」当错误会让首次启动失败。
 - 验收边界：`tools/smoke_light.py` 覆盖「启动 → 激活 → 会话 → 状态 → 页面与构建产物 →
