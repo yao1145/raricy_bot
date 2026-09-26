@@ -1037,8 +1037,10 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   启动机器人（`start`）｜停止机器人（`stop`）｜重启机器人（`restart`）｜打开诊断目录
   （`open_diagnostics`，始终可用）｜退出 Light（`quit`，始终可用）。账号行为
   `TRAY_ACCOUNT_PREFIX + (account or TRAY_ACCOUNT_UNSET)`，状态行为 `TRAY_STATUS_PREFIX + 状态标签`；
-  两条展示行 `command` 是空串且 `enabled is False`。分隔符不占独立菜单项，而是挂在紧随其后
-  的项上（`separator_before`），窗口层按序渲染。可用性：`start` = 配置 `configured` 且进程
+  两条展示行 `command` 是空串且 `enabled is False`。分隔符在这张表里**不占独立菜单项**，而是
+  挂在紧随其后的项上（`separator_before`）；窗口层渲染时要在**该项之前**补一条独立的
+  `MF_SEPARATOR` 项，而不是把这一项自己变成分隔线（§61.4）。整个菜单 12 行 = 8 项 + 4 个
+  分隔符。可用性：`start` = 配置 `configured` 且进程
   `stopped` / `failed` 且非 `quitting`；`stop` = 进程 `running` / `starting` 且非 `quitting`；
   `restart` = 配置 `configured` 且进程 `running` / `stopped` / `failed` 且非 `quitting`。
   禁用只是交互提示，服务端仍然自己判。N3 **不**放切换账号（等 N2 的页面）与登录启动设置
@@ -1158,8 +1160,15 @@ import 本模块（`--no-tray` 与非 Windows 路径都不加载 `win32gui`）�
 - **右键菜单**：`LOWORD(lParam) == WM_CONTEXTMENU` 时 `SetForegroundWindow(hwnd)` 后用
   `TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY` 弹 `TrackPopupMenu`（坐标取 `wParam` 的
   `GET_X_LPARAM`/`GET_Y_LPARAM`，按有符号 16 位解释；多显示器在左侧时可能是负数）。菜单项
-  id 是 1..n，按 `TrayMenuItem.separator_before` 挂 `MF_SEPARATOR`、按 `enabled` 挂
-  `MF_GRAYED`；**弹出前把视图拷成局部变量**，返回的 id 必须用同一份快照映射回命令 ——
+  id 是 1..n，按 `enabled` 挂 `MF_GRAYED`（可点项是 `MF_STRING`，`MF_STRING` 的值就是 0）；
+  `TrayMenuItem.separator_before` 表示「**这一项前面**先补一条**独立**的分隔项」，不是「这一项
+  是分隔符」—— 必须另起一次 `AppendMenu(MF_SEPARATOR, 0, "")`，而**不是**把 `MF_SEPARATOR`
+  或到该项自己的标志位上。Win32 的 `MF_SEPARATOR` 语义是「画一条横线，`lpNewItem` 与
+  `uIDNewItem` 都被忽略」（实测：`MF_STRING | MF_SEPARATOR` 的行 `GetMenuState` 带
+  `MF_SEPARATOR` 位、文本被丢弃）：并到带命令的项上会让它变成一条不可选中的空线，菜单从
+  12 行塌成 8 行 —— 账号行文案消失，`start`/`open_diagnostics`/`quit` 三条命令从托盘不可达
+  （`TrackPopupMenu` 永远拿不到它们的 id）。**弹出前把视图拷成局部变量**，返回的 id 必须用
+  同一份快照映射回命令 ——
   `TrackPopupMenu` 阻塞期间 `present()` 可能已经换掉视图，用新视图解释旧菜单的返回值会映射
   到错误命令。收尾 `PostMessage(hwnd, WM_NULL, 0, 0)`。空串（账号行/状态行）与 0（取消）
   都不投递。

@@ -488,9 +488,15 @@ class WinTrayIcon:
         menu = win32gui.CreatePopupMenu()
         try:
             for index, item in enumerate(view.menu, start=1):
-                flags = win32con.MF_STRING
                 if item.separator_before:
-                    flags |= win32con.MF_SEPARATOR
+                    # 分隔符是**独立**的一次 `AppendMenu`：Win32 的 `MF_SEPARATOR` 只画一条
+                    # 横线，`lpNewItem` 与 `uIDNewItem` 都被忽略。写成 `MF_STRING |
+                    # MF_SEPARATOR` 就会把「带命令的项」变成不可选中的空线 —— 账号行文案消失，
+                    # `start`/`open_diagnostics`/`quit` 从托盘不可达（`TrackPopupMenu` 永远
+                    # 拿不到它们的 id）。`separator_before` 是「这一项前面加一条分隔线」，
+                    # 不是「这一项是分隔符」。
+                    win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
+                flags = win32con.MF_STRING
                 if not item.enabled:
                     flags |= win32con.MF_GRAYED
                 win32gui.AppendMenu(menu, flags, index, item.label)
