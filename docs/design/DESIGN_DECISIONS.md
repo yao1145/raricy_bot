@@ -1201,6 +1201,42 @@ N1 的落地口径（[下一代设计](LIGHT_NEXT_GENERATION.md) §4.1、§5.1�
   目录，取值逐字节不变。`update_catalog()` 先读后写在读失败时直接抛出，绝不覆盖损坏
   现场 —— 与 D-130 的「查询不修复」是同一条原则的写入口版本。
 
+<a id="d-134"></a>
+
+## D-134 档案记录：缺 `profile.json` 按降级默认读、账号名不进记录、激活是低层 API
+
+N1 Task 2 的落地口径（[下一代设计](LIGHT_NEXT_GENERATION.md) §4.1、§4.2、§5.1）。
+`profiles/<id>/profile.json` 承载稳定身份、生命周期状态与 `profile_revision`，
+由 `profile_service.ProfileService` 维护（字段表与三种读故障码见 §58）。
+
+- **为什么缺 `profile.json` 按降级默认处理而不是报错**：现存安装只有档案目录与
+  `config.yaml`，没有记录文件；把「文件不存在」当成故障会让升级后的每一次读取都停在
+  恢复态，v1 无损接管（§10）也就无从谈起。因此缺失读作「未验证、没有身份、revision 0」
+  的默认记录，并且**不**顺手补写 —— 查询路径一旦会写盘，只读的列表与状态就会改变现场。
+  真正读不出来时反过来绝不当成「没有」：非 UTF-8、非法 JSON、顶层不是对象或版本字段
+  类型不对报 `profile_corrupt`，`OSError` 报 `profile_unreadable`，版本更大报
+  `profile_unsupported_version`，三者都不覆盖现场 —— 这是 D-130 同一条原则在档案记录上
+  的版本。补写只发生在写路径：`ensure_first_profile()` 建立或补全记录，`bind_identity()`
+  与 `create_profile()` 写自己的新版本。
+- **为什么账号名不进 `profile.json`**：登录账号名已经以 `config.yaml` 的
+  `_launcher.account` 为唯一来源（§13.3 规定档案内不可变），复制进记录会让同一个事实
+  出现两个副本：改名（N2 的 `display_name` 改名或重设账号）时两者可能不一致，而按记录
+  里的名字显示、按配置里的名字登录正是最难发现的那类偏差。`display_name` 是可改的本地
+  标签，与登录身份无关；稳定身份只由 `site_user_id` 表达。
+- **为什么激活是低层 API 且由调用方负责停机**：`activate()` 只做「读目录、比代次、
+  一次写入指针与代次」，它不碰 Worker，也不该碰：迁移/切换的事务（验证目标、停旧 Worker、
+  确认退出、提交指针、按需启动）属于 N2 的 `LifecycleService`，N1 只固定输入（§5.2）。
+  文档化的前置条件是**调用方先停稳 Worker 并确认进程退出**（§5.1 第 2 条），因为指针一改，
+  旧 Worker 的写入就归属到新档案，而同号 revision 不串档案靠的正是代次比较。N1 不把它
+  暴露成 HTTP 路由；带 `expected_epoch` 的冲突返回 `revision_conflict`，且在任何写入之前失败。
+- **边界**：`catalog()` 是只读视图，指针缺失或不是合法档案 ID 时如实给出 `None`；
+  「文件存在但没有可用指针」属于元数据故障，由 `ConfigService.profile_or_none()` 一侧
+  报 `metadata_pointer_invalid`（D-130），本模块不修它。`create_profile()` 在
+  `launcher.json` 尚不存在的全新根目录上把 `catalog_revision` 与 `active_profile`、
+  `active_epoch`、schema 写进**同一次**写入：只写计数会留下一个没有指针的文件，
+  此后所有读都判 `metadata_pointer_invalid`，而 `ensure_first_profile()` 按 F2 拒绝修复它。
+  文件存在时本模块只改 `catalog_revision`，绝不改指针。
+
 ## 实施期编号兼容
 
 源码中的“裁决 A–G”与长期记忆 R8–R16：A/G→D-61，B→D-62，C→D-61/§33，

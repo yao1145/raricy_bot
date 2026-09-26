@@ -824,7 +824,8 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 [凭据库](../../src/raricy_launcher/credential_store.py)、[数据档案锁](../../src/raricy_bot/data_lock.py)。
 
 - **档案布局**（§13.1）：`launcher.json` 只放活动档案指针与 schema；每个档案有
-  `config.yaml`、`draft.yaml`、`revisions/`、`data/`、`knowledge/`、`logs/{runtime,errors}/`。
+  `profile.json`、`config.yaml`、`draft.yaml`、`revisions/`、`data/`、`knowledge/`、
+  `logs/{runtime,errors}/`。
   路径判定一律先规范化（绝对、解析链接/重解析点、大小写）再做包含检查：档案内的存储、
   记忆、知识与归档目录必须落在当前档案目录内（D-122 的路径口径见 §9.5）。
 - **配置三个对象**（§6.1）：`EditableConfig` 是表单可编辑字段的白名单（`EDITABLE_FIELDS`），
@@ -886,6 +887,44 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   （`storage.db_path`、`knowledge_base.root_dir`、`memory.root_dir`、
   `logging.archive.directory`），其余取值不变，仅供「还没有档案」的查询与向导临时校验；
   正式提交路径始终传真实档案目录。
+- **档案记录与身份**（§4.1，D-134）：`profiles/<id>/profile.json` 是档案级记录
+  （UTF-8 JSON、键固定、`profile_revision` 每次写入 +1）：
+
+  | 字段 | 含义 |
+  |---|---|
+  | `schema_version` | 记录版本，当前 `PROFILE_SCHEMA_VERSION = 1` |
+  | `profile_id` | 随机不可变的档案 id（同目录名） |
+  | `display_name` | 可改的本地标签；N2 才提供改名 |
+  | `site_user_id` | 站点登录返回并验证过的稳定 ID；`null` 表示未验证 |
+  | `identity_state` | `unverified` / `verified`，只有 `verified` 会被信任 |
+  | `state` | 生命周期状态；N1 只写 `active`，`detached` / `deleting` 留给 N2，读到未知值原样保留 |
+  | `profile_revision` | 记录版本（本模块管理，不等同 `config.yaml` 的 revision） |
+  | `created_at` | 注入时钟的 ISO 时间，只用于显示与记录，不参与判定 |
+
+  登录账号名**不**进 `profile.json`：仍以 `config.yaml` 的 `_launcher.account` 为唯一来源。
+- **档案记录的读容错**（绝不把「读不出来」当成「没有」）：`profile.json` 不存在是
+  v1 档案与尚未迁移根目录的正常形态，读记录返回降级默认值（`identity_state="unverified"`、
+  `site_user_id=None`、`profile_revision=0`、`state="active"`）且**不补写文件**；存在但
+  非 UTF-8、非法 JSON、顶层不是对象或版本字段类型不对 → `profile_corrupt`，`OSError` →
+  `profile_unreadable`，`schema_version` 大于 1 → `profile_unsupported_version`；三种情况
+  都不得覆盖现场。`ProfileError` 继承 `ConfigServiceError`，经 `api._handle` 自动得到
+  409 + 稳定码。目录级的列表读（`list_profiles()`）跳过目录名非法或不是目录的条目，
+  但**不**跳过读不出来的记录（那会掩盖故障）。写盘失败沿用既有 `config_write_failed`。
+- **身份**（§4.2）：`unverified` 的档案跑起来**不注入**身份校验（Task 4 的接缝按
+  `expected_site_user_id()` 决定），首次受控登录验证前不假定身份。`bind_identity()` 是
+  绑定站点的唯一入口，写 `identity_state="verified"` 与 `site_user_id`；一个稳定 ID
+  只属于一个可用档案：另一个 `state != "detached"` 的档案占用同一 ID 时抛
+  `profile_identity_taken`（`detached` 不占用，供 N2 引导回已有档案）。
+  `create_profile(site_user_id=…)` 只是预占，未验证前不参与校验。
+- **创建与激活**：`ProfileService.ensure_first_profile()` 是首个档案的唯一入口
+  （内部经 `ConfigService.ensure_first_profile()`，并补写缺失的 `profile.json`）；
+  `create_profile()` 建立非活动档案并让 `catalog_revision` +1，已有指针不动 —— 只有
+  `launcher.json` 尚不存在的全新根目录会在同一次写入里显式带上 `active_profile`、
+  `active_epoch` 与 schema，避免留下没有指针的目录文件。
+  `activate(profile_id, *, expected_epoch)` 是低层激活：**调用方负责先停稳 Worker、
+  确认退出**（§5.1 第 2 条），`expected_epoch` 不符抛 `revision_conflict`；N1 不把它
+  暴露成 HTTP 路由。`catalog()`、`active_profile_id()`、`list_profiles()`、
+  `expected_site_user_id()` 只读，不创建、不补写。
 - **运行快照**（§6.5）：`build_run_launch(revision)` 在写锁内**一次**取到「指定版本的运行
   快照 + 对应凭据」（分开调用会拼出旧配置配新 Key）；`build_run_config()` / `credentials_for()`
   都**必须显式给 revision**，快照写在档案自己的 `runtime/` 下，换档案不会互相覆盖。
