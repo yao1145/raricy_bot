@@ -47,6 +47,7 @@ from .config_service import (
     ConfigServiceError,
     ConfigStatus,
 )
+from .credential_lifecycle import CredentialLifecycle
 from .credential_store import CredentialStore, SessionMemoryStore, SystemKeyringStore
 from .desktop_settings import DesktopSettings, DesktopSettingsError, DesktopSettingsService
 from .events import EventService
@@ -69,6 +70,7 @@ from .process_manager import (
     WorkerSpec,
     default_worker_spec,
 )
+from .profile_removal import RemovalService
 from .profile_service import ProfileService
 from .session import SessionManager
 from .startup_service import StartupService
@@ -76,6 +78,7 @@ from .status_service import StatusService
 from .tray_model import TrayView
 from .tray_service import CODE_CONFIG_NOT_READY, CODE_LIFECYCLE_BUSY, CODE_QUITTING
 from .tray_service import TrayCommandError, TrayCoordinator
+from .verification import VerificationStore
 
 _RUNTIME_FILE = "launcher-runtime.json"
 
@@ -179,8 +182,16 @@ class Controller:
                     status="session_only",
                     error="SystemKeyringStore",
                 )
+        # 凭据引用归属索引（N2 Task 2、D-144）：提交、清除与卡片查询共用同一个实例；
+        # 与配置服务分开的写锁，调用顺序固定为「配置锁 → 生命周期锁」。
+        self._credential_lifecycle = CredentialLifecycle(
+            self._data_root, store=self._credentials
+        )
         self._config = ConfigService(
-            self._data_root, credential_store=self._credentials, profile_id=profile_id
+            self._data_root,
+            credential_store=self._credentials,
+            profile_id=profile_id,
+            credential_lifecycle=self._credential_lifecycle,
         )
         # 桌面偏好与登录启动项（§58、§59）：装配一次，API 与后续的自动运行解析共用；
         # 注册表适配器在这里惰性取得，测试用替身注入 `LocalApi`，不碰真实注册表。
@@ -191,6 +202,23 @@ class Controller:
         self._profiles = ProfileService(
             self._data_root, base_config_service=self._config
         )
+        # 移除服务（N2 Task 3、D-145）：预览令牌只存内存，HTTP 入口与协调器的删除
+        # 命令必须看到同一张表，所以只装配一个实例、两边共用。
+        self._removal = RemovalService(
+            self._data_root,
+            profiles=self._profiles,
+            credentials=self._credential_lifecycle,
+            desktop_settings=self._desktop_settings,
+            # 判据与状态聚合一致：进程句柄在场才算「这个档案在跑」（延迟取值，
+            # 协调器在它之后才装配）。
+            running_profile=lambda: (
+                self._lifecycle_service.running_profile_id()
+                if self._lifecycle_service is not None
+                else None
+            ),
+        )
+        # 一次性验证票据（N2 Task 4、D-146）：只存内存，`stop()` 里全部作废。
+        self._verification = VerificationStore()
         # v1 迁移（§10）：服务在装配期构造，真正的迁移在 `start()` 的第一步跑；
         # 结果留在这里供 `_auto_start()` 判断（迁移未完成不自动运行机器人）。
         self._migration = MigrationService(
@@ -209,12 +237,6 @@ class Controller:
             stop_budget_ms=stop_budget_ms,
             on_event=self._on_worker_event,
         )
-        self._status = StatusService(
-            instance_id=self._instance_id,
-            config_service=self._config,
-            manager=self._manager,
-            profile_service=self._profiles,
-        )
         # 站点测试与启停共用的生命周期门：进程内单实例，随控制器一起装配
         # （§59、D-132）。互斥范围就是这个对象，所以只能有一个。
         self._lifecycle = LifecycleGate()
@@ -228,6 +250,19 @@ class Controller:
             gate=self._lifecycle,
             events=self._events,
             logger=self._logger,
+            # 阶段事件带目标档案（§59）：钩子只拿到 operation_id 与阶段码，
+            # 档案由控制器按记录补上。
+            stage_hook=self._on_lifecycle_stage,
+            # 删除命令经同一个移除服务（令牌表只有一张）。
+            removal=self._removal,
+        )
+        self._status = StatusService(
+            instance_id=self._instance_id,
+            config_service=self._config,
+            manager=self._manager,
+            profile_service=self._profiles,
+            # 未完成操作优先取协调器：切换事务的阶段只有它知道（§5.2、§59）。
+            lifecycle_service=self._lifecycle_service,
         )
         self._api: LocalApi | None = None
         self._server = None
@@ -371,6 +406,8 @@ class Controller:
         if watcher is not None and watcher is not threading.current_thread():
             watcher.join(timeout=2)
         self._sessions.revoke_all()
+        # 验证票据同样作废：进程退出后必须重新登录站点验证身份（§59、D-146）。
+        self._verification.revoke_all()
         self._events.close()
         if self._server is not None:
             self._server.should_exit = True
@@ -766,6 +803,12 @@ class Controller:
             lifecycle_gate=self._lifecycle,
             desktop_settings=self._desktop_settings,
             startup_service=self._startup_service,
+            # 账号 API 的依赖（N2 Task 4、§59）：协调器、移除服务（与协调器同一个
+            # 实例）、凭据归属索引与只存内存的验证票据。
+            lifecycle_service=self._lifecycle_service,
+            removal_service=self._removal,
+            credential_lifecycle=self._credential_lifecycle,
+            verification_store=self._verification,
         )
         api = self._api  # 线程只认这个局部引用：stop() 会先把 self._api 置空
         self._api_thread = threading.Thread(
@@ -981,12 +1024,34 @@ class Controller:
         )
 
     def _on_worker_event(self, name: str, fields: dict, level: str = "info") -> None:
-        """把进程阶段与 Worker 上报折进事件缓冲（§12）。
+        """把进程阶段与 Worker 上报折进事件缓冲（§12），并标上事件归属（§59）。
 
         帧本身由管理器消费（它负责最近状态快照）；控制器只把事件转发出去，
         不再自己抽帧 —— 两边都抽会让快照永远空着（审查 I3）。
+
+        归属取管理器**在途操作**的目标档案（`Operation.profile_id`，派发时就固定）：
+        全局事件（没有在途操作）保持 `None`。帧里同名的字段先拿掉 —— 归属是控制器
+        的事实，不由上游帧自报，也避免与显式关键字参数撞名。
         """
-        self._events.publish(name, level=level, **fields)
+        operation = self._manager.current_operation()
+        tagged = {key: value for key, value in fields.items() if key != "profile_id"}
+        self._events.publish(
+            name,
+            level=level,
+            profile_id=operation.profile_id if operation is not None else None,
+            **tagged,
+        )
+
+    def _on_lifecycle_stage(self, operation_id: str, stage: str) -> None:
+        """协调器的阶段事件（§59）：带目标档案，页面据此只显示当前账号的进度。"""
+        record = self._lifecycle_service.operation(operation_id)
+        self._events.publish(
+            "launcher.lifecycle_stage",
+            profile_id=record.profile_id if record is not None else None,
+            kind=record.kind if record is not None else None,
+            stage=stage,
+            status=record.state if record is not None else None,
+        )
 
     # --- 元数据 -----------------------------------------------------------
 

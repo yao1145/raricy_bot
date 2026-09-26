@@ -23,7 +23,12 @@ MAX_SUBSCRIBERS: int = 8
 
 @dataclass(frozen=True)
 class Event:
-    """一条已清洗的近期事件。"""
+    """一条已清洗的近期事件。
+
+    `profile_id` 是**事件归属**（§59）：档案级事件带自己的档案 id，全局事件为
+    `None`。它是顶层字段而不是 `fields` 里的普通一项 —— 页面按它过滤「只显示当前
+    档案的事件」，与事件名、等级并列，不需要先解包 `fields`。
+    """
 
     event_id: str
     seq: int
@@ -31,6 +36,7 @@ class Event:
     level: str
     name: str
     fields: tuple[tuple[str, int | float | str], ...]
+    profile_id: str | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -38,6 +44,8 @@ class Event:
             "at": self.at,
             "level": self.level,
             "event": self.name,
+            # 全局事件是 null，不是缺键：SSE 帧的形状因此恒定（§12、§59）。
+            "profile_id": self.profile_id,
             "fields": dict(self.fields),
         }
 
@@ -72,9 +80,26 @@ class EventService:
         """慢消费者丢掉的帧数；只用于诊断。"""
         return self._dropped
 
-    def publish(self, name: str, *, level: str = "info", at: float | None = None, **fields) -> Event:
-        """发布一条事件；字段经白名单清洗，超限字段直接丢弃。"""
+    def publish(
+        self,
+        name: str,
+        *,
+        level: str = "info",
+        at: float | None = None,
+        profile_id: str | None = None,
+        **fields,
+    ) -> Event:
+        """发布一条事件；字段经白名单清洗，超限字段直接丢弃。
+
+        `profile_id` 与其它字段同样过 `build_event()` 的白名单（`FIELD_KINDS` 的
+        `TOKEN` 类型）：形状不合法的归属被丢弃成全局事件，而不是原样带出去。
+        """
+        if profile_id is not None:
+            fields["profile_id"] = profile_id
         payload = build_event(name, fields)
+        cleaned = dict(payload.fields)
+        # 归属是顶层字段：从清洗后的字段里取走，不重复出现在 `fields` 里。
+        owned = cleaned.pop("profile_id", None)
         seq = next(self._sequence)
         event = Event(
             event_id=f"{self._instance_id}-{seq}",
@@ -82,7 +107,8 @@ class EventService:
             at=self._clock() if at is None else at,
             level=level,
             name=payload.name,
-            fields=payload.fields,
+            fields=tuple(cleaned.items()),
+            profile_id=owned if isinstance(owned, str) else None,
         )
         with self._lock:
             self._ring.append(event)

@@ -77,12 +77,16 @@ class StatusService:
         config_service,
         manager,
         profile_service=None,
+        lifecycle_service=None,
         clock=time.time,
     ) -> None:
         self._instance_id = instance_id
         self._config = config_service
         self._manager = manager
         self._profiles = profile_service
+        # 协调器（N2 Task 1）：它的未完成操作优先于管理器的在途操作 —— 切换事务的
+        # 阶段（`stop_A` 等）只有协调器知道，管理器看到的是它自己派发的那一次停止。
+        self._lifecycle = lifecycle_service
         self._clock = clock
         self._lock = threading.Lock()
         self._tests: dict[str, TestResult] = {}
@@ -153,6 +157,35 @@ class StatusService:
             return self._stale(result)
         return {"state": FRESH, "ok": result.ok, "detail": result.detail, "at": result.at}
 
+    def _pending_operation(self) -> dict | None:
+        """未完成操作的视图：协调器优先，其次管理局（§5.2、§9.1）。
+
+        协调器有未完成操作时它才是页面该看的进度（阶段、目标档案都在事务自己手里）；
+        管理器一侧的操作没有阶段概念，`stage` 如实回 `null`。
+        """
+        if self._lifecycle is not None:
+            record = self._lifecycle.current_operation()
+            if record is not None:
+                return {
+                    "operation_id": record.operation_id,
+                    "kind": record.kind,
+                    "state": record.state,
+                    "stage": record.stage,
+                    "profile_id": record.profile_id,
+                    "revision": record.target_revision,
+                }
+        pending = self._manager.current_operation()
+        if pending is None or pending.finished_at is not None:
+            return None
+        return {
+            "operation_id": pending.operation_id,
+            "kind": pending.kind,
+            "state": pending.state,
+            "stage": None,
+            "profile_id": pending.profile_id,
+            "revision": pending.target_revision,
+        }
+
     def snapshot(self) -> dict:
         """聚合状态；可能阻塞，调用方负责放到工作线程里。"""
         config_status = self._config.status()
@@ -182,16 +215,7 @@ class StatusService:
                 active_profile_id = None
                 profile_epoch = None
                 startup_profile_id = None
-        pending = self._manager.current_operation()
-        pending_operation: dict | None = None
-        if pending is not None and pending.finished_at is None:
-            pending_operation = {
-                "operation_id": pending.operation_id,
-                "kind": pending.kind,
-                "state": pending.state,
-                "profile_id": pending.profile_id,
-                "revision": pending.target_revision,
-            }
+        pending_operation = self._pending_operation()
         return {
             "instance_id": self._instance_id,
             # 保存的版本与正在跑的版本分开报；两者不同就是「待重启」。

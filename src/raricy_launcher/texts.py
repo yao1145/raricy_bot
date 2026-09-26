@@ -76,6 +76,52 @@ ACCOUNT_NO_SELECTION: str = (
     "当前没有选中的账号。请到「账号」页选择一个已有账号，或添加一个新账号。"
 )
 
+# 账号 API 的稳定码文案（N2 Task 4、§59）。页面按码取这里的说法；服务端在码本身
+# 不足以说明「接下来做什么」时把它放进响应信封的 `message`（与既有机制同一套）。
+CLIENT_UPGRADE_REQUIRED: str = (
+    "页面版本过旧，缺少当前账号与代次信息；请刷新页面后重试。"
+    "为避免把改动写到刚刚切换过去的账号上，这次请求没有被执行。"
+)
+VERIFICATION_REQUIRED: str = (
+    "这个账号还没有验证过身份；请先填写站点账号与密码并完成一次性验证，再保存设置。"
+)
+VERIFICATION_INVALID: str = (
+    "验证票据无效、已过期或已经使用过；请重新验证身份后再保存。"
+)
+VERIFICATION_MISMATCH: str = (
+    "这次提交的账号或密码与验证时输入的不一致；请按验证时的那份输入重新提交，"
+    "或重新验证身份。"
+)
+PROFILE_IDENTITY_TAKEN: str = (
+    "这个站点账号已经绑定在另一个账号档案上；请改用它，或先在那个档案上处理。"
+)
+PROFILE_IDENTITY_MISMATCH: str = (
+    "登录得到的站点账号与这个已移除档案原来的账号不一致；"
+    "已移除的档案只能重新绑定原来的账号。"
+)
+PROFILE_STATE_CONFLICT: str = (
+    "这个账号正在删除中，不能再修改配置或草稿；请先完成删除，或换一个账号。"
+)
+PROFILE_REVISION_CONFLICT: str = (
+    "账号记录在本次编辑期间变过（例如改名或状态变化）；请刷新后重试。"
+)
+TARGET_NOT_READY: str = (
+    "目标账号还没有可用的配置与凭据，无法选中或启动；请先把它配置好并验证身份。"
+)
+IDEMPOTENCY_KEY_REQUIRED: str = (
+    "这次请求缺少或不符合幂等键要求；请由页面重新发起。"
+)
+IDEMPOTENCY_CONFLICT: str = (
+    "同一个幂等键被用在了一次内容不同的请求上；请用新的键重试。"
+)
+CREDENTIAL_SCOPE_REQUIRED: str = (
+    "清除凭据要至少选择一项（密码或模型 Key）。"
+)
+CREDENTIALS_INDEX_BROKEN: str = (
+    "凭据归属索引读不出来，无法安全清除；为避免删错账号的条目，这次操作没有执行。"
+    "请按使用手册处理索引文件后重试。"
+)
+
 # 托盘菜单（N3）：顺序与可用性由 tray_model 固定，文案只在这里维护。
 TRAY_MENU_OPEN_ADMIN: str = "打开管理页"
 TRAY_MENU_START: str = "启动机器人"

@@ -1133,6 +1133,23 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   边界（D-145）：旧版本程序不认识墓碑，且手工把 `storage.db_path` 改到档案内更深层时
   `raricy_bot/__main__.py` 的检查会漏 —— 不宣称对任意旧 CLI 的保护。
 
+- **验证票据**（N2 Task 4、§4.2 第 3 条、D-146）：`VerificationStore`（
+  [verification.py](../../src/raricy_launcher/verification.py)）只在**内存**里保存票据，
+  有效期 600 秒；绑定 `session_id + profile_id + 精确账号 + 精确密码 + 服务端登录得到的
+  `site_user_id`；`consume()` 一次性（成功即作废），未知/过期/已用 → `verification_invalid`，
+  会话、档案、账号或密码不符 → `verification_mismatch`（不消耗，可改正后再提交）。
+  票据对象只在 `verify` 与 `config` 两个调用之间持有密码，不落盘、不写日志、不进事件、不进
+  操作记录；`Controller.stop()` 调 `revoke_all()`，进程重启后必须重新验证。
+  `verify` 与 `/api/test/site` 共用两条判据（`manager.state ∈ {stopped, failed}` 且无未完成
+  在途操作）与同一个站点登录路径；机器人运行时不代为停止，回 409 `bot_running`，由账号页先
+  提示、再由用户调用 `/api/bot/stop`。**绝不采信前端自报的 `account_id`**：稳定 ID 一律取
+  登录结果。
+- **`detached → active` 的唯一路径**（N2 Task 4、§6.2、§59）：`detached`（保留数据的移除）
+  档案不能用 `/activate` 回到可用列表 —— 唯一路径是 `PUT /api/profiles/{id}/config` 用**同一
+  稳定 ID**的验证票据重新保存一次配置（登录得到的 ID 与存档不符时 `verify` 就回
+  `profile_identity_mismatch`）。对**已绑定**档案改名不需要票据，写的是存档里的那一个
+  `site_user_id`（`bind_identity(id, site_user_id=<存档 ID>, display_name=<新值>)`，
+  `profile_revision` +1），不新增改名方法或端点。
 ## 59. Light 控制面（会话、API、进程与事件）
 
 入口：[桌面入口](../../src/raricy_launcher/main.py)、[会话](../../src/raricy_launcher/session.py)、
@@ -1416,9 +1433,9 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
     超时（`EXIT_CONFIRM_TIMEOUT_SECONDS = 2 × STOP_BUDGET_MS + 5 秒 = 45`，可注入）或结果不在
     集合内都算未确认。目标与当前活动档案是同一个时跳过停与提交，退化成一次普通启动
     （不写指针、不 bump epoch，结果码仍用 `started` / `selected`）。`invalidate_old_views`
-    发布事件 **`launcher.profile_activated`**（**Task 4 起**字段 `profile_id` 与代次随
-    `FIELD_KINDS` 的登记进事件 —— 登记之前 `build_event` 会静默丢弃这两个字段，所以本阶段
-    不声称它们已经可见；N1 的测试结果按身份键自然过期），不重写任何状态。
+    发布事件 **`launcher.profile_activated`**（N2 Task 4 起 `profile_id` 已随
+    `FIELD_KINDS` 登记进事件，见本节的「事件归属」条；N1 的测试结果按身份键自然过期），
+    不重写任何状态。
   - **幂等键**（§4.2、总表）：形状 `[A-Za-z0-9_-]{8,64}`（`IDEMPOTENCY_KEY_MIN_CHARS` /
     `_MAX_CHARS`），摘要 = 规范化请求字段的 JSON 排序键 + sha256，**输入不含秘密、摘要不落盘**。
     内存表保留最近 50 个键；服务重启后回落到记录级比较（同一键、同一 `kind`、同一目标档案、
@@ -1512,6 +1529,75 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   `worker.data_locked`（`reason="profile_removed"`）与退出码 `EXIT_DATA_LOCKED = 4`，
   不新增退出码。
 
+- **账号 API**（N2 Task 4、§4.2、§9、[verification.py](../../src/raricy_launcher/verification.py)、D-146）：
+  全部沿用既有会话（`_require_session`）、写请求校验（精确 Origin / Fetch Metadata / CSRF /
+  JSON 内容类型 / 256 KiB 上限）与**严格字段白名单**：请求体出现未列出的键 → 400
+  `bad_request`（`field` 指向第一个多余键），类型与长度错误 → 422 + 对应稳定码。
+  成功信封一律 `{"ok": true, …}`，失败信封与既有形状相同（`ok`/`code`，可选 `field`、
+  `message`、`details`）。
+
+  | 方法与路径 | 请求字段（白名单） | 成功响应 | 失败（稳定码，HTTP） |
+  |---|---|---|---|
+  | `GET /api/profiles` | — | 200 `{"ok":true,"catalog":{active_profile_id,active_epoch,catalog_revision,schema_version},"profiles":[ProfileCard…]}` | 409 元数据故障码（N0） |
+  | `POST /api/profiles` | `display_name?`、`expected_catalog_revision`、`idempotency_key` | 200 `{"ok":true,"profile_id":"p-…","catalog_revision":n}` | 409 `revision_conflict` / `idempotency_conflict` / `lifecycle_busy`；422 `invalid_value` / `invalid_revision` / `idempotency_key_required` |
+  | `GET /api/profiles/{id}/draft` | — | 200 `{"ok":true,"revision":n,"values":{…}}` | 404 `not_found`；409 `profile_state_conflict` |
+  | `PUT /api/profiles/{id}/draft` | `expected_revision`、`values`、`expected_profile_revision?` | 200 `{"ok":true,"revision":n}` | 404 `not_found`；409 `revision_conflict` / `profile_state_conflict`；422 |
+  | `POST /api/profiles/{id}/verify` | `account`（1–256 字符）、`password`（1–4096 字符） | 200 `{"ok":true,"verification_id":"…","site_user_id":"…","chat_ready":bool,"expires_in":600}`；登录失败是 200 `{"ok":false,"detail":"…"}`（与 `/api/test/site` 同形，不签发票据） | 409 `bot_running` / `lifecycle_busy` / `profile_state_conflict` / `profile_identity_taken` / `profile_identity_mismatch`；422 `invalid_test_input` |
+  | `PUT /api/profiles/{id}/config` | `expected_revision`、`expected_profile_revision`、`verification_id?`、`values`、`credentials`、`account?`、`display_name?` | 200 `{"ok":true,"revision":n,"profile_revision":n}` | 404 `not_found`；409 `verification_required` / `verification_invalid` / `verification_mismatch` / `profile_revision_conflict` / `revision_conflict` / `profile_state_conflict`；422 |
+  | `POST /api/profiles/{id}/activate` | `expected_catalog_revision`、`expected_epoch`、`target_revision?`、`start`（默认 true）、`idempotency_key` | 202 `{"ok":true,"operation_id":"op-…"}` | 409 `revision_conflict` / `target_not_ready` / `profile_state_conflict` / `lifecycle_busy` / `idempotency_conflict`；422 `idempotency_key_required` |
+  | `POST /api/profiles/{id}/removal-preview` | `scope` | 200 `{"ok":true,"preview":{…},"confirmation_token":"…","expires_in":300}` | 404 `not_found`；409 `removal_unsafe_path`；422 `removal_scope_invalid` |
+  | `POST /api/profiles/{id}/remove` | `scope`、`confirmation_token`、`idempotency_key` | 202 `{"ok":true,"operation_id":"op-…"}` | 409 `removal_token_invalid` / `removal_preview_stale` / `removal_unsafe_path` / `profile_state_conflict` / `lifecycle_busy` / `idempotency_conflict`；422 |
+  | `POST /api/profiles/{id}/credentials/clear` | `kinds`（`["password","llm_api_key"]` 的非空子集）、`idempotency_key` | 202 `{"ok":true,"operation_id":"op-…"}` | 409 `lifecycle_busy` / `idempotency_conflict` / 三种索引故障码 / `profile_state_conflict`；422 `credential_scope_required` / `idempotency_key_required` |
+  | `GET /api/operations/{id}` | — | 200 `{"ok":true,"operation":{id,kind,state,stage,result,profile_id,revision,finished}}` | 404 `not_found`（协调器与管理局都没有） |
+
+  - **202 语义**：破坏性与长操作（`activate` / `remove` / `credentials/clear`）只预留并派发，
+    立刻回 `operation_id`；页面用 `GET /api/operations/{id}` 轮询，协调器记录带 `stage`
+    （`reserve_operation` / `stop_A` / … / `finished` 等固定阶段码），管理局的单次启停 `stage` 为 `null`。
+  - **404 / 422 的映射**：服务层对未知或已删除（墓碑）档案抛 `ProfileError("not_found")`，
+    由 `api._handle()` 映射成 **404**；`idempotency_key_required` / `removal_scope_invalid` /
+    `credential_scope_required` 映射成 **422**（各自带 `field`）。其余 `ProfileError` 与
+    `ConfigServiceError` 仍是 **409** + 稳定码。
+  - **`details` 白名单**：错误信封只并入 `existing_profile_id` / `profile_id` / `operation_id` /
+    `scope` 四个键（`ApiError(details=…)` 在构造时拒绝其余键），服务层不能借它夹带路径、
+    凭据引用或异常文本。
+  - **只读语义**：`GET /api/profiles` 在空数据根回 200 + 空数组，**不创建**任何档案或指针；
+    卡片的 `config` 取自该档案自己的 `ProfileService.config_service(id).status()`，一次请求
+    内每个档案只解析一次上下文（§4.1）。`actions` 由服务端判定：`deleting` →
+    `["remove","purge"]`；`detached` → `["purge","rebind"]`；其余 → `["edit","clear_credentials",
+    "remove","purge","verify"]`，非活动档案在身份已验证且配置就绪时前面再加
+    `["activate","activate_and_start"]`。页面不自己推断可行动作（§60）。
+  - **创建与幂等**：`POST /api/profiles` 建立**非活动**档案（首个档案在全新数据根上会同时
+    写入活动指针，与 N1 的 `create_profile()` 口径一致），并立即补齐 `profile.json`。
+    串行化取生命周期门的短租约、并在协调器有未完成操作时回 `lifecycle_busy`；幂等表留在
+    API 层（协调器的幂等表只覆盖写恢复记录的三种操作），规则与协调器逐字一致：同键同摘要
+    永远回同一 `profile_id`，同键不同摘要 → 409 `idempotency_conflict`，只保留最近 50 个键。
+  - **清除命令的阶段与结果码**：`credentials/clear` 经协调器的 `submit()` 预留（记录写盘、
+    串行化、幂等键），执行体阶段固定 `stop` → `clear_credentials` → `commit_config`；结果码
+    `cleared` / `cleared_partial` / `clear_failed`，错误码沿用 `stop_unconfirmed` /
+    `credential_backend_unavailable` 与 `config_write_failed`（凭据清了但配置窄写失败）。
+    `clear()` 正常返回就照常 `commit_credentials_clear()`：`ok=false` 只影响结果码与卡片的
+    清理待办，不表示什么都没清；只有 `clear()` 抛异常才是「凭据库这一侧完全没动」。
+- **过渡入口的活动代次门**（N2 Task 4、§9.4、D-146）：`PUT /api/config` 与
+  `POST /api/bot/{start,restart}` 的请求体必须另带 `profile_id`（等于当前活动档案）与
+  `expected_profile_epoch`（等于 `catalog().active_epoch`）：缺任一 → 409
+  `client_upgrade_required`（明确要求页面升级，**不**把改动透明转发到刚切过去的账号）；
+  在场但与当前不符 → 409 `revision_conflict`（`field` 指向 `profile_id` 或
+  `expected_profile_epoch`）。首次设置（还没有任何档案）时正确取值是
+  `profile_id: null`、`expected_profile_epoch: 0`。元数据故障（N0 的四个码）在判上下文之前
+  如实抛出。`POST /api/bot/stop` 不变（停止不受代次门限制）。
+  `POST /api/bot/{start,stop,restart}` 一律经协调器的 `start_bot(expected_epoch=…)` /
+  `stop_bot()` / `restart_bot(expected_epoch=…)`：启停因此共用同一条串行化与取消代次
+  （`stop` 会提高代次，在途切换据此收敛）。请求体里的 `revision` 不再参与判定 —— 启动绑定的
+  版本一律取该档案当前已保存的那一版（`start=False` 的「只选中」不需要版本）。
+- **事件归属**（N2 Task 4、§12、D-146）：`EventService.publish(name, …, profile_id=None, **fields)`
+  把 `profile_id` 经 `logging_setup.build_event()` 的同一份白名单清洗（`FIELD_KINDS` 的
+  `TOKEN` 类型），`Event.as_dict()` 顶层带 `"profile_id"`（全局事件为 `null`，不是缺键），
+  SSE 帧因此天然携带。`Controller._on_worker_event()` 用
+  `manager.current_operation().profile_id` 给进程与 Worker 事件打标；协调器的阶段事件
+  （`launcher.lifecycle_stage`）与 `launcher.profile_activated` 带目标档案。**前端默认只展示
+  `profile_id` 为空或等于当前活动档案的事件**（Task 5）；切换档案时清掉旧表单、密码输入、
+  测试结果与待提交动作，服务端不代做这件事。
+
 ## 60. 管理页与发行（`frontend/`、`packaging/light/`）
 
 入口：[前端工程](../../frontend/package.json)、[发行元数据](../../packaging/light/pyproject.toml)、
@@ -1568,6 +1654,28 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   凭据后端可用 → 退出 → 元数据清理」，运行时本机不能再有另一个 Light 实例（激活通道与
   互斥体按当前用户命名）。**干净 Windows 清单（§17.2）与真实站点/模型验收仍未执行**，
   见使用手册 §7。
+- **账号页要用的字段**（N2 Task 4；服务端形状见 §59 的 ProfileCard）：页面只用
+  `GET /api/profiles` 的 `catalog`（`active_epoch` 给 `activate` 的 `expected_epoch`、
+  `catalog_revision` 给 `expected_catalog_revision`）与每张卡片的
+  `profile_id` / `display_name` / `account` / `site_user_id` / `identity_state` / `state` /
+  `profile_revision` / `config{state,revision,error}` / `is_active` / `is_running` /
+  `is_startup_target` / `credentials{backend,cleanup_pending,historical_managed,
+  unknown_ownership}` / `actions`。页面**不自己推断可行动作**，按 `actions` 呈现按钮：
+  `activate`/`activate_and_start` 只用 `catalog.active_epoch` 与 `catalog_revision`、
+  `edit` 走草稿与 `PUT …/config`、`verify` 先 `POST …/verify`（机器人运行时先提示并调用
+  `/api/bot/stop`）、`clear_credentials` 走 202、`remove`/`purge` 必须先
+  `POST …/removal-preview` 拿令牌、`rebind` 走 `PUT …/config` + 同一稳定 ID 的新票据。
+  `credentials.cleanup_pending` 为真时必须显示清理待办与重试入口（§58）。
+  切换账号后清空旧表单、密码输入、测试结果与待提交动作，并按事件归属过滤日志流（§59）。
+  `PUT /api/config` 与 `POST /api/bot/{start,restart}` 的过渡门字段由页面从 `catalog` 读出后
+  原样带上（首次设置是 `null` / `0`）。
+  **文案**：账号页的稳定码文案与 `src/raricy_launcher/texts.py` 的新增常量一一对应
+  （`client_upgrade_required` / `verification_*` / `profile_identity_*` /
+  `profile_state_conflict` / `profile_revision_conflict` / `target_not_ready` /
+  `idempotency_*` / `credential_scope_required`），页面不得另写一套说法。
+- **构建产物与页面目标**（N2 Task 5）：账号页是 `frontend/src/Accounts.svelte`，导航在既有
+  页签之后新增「账号」入口；`npm run check` 与 `npm run build` 之后 `static/` 的产物
+  **必须重新构建并提交**（N2 的前端活只归 Task 5）。
 
 ## 61. Windows 托盘
 

@@ -101,6 +101,9 @@ FIELD_KINDS: dict[str, str] = {
     "http_status": TOKEN,
     "stage": TOKEN,
     "duration_ms": TOKEN,
+    # 档案归属（LIGHT_EDITION_DESIGN §4.1、§59、D-146）：只是本机档案 ID（`p-…`），
+    # 不含账号、用户名或路径；全局事件不带它。前端按它过滤「只显示当前档案的事件」。
+    "profile_id": TOKEN,
     # MCP 数字错误码、子进程退出码与信号；都是上游给的数字，不是正文。
     "code": TOKEN,
     "exit_code": TOKEN,
