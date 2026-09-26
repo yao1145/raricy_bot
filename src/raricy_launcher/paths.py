@@ -36,6 +36,8 @@ from pathlib import Path
 from uuid import uuid4
 
 LAUNCHER_FILE: str = "launcher.json"
+# 凭据引用归属索引：与 launcher.json 同级，**不含任何秘密取值**（§7、D-144）。
+CREDENTIALS_INDEX_FILE: str = "credentials-index.json"
 # 桌面偏好：与 launcher.json 同级，独立于任何档案（§8、D-142）。
 DESKTOP_FILE: str = "desktop.json"
 RUNTIME_DIR: str = "runtime"
@@ -80,6 +82,11 @@ def default_data_root() -> Path:
 def launcher_json_path(data_root: Path) -> Path:
     """活动档案指针与 Launcher schema 的位置（非敏感）。"""
     return Path(data_root) / LAUNCHER_FILE
+
+
+def credentials_index_path(data_root: Path) -> Path:
+    """凭据引用归属与清理状态的位置（非敏感，只计算路径、不创建；§7、D-144）。"""
+    return Path(data_root) / CREDENTIALS_INDEX_FILE
 
 
 def desktop_json_path(data_root: Path) -> Path:

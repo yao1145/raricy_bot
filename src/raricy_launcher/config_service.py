@@ -24,7 +24,7 @@ import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
@@ -38,6 +38,9 @@ from .credential_store import (
     CredentialStoreError,
     new_reference,
 )
+
+if TYPE_CHECKING:  # 只为注解：运行时由调用方注入实例，避免与 lifecycle 互相导入。
+    from .credential_lifecycle import CredentialLifecycle
 
 # 档案内 `config.yaml` / `draft.yaml` 的 `_launcher.schema_version`：取值与校验口径
 # 与拆分前完全一致（`_to_saved()` 仍要求等于它）。
@@ -152,6 +155,13 @@ _CATALOG_FIELDS: frozenset[str] = frozenset(
 ACTION_KEEP: str = "keep"
 ACTION_REPLACE: str = "replace"
 ACTION_DELETE: str = "delete"
+
+# 凭据载荷里可以单独清除的类别（§6.1 的三种清除范围）。这里是**唯一定义**：
+# `CredentialLifecycle` 的 `clear(kinds=…)` 与归属索引条目的 `kinds` 都从这里取，
+# 不在别处再写一份取值。账号名不在其中：清除只针对密码与模型 Key。
+KIND_PASSWORD: str = "password"
+KIND_LLM_API_KEY: str = "llm_api_key"
+CREDENTIAL_KINDS: tuple[str, str] = (KIND_PASSWORD, KIND_LLM_API_KEY)
 
 
 class ConfigServiceError(Exception):
@@ -384,10 +394,13 @@ class ConfigService:
         credential_store: CredentialStore,
         profile_id: str | None = None,
         lock: threading.RLock | None = None,
+        credential_lifecycle: CredentialLifecycle | None = None,
     ) -> None:
         self._root = Path(data_root)
         self._store = credential_store
         self._profile_id = profile_id
+        # 缺省不装配归属索引：不装配索引的孤立测试走原来的提交路径（N2 之前的语义）。
+        self._credential_lifecycle = credential_lifecycle
         self._bootstrap_lock = threading.Lock()
         # 可重入：`ensure_first_profile()` 可能在已持锁的提交路径上建立第一个档案
         # （§5.1 第 1 步），普通 Lock 会在那里自锁死（复审 N-1）。`for_profile()`
@@ -400,6 +413,8 @@ class ConfigService:
         绑定实例的读路径由 `profile_id` 直接求档案目录，**完全不读 `launcher.json`**，
         因此活动指针在别处切换也不会串档案（§4.1「一次请求内不反复从可变活动指针
         推导目录」）。写锁共享是硬要求：分开的锁会让两个实例对同一数据根并发写。
+        归属索引（`credential_lifecycle`）一并传给绑定实例：档案切换后提交仍登记到
+        自己的档案上。
         """
         paths.validate_profile_id(profile_id)
         return ConfigService(
@@ -407,6 +422,7 @@ class ConfigService:
             credential_store=self._store,
             profile_id=profile_id,
             lock=self._lock,
+            credential_lifecycle=self._credential_lifecycle,
         )
 
     # --- 档案指针 ---------------------------------------------------------
@@ -465,6 +481,17 @@ class ConfigService:
 
     def profile_id(self) -> str | None:
         return self._profile_id or self.active_profile()
+
+    def _resolved_profile_id(self) -> str:
+        """写路径上的档案 id；调用前必须已经过 `profile()`（必要时建立首个档案）。
+
+        绑定实例直接用构造时的 `profile_id`（不读 `launcher.json`）；未绑定实例读一次
+        活动指针。指针仍不可解析时抛稳定错误：写路径不在这里创建档案（F2）。
+        """
+        resolved = self._profile_id or self.active_profile()
+        if resolved is None:
+            raise ConfigServiceError(METADATA_POINTER_INVALID)
+        return resolved
 
     def _has_existing_profiles(self) -> bool:
         """`profiles/` 下是否已有档案目录；读不了就当作有（宁可拒绝初始化）。"""
@@ -695,6 +722,15 @@ class ConfigService:
                 revision=saved.revision,
                 account=saved.account,
             )
+        if not (credentials.username and credentials.password and credentials.llm_api_key):
+            # 载荷在、但某一项被清空（N2 的单独清除）：结构与可启动分开判定 ——
+            # 配置仍然合法（`invalid` 只描述结构），但缺了任何一项都不能启动。
+            # 与「没有引用」同形（`error=None`），这是用户主动清除后的正常状态（D-144）。
+            return ConfigStatus(
+                state=STATE_NEEDS_CREDENTIALS,
+                revision=saved.revision,
+                account=saved.account,
+            )
         try:
             core_config.parse_config(
                 saved.mapping, config_dir=str(profile), secrets=credentials
@@ -805,6 +841,7 @@ class ConfigService:
         """
         with self._lock:
             profile = self.profile()
+            profile_id = self._resolved_profile_id()
             current = self._read_formal()
             saved = self._to_saved(current) if current is not None else None
             current_revision = saved.revision if saved is not None else 0
@@ -850,16 +887,30 @@ class ConfigService:
             self._validate_policy(merged, profile)
 
             # 4) 凭据：先登记脱敏（内存），再写库并回读确认；旧引用此时仍然有效。
+            #    装配了归属索引时，登记的时点提前到写库**之前**：索引里先有
+            #    `pending` 条目，崩溃重启才能找回「写过但尚未引用」的条目（§6.3、D-144）。
             credentials_ref = saved.credentials_ref if saved is not None else None
             created_ref: str | None = None
             if password.action == ACTION_REPLACE or llm_api_key.action == ACTION_REPLACE:
                 secret_registry().register(new_secrets.password)
                 secret_registry().register(new_secrets.llm_api_key)
-                created_ref = new_reference()
-                self._store.put(created_ref, new_secrets)
-                readback = self._store.get(created_ref)
+                if self._credential_lifecycle is not None:
+                    created_ref = self._credential_lifecycle.reserve(
+                        profile_id=profile_id,
+                        kinds=_payload_kinds(new_secrets),
+                    )
+                else:
+                    created_ref = new_reference()
+                try:
+                    self._store.put(created_ref, new_secrets)
+                    readback = self._store.get(created_ref)
+                except BaseException:
+                    # 写库或回读失败：回滚刚登记的引用（删不掉就留 orphan），旧引用不动。
+                    self._discard_unreferenced(created_ref)
+                    raise
                 if readback != new_secrets:
                     # 回读不一致：不确定的新引用不复用，也不删除（§7 最后一段）。
+                    self._mark_uncertain(created_ref)
                     raise CredentialStoreError("credential_readback_mismatch")
                 credentials_ref = created_ref
 
@@ -885,6 +936,90 @@ class ConfigService:
                 if created_ref is not None:
                     self._discard_unreferenced(created_ref)
                 raise
+            if created_ref is not None and self._credential_lifecycle is not None:
+                # 配置已经落盘，这一版引用了它：标成 owned 并记下 revision。
+                try:
+                    self._credential_lifecycle.confirm(
+                        created_ref, profile_id=profile_id, revision=revision
+                    )
+                except ConfigServiceError:
+                    # 归属确认失败不推翻已提交的配置：引用就在 YAML 里，`reconcile()`
+                    # 下次会把它认领回来（先登记后写库留下的恢复路径）。
+                    pass
+            return revision
+
+    # --- 凭据清除后的窄写（§6.1、D-144） -----------------------------------
+
+    def commit_credentials_clear(
+        self,
+        *,
+        expected_revision: int,
+        credentials_ref: str | None,
+        account: str | None,
+    ) -> int:
+        """把「清除凭据」的结果写成一版新配置，返回新 revision。
+
+        只改 `_launcher.credentials_ref`（`account` 非空时一并写账号名，其余键原样
+        保留）。校验用 `allow_missing_required=True`：清除后配置**结构仍然有效**，
+        只是缺了必填凭据 —— 「结构有效」与「可启动」分开判定，能不能启动交给
+        `status()`（缺任何一项即 `needs_credentials`）。`credentials_ref=None` 表示
+        密码与模型 Key 都已清除。
+
+        装配了归属索引时：先在写任何东西之前确认索引可读（坏索引 → 稳定码，
+        不写文件），写成功后再把新引用标成 `owned`（`clear()` 登记的是 `pending`）。
+        """
+        with self._lock:
+            profile = self.profile()
+            profile_id = self._resolved_profile_id()
+            if self._credential_lifecycle is not None:
+                # 破坏性操作拒绝推进：坏索引必须在写任何东西之前失败（§6.1）。
+                self._credential_lifecycle.ensure_readable()
+            current = self._read_formal()
+            if current is None:
+                raise ConfigServiceError("no_active_config")
+            saved = self._to_saved(current)
+            if expected_revision != saved.revision:
+                raise ConfigConflict("revision_conflict")
+
+            raw_launcher = current.get(LAUNCHER_SECTION)
+            launcher = dict(raw_launcher) if isinstance(raw_launcher, dict) else {}
+            launcher["credentials_ref"] = credentials_ref
+            if account is not None:
+                launcher["account"] = account
+            revision = saved.revision + 1
+            launcher["revision"] = revision
+            document: dict[str, Any] = {
+                **{key: value for key, value in current.items() if key != LAUNCHER_SECTION},
+                LAUNCHER_SECTION: launcher,
+            }
+            mapping = {
+                key: value for key, value in document.items() if key != LAUNCHER_SECTION
+            }
+            self._validate(
+                mapping,
+                credentials=None,
+                allow_missing_required=True,
+                profile=profile,
+            )
+            self._validate_policy(mapping, profile)
+
+            snapshot_path = paths.revisions_dir(profile) / f"{revision}.yaml"
+            try:
+                self._write_document(snapshot_path, document)
+                self._write_document(paths.config_path(profile), document)
+            except ConfigServiceError:
+                # 这一版没有生效：没被引用的快照一并收回（与 `commit()` 同一手法）。
+                self._discard_snapshot(snapshot_path)
+                raise
+            if credentials_ref is not None and self._credential_lifecycle is not None:
+                try:
+                    self._credential_lifecycle.confirm(
+                        credentials_ref, profile_id=profile_id, revision=revision
+                    )
+                except ConfigServiceError:
+                    # 与 `commit()` 同一口径：归属确认失败不推翻已经写上的配置，
+                    # `reconcile()` 会从 YAML 里把这条引用认领回来。
+                    pass
             return revision
 
     # --- 运行快照与凭据（§6.5） --------------------------------------------
@@ -1128,11 +1263,39 @@ class ConfigService:
             pass
 
     def _discard_unreferenced(self, reference: str) -> None:
-        """清理本次新建、但没能被配置引用的凭据；清理失败只是留下垃圾，不影响结果。"""
+        """清理本次新建、但没能被配置引用的凭据；清理失败只是留下垃圾，不影响结果。
+
+        装配了归属索引时走 `abandon()`：删得掉标 `revoked`，删不掉留 `orphan` +
+        `last_error`，不把失败吞成无声的垃圾（D-144）。
+        """
+        if self._credential_lifecycle is not None:
+            try:
+                self._credential_lifecycle.abandon(reference, profile_id=self._profile_id)
+            except ConfigServiceError:
+                # 索引本身写不动时不再抛：调用方正在处理更重要的失败（原始异常）。
+                pass
+            return
         try:
             self._store.delete(reference)
         except CredentialStoreError:
             pass
+
+    def _mark_uncertain(self, reference: str) -> None:
+        """回读不一致的引用：不复用也不删除，只在索引里记下原因（D-127、D-144）。"""
+        if self._credential_lifecycle is None:
+            return
+        try:
+            self._credential_lifecycle.mark_uncertain(
+                reference, error="credential_readback_mismatch"
+            )
+        except ConfigServiceError:
+            pass
+
+
+def _payload_kinds(secrets: Secrets) -> tuple[str, ...]:
+    """这次写入的载荷实际装了哪些类别（账号名不算：它不参与清除）。"""
+    values = {KIND_PASSWORD: secrets.password, KIND_LLM_API_KEY: secrets.llm_api_key}
+    return tuple(kind for kind in CREDENTIAL_KINDS if values[kind])
 
 
 def _merge_editable(
