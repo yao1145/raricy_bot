@@ -162,8 +162,10 @@ MAX_OPERATION_RECORDS: int = 50
 # 幂等键与它的内存表同样有界。
 IDEMPOTENCY_KEY_MIN_CHARS: int = 8
 IDEMPOTENCY_KEY_MAX_CHARS: int = 64
+# 锚点用 `\Z` 而不是 `$`：Python 的 `$` 也匹配结尾换行之前的空位，`"key12345\n"`
+# 因此会被放行并原样写进记录文件（API 一侧用的是 `\Z`，两边必须逐字一致）。
 _IDEMPOTENCY_KEY_RE = re.compile(
-    rf"^[A-Za-z0-9_-]{{{IDEMPOTENCY_KEY_MIN_CHARS},{IDEMPOTENCY_KEY_MAX_CHARS}}}$"
+    rf"\A[A-Za-z0-9_-]{{{IDEMPOTENCY_KEY_MIN_CHARS},{IDEMPOTENCY_KEY_MAX_CHARS}}}\Z"
 )
 
 # 协调器操作的执行线程名。

@@ -1847,6 +1847,38 @@ N1 = D-133–D-137，N3 = D-138–D-141，N4 从 D-142 起，N2 = D-143–D-147�
 凭据归属索引，档案很多时是线性开销 —— 当前上限是「一个人的几个账号」，不引入缓存；
 配置读不出来的单个档案只让它的卡片报 `invalid`，不让整个列表失败。
 
+**门的校验必须钉住写目标，而不只是先看一眼。** 过渡门在事件循环里比对
+`body["profile_id"] == catalog().active_profile_id`，但真正落盘的 `commit()` 在工作线程里
+跑；从校验到落盘的这段时间里，协调器的 `commit_active_B` 可以把指针切走（它不受
+`/api/config` 约束，后者全程不取生命周期租约）。只校验一次、写路径再按指针解析，等于把
+竞态窗口挪了个位置：两个档案 revision 同号时连 `expected_revision` 都挡不住，用户的这次
+编辑（含凭据替换）会静默写进另一个账号 —— 正是这道门要防的事。因此门返回它核过的
+`(profile_id, epoch)`，写路径只对钉住的档案写，并在写前复核代次（代次变过就 409）。
+传输层的一次校验 + 写路径的一次复核 + 钉住的目标，三者缺一不可。
+
+**本轮的已知偏差与迁移目标**（本轮不可修改 `lifecycle_service.py`，只允许改其中幂等键
+正则的一行）：
+
+1. **创建档案的幂等表没有记录级回退**。协调器的幂等表覆盖写恢复记录的三种操作
+   （`operations/<id>.json` 在重启后仍能按键+摘要复用），创建不写记录：进程内同键同体
+   永远回同一 `profile_id`（同键异体 409 `idempotency_conflict`），但**进程重启后同键同体
+   重发会再建一个非活动空档案**。判断是记录级回退的成本明显高于收益：记录的 `kind` 枚举
+   是冻结的（`activate`/`remove`/`credentials_clear`），加一个 `create` 会同时改动总表、
+   协调器的恢复对账（`recover()` 会把不认识的文件算进 `unreadable`）与记录清理策略，而
+   失败模式只是「多一个可移除的空档案」，不影响任何破坏性路径。迁移方向：把创建并入
+   协调器（新 kind + 记录级回退）或另设 `operations/create-<key>.json` 专用文件。
+2. **凭据清除命令体住在 `api.py`**，不是计划里的 `LifecycleService.clear_credentials()`。
+   串行化、幂等、记录与阶段钩子仍经协调器（`submit(KIND_CREDENTIALS_CLEAR)`），阶段码
+   `stop` / `clear_credentials` / `commit_config` 从 `lifecycle_service` 导入，但结果码
+   `cleared` / `cleared_partial` / `clear_failed` 与总表里没有的 `config_write_failed`
+   目前由 `api.py` 定义 —— 这是它们唯一的定义处。迁移目标：整体搬成
+   `LifecycleService.clear_credentials(profile_id, kinds=…, idempotency_key=…)`，结果码常量
+   同时移进 `lifecycle_service`（签名与阶段已按 §59 冻结，搬迁不改对外形状）。
+3. **幂等键的形状口径**：`api.py` 与协调器都必须用 `\A…\Z` 锚定。Python 的 `$` 也匹配
+   结尾换行之前的空位，`"key12345\n"` 因此会在协调器一侧通过并原样写进记录文件，而 API
+   一侧拒绝 —— 同一个键在两个入口得到两种判定。本轮已把 `lifecycle_service._IDEMPOTENCY_KEY_RE`
+   统一成 `\A…\Z`（本轮唯一允许的 `lifecycle_service.py` 改动）。
+
 编号说明：本条是 N2 阶段的第四条，按最终分配用 D-146（N0 = D-130/131/132，
 N1 = D-133–D-137，N3 = D-138–D-141，N4 从 D-142 起，N2 = D-143–D-147，D-143/D-144/D-145
 已由前三个任务写入）；本条不占其他阶段的号。

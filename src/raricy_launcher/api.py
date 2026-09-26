@@ -68,6 +68,7 @@ from .lifecycle_service import (
     CODE_CONFIG_NOT_READY,
     CODE_IDEMPOTENCY_KEY_REQUIRED,
     CODE_LIFECYCLE_BUSY,
+    CODE_QUITTING,
     ERROR_CREDENTIAL_BACKEND_UNAVAILABLE,
     ERROR_STOP_UNCONFIRMED,
     KIND_CREDENTIALS_CLEAR,
@@ -748,18 +749,31 @@ class LocalApi:
             self._require_write(request, session)
             body = await self._json_body(request)
             # 过渡入口的活动代次门（§59、D-146）：旧页面不带上下文时明确要求升级，
-            # 绝不把一次「当时看着 A」的提交落到刚刚切过去的 B 上。
-            self._transition_gate(body)
+            # 绝不把一次「当时看着 A」的提交落到刚刚切过去的 B 上。门返回的门里
+            # 核过的档案与代次必须一路带进写路径，不能在工作线程里重新解析指针。
+            target_profile_id, epoch = self._transition_gate(body)
         except ApiError as exc:
             return self._json(exc.status, exc.payload())
         try:
-            revision = await asyncio.to_thread(self._commit_config, body)
+            revision = await asyncio.to_thread(
+                self._commit_config, body, target_profile_id, epoch
+            )
         except Exception as exc:
             mapped = self._handle(exc)
             return self._json(mapped.status, mapped.payload())
         return self._json(200, {"ok": True, "revision": revision})
 
-    def _commit_config(self, body: dict) -> int:
+    def _commit_config(
+        self, body: dict, target_profile_id: str | None, expected_epoch: int
+    ) -> int:
+        """提交到**门里核过的那个档案**，并在写前复核代次（§59、D-146）。
+
+        `target_profile_id` 由 `_transition_gate()` 在事件循环里核过；工作线程绝不
+        重新解析活动指针 —— 从门校验到真正落盘之间，协调器的 `commit_active_B`
+        完全可能把指针切到别的账号，那时按指针解析就会把这次编辑写进另一个档案
+        （用户看不见的串账号写入，含凭据替换）。因此这里只对钉住的档案写，
+        并在写前复核代次：指针变过就如实回 409，而不是写到一个已经不该写的地方。
+        """
         if "start_bot_on_launch" in body:
             # 桌面偏好已移出配置面（§58）：如实回稳定码与去向，而不是静默忽略
             # 或多写一份会与 desktop.json 打架的副本。
@@ -779,10 +793,21 @@ class LocalApi:
         account = body.get("account")
         if account is not None and not isinstance(account, str):
             raise ApiError(400, "bad_request")
-        # 写路径才允许创建：无档案时在这里建立首个档案（profile.json 一并补齐），
-        # 请求体本身的错误已经在上面拒绝，不会因为一次坏请求留下新档案。
-        profile_id = self._profile_id(create=True)
-        return self._bound(profile_id).commit(
+        # 写前复核：门之后活动代次变过（切换提交、删除清指针、新建首个档案）就拒绝。
+        catalog = self._profiles.catalog()
+        if catalog.active_epoch != expected_epoch:
+            raise ApiError(
+                409, "revision_conflict", field="expected_profile_epoch"
+            )
+        if target_profile_id is None:
+            # 首次设置：门核过「当时没有档案」，写路径才允许建立首个档案
+            # （profile.json 一并补齐）；请求体本身的错误已经在上面拒绝。
+            target_profile_id = self._profiles.ensure_first_profile()
+        elif catalog.active_profile_id == target_profile_id:
+            # 指针在场但档案目录可能还没建（N1 的首次写入语义）：补齐记录，
+            # 已存在时不覆盖现场。
+            self._profiles.ensure_first_profile()
+        return self._bound(target_profile_id).commit(
             values,
             expected_revision=expected,
             password=updates.get("password", CredentialUpdate.keep()),
@@ -1103,14 +1128,17 @@ class LocalApi:
             self._lifecycle.end(ticket)
         return str(operation.operation_id)
 
-    def _transition_gate(self, body: dict) -> None:
-        """过渡入口的活动代次门（§59、D-146）。
+    def _transition_gate(self, body: dict) -> tuple[str | None, int]:
+        """过渡入口的活动代次门（§59、D-146）；返回门里核过的 `(档案, 代次)`。
 
         两个字段都必须在场：缺失说明调用方还是 N2 之前的页面，回
         `client_upgrade_required`（明确要求升级，**不**透明转发到刚切过去的账号）；
         在场但与当前不符是「拿着过期上下文」，回 `revision_conflict` 并指出是哪个
         字段过期。首次设置（还没有任何档案）时正确的取值是 `profile_id: null`、
         `expected_profile_epoch: 0`。
+
+        返回值不是装饰：写路径必须带着它落到**同一个**档案上（见 `_commit_config()`），
+        否则门只是把竞态窗口挪了个位置。
 
         元数据故障（N0 的四个码）在**判上下文之前**如实抛出：恢复态下「页面该刷新
         配置」比「页面该升级」更接近事实，且四个码是既有契约。
@@ -1123,6 +1151,7 @@ class LocalApi:
         epoch = body["expected_profile_epoch"]
         if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch != catalog.active_epoch:
             raise ApiError(409, "revision_conflict", field="expected_profile_epoch")
+        return catalog.active_profile_id, catalog.active_epoch
 
     def _target_revision(self, body: dict, profile_id: str) -> int | None:
         """启动/重启的目标版本：请求指定优先，否则用该档案已保存的版本（§6.5）。
@@ -1633,6 +1662,7 @@ class LocalApi:
 
     def _run_create(self, intent: dict) -> dict:
         """创建档案：串行化 + 幂等。返回响应信封（不含任何凭据材料）。"""
+        self._require_not_quitting()
         ticket = self._lifecycle.begin_operation("create")
         if ticket is None:
             # 站点测试持有租约：与其它写入口同一口径，不排队。
@@ -1641,6 +1671,18 @@ class LocalApi:
             return self._create_locked(intent)
         finally:
             self._lifecycle.end(ticket)
+
+    def _require_not_quitting(self) -> None:
+        """退出流程已开始（`request_quit()` 之后）不再接受新的写命令。
+
+        与协调器 `_require_launch_context()` 的 `quitting` 判定同口径、同一个标志位；
+        协调器没有公开这个只读状态（它只在启停与切换路径内部判），因此这里按属性读取
+        同一个标志而不是另存一份状态 —— 两份状态迟早会不一致。缺属性（未装配协调器
+        的隔离调用方、替身）按「未退出」处理。
+        """
+        service = self._lifecycle_service
+        if service is not None and getattr(service, "_quitting", False):
+            raise ConfigServiceError(CODE_QUITTING)
 
     def _create_locked(self, intent: dict) -> dict:
         with self._creates_lock:

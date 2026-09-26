@@ -1568,15 +1568,30 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
     `["activate","activate_and_start"]`。页面不自己推断可行动作（§60）。
   - **创建与幂等**：`POST /api/profiles` 建立**非活动**档案（首个档案在全新数据根上会同时
     写入活动指针，与 N1 的 `create_profile()` 口径一致），并立即补齐 `profile.json`。
-    串行化取生命周期门的短租约、并在协调器有未完成操作时回 `lifecycle_busy`；幂等表留在
-    API 层（协调器的幂等表只覆盖写恢复记录的三种操作），规则与协调器逐字一致：同键同摘要
-    永远回同一 `profile_id`，同键不同摘要 → 409 `idempotency_conflict`，只保留最近 50 个键。
+    串行化取生命周期门的短租约、并在协调器有未完成操作或退出流程已开始时分别回
+    `lifecycle_busy` / `quitting`（与协调器 `_require_launch_context()` 同一个标志位）。
+    幂等键的形状与比较规则和协调器一致（`[A-Za-z0-9_-]{8,64}`、锚点 `\A…\Z`；同键同摘要
+    永远回同一 `profile_id`，同键不同摘要 → 409 `idempotency_conflict`），但**幂等表只在
+    内存、没有记录级回退**：协调器的表覆盖的是写恢复记录的三种操作（`operations/<id>.json`
+    在重启后仍能按按键+摘要复用），创建不写记录，因此**进程重启后同键同体重发会再建一个
+    档案**。这是一处如实记录的缺口，不是「逐字一致」：多出来的档案是空的，可用常规移除
+    流程删掉；进程内的重复提交不受影响。迁移方向见 D-146。
   - **清除命令的阶段与结果码**：`credentials/clear` 经协调器的 `submit()` 预留（记录写盘、
     串行化、幂等键），执行体阶段固定 `stop` → `clear_credentials` → `commit_config`；结果码
     `cleared` / `cleared_partial` / `clear_failed`，错误码沿用 `stop_unconfirmed` /
     `credential_backend_unavailable` 与 `config_write_failed`（凭据清了但配置窄写失败）。
     `clear()` 正常返回就照常 `commit_credentials_clear()`：`ok=false` 只影响结果码与卡片的
     清理待办，不表示什么都没清；只有 `clear()` 抛异常才是「凭据库这一侧完全没动」。
+    **执行体目前住在 `api.py`**（不是计划里的 `LifecycleService.clear_credentials()`）：
+    `KIND_CREDENTIALS_CLEAR` 与阶段码仍从 `lifecycle_service` 导入，结果码
+    `cleared` / `cleared_partial` / `clear_failed` 与总表里没有的 `config_write_failed`
+    由 `api.py` 定义 —— 这是本阶段唯一的定义处，迁移目标见 D-146。
+  - **保存失败会消耗票据**：`PUT /api/profiles/{id}/config` 在 `commit()` **之前**消费
+    票据（先钉死身份，再写配置），因此提交阶段的失败（例如 `expected_revision` 与已保存
+    配置不符的 `revision_conflict`）也会让这张票据作废 —— 重试要先重新验证身份。
+    改成「提交成功后再消费」会把「验证过的那份输入」与「写进配置的那份输入」重新分开，
+    所以这是有意的取舍。输入不符（`verification_mismatch`）与状态/版本类前置拒绝
+    （`verification_required`、`profile_revision_conflict`）发生在消费之前，不消耗票据。
 - **过渡入口的活动代次门**（N2 Task 4、§9.4、D-146）：`PUT /api/config` 与
   `POST /api/bot/{start,restart}` 的请求体必须另带 `profile_id`（等于当前活动档案）与
   `expected_profile_epoch`（等于 `catalog().active_epoch`）：缺任一 → 409
@@ -1585,6 +1600,11 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   `expected_profile_epoch`）。首次设置（还没有任何档案）时正确取值是
   `profile_id: null`、`expected_profile_epoch: 0`。元数据故障（N0 的四个码）在判上下文之前
   如实抛出。`POST /api/bot/stop` 不变（停止不受代次门限制）。
+  **门核过的档案必须一路带进写路径**：`PUT /api/config` 的工作线程只对门里核过的
+  `profile_id` 写（不在线程里重新解析活动指针），并在写前复核 `active_epoch`；门之后
+  指针被切换/删除提交改过就回 409 `revision_conflict`（`field="expected_profile_epoch"`），
+  **绝不**把这次编辑（含凭据替换）落到另一个账号上。只校验一次门、写路径再按指针解析
+  等于把竞态窗口挪了个位置 —— 两个档案 revision 同号时连 `expected_revision` 都挡不住。
   `POST /api/bot/{start,stop,restart}` 一律经协调器的 `start_bot(expected_epoch=…)` /
   `stop_bot()` / `restart_bot(expected_epoch=…)`：启停因此共用同一条串行化与取消代次
   （`stop` 会提高代次，在途切换据此收敛）。请求体里的 `revision` 不再参与判定 —— 启动绑定的
