@@ -167,7 +167,12 @@ class TrayIcon(Protocol):
         ...
 
     def request_close(self) -> None:
-        """请求关闭消息循环；线程安全，未创建/已销毁是空操作。"""
+        """请求关闭消息循环；线程安全。
+
+        窗口尚未创建时**记下请求**，由 `run()` 在建好窗口、进消息循环之前兑现：
+        `request_quit()` 可能早于 `run()` 到达，丢掉这条请求会让消息循环没人叫醒。
+        已销毁时是空操作。
+        """
         ...
 
     def close(self) -> None:
