@@ -268,6 +268,21 @@ button.ghost {
   gap: 8px;
 }
 
+/* 账号卡片：当前选中的档案用强调色边框区分（账号页）。 */
+.panel.current {
+  border-color: var(--accent-dim);
+}
+
+/* 二级对话框：同一页面内的独立面板，带上强调边框与更亮的标题，不是模态遮罩。 */
+.panel.dialog {
+  border-color: var(--accent-dim);
+  box-shadow: 0 0 0 1px rgba(53, 224, 208, 0.15) inset;
+}
+
+.panel.dialog h2 {
+  color: var(--accent);
+}
+
 .checkbox input {
   width: auto;
 }

@@ -1701,9 +1701,43 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   （`client_upgrade_required` / `verification_*` / `profile_identity_*` /
   `profile_state_conflict` / `profile_revision_conflict` / `target_not_ready` /
   `idempotency_*` / `credential_scope_required`），页面不得另写一套说法。
-- **构建产物与页面目标**（N2 Task 5）：账号页是 `frontend/src/Accounts.svelte`，导航在既有
-  页签之后新增「账号」入口；`npm run check` 与 `npm run build` 之后 `static/` 的产物
-  **必须重新构建并提交**（N2 的前端活只归 Task 5）。
+- **账号页与四个主区**（N2 Task 5、§9、D-147）：页签顺序是「状态（概览）/ 设置（当前账号
+  设置）/ 近期事件 / 桌面（桌面设置）/ 账号」——「账号」在既有页签之后新增，**不重排**
+  已有页面；「近期事件」保留入口。概览页在「有档案但一个都没选中」（`no_selection`）时
+  自动切到账号页；`needs_credentials` / `invalid` / 身份未验证各有独立提示面板与行动按钮，
+  `recovery` 仍是只读面板（不加修复按钮）。首次设置向导只在 `GET /api/profiles` 为空且
+  `config.state == needs_setup` 时出现，出现后锁定到用户保存或取消为止（保存过程中档案
+  已经建立，不能把向导从用户脚下撤走）。向导保存时先经 `POST /api/profiles` 建立首个
+  档案（空数据根上它同时成为活动档案），再用一次性票据走 `PUT /api/profiles/{id}/config`
+  绑定身份 —— **N2 起身份只能经票据写入**，无票据的 `PUT /api/config` 路径不绑定身份，
+  因此首次设置不能再只靠它完成。
+- **账号卡片与动作渲染**（N2 Task 5）：账号页是 `frontend/src/Accounts.svelte`，卡片字段
+  逐个来自 `GET /api/profiles` 的 `ProfileCard`（标签、账号、稳定 ID、身份/档案/配置三个
+  徽标、选中/运行/启动目标标记、`credentials` 摘要）；**页面不自己推断可行动作**，按钮一律
+  按服务端给的 `actions` 渲染，标签取自 `texts.ts` 的 `PROFILE_ACTION_LABELS`。动作语义：
+  `activate` / `activate_and_start` 带 `catalog.active_epoch` 与 `catalog_revision`；
+  `edit` 只对当前选中档案切到设置页（未选中时只提示先选中，避免改到别的账号）；
+  `verify` / `rebind` 用账号+密码走 `POST …/verify` 再 `PUT …/config`（`values` 只提交
+  与装载快照不同的字段；`rebind` 的账号字段锁定），运行中的机器人在获得用户确认后先
+  `/api/bot/stop`、等状态变成 `stopped` / `failed` 再验证，**不自动重启**；
+  `clear_credentials` 与 `remove` / `purge` 是独立入口（停止机器人 / 清除凭据 / 移除账号
+  三件事不共用按钮）。`credentials.cleanup_pending` 与 `unknown_ownership` 为真时卡片如实
+  显示待办与重试，不谎报已清理。
+- **删除对话框的两步确认**（N2 Task 5、§6.2）：点「移除账号（保留数据）」或「彻底删除」→
+  `POST …/removal-preview` 拿只读预览与一次性令牌 → 对话框列出类别与大小（`size_complete`
+  为假时标注估计值）、是否运行 / 是否启动目标 / 是否当前选中、凭据归属提醒与「没有撤销、
+  不影响站点已发内容」→ 勾选确认复选框（彻底删除用醒目文案）→ `POST …/remove` → 用
+  `GET /api/operations/{id}` 轮询 `stage` 到收尾。**参数（scope）变化必须重新预览**：令牌
+  绑定 scope 与两个 revision，`removal_preview_stale` / `removal_token_invalid` 一律要求
+  重新生成预览，页面不自动重试。部分完成（`removed_partial` / `remove_failed`）时如实显示
+  结果与停在的阶段，并给「重新预览」入口（已清理的类别不会回滚）。
+- **切换档案时的页面状态**（N2 Task 5、§9 末段、D-146）：账号页、设置页与向导在活动档案
+  变化时按 `{#key active_profile_id}` 重建组件，旧表单、密码输入、测试结果与待提交动作
+  随之作废；「近期事件」默认只展示全局事件与当前活动档案的事件（`Event.profile_id`）。
+  异步动作期间禁用重复提交，但**不做前端假同步**：202 + `operation_id` 是唯一依据，
+  轮询没结束就如实显示「进行中」。
+- **构建产物与页面目标**（N2 Task 5）：`npm run check` 与 `npm run build` 之后 `static/`
+  的产物**必须重新构建并提交**（N2 的前端活只归 Task 5）。
 
 ## 61. Windows 托盘
 
