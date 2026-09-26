@@ -35,6 +35,12 @@ a = Analysis(
         "keyring",
         "keyring.backends.Windows",
         "keyring.backends.null",
+        # 托盘窗口层同样只在 `WindowsPlatform.create_tray()` 的方法体里导入（N3
+        # Task 4）。它不存在时 `create_tray()` 会抛 TrayError、托盘降级为「只有
+        # 管理页」，表面上不崩 —— 正是这种「静默少一个能力」最难在验收里发现，
+        # 所以按本列表的口径显式列出（与 keyring 同一条理由；缺失时 light.spec
+        # 的本次冻结产物就是缺托盘的版本，见 INTERFACES §61.4）。
+        "raricy_launcher.platform.tray_windows",
     ],
     hooksconfig={},
     runtime_hooks=[],

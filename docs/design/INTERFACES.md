@@ -1007,7 +1007,7 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 [文案](../../src/raricy_launcher/texts.py)、[状态聚合](../../src/raricy_launcher/status_service.py)、
 [平台协议](../../src/raricy_launcher/platform/__init__.py)、[控制器](../../src/raricy_launcher/controller.py)。
 本节的词表是这些实现共用的唯一来源，窗口层不认识别的字符串，未列入词表的命令与事件
-一律忽略。窗口层（隐藏窗口、图标、系统事件）的合同随 Task 4 的实现补入本节。
+一律忽略。窗口层（隐藏窗口、图标、系统事件）的实现与合同见 §61.4。
 
 ### 61.1 状态与图标
 
@@ -1114,3 +1114,80 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   当空操作丢掉。真正的窗口与图标释放在拥有窗口的线程上完成，`close()` 幂等。
   `TrayIcon` 协议与 `TrayError` 定义在 `platform/__init__.py`（非 Windows 平台仍由
   `get_platform()` 的既有 `PlatformError("unsupported_platform")` 拦住，不新增平台分支）。
+- **`request_close()` 的窗口未就绪语义**：与首帧同构 —— 窗口**尚未创建**时不得把请求
+  当空操作丢掉，而要记下「已请求关闭」，由 `run()` 在**建好窗口之后、进入消息循环之前**
+  检查该标记，若已置位就直接走正常关闭路径（销毁窗口、`PostQuitMessage`）而不进循环。
+  `run()` 建窗口发生在 `_start_tray()` 之后，而管理页与激活入口的退出走的正是
+  `request_quit()` → `tray.request_close()`：先到的关闭请求被丢掉的话，`self._quit` 已置位
+  却没人叫醒消息循环，进程会一直挂着不退出。窗口已创建时按常规投递 `WM_CLOSE`。
+
+### 61.4 Windows 窗口层（`platform/tray_windows.py`）
+
+[窗口层](../../src/raricy_launcher/platform/tray_windows.py)、[平台实现](../../src/raricy_launcher/platform/windows.py)、
+[协议](../../src/raricy_launcher/platform/__init__.py)。`WindowsPlatform.create_tray()` **惰性**
+import 本模块（`--no-tray` 与非 Windows 路径都不加载 `win32gui`），返回 `WinTrayIcon`；
+窗口与图标在 `run()` 里才真正建立。
+
+- **一个图标 = 一个隐藏的顶层窗口**：`RegisterClass` 注册 `RaricyBotLight.TrayWindow`，
+  `CreateWindowEx` 用 `WS_OVERLAPPED`、**不带** `WS_VISIBLE`、`parent = 0` 建窗口，没有任何
+  可见 UI。**禁止 `HWND_MESSAGE` 消息窗口**：`TaskbarCreated`、`WM_POWERBROADCAST`、
+  `WM_QUERYENDSESSION`/`WM_ENDSESSION` 都只广播给顶层窗口，消息窗口收不到 —— 那样的代价是
+  Explorer 重启后图标再也回不来、注销/关机也看不到。
+- **图标资源**：`LoadImage(0, path, IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+  GetSystemMetrics(SM_CYSMICON), LR_LOADFROMFILE)` 加载 `assets/` 下三个文件（§60）；文件名
+  与 `tray_model.ICON_*` 一一对应，词表外的图标名按停止态占位处理。加图标用
+  `Shell_NotifyIcon(NIM_ADD, ...)`，随后 `NIM_SETVERSION` 声明 `NOTIFYICON_VERSION_4`（值 4）。
+- **pywin32 的元组形状与本地常量**（本机 pywin32 build 312 实测；细节见模块 docstring）：
+  `Shell_NotifyIcon(Message, nid)` 的 `nid` 是**元组** `(hwnd, uID, uFlags, uCallbackMessage,
+  hIcon, szTip)`；`NIM_SETVERSION` 用**八元组**（第 7 位 `szInfo` 留空串、第 8 位是
+  `uTimeout`/`uVersion` 联合槽放 4）。成功返回 `None`，**失败抛 `pywintypes.error`**。
+  `NOTIFYICON_VERSION_4`、`NIN_SELECT`（`WM_USER + 0`）、`NIN_KEYSELECT`（`WM_USER + 1`）在
+  pywin32 里**没有**，必须本地定义；`SM_CXSMICON`/`SM_CYSMICON` 在 `win32con`，只有
+  `RegisterClass`（没有 `RegisterClassEx`）。`GetMessage(None, 0, 0)` 返回
+  `[ret, (hwnd, msg, wParam, lParam, time, pt)]`，`WM_QUIT` 时 `ret == 0`。
+- **消息与词表**：`WM_TRAY_CALLBACK = WM_APP + 1` 是 `uCallbackMessage`，
+  `WM_TRAY_PRESENT = WM_APP + 2` 是状态更新投递（`present()` 从任意线程投，窗口线程收到后
+  才 `NIM_MODIFY`）。窗口回调**只做三件事**：映射成 `tray_model` 词表常量交给 `on_message`、
+  渲染、返回。回调内不做文件/注册表/网络/keyring/子进程/等待；异常在回调内被捕获并记
+  `launcher.tray_callback_failed`（`error` 为稳定类别：`win32_error` 或异常类型名），
+  **绝不抛回消息循环**。
+- **v4 的等价关系**：`LOWORD(lParam) == NIN_SELECT` 或 `NIN_KEYSELECT`（左键单击/键盘选中）
+  → `on_message("open_admin")`。v4 不再单独送 `WM_LBUTTONDBLCLK`：左键单击与双击合并成
+  `NIN_SELECT`，与设计 §7.1「双击图标执行同一动作」等效 —— 打开管理页这个动作不需要区分
+  单击还是双击。`NIN_BALLOON*` 一律忽略（N3 不做通知）。
+- **右键菜单**：`LOWORD(lParam) == WM_CONTEXTMENU` 时 `SetForegroundWindow(hwnd)` 后用
+  `TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY` 弹 `TrackPopupMenu`（坐标取 `wParam` 的
+  `GET_X_LPARAM`/`GET_Y_LPARAM`，按有符号 16 位解释；多显示器在左侧时可能是负数）。菜单项
+  id 是 1..n，按 `TrayMenuItem.separator_before` 挂 `MF_SEPARATOR`、按 `enabled` 挂
+  `MF_GRAYED`；**弹出前把视图拷成局部变量**，返回的 id 必须用同一份快照映射回命令 ——
+  `TrackPopupMenu` 阻塞期间 `present()` 可能已经换掉视图，用新视图解释旧菜单的返回值会映射
+  到错误命令。收尾 `PostMessage(hwnd, WM_NULL, 0, 0)`。空串（账号行/状态行）与 0（取消）
+  都不投递。
+- **`TaskbarCreated` 重加**（Explorer 重建任务栏）：`NIM_DELETE` → `NIM_ADD` →
+  `NIM_SETVERSION` —— 菜单每次弹出都现场构建，不需要重建；重加后投递 `taskbar_created`
+  让协调器重画一次。重加失败只记 `launcher.tray_icon_readd_failed`（`error` 是稳定码），
+  不崩、不重启 Controller/Worker。
+- **系统事件合同**（处理函数本身不做任何等待）：
+  - `WM_QUERYENDSESSION` → **立即 `return True`**（同意注销/关机），并投递 `session_query`；
+    不弹窗、不阻塞、不试图取消。
+  - `WM_ENDSESSION` → `wParam != 0` 时投递 `session_end` 并 `return 0`；`wParam == 0`
+    （关机被取消）什么都不做。
+  - `WM_POWERBROADCAST` → `PBT_APMSUSPEND` 投 `power_suspend`；`PBT_APMRESUMESUSPEND` /
+    `PBT_APMRESUMEAUTOMATIC` 投 `power_resume`；其余忽略；返回 `True`。
+  - **有界收尾**：`session_end` 由协调器转成 `commands.begin_session_end()`（拒绝新启动 +
+    请求退出），窗口线程**从不等待 Worker**；真正的停止仍走既有的 20 秒预算
+    （`STOP_BUDGET_MS`）与 Job 的 `KILL_ON_JOB_CLOSE` 兜底。不新增「无限等待」路径、不改
+    停止预算；系统提前终止进程时 `launcher.quit` 记 `status="session_end"`，不得写成优雅完成。
+- **线程归属**：`run()` 必须在调用线程里建窗口并跑消息循环，**窗口因此属于那个线程**；
+  `_owner_thread` 记下它，`NIM_DELETE` / `DestroyIcon` / `DestroyWindow` / `UnregisterClass`
+  只在 `run()` 的 `finally` 里、仍在那个线程上执行（全部幂等，重复调用不抛）。
+  `present()` / `request_close()` / `close()` 任意线程可调：只改锁保护的状态再投消息，窗口
+  未创建或已销毁时不留异常；`close()` 在非拥有线程上等价于 `request_close()`，绝不跨线程
+  销毁窗口。**两条「窗口还没准备好」的请求都不丢**：首帧视图先存下、`NIM_ADD` 之后套用；
+  关闭请求先记下、`run()` 建窗口之后进循环之前兑现（见 §61.3）。
+- **稳定码**：`TrayError` 只有 `tray_window_failed`（类注册/窗口创建/消息循环失败）、
+  `tray_icon_missing`（图标文件缺失或加载不出来）、`tray_icon_failed`（加进通知区域失败）。
+  `create_tray()` 把窗口层的一切失败（含惰性 import 失败与 `pywintypes.error`）归一成
+  `TrayError`：`Controller._start_tray()` 只捕获 `(PlatformError, TrayError, OSError)`，而
+  `pywintypes.error` **不是** `OSError` 的子类，逸出的原始异常会直接结束进程，让「托盘建不
+  起来仍继续运行、管理页仍是入口」的降级路径落空（§61.3）。

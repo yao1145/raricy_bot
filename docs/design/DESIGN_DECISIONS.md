@@ -22,7 +22,8 @@ D-131 凭据删除先摘入口（N2 再交付完整清除），D-132 Light 控�
 N3（Windows 托盘）占 D-138–D-141，N2（账号与凭据操作）占 D-143–D-147，N4（登录启动）从
 D-142 起（D-142 已被 N4 Task 2 占用，N2 分配后 N4 续用 D-148 及以后）；已落地：D-138 托盘
 图标资源与冻结闭包（N3 Task 1）、D-139 托盘视图模型（N3 Task 2）、D-140 托盘协调器与命令
-边界（N3 Task 3）、D-142 桌面偏好独立成文件（N4 Task 2）；其余留给对应阶段实施时补写。
+边界（N3 Task 3）、D-141 托盘窗口层与系统事件（N3 Task 4）、D-142 桌面偏好独立成文件
+（N4 Task 2）；其余留给对应阶段实施时补写。
 后续变更沿用编号注明替代关系，不叠加互相矛盾的补丁段落。
 
 <a id="d-1"></a>
@@ -1302,6 +1303,50 @@ N3 Task 3 的落地口径（[下一代设计](LIGHT_NEXT_GENERATION.md) §7.2、
   `session_end`（`WM_ENDSESSION` 且 `wParam != 0`）才走 `begin_session_end()`。
 
 编号说明：本条用 D-140（N3 = D-138–D-141 的第三条；N0 = D-130–132、N1 = D-133–137、
+N2 = D-143–147，N4 从 D-142 起续用 D-148 及以后）。
+
+<a id="d-141"></a>
+
+## D-141 托盘窗口层：隐藏顶层窗口而不是消息窗口，v4 + `NIN_SELECT`，关机不等确认
+
+N3 Task 4 的落地口径（[下一代设计](LIGHT_NEXT_GENERATION.md) §7.1、§7.2、§11 N3，契约见
+[INTERFACES.md](INTERFACES.md) §61.3、§61.4）。`platform/tray_windows.py` 是 `TrayIcon`
+协议的真实实现：一个隐藏窗口 + 一个通知区域图标 + 一个消息循环。
+
+- **隐藏的顶层窗口，不是 `HWND_MESSAGE` 消息窗口**：消息窗口看起来更「干净」（不进任务栏、
+  不可见、资源更省），但它**收不到顶层窗口广播**：`TaskbarCreated`（Explorer 崩溃重启后
+  重建任务栏）会让图标永远回不来，`WM_POWERBROADCAST` 与 `WM_QUERYENDSESSION`/
+  `WM_ENDSESSION` 也收不到 —— 睡眠/恢复的显示与注销关机的收尾全部失效。窗口用
+  `WS_OVERLAPPED`、不带 `WS_VISIBLE`、`parent = 0`：没有任何 UI，但具备顶层窗口的全部消息。
+- **`NOTIFYICON_VERSION_4` + `NIN_SELECT`**：v4 之后左键单击与双击合并成一条 `NIN_SELECT`
+  （键盘选中是 `NIN_KEYSELECT`），不再单独送 `WM_LBUTTONDBLCLK`。设计 §7.1 要求「双击图标
+  执行同一动作（打开管理页）」，而在 v4 下单击与双击本来就没有区别 —— 等价关系成立，图标
+  交互因此不需要区分单击/双击，也不需要回退到旧版本协议（回退会丢掉菜单坐标随 `wParam`
+  传递等便利）。`NIN_SELECT`/`NIN_KEYSELECT`/`NOTIFYICON_VERSION_4` 在 pywin32 里没有导出，
+  按 shellapi.h 本地定义，并在模块里写明本机实测的元组形状（`NIM_SETVERSION` 用八元组）。
+- **关机不做等待、不弹确认**：`WM_QUERYENDSESSION` **立即返回 True**，只投一条
+  `session_query`（协调器只重画一次，不声明「正在退出」—— 用户随时可能取消关机）；
+  `WM_ENDSESSION` 且 `wParam != 0` 才投 `session_end` → `begin_session_end()`。窗口线程
+  **从不等待 Worker**：真正的停止仍走既有的 20 秒预算与 Job 的 `KILL_ON_JOB_CLOSE` 兜底，
+  系统提前终止进程时日志记 `status="session_end"` 而不是优雅完成。理由是没有比停止预算更
+  可靠的「关机前还能等多久」的信息：弹一个确认框会让无人值守的注销卡在一个看不见的窗口上
+  （窗口本身是隐藏的），而在回调里等待 Worker 又会阻塞整个托盘消息循环。
+- **窗口回调只投递结构化命令**：回调里只做「映词表 → 渲染 → 返回」，没有任何文件/注册表/
+  网络/keyring/子进程/等待。异常在回调内捕获并记 `launcher.tray_callback_failed`，绝不抛回
+  消息循环 —— 抛回去会连带弄死托盘自己，而托盘正是没有浏览器时的可见入口。
+- **两条「窗口还没准备好」的请求都不能丢**：`present()` 的首帧常常早于窗口（协调器在
+  `run()` 之前就渲染），所以视图先存下、`NIM_ADD` 之后套用；同构地，`request_close()` 可能
+  早于窗口（`request_quit()` 已置退出事件，但 `run()` 建窗口发生在 `_start_tray()` 之后），
+  这时请求要记下来、由 `run()` 在建窗口之后进循环之前兑现。两条都按「空操作」处理的话，
+  前者表现为托盘初始图标空白、后者表现为**进程永远不退出**（消息循环没人叫醒）。
+- **失败归一成 `TrayError`**：`create_tray()`/`run()` 把窗口层的一切失败折成
+  `tray_window_failed`/`tray_icon_missing`/`tray_icon_failed` 三个稳定码。`pywintypes.error`
+  不是 `OSError` 的子类，`AttributeError` 更是谁都接不住 —— 逸出 `run()` 会让
+  `Controller._start_tray()` 的捕获元组落空，进程直接结束，「托盘建不起来仍继续运行、
+  管理页仍是入口」的降级路径就不成立。惰性 import 失败（冻结包里漏收模块）同样在这里被
+  折成 `TrayError`：代价是少一个托盘，而不是整个 Light 起不来。
+
+编号说明：本条用 D-141（N3 = D-138–D-141 的最后一条；N0 = D-130–132、N1 = D-133–137、
 N2 = D-143–147，N4 从 D-142 起续用 D-148 及以后）。
 
 ## 实施期编号兼容

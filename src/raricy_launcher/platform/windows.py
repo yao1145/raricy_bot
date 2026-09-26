@@ -19,6 +19,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Sequence
+from pathlib import Path
 
 import pywintypes
 import win32api
@@ -40,6 +41,8 @@ from . import (
     LauncherPlatform,
     PlatformError,
     SuspendedProcess,
+    TrayError,
+    TrayIcon,
     WorkerJob,
 )
 
@@ -622,4 +625,24 @@ class WindowsPlatform:
         except pywintypes.error as exc:
             raise PlatformError("process_create_failed") from exc
         return _WinSuspendedProcess(process_handle, thread_handle, pid)
+
+    def create_tray(
+        self, *, icon_dir: Path, on_message: Callable[[str], None]
+    ) -> TrayIcon:
+        """创建托盘图标对象；窗口、图标与消息循环都在 `run()` 里才建立（§61.4）。
+
+        惰性 import `tray_windows`：这一层要 import `win32gui`，不用托盘的场景
+        （`--no-tray`）与任何非 Windows 路径都不该加载它。
+        失败一律归一成 `TrayError`：`Controller` 只捕获
+        `(PlatformError, TrayError, OSError)`，而 `pywintypes.error` 与 `ImportError`
+        都不在其中 —— 逸出会让「托盘建不起来仍继续运行」的降级路径落空。
+        """
+        try:
+            from .tray_windows import WinTrayIcon
+
+            return WinTrayIcon(icon_dir=icon_dir, on_message=on_message)
+        except TrayError:
+            raise
+        except Exception as exc:
+            raise TrayError("tray_window_failed") from exc
 
