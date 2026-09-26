@@ -58,6 +58,7 @@ from .lifecycle_service import (
     ERROR_CATALOG_WRITE_FAILED,
     ERROR_CREDENTIAL_BACKEND_UNAVAILABLE,
     ERROR_DATA_IN_USE,
+    ERROR_RECORD_WRITE_FAILED,
     ERROR_REMOVAL_UNSAFE_PATH,
     ERROR_STOP_UNCONFIRMED,
     OP_STATE_FAILED,
@@ -329,25 +330,49 @@ def _remove_tree(profile: Path, *, data_dir: Path) -> _TreeOutcome:
     )
     if reason is not None:
         return _TreeOutcome(complete=False, error=reason, removed=tuple(removed))
-    if os.path.lexists(data_dir):
-        # `data/` 被排除在上面的循环之外（要留下它本身），因此在这里单独判定：
-        # 它是指向别处的链接/重解析点、或不是目录，都按拒绝处理 —— 跳过它会让
-        # 「彻底删除」在数据其实还挂在档案外面的时候报成功。
-        if _lstat_directory(data_dir) is None:
-            return _TreeOutcome(
-                complete=False, error=ERROR_REMOVAL_UNSAFE_PATH, removed=tuple(removed)
-            )
-        reason = _prune_directory(
-            data_dir,
-            root_dev=top.st_dev,
-            keep=frozenset({DATA_LOCK_FILE}),
-            delete_self=False,
-            relative=f"{relative}/{paths.DATA_DIR}",
-            removed=removed,
+    # `data/` 被排除在上面的循环之外（要留下它本身），因此在这里单独判定。
+    # **三态显式分开**：确实不存在才跳过；看得见但不是目录/是重解析点、或**读不出来**
+    # （权限、占用、无法解析）一律拒绝 —— 报告成功必须基于「确实不存在」的证据
+    # （`os.path.lexists` 会把非 ENOENT 的错误一并吞成「不存在」，不能拿它当判据）。
+    try:
+        data_st = os.lstat(data_dir)
+    except FileNotFoundError:
+        return _TreeOutcome(complete=True, error=None, removed=tuple(removed))
+    except OSError:
+        return _TreeOutcome(
+            complete=False, error=ERROR_REMOVAL_UNSAFE_PATH, removed=tuple(removed)
         )
-        if reason is not None:
-            return _TreeOutcome(complete=False, error=reason, removed=tuple(removed))
+    if _is_reparse(data_st) or not stat.S_ISDIR(data_st.st_mode):
+        return _TreeOutcome(
+            complete=False, error=ERROR_REMOVAL_UNSAFE_PATH, removed=tuple(removed)
+        )
+    reason = _prune_directory(
+        data_dir,
+        root_dev=top.st_dev,
+        keep=frozenset({DATA_LOCK_FILE}),
+        delete_self=False,
+        relative=f"{relative}/{paths.DATA_DIR}",
+        removed=removed,
+    )
+    if reason is not None:
+        return _TreeOutcome(complete=False, error=reason, removed=tuple(removed))
     return _TreeOutcome(complete=True, error=None, removed=tuple(removed))
+
+
+def _exists_plain(path: Path) -> bool:
+    """路径是否**确实**存在：显式 `lstat`，只把 `FileNotFoundError` 当不存在。
+
+    读不出来（权限、占用、无法解析）按「还在」处理 —— 收尾要把未完成的类别如实列进
+    记录，漏掉一个只可能是没读出来，而不是已经删干净（`os.path.lexists` 会把这类
+    错误一并吞成「不存在」，与 D-130「读不出来不等于没有」相反）。
+    """
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
 
 
 def _unlink_leaf(path: Path) -> str | None:
@@ -554,8 +579,16 @@ class RemovalService:
                 binding=binding,
                 outcome=outcome,
             )
-            with context.stage(STAGE_FINALIZE):
-                context.record_details(managed_paths=self._remaining_paths(profile, scope))
+            # 收尾记账（阶段与未完成项写进记录）失败**不改写结果**：数据已经删净/保留
+            # 完成、墓碑已经落盘，操作就是成功的；把一次记账失败报成
+            # `failed`/`removal_unsafe_path` 会让用户看到失败、而预览又已经查不到这个
+            # 档案。诊断信息落进记录的 `error` 字段（结果码保持成功）。
+            try:
+                with context.stage(STAGE_FINALIZE):
+                    context.record_details(managed_paths=self._remaining_paths(profile, scope))
+            except ConfigServiceError:
+                if error is None:
+                    error = ERROR_RECORD_WRITE_FAILED
             context.finish(state=OP_STATE_FINISHED, result=result, error=error)
         finally:
             if lock is not None:
@@ -739,6 +772,7 @@ class RemovalService:
         self._require_no_reparse_points(profile_id)
         if not profile.is_dir():
             raise ProfileError(NOT_FOUND)
+        self._require_plain_targets(profile)
         return profile, record
 
     def _require_no_reparse_points(self, profile_id: str) -> None:
@@ -757,6 +791,32 @@ class RemovalService:
                 raise ProfileError(ERROR_REMOVAL_UNSAFE_PATH)
             if _is_reparse(st):
                 raise ProfileError(ERROR_REMOVAL_UNSAFE_PATH)
+
+    def _require_plain_targets(self, profile: Path) -> None:
+        """档案内的类别目标（含 `data/`）逐段不得是链接/重解析点。
+
+        只查档案根不够（审查 Important 1）：`acquire_data_lock()` 会 `mkdir` 并
+        `os.open()` 锁文件，而操作系统会**穿过 junction 解析** —— `data/` 被指到别的
+        目录时，`.raricy-data.lock` 会被创建并锁在那个**外部目录**里；预览的大小统计
+        也会把外面的字节算成这个档案的。判定因此必须**在加锁与统计之前**、与删除同处
+        完成：预览、取锁、删除三个入口都先经过 `_assert_removable()`。
+        """
+        targets = [paths.data_dir(profile)]
+        for target_paths in self._category_targets(profile).values():
+            targets.extend(target_paths)
+        for target in targets:
+            current = profile
+            for part in target.relative_to(profile).parts:
+                current = current / part
+                try:
+                    st = os.lstat(current)
+                except FileNotFoundError:
+                    break  # 这一段起都不存在，再往下没有东西可查
+                except OSError:
+                    # 读不出来不等于没有（D-130 同口径）：只接受看得清楚的现场。
+                    raise ProfileError(ERROR_REMOVAL_UNSAFE_PATH) from None
+                if _is_reparse(st):
+                    raise ProfileError(ERROR_REMOVAL_UNSAFE_PATH)
 
     def _current_revisions(self, profile_id: str) -> tuple[int, int] | None:
         """当前的 (profile_revision, catalog_revision)；档案不在了返回 None。"""
@@ -794,15 +854,20 @@ class RemovalService:
     def _scan(
         self, profile: Path, scope: str
     ) -> tuple[tuple[Mapping[str, Any], ...], int, bool]:
-        """类别与大小（有界扫描，最多 20000 个条目；只读、不跟随链接）。"""
+        """类别与大小（有界扫描，最多 20000 个条目；只读、不跟随链接）。
+
+        `size_complete` 同时反映两件事：预算够用，且**每个类别都读得出来**。读不出来
+        的类别不当成 0 字节的完整统计（那会把「看不到」显示成「没有」）。
+        """
         budget = [MAX_SCAN_ENTRIES]
+        unreadable = [False]
         targets = self._category_targets(profile)
         categories: list[Mapping[str, Any]] = []
         total = 0
         for key in CATEGORY_KEYS:
             size = 0
             for target in targets[key]:
-                size += self._measure(target, budget)
+                size += self._measure(target, budget, unreadable)
             total += size
             categories.append(
                 {
@@ -812,13 +877,20 @@ class RemovalService:
                     "removable": key == CATEGORY_CREDENTIALS or scope == SCOPE_PURGE_DATA,
                 }
             )
-        return tuple(categories), total, budget[0] > 0
+        return tuple(categories), total, budget[0] > 0 and not unreadable[0]
 
-    def _measure(self, target: Path, budget: list[int]) -> int:
-        """统计一个文件或目录的字节数；每个条目消耗一格预算，链接不计入。"""
+    def _measure(self, target: Path, budget: list[int], unreadable: list[bool]) -> int:
+        """统计一个文件或目录的字节数；每个条目消耗一格预算，链接不计入。
+
+        「确实不存在」按 0 处理（文件被删掉或被上一次中断的续做清掉了）；**读不出来**
+        记进 `unreadable` —— 统计不完整要如实反映，不能报成 0 字节的完整结果。
+        """
         try:
             st = os.lstat(target)
+        except FileNotFoundError:
+            return 0
         except OSError:
+            unreadable[0] = True
             return 0
         if _is_reparse(st):
             return 0
@@ -836,7 +908,10 @@ class RemovalService:
             try:
                 with os.scandir(directory) as entries:
                     children = list(entries)
+            except FileNotFoundError:
+                continue
             except OSError:
+                unreadable[0] = True
                 continue
             for entry in children:
                 if budget[0] <= 0:
@@ -844,7 +919,10 @@ class RemovalService:
                 budget[0] -= 1
                 try:
                     child = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
                 except OSError:
+                    unreadable[0] = True
                     continue
                 if _is_reparse(child):
                     continue
@@ -878,14 +956,18 @@ class RemovalService:
         )
 
     def _remaining_paths(self, profile: Path, scope: str) -> tuple[str, ...]:
-        """范围里仍然存在的受管相对路径（部分完成时如实列出未完成项）。"""
+        """范围里仍然存在的受管相对路径（部分完成时如实列出未完成项）。
+
+        用 `_exists_plain()` 而不是 `os.path.lexists()`：读不出来的路径按「还在」处理，
+        免得一次权限/占用错误把没清理的类别从记录的待办里悄悄抹掉。
+        """
         if scope != SCOPE_PURGE_DATA:
             return ()
         return tuple(
             self._relative(profile, target)
             for targets in self._category_targets(profile).values()
             for target in targets
-            if os.path.lexists(target)
+            if _exists_plain(target)
         )
 
     @staticmethod

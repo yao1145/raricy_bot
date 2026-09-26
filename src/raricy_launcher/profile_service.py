@@ -107,6 +107,24 @@ def _counter(value: Any) -> int:
     return value
 
 
+def _removed_marker_present(profile: Path) -> bool:
+    """该档案目录里有没有墓碑；**只把「确实不存在」当没有**（与 D-130 同口径）。
+
+    `Path.exists()` 会跟着链接看、并把权限/占用/无法解析这类错误一并吞成 False 或
+    「不存在」（悬空链接就是 False）——于是一个**读不出来或解析不了**的墓碑会被当成
+    「没有墓碑」，已删除的账号会以一份全新的空记录重新出现在 `list_profiles()` 里。
+    这里显式 `lstat`：ENOENT 才是没有；其余情况按「有墓碑」处理（宁可隐藏，也不让
+    已删除的账号冒充新档案）。
+    """
+    try:
+        os.lstat(paths.removed_json_path(profile))
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
 class ProfileService:
     """一个数据根上的档案记录与身份入口；所有方法线程安全。
 
@@ -451,7 +469,7 @@ class ProfileService:
                 continue
             if not entry.is_dir():
                 continue
-            if paths.removed_json_path(entry).exists():
+            if _removed_marker_present(entry):
                 continue
             records.append(self._to_record(entry.name, self._read_document(entry)))
         records.sort(key=lambda record: record.profile_id)

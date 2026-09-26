@@ -1794,6 +1794,25 @@ N2 的删除路径（`profile_removal.py`，§6.2）只接受**档案 ID**，绝
 档案根，手工把 `storage.db_path` 改到档案内更深的位置时这道检查会漏。升级/删除期间
 不要并行运行旧版本程序。
 
+**审查修复第 1 轮（四条同族「读不出来当没有」与越过重解析点的写）**：
+
+- **链接判定要在写/读之前、与删除同处**：`acquire_data_lock()` 会 `mkdir` 并 `os.open()`
+  锁文件，操作系统会穿过 junction 解析 —— `profiles/<id>/data` 被 junction 到别的盘时，
+  `.raricy-data.lock` 会被创建并锁在那个**外部目录**里，预览的大小统计也会把外面的
+  字节算成这个档案的。删除器本身会拒绝，但「不跟随链接」在写侧与读侧已经破了。修法是把
+  类别目标（含 `data/`）的逐段 `lstat` 判定放进 `_assert_removable()`：预览、取数据锁与
+  删除三个入口都先经过它，拒绝发生在任何写入之前。
+- **「报告成功」必须基于「确实不存在」的证据**：`os.path.lexists()`（Windows 上是 C
+  实现）把非 ENOENT 的错误一并吞成「不存在」，于是 `data/` 存在但 `lstat` 报错时整段
+  跳过并返回成功 —— 一次没删到数据的彻底删除写成 `removed_purged`。那一行改成显式
+  `lstat`：`FileNotFoundError` 才是「没有 `data/`」，其它 `OSError` 一律拒绝。
+- **预览的完整性要如实反映**：类别读不出来时 `size_complete=False`（它原先只跟踪
+  20000 条目预算）；收尾把未完成类别写进 `managed_paths` 时也按「读不出来 = 还在」
+  处理，`os.path.lexists()` 会把没清理的类别从待办里悄悄抹掉。
+- **收尾记账失败不改写结果**：数据已经删净/保留完成、墓碑已经落盘之后，`finalize`
+  阶段的记账写失败只把 `record_write_failed` 记进记录的 `error`，结果码保持成功 ——
+  否则用户看到 `failed`/`removal_unsafe_path`，而预览又已经查不到这个档案。
+
 **裁决：清空活动指针与 F2 冲突**：删除活动档案要把 `active_profile` 清成 null，而 F2
 把「文件可读但没有合法指针」判成 `metadata_pointer_invalid`。本设计明确区分两种情形：
 键**存在且值为 null** 是合法的「当前没有选中档案」（`_resolve_pointer()` 返回 `None`

@@ -1132,6 +1132,14 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   两边的文件名常量 `paths.REMOVED_FILE` / `REMOVED_MARKER_FILE` 必须逐字一致。
   边界（D-145）：旧版本程序不认识墓碑，且手工把 `storage.db_path` 改到档案内更深层时
   `raricy_bot/__main__.py` 的检查会漏 —— 不宣称对任意旧 CLI 的保护。
+  **墓碑判定只看 `lstat`**：`ENOENT` 才是「没有墓碑」，其余（权限、占用、无法解析、
+  悬空链接）一律按有墓碑处理 —— `Path.exists()` 会把这些吞成 False，让读不出来的墓碑
+  把已删除账号重新放回 `list_profiles()`。同理，档案内的类别目标（含 `data/`）**在
+  预览、取数据锁与删除三处同一判定里拒绝链接/重解析点**：`acquire_data_lock()` 会
+  `mkdir` 并写锁文件，操作系统会穿过 junction 解析，`data/` 被指到别处时锁会落在
+  **外部目录**里；预览的大小统计对读不出来的类别把 `size_complete` 置假而不是报成
+  0 字节的完整统计。移除的操作记录里，收尾阶段的记账失败**不改写结果码**
+  （数据已删净/保留完成就是成功），只把 `record_write_failed` 记进记录的 `error`。
 
 - **验证票据**（N2 Task 4、§4.2 第 3 条、D-146）：`VerificationStore`（
   [verification.py](../../src/raricy_launcher/verification.py)）只在**内存**里保存票据，
