@@ -35,6 +35,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -145,6 +146,9 @@ MAX_OPERATION_RECORDS: int = 50
 # 幂等键与它的内存表同样有界。
 IDEMPOTENCY_KEY_MIN_CHARS: int = 8
 IDEMPOTENCY_KEY_MAX_CHARS: int = 64
+_IDEMPOTENCY_KEY_RE = re.compile(
+    rf"^[A-Za-z0-9_-]{{{IDEMPOTENCY_KEY_MIN_CHARS},{IDEMPOTENCY_KEY_MAX_CHARS}}}$"
+)
 
 # 协调器操作的执行线程名。
 THREAD_NAME: str = "raricy-lifecycle"
@@ -995,12 +999,12 @@ class LifecycleService:
         return ERROR_CATALOG_WRITE_FAILED
 
     def _validate_idempotency_key(self, key: Any) -> str:
-        """幂等键形状固定：`[A-Za-z0-9_-]{8,64}`；不合格按缺失处理（API 给 422）。"""
-        if not isinstance(key, str) or not (
-            IDEMPOTENCY_KEY_MIN_CHARS <= len(key) <= IDEMPOTENCY_KEY_MAX_CHARS
-        ):
-            raise ProfileError(CODE_IDEMPOTENCY_KEY_REQUIRED)
-        if not all(char.isalnum() or char in "_-" for char in key):
+        """幂等键形状固定：`[A-Za-z0-9_-]{8,64}`；不合格按缺失处理（API 给 422）。
+
+        用显式的 ASCII 字符集而不是 `str.isalnum()`：后者会放行中文与全角数字，
+        而键会原样写进记录文件，形状必须与总表逐字一致。
+        """
+        if not isinstance(key, str) or not _IDEMPOTENCY_KEY_RE.match(key):
             raise ProfileError(CODE_IDEMPOTENCY_KEY_REQUIRED)
         return key
 
