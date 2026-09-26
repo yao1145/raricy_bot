@@ -4,6 +4,7 @@
   // 服务端对 delete 一律回 409 `credential_delete_unavailable`，见 D-131）。
   import * as api from "./api";
   import { FIELDS, LEVELS, fromInput, toInput, type FieldSpec } from "./fields";
+  import { conflictNotice } from "./texts";
 
   let { onchanged }: { onchanged: () => void } = $props();
 
@@ -158,7 +159,12 @@
       if (error.status === 401) return "会话已失效，请从桌面图标重新打开管理页。";
       // 无本地条目的稳定码用服务端固定文案（例如删除凭据暂不可用），页面不自行翻译。
       if (error.status === 409)
-        return CONFLICT_TEXT[error.code] ?? error.detail ?? `操作冲突：${error.code}`;
+        return (
+          CONFLICT_TEXT[error.code] ??
+          conflictNotice(error.code) ??
+          error.detail ??
+          `操作冲突：${error.code}`
+        );
       if (error.detail) return error.detail;
       if (error.field) return `字段有问题：${error.field}（${error.code}）`;
       return `操作失败：${error.code}`;

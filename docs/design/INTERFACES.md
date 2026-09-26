@@ -910,11 +910,13 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   `POST /api/test/site` 在整段执行期间持有租约，`manager.state` 检查与派发都在租约覆盖内
   由**工作线程**完成、租约只在该线程的 `finally` 释放（请求协程被取消时线程仍在跑，协程侧
   释放等于把门开在测试进行中）。`POST /api/bot/{start,stop,restart}` 先取租约再调用管理器，
-  取不到就 409 `lifecycle_busy` 且不派发，租约在管理器调用返回后立刻释放。测试入口的 409
-  分两个稳定码：进程确实 `running` 时沿用 `bot_running`（既有语义），门被占用或处于
-  `starting` / `stopping` 时回 `lifecycle_busy`。门内不等待 Worker、网络或 keyring；操作之间
-  不互斥，`WorkerManager` 对启停的串行化与 `stop` 抢占 `starting` 的语义不变 —— 门只解决
-  跨入口（测试 vs 启停）的竞态。
+  取不到就 409 `lifecycle_busy` 且不派发，租约在管理器调用返回后立刻释放。测试入口在**持租约
+  期间**按两条判据放行：进程处于 `stopped` / `failed`，且没有未完成的在途操作。在途操作这条
+  不可省：`restart` 的停止阶段会先把状态写回 `stopped` / `failed`、之后才写 `starting`，只看
+  `state` 会在那段空档放行测试。拒绝分两个稳定码：进程确实 `running` 时沿用 `bot_running`
+  （既有语义），门被占用、处于 `starting` / `stopping`、或仍有未完成操作时回 `lifecycle_busy`。
+  门内不等待 Worker、网络或 keyring；操作之间不互斥，`WorkerManager` 对启停的串行化与 `stop`
+  抢占 `starting` 的语义不变 —— 门只解决跨入口（测试 vs 启停）的竞态。
 - **IPC**（§10.1）：控制通道（父→子：`stop`、`status_request`）与上报通道（子→父：
   `ready`、`status`、`log`、`stopped`）分向；帧有长度前缀与上限，信封固定携带协议版本、
   实例 ID、运行 ID 与序号，身份不符即终止会话。日志帧只承载 `log_event` 的白名单事件。

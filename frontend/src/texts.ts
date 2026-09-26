@@ -42,3 +42,14 @@ export const RECOVERY_NEXT_STEP: string =
 export function recoveryNotice(code: string | null | undefined): RecoveryNotice {
   return (code ? RECOVERY_NOTICES[code] : undefined) ?? FALLBACK_NOTICE;
 }
+
+// 409 冲突码的固定文案：与服务端信封的 `code` 一一对应（F3 的生命周期门）。
+// 组件只按码取文案，不自己拼接中文长句；未命中的码仍回退到服务端文案或原始码。
+export const CONFLICT_NOTICES: Record<string, string> = {
+  lifecycle_busy:
+    "另一个生命周期操作正在进行（站点测试或启停），请等它结束后再试。",
+};
+
+export function conflictNotice(code: string | null | undefined): string | undefined {
+  return code ? CONFLICT_NOTICES[code] : undefined;
+}

@@ -1147,6 +1147,12 @@ F3 的落地口径（[下一代设计](LIGHT_NEXT_GENERATION.md) §1.3、§11 N0
 - **检查与派发同租约，租约不跨管理器调用**：`manager.state` 检查必须在持租约期间完成，
   否则「读到 stopped」与「派发测试」之间就是原来那个窗口；启动路径同样先取租约再调用管理器，
   取不到就不派发。启动之后的并发由 `manager.state`（`starting` 等）在测试入口的租约内兜住。
+- **准入门还要看 `current_operation()`**：`restart` 的停止阶段会先把状态写回 `stopped` /
+  `failed`（`process_manager.py` 的 `_stop_synchronously`），之后才写 `starting`（`_do_restart`）。
+  那段空档里 `state` 是测试允许的取值，而组合操作尚未完成 —— 只看 `state` 会放行测试，让它与
+  随即启动的新 Worker 并行，正是 F3 要消灭的交错。所以持租约期间在 `state` 之外再查一次在途
+  操作（`finished_at is None`），命中一律 409 `lifecycle_busy`：宁可保守地多拒一次测试，也不让
+  测试与启动并行。判据仍在租约内、不等待也不延长持锁，`WorkerManager` 的串行化逻辑不动。
 - **租约归工作线程释放**：站点测试的租约在执行它的**工作线程**的 `finally` 里释放 —— 请求
   协程可能被取消而线程仍在跑，协程侧释放等于把门开在测试进行中（协程用 `asyncio.shield`
   等这个任务，取消不传导给线程）。
