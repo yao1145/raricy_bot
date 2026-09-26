@@ -6,6 +6,7 @@ Windows 默认 ``%LOCALAPPDATA%\\RaricyBotLight``（§13.1）；其他平台仅�
 ```text
 RaricyBotLight/
   launcher.json      活动档案指针与 Launcher schema（非敏感）
+  desktop.json       桌面偏好与独立 settings revision（非敏感，§8）
   runtime/           非敏感实例元数据，不是互斥锁的替代品
   diagnostics/       有界 Launcher 诊断
   profiles/<id>/
@@ -31,6 +32,8 @@ from pathlib import Path
 from uuid import uuid4
 
 LAUNCHER_FILE: str = "launcher.json"
+# 桌面偏好：与 launcher.json 同级，独立于任何档案（§8、D-142）。
+DESKTOP_FILE: str = "desktop.json"
 RUNTIME_DIR: str = "runtime"
 DIAGNOSTICS_DIR: str = "diagnostics"
 PROFILES_DIR: str = "profiles"
@@ -66,6 +69,11 @@ def default_data_root() -> Path:
 def launcher_json_path(data_root: Path) -> Path:
     """活动档案指针与 Launcher schema 的位置（非敏感）。"""
     return Path(data_root) / LAUNCHER_FILE
+
+
+def desktop_json_path(data_root: Path) -> Path:
+    """桌面偏好与独立 settings revision 的位置（非敏感，§8）。"""
+    return Path(data_root) / DESKTOP_FILE
 
 
 def runtime_dir(data_root: Path) -> Path:
