@@ -12,8 +12,12 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-if TYPE_CHECKING:  # 只在类型标注里用，平台层不在 import 期依赖托盘视图模型
+if TYPE_CHECKING:
+    # 两个协议都只在类型标注里出现：托盘视图模型不必在 import 期被平台层依赖，
+    # 启动项协议运行期由 `get_startup_registry()` 惰性导入，
+    # 非 Windows 平台不会因为它被牵扯进 `winreg`。
     from ..tray_model import TrayView
+    from .startup_windows import StartupRegistry
 
 
 class PlatformError(Exception):
@@ -244,4 +248,18 @@ def get_platform() -> LauncherPlatform:
         from .windows import WindowsPlatform
 
         return WindowsPlatform()
+    raise PlatformError("unsupported_platform")
+
+
+def get_startup_registry() -> StartupRegistry:
+    """返回当前平台的登录启动项读写实现；不支持的平台抛 PlatformError。
+
+    与 `get_platform()` 同风格：只在 win32 下惰性导入实现模块，因此不需要注册表
+    的调用方（以及所有离线测试）都不会因为 import 本函数而拿到 `winreg`。
+    实现只写当前用户的 Run 键（§8、§59），不请求管理员、不碰 HKLM。
+    """
+    if sys.platform == "win32":
+        from .startup_windows import WinRegistryStartup
+
+        return WinRegistryStartup()
     raise PlatformError("unsupported_platform")

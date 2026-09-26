@@ -890,7 +890,13 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   ...)` 仍然成立），写完即不再回退到档案；**N1 的 `migration.py` 落地后，这条回退仍是升级
   用户的唯一导入路径**。查询不修复、不创建、不覆盖（与 D-130 同口径）：只有这一次导入会创建
   文件，损坏、版本不认识或不支持时只报码、不动现场；全新实例（没有 `launcher.json`）连默认值
-  也不落盘。
+  也不落盘。**配置面不再承载该偏好**（N4 Task 4）：`GET /api/config` 不再返回
+  `start_bot_on_launch`；`PUT /api/config` 收到该键时在任何写入之前回 422
+  `desktop_setting_moved`（`field=start_bot_on_launch`，`message=texts.DESKTOP_SETTING_MOVED`
+  指向「桌面」页），不静默忽略、也不写第二份副本；`ConfigService.commit()` 不再接受该参数、
+  不再写入 `_launcher.start_bot_on_launch`。档案里的同名字段只在**历史快照与迁移的只读口径**
+  里保留（`SavedConfig.start_bot_on_launch`、`ConfigService.start_bot_on_launch()`、
+  一次性导入），新提交不再产生它。
 - **桌面设置的稳定码**（§8、§11）：`desktop_settings_conflict`（revision 不符）、
   `invalid_desktop_settings`（参数类型/取值非法）、`desktop_unreadable`（读不到：权限、占用）、
   `desktop_corrupt`（JSON 解析失败、顶层非映射、`settings_revision` 不是非负整数、布尔字段
@@ -904,7 +910,10 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 [API](../../src/raricy_launcher/api.py)、
 [进程管理](../../src/raricy_launcher/process_manager.py)、[IPC 协议](../../src/raricy_launcher/ipc.py)、
 [事件](../../src/raricy_launcher/events.py)、[状态聚合](../../src/raricy_launcher/status_service.py)、
-[生命周期门](../../src/raricy_launcher/lifecycle_gate.py)、[控制器](../../src/raricy_launcher/controller.py)。
+[生命周期门](../../src/raricy_launcher/lifecycle_gate.py)、[控制器](../../src/raricy_launcher/controller.py)、
+[启动项服务](../../src/raricy_launcher/startup_service.py)、
+[启动项适配层](../../src/raricy_launcher/platform/startup_windows.py)、
+[桌面设置](../../src/raricy_launcher/desktop_settings.py)。
 
 - **入口参数与来源提示**（§9.4）：`--worker` 仍优先按 Worker 分派，其后参数原样透传；
   否则按 Controller 入口解析，只识别字面量 `--startup` 与 `--no-tray`（都可出现在任意
@@ -915,6 +924,111 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 - **托盘命令入口**（§61.2、D-140）：托盘的命令**不经过 HTTP** —— `Controller` 自己实现
   `tray_service.DesktopCommands`，与 `/api/bot/*` 共用同一把生命周期门、同一个管理器与
   同一套稳定码；窗口回调只投递结构化命令，耗时动作在协调器线程里执行（§7.2）。
+- **自动运行解析与目标清理**（§5.2、§8.1、D-150）：`Controller._auto_start()` 每次进入只解析
+  一次，固定顺序是**读偏好 → 校验目标 → 设选中指针 → 启动**。偏好只读 `desktop.json`
+  （唯一来源，顺带完成升级用户的一次性导入），不再读档案里的旧 `start_bot_on_launch`：
+  1. 偏好关：不启动机器人，只给入口（手动启动打开向导/管理页；登录启动按可见控制入口决定）。
+  2. 目标档案**已被移除**（档案目录不存在）：经 `DesktopSettingsService.update()` 清空
+     `startup_profile_id` 并把 `start_bot_on_launch` 置 false，**保留** `launch_at_sign_in`
+     与其注册项，本次不启动；revision 冲突时不重试、不覆盖，只保证本次不启动。
+     「已移除」只认 `FileNotFoundError` / `NotADirectoryError`：档案目录**读不到**（权限、
+     被占用、数据根暂时不可用）**不等于**已移除 —— 读不到时保留目标与偏好、不启动
+     （可区分状态 `target_unreadable`，且不做任何清理），下一次启动重新判定。判定不复用
+     `Path.is_dir()`，正是因为它会把 `OSError` 吞成 `False`，把「读不到」说成「不存在」。
+  3. 目标**暂时不完整**（`needs_credentials` / `invalid` / `recovery` / 读不出来）：保留目标与
+     偏好，不启动、不自动清除（凭据可以再填、配置可以再修）。
+  4. 目标可用：先把选中指针设为该目标（§5.2 切换事务的退化形态：本次没有运行中的 Worker，
+     事务就是「校验目标 → 提交选中指针 → 启动」）。这一步调用选中服务入口，**控制器不自行
+     写 `launcher.json`**；选中无法确认时本次不启动，不允许页面显示 A 而后台自动运行 B。
+  5. 只有走到这里才启动一次，且仍先取 `LifecycleGate` 租约 —— `--startup` 不绕过并发门，
+     派发返回后立刻释放（与 §9.2 的启停入口同一口径）。
+  手动启动保持原行为：偏好开且当前档案可用就用**当前选中档案**启动，否则打开向导/恢复页；
+  登录启动没有明确目标时不启动（不猜档案），默认不打开浏览器（托盘落地前降级为最多打开一次
+  管理页，接缝见 `Controller._tray_available()`）。目标的状态按**目标档案自己**读
+  （`_profile_status()`：带显式档案 id 的只读查询，不建立档案、不写指针）。
+  尚未并入的依赖：N1/N2 的选中服务入口落地前 `_select_startup_profile()` 一律返回 False
+  （有目标但选不了时本次不启动、只给提示）；N3 的托盘落地前 `_tray_available()` 恒为 False。
+  用户退出 Light 后本次会话不自动复活；已有实例的重复入口（含 `--startup`）在入口层静默去重。
+- **登录启动项**（§8、D-148）：只碰当前用户 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+  下本产品自己的值名 `RaricyBotLight`（`REG_SZ`），值内容固定为
+  `"<绝对 EXE 路径>" --startup`（引号包围路径、一个空格、恰好一个固定参数；
+  `startup_service.build_startup_command()`）。命令按 `len(command)` 计上限 260 字符，
+  超限拒绝、**不静默截断**；非冻结发行形态（防止把 `python.exe --startup` 写进 Run）、
+  EXE 路径为空、非绝对或不存在也一律拒绝，且拒绝在**写入之前**判定。**归属判定只用命令
+  格式**：只有形如上述格式的值才认为本产品持有、可以覆盖与修复；其他形态（别的应用写在
+  同名值里的命令行）一律 `registration_conflict`，不覆盖、不删除，原值一个字节都不动。
+  不枚举其他启动项（只按固定值名访问），也不读、不写 `StartupApproved` —— 系统侧
+  （任务管理器、设置页、企业策略）的禁用决定没有受支持的读取方式，程序不覆盖它。
+- **启动项读写边界**（§8）：`platform/startup_windows.py` 的 `StartupRegistry`
+  （`runtime_checkable` Protocol，三个方法 `read_value(name) -> (bool, str | None)`、
+  `write_value(name, command)`、`delete_value(name)`，删除幂等、键或值不存在不算错误）
+  是唯一通道。`WinRegistryStartup` 是标准库 `winreg` 实现：根只用 `HKEY_CURRENT_USER`，
+  读取用 `KEY_READ`、写入用 `KEY_SET_VALUE`（`CreateKeyEx` + `SetValueEx(REG_SZ)`）。
+  `get_startup_registry()` 在 win32 下惰性导入实现，其他平台抛
+  `PlatformError("unsupported_platform")`（与 `get_platform()` 同风格）。适配层错误
+  `StartupRegistryError` 的消息是内部类别码（`startup_registry_read_failed` /
+  `_write_failed` / `_delete_failed`），不透传 `WinError` 原文；服务层把它映射为
+  `read_failed` / `apply_failed`，这几个内部码不出现在 API 响应里。**自动化测试只注入
+  内存替身，不打开真实注册表**（N4 全局约束）。
+- **启动项事实与状态**（§8、D-148）：`StartupService(settings, registry, *, executable,
+  frozen, path_exists=os.path.isfile)` 的三个入口 —— `status()`（只看不写）、`apply()`
+  （按当前意图登记/注销，写前判定、写后回读、把结果写回设置文件）、
+  `repair(expected_revision)`（revision 不符抛 `DesktopSettingsConflict`）—— 都返回
+  `StartupFacts`（frozen dataclass，可直接 `dataclasses.asdict`）。字段就是五项分离事实
+  `requested_enabled`（`desktop.json` 的 `launch_at_sign_in`）、`registration_present`、
+  `command_matches`（读到的内容与 `expected_command` 逐字相等）、`executable_exists`、
+  `last_apply_result`，加上 `effective_state`、`divergence`、`expected_command`（本程序
+  算出的命令，算不出来时是空串）与 `pending_apply`。**不回显注册表里读到的原始命令
+  内容**：只给本程序算出的命令与布尔事实，别的应用写在同名值里的命令行不会被带回本机
+  页面。`status()` 不回写设置文件；注册表读不到或同名值非本产品持有时，返回的事实里
+  `last_apply_result` 是**本次观测**的结论（`read_failed` / `registration_conflict`，
+  连同待应用诊断），文件里保留上一次真实应用的结果。
+- **`effective_state` 判定**（确切值总表；判定只有一处实现，各任务不得各写一套）：
+  `unknown` **优先** ——
+  注册表读不到、同名值无法确认是本产品持有、或上次结果是 `apply_failed` / `read_failed`
+  且未回读一致（含「意图为关但值未删掉」，**不假报关闭成功**）；`enabled` =
+  `requested_enabled=true` 且三条事实全为真且 `last_apply_result ∈ {ok, not_attempted}`
+  —— 语义只是「登记完整且路径有效」，**不表示「下次登录必定启动」**（界面文案不得出现
+  这类承诺）；`needs_repair` = 意图为开但登记不完整（值被删、搬目录、EXE 不在原位置）；
+  `disabled` = 意图为关且值已不在。`divergence` = 意图与登记事实不一致
+  （`requested_enabled != registration_present`，或意图为开而 `command_matches=false`），
+  或 `last_apply_result ∈ {apply_failed, read_failed}`。`apply()` 写完必须回读：命令发出
+  去了不等于事实成立；应用失败**不回滚意图**（意图是用户要的、结果由 `record_apply_result`
+  单独记录）。`repair()` 一律按**当前** EXE 路径重新生成命令，**永不重放**
+  `pending_startup_apply`：它只是「上次想写什么」的诊断记录，重放会把搬目录前的旧路径
+  写回注册表。
+- **桌面设置与启动项端点**（§8、§58、D-149）：三个端点都要求已认证会话，写请求另走
+  Origin / Fetch Metadata / CSRF / JSON 内容类型与请求体上限。
+  - `GET /api/desktop-settings` → `{"ok": true, "settings_revision", "launch_at_sign_in",
+    "start_bot_on_launch", "startup_profile_id"}`；失败按稳定码映射（`desktop_unreadable` /
+    `desktop_corrupt` / `desktop_unsupported_version` / `desktop_settings_write_failed` 都是 409，
+    **必须显式映射**，否则一次性导入落盘失败会变成 500）。
+  - `PUT /api/desktop-settings`：body 严格白名单 `{"expected_settings_revision": int,
+    "launch_at_sign_in"?: bool, "start_bot_on_launch"?: bool, "startup_profile_id"?: str|null}`。
+    缺版本守卫、多余键、类型不对 → 422 `invalid_desktop_settings`（`field` 指到具体键）；
+    revision 不符 → 409 `desktop_settings_conflict`；`startup_profile_id` 形态非法同样 422
+    （目标是否真的存在由档案服务判定，本阶段尚未落地）。开启 `launch_at_sign_in` 之前先做
+    写前判定：命令超 260 → 409 `startup_command_too_long`、路径不可用/非冻结形态 → 409
+    `startup_path_unusable`（`field=launch_at_sign_in`，带 `texts.py` 的固定文案），**且不写意图**
+    ——做不到的偏好不落盘。成功 → 200 `{"ok": true, "settings_revision", "applied": bool,
+    "startup": {…事实…}}`：写意图（revision +1）→ 按意图应用 → 回读 → 记录结果。应用失败
+    **不回滚意图**，`applied=false` 加事实由页面显示差异。
+  - `GET /api/desktop/startup-status` → `{"ok": true, "settings_revision", "requested_enabled",
+    "registration_present", "command_matches", "executable_exists", "effective_state",
+    "divergence", "last_apply_result", "pending_apply": obj|null, "expected_command"}`。
+    **只读自有值、不回显原始命令**：不返回注册表里读到的内容（可能是别的应用写的），只给
+    本程序算出的 `expected_command` 与布尔事实；不枚举其他启动项。这里的 `last_apply_result`
+    是**本次观测**的结论（读不到或同名值非本产品持有时是 `read_failed` /
+    `registration_conflict`），不写回设置文件、也不得当作持久值回用 —— 文件里保留上一次
+    真实应用的结果。查询路径同样不落盘。
+  - `POST /api/desktop/startup-repair`：body 只接受 `expected_settings_revision`（任何
+    `command` 之类的键 → 422 `invalid_desktop_settings`，**不接受任意执行命令**）。按**当前**
+    EXE 路径重新生成命令并执行，成功 → 200 同 `PUT` 的成功形状。**两个冲突来源都要映射**：
+    revision 过期由服务层抛 `DesktopSettingsConflict` → 409 `desktop_settings_conflict`；
+    同名值非本产品持有**不抛异常**、以事实返回 → 409 `startup_registration_conflict`；
+    `apply_failed` / 读不到（`read_failed`，没有专属码）→ 409 `startup_apply_failed`，
+    `command_too_long` / `path_unusable` → 各自的稳定码，都带 `texts.py` 的固定文案。
+    启动时**不重放** `pending_startup_apply`：系统偏好只由用户在页面上按修复时改写。
 - **会话**（§8.1）：引导令牌单次、限时（120 秒），经 URL fragment 交付；兑换成功即发放
   HttpOnly + SameSite=Strict 的会话 Cookie，并回一个会话绑定的 CSRF 值。兑换按 60 秒窗口限次，
   窗口会滚动，本机他人刷满也不能把用户永久挡在门外。会话只存内存，Controller 重启即全部失效。
@@ -982,6 +1096,17 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   `detail`、`elapsed_ms`，不返回生成内容或凭据。测试输入只在本次调用内使用，不写入正式/草稿配置，
   也不更新 revision 绑定的测试状态；已保存配置测试仍按原规则记录 revision 结果。模型测试仍受
   单次并发、固定样例、输出 token 上限和超时约束。
+- **桌面页签与文案约定**（§8、D-149）：导航在既有三页之后新增「桌面」页签（不重排现有页面），
+  由 `frontend/src/DesktopSettings.svelte` 承载三个开关（「登录 Windows 时启动 Light」「打开 Light
+  时启动机器人」「启动目标档案」）、启动项事实、差异提示与「修复启动项」。机器码 → 固定中文
+  文案映射放 `frontend/src/texts.ts`：`STARTUP_STATUS_NOTICES`（按 `effective_state`，与
+  `RECOVERY_NOTICES` 同构）、`STARTUP_RESULT_NOTICES`（按 `last_apply_result`），
+  `desktop_settings_conflict` 进既有 `CONFLICT_NOTICES`。`enabled` 的文案必须写明
+  「Windows 可能延迟执行，或按你在系统设置里的选择跳过；本程序不修改该选择」，**不得**出现
+  「下次登录必定启动」一类承诺。启动目标档案在档案列表接口（N2）交付前只显示当前值并说明
+  由账号页管理，页面不自行列出档案。设置页移除原复选框并指向桌面页；向导保存成功后改用
+  `PUT /api/desktop-settings` 写 `start_bot_on_launch=true`（`expected_settings_revision` 取当前值），
+  `startup_profile_id` 的接线等 N1 的档案状态 DTO 落地后再补。
 - 发行构建：`tools/build_light.py` 生成 staging（Light 闭包 + 静态资源 + 构建信息），
   `--pyinstaller` 用 `light.spec` 冻结为 onedir/windowed 应用，`--zip` 打出 ZIP 与 `.sha256`。
   `build-info.json` 记录版本、协议版本、Python 版本、依赖清单与整包校验和。

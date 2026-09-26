@@ -48,8 +48,60 @@ export function recoveryNotice(code: string | null | undefined): RecoveryNotice 
 export const CONFLICT_NOTICES: Record<string, string> = {
   lifecycle_busy:
     "另一个生命周期操作正在进行（站点测试或启停），请等它结束后再试。",
+  desktop_settings_conflict:
+    "桌面设置已被另一个页面改过，请刷新后重试。",
 };
 
 export function conflictNotice(code: string | null | undefined): string | undefined {
   return code ? CONFLICT_NOTICES[code] : undefined;
+}
+
+// 登录启动的状态文案（N4 §8、§60）：键是服务端 `effective_state` 的机器码，
+// 与 `RECOVERY_NOTICES` 同构。`enabled` 的语义只是「登记完整且路径有效」：
+// 系统侧的禁用决定本程序读不到、也不覆盖，所以不得写成「下次登录必定启动」。
+export const STARTUP_STATUS_NOTICES: Record<string, RecoveryNotice> = {
+  enabled: {
+    title: "登录启动已登记",
+    detail:
+      "启动项登记完整且程序路径有效。Windows 可能延迟执行，或按你在系统设置里的选择跳过；本程序不修改该选择，也不保证每次登录都会启动。",
+  },
+  disabled: {
+    title: "登录启动已关闭",
+    detail: "注册表里没有本程序的启动项，且本次关闭已回读确认。",
+  },
+  needs_repair: {
+    title: "启动项需要修复",
+    detail:
+      "意图为开启但登记不完整：启动项可能被删除、程序目录被移动，或可执行文件不在原位置。",
+  },
+  unknown: {
+    title: "启动项状态未知",
+    detail:
+      "读不到注册表、同名值无法确认是本程序写入的，或上次操作没有回读确认；程序不会据此报告为已关闭。",
+  },
+};
+
+const FALLBACK_STATUS_NOTICE: RecoveryNotice = {
+  title: "启动项状态未知",
+  detail: "服务端没有给出可识别的状态码；请刷新后重试。",
+};
+
+export function startupStatusNotice(code: string | null | undefined): RecoveryNotice {
+  return (code ? STARTUP_STATUS_NOTICES[code] : undefined) ?? FALLBACK_STATUS_NOTICE;
+}
+
+// 上次应用结果码的固定文案（与 `last_apply_result` 一一对应）。
+export const STARTUP_RESULT_NOTICES: Record<string, string> = {
+  ok: "上次应用已回读确认。",
+  not_attempted: "还没有执行过启动项应用。",
+  command_too_long: "上次应用失败：命令超过长度上限，请把应用目录移到更短的路径。",
+  path_unusable: "上次应用失败：当前形态或程序路径不能用于登录启动。",
+  registration_conflict:
+    "上次应用失败：注册表里的同名项不是本程序写入的，程序不会覆盖或删除它。",
+  apply_failed: "上次应用失败：可能被权限或系统策略拒绝。",
+  read_failed: "上次读注册表失败，无法确认登记事实。",
+};
+
+export function startupResultNotice(code: string | null | undefined): string | undefined {
+  return code ? STARTUP_RESULT_NOTICES[code] : undefined;
 }

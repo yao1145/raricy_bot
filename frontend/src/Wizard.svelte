@@ -229,6 +229,23 @@
     }
   }
 
+  async function saveLaunchPreference(): Promise<boolean> {
+    // 桌面偏好（§58、§60）：启动偏好归 desktop.json，不再随配置提交。
+    // `startup_profile_id` 的接线要等 N1 的档案状态 DTO（active_profile_id）落地，
+    // 现在不猜档案 id；这一步只写 `start_bot_on_launch`。
+    try {
+      const current = await api.getDesktopSettings();
+      await api.saveDesktopSettings({
+        expected_settings_revision: current.settings_revision,
+        start_bot_on_launch: true,
+      });
+      return true;
+    } catch {
+      // 配置已经保存：偏好没写进去只影响下次自动启动，不能把保存说成失败。
+      return false;
+    }
+  }
+
   async function saveAndStart(): Promise<void> {
     busy = true;
     failure = null;
@@ -243,15 +260,17 @@
         expected_revision: revision,
         values: collectedValues(),
         account: account.trim(),
-        start_bot_on_launch: true,
         credentials: {
           password: { action: "replace", value: password },
           llm_api_key: { action: "replace", value: apiKey },
         },
       });
       revision = result.revision;
+      const preferenceWritten = await saveLaunchPreference();
       await api.botAction("start", result.revision);
-      message = "已保存并启动；机器人正在初始化。";
+      message = preferenceWritten
+        ? "已保存并启动；机器人正在初始化。"
+        : "已保存并启动；但「打开 Light 时启动机器人」偏好没有写入，请在「桌面」页重试。";
       ondone();
     } catch (error) {
       failure = describe(error);

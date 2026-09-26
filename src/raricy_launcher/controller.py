@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import socket
+import sys
 import threading
 import time
 import webbrowser
@@ -35,11 +36,24 @@ from raricy_bot.logging_setup import log_event
 from . import __version__, activation, paths, texts
 from .activation import ActivationError
 from .api import LocalApi
-from .config_service import ConfigService, ConfigServiceError
+from .config_service import (
+    STATE_CONFIGURED,
+    ConfigService,
+    ConfigServiceError,
+    ConfigStatus,
+)
 from .credential_store import CredentialStore, SessionMemoryStore, SystemKeyringStore
+from .desktop_settings import DesktopSettings, DesktopSettingsError, DesktopSettingsService
 from .events import EventService
 from .lifecycle_gate import LifecycleGate
-from .platform import InstanceGuard, LauncherPlatform, PlatformError, TrayError, TrayIcon
+from .platform import (
+    InstanceGuard,
+    LauncherPlatform,
+    PlatformError,
+    TrayError,
+    TrayIcon,
+    get_startup_registry,
+)
 from .process_manager import (
     START_TIMEOUT_SECONDS,
     STOP_BUDGET_MS,
@@ -49,6 +63,7 @@ from .process_manager import (
     default_worker_spec,
 )
 from .session import SessionManager
+from .startup_service import StartupService
 from .status_service import StatusService
 from .tray_model import TrayView
 from .tray_service import CODE_CONFIG_NOT_READY, CODE_LIFECYCLE_BUSY, CODE_QUITTING
@@ -151,6 +166,10 @@ class Controller:
         self._config = ConfigService(
             self._data_root, credential_store=self._credentials, profile_id=profile_id
         )
+        # 桌面偏好与登录启动项（§58、§59）：装配一次，API 与后续的自动运行解析共用；
+        # 注册表适配器在这里惰性取得，测试用替身注入 `LocalApi`，不碰真实注册表。
+        self._desktop_settings = DesktopSettingsService(self._data_root)
+        self._startup_service = self._build_startup_service()
         # 事件时间要与管理页显示的墙钟一致（同一处时钟时基缺陷，复审指出）。
         self._events = EventService(instance_id=self._instance_id, clock=time.time)
         self._sessions = SessionManager(instance_id=self._instance_id, clock=time.monotonic)
@@ -178,6 +197,30 @@ class Controller:
         self._api_socket: socket.socket | None = None
         self._port = 0
         self._listener = None
+
+    def _build_startup_service(self) -> StartupService | None:
+        """装配登录启动项服务；取不到本机注册表通道时返回 None（端点回稳定失败）。
+
+        `executable` 只有冻结发行形态才给出：开发形态是 `python.exe` 加源码目录，
+        登记进 Run 在登录时跑不起来，服务层也会拒绝（`path_unusable`）。
+        """
+        try:
+            registry = get_startup_registry()
+        except PlatformError:
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "launcher.startup_unavailable",
+                error="PlatformError",
+            )
+            return None
+        frozen = bool(getattr(sys, "frozen", False))
+        return StartupService(
+            self._desktop_settings,
+            registry,
+            executable=sys.executable if frozen else None,
+            frozen=frozen,
+        )
 
     # --- 查询 -------------------------------------------------------------
 
@@ -319,34 +362,247 @@ class Controller:
             tray.request_close()
 
     def _auto_start(self) -> None:
-        """首次进入：配置可用且偏好开启时静默启动；否则打开向导/修复页（§5.2）。"""
+        """首次进入：按桌面偏好解析自动运行并决定是否启动（§5.2、§8、D-150）。
+
+        解析顺序（INTERFACES §59 的唯一实现）：
+
+        1. 读 `desktop.json`（桌面偏好的**唯一来源**，顺带完成升级用户的一次性导入）；
+        2. 校验启动目标 —— 目标档案已被移除就清空目标并关掉机器人自动启动偏好，
+           保留 `launch_at_sign_in` 与注册项；目标暂时不完整则保留目标与偏好；
+        3. 把选中指针设为启动目标（`_select_startup_profile()`；N1/N2 的服务入口
+           尚未并入，见该方法）；
+        4. 只有「偏好开 + 目标可用 + 选中成功」才启动机器人。
+
+        `--startup` 只是来源提示：授权偏好、档案状态与恢复记录一概重新读取，启停
+        仍走 `LifecycleGate` 与 `WorkerManager` 的同一条路（§8.1）。任何一步读不
+        出来都不猜：不启动、不改写现场，只给一次可见提示。
+        """
         try:
-            status = self._config.status()
-        except ConfigServiceError:
-            status = None
-        configured = status is not None and status.state == "configured"
-        if configured and self._config.start_bot_on_launch():
-            operation = self._manager.start(revision=status.revision)
-            watcher = threading.Thread(
-                target=self._watch_auto_start,
-                args=(operation.operation_id,),
-                name="raricy-auto-start-watch",
-                daemon=True,
+            settings = self._desktop_settings.read()
+        except DesktopSettingsError as exc:
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "launcher.auto_start_preference_failed",
+                error=type(exc).__name__,
             )
-            self._auto_start_watcher = watcher
-            watcher.start()
+            self._open_entry_or_tray()
+            return
+        if not settings.start_bot_on_launch:
+            log_event(
+                self._logger,
+                logging.INFO,
+                "launcher.auto_start_skipped",
+                status="preference_off",
+            )
+            self._open_entry_or_tray()
+            return
+        target = settings.startup_profile_id
+        if target is None:
+            if self._startup_launch:
+                # 登录启动只使用明确的启动目标，没有目标就不猜启动哪个档案（§8.1）；
+                # 手动启动沿用原行为，启动当前选中档案。
+                log_event(
+                    self._logger,
+                    logging.INFO,
+                    "launcher.auto_start_skipped",
+                    status="no_target",
+                )
+                self._open_entry_or_tray()
+                return
+            status = self._profile_status(None)
+            if status is None or status.state != STATE_CONFIGURED:
+                self._open_entry_or_tray()
+                return
+            self._start_bot(status.revision)
+            return
+        try:
+            target_removed = not self._profile_exists(target)
+        except (OSError, ValueError) as exc:
+            # 档案目录**读不到**（权限、被占用、数据根暂时不可用、布局损坏）：
+            # 这不是「已移除」，不能触发清空目标与偏好的破坏性清理；保留现场，
+            # 本次不启动，下一次启动重新判定（与 D-130 同口径）。
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "launcher.auto_start_skipped",
+                status="target_unreadable",
+                error=type(exc).__name__,
+            )
+            self._open_entry_or_tray()
+            return
+        if target_removed:
+            # 目标**真的**已被移除（不存在/已删除）：清空目标并关掉机器人自动启动偏好。
+            self._clear_startup_target(settings)
+            self._open_entry_or_tray()
+            return
+        status = self._profile_status(target)
+        if status is None or status.state != STATE_CONFIGURED:
+            # 暂时不完整（缺凭据、配置非法、恢复态）：保留目标与偏好，不启动、
+            # 不自动清除 —— 凭据可以再填，配置可以再修。
+            log_event(
+                self._logger,
+                logging.INFO,
+                "launcher.auto_start_skipped",
+                status="target_incomplete",
+            )
+            self._open_entry_or_tray()
+            return
+        if not self._select_startup_profile(target):
+            # 选中指针无法确认指向目标：宁可这次不启动，也不让页面显示的档案与
+            # 后台自动运行的档案不一致（§5.2）。
+            log_event(
+                self._logger,
+                logging.INFO,
+                "launcher.auto_start_skipped",
+                status="selection_unavailable",
+            )
+            self._open_entry_or_tray()
+            return
+        self._start_bot(status.revision)
+
+    def _start_bot(self, revision: int | None) -> None:
+        """取生命周期租约后派发一次启动，并挂上静默失败监视（§9.2、D-132）。"""
+        ticket = self._lifecycle.begin_operation("start")
+        if ticket is None:
+            # 门被站点测试占着：不绕过并发门，也不排队（§5.1 第 3 条）。
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "launcher.auto_start_skipped",
+                status="lifecycle_busy",
+            )
+            self._open_entry_or_tray()
+            return
+        try:
+            operation = self._manager.start(revision=revision)
+        finally:
+            # 租约只覆盖派发本身，长等待不留在门内（与 §59 的启停入口同一口径）。
+            self._lifecycle.end(ticket)
+        log_event(
+            self._logger,
+            logging.INFO,
+            "launcher.auto_start",
+            status="ok",
+            trace_id=self._instance_id,
+        )
+        watcher = threading.Thread(
+            target=self._watch_auto_start,
+            args=(operation.operation_id,),
+            name="raricy-auto-start-watch",
+            daemon=True,
+        )
+        self._auto_start_watcher = watcher
+        watcher.start()
+
+    def _open_entry_or_tray(self) -> None:
+        """没有自动启动机器人时的一次可见提示（§8.1）。
+
+        手动启动沿用原行为：打开向导/恢复/管理页。登录启动默认只进托盘、不打开
+        浏览器、不重复弹窗；托盘不可用（N3 尚未并入，见 `_tray_available()`）时
+        按降级路径最多打开一次管理页，让用户仍看得到提示与恢复入口。
+        """
+        if self._startup_launch and self._tray_available():
             return
         self._open_url(self.entry_url())
 
+    def _select_startup_profile(self, profile_id: str) -> bool:
+        """把选中指针切到启动目标档案并发布新上下文（§5.2）。
+
+        本次没有运行中的 Worker，切换事务退化为「校验目标 → 提交选中指针 → 启动」；
+        目标校验由调用方完成。返回 True 表示「可以确认选中的就是目标」，只有这时
+        才允许自动启动 —— 页面显示 A 而后台运行 B 是不允许的。
+
+        **N1/N2 的选中/切换服务入口尚未并入本分支**（`ProfileService.activate()`
+        之类还不存在）：这里只留接缝、一律返回 False，于是「有目标但选不了」时本次
+        不启动、只给提示，而不是拿当前选中的档案凑数。服务落地后在这里调用选中
+        服务（提交指针 + 发布新上下文）；**不自行写 `launcher.json`，也不在这里
+        实现事务**（§5.2 的事务归档案服务）。
+        """
+        # TODO(N1/N2)：调用选中服务（如 profiles.activate(profile_id)）提交指针并
+        # 发布新上下文；失败或服务未落地时继续保持 False。
+        return False
+
+    def _tray_available(self) -> bool:
+        """登录启动时是否已有可见控制入口（N3 的托盘）。
+
+        N3 的托盘尚未并入本分支，因此这里恒为 False：登录启动按降级路径「最多
+        打开一次管理页」。接线位置就是本方法 —— N3 落地后改成报告托盘可用性
+        （初始化失败即 False），上层分支不必再改。
+        """
+        return False
+
+    def _profile_exists(self, profile_id: str) -> bool:
+        """目标档案目录是否真的**不存在**（查询路径：不建目录、不写指针）。
+
+        只有 `FileNotFoundError` / `NotADirectoryError` 才算「已移除」；其余
+        `OSError`（权限、被占用、暂时不可用的数据根）一律向上抛，由调用方按
+        「读不到」处理并**保留**目标。不用 `Path.is_dir()`：它会把 `OSError` 吞成
+        `False`，于是「读不到」会被当成「不存在」，触发清空目标与偏好的破坏性清理
+        （与 D-130「读不到、读到了但不能用、不存在」三者严格分开同口径）。
+        """
+        try:
+            paths.profile_dir(self._data_root, profile_id).stat()
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        return True
+
+    def _profile_status(self, profile_id: str | None) -> ConfigStatus | None:
+        """按档案读配置就绪状态；读不出来返回 None（查询路径，不建立档案）。
+
+        `profile_id` 为 None 时读当前活动档案。启动目标必须按**目标档案自己**读：
+        活动指针还没切过去时，拿活动档案的状态判断目标是否可用会答错人。
+        """
+        try:
+            if profile_id is None:
+                return self._config.status()
+            service = ConfigService(
+                self._data_root,
+                credential_store=self._credentials,
+                profile_id=profile_id,
+            )
+            return service.status()
+        except ConfigServiceError:
+            # 元数据故障等：不猜成「没有配置」，也不清任何东西。
+            return None
+
+    def _clear_startup_target(self, settings: DesktopSettings) -> None:
+        """启动目标已被移除：清空目标并关掉机器人自动启动偏好（§8.1、D-142）。
+
+        **保留** `launch_at_sign_in` 与它已建好的注册项 —— 用户自己的「登录时启动
+        Light」选择不由某个档案的存亡决定。revision 冲突说明别的页面刚改过设置：
+        不重试、不覆盖，本次只是不启动，下一次启动重新解析。
+        """
+        try:
+            self._desktop_settings.update(
+                settings.settings_revision,
+                startup_profile_id=None,
+                start_bot_on_launch=False,
+            )
+        except DesktopSettingsError as exc:
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "launcher.startup_target_clear_failed",
+                error=type(exc).__name__,
+            )
+            return
+        log_event(
+            self._logger,
+            logging.INFO,
+            "launcher.startup_target_cleared",
+            status="ok",
+        )
+
     def _watch_auto_start(self, operation_id: str) -> None:
-        """静默自启动失败时只打开一次管理页，让用户看到可恢复入口。"""
+        """静默自启动失败时给出一次可恢复入口（托盘可用时只进托盘）。"""
         while not self._quit.is_set():
             operation = self._manager.operation(operation_id)
             if operation is None:
                 return
             if operation.state == OP_FAILED:
                 if not self._quit.is_set():
-                    self._open_url(self.entry_url())
+                    self._open_entry_or_tray()
                 return
             if operation.finished_at is not None:
                 return
@@ -374,6 +630,8 @@ class Controller:
             port=self._port,
             on_quit=self.request_quit,
             lifecycle_gate=self._lifecycle,
+            desktop_settings=self._desktop_settings,
+            startup_service=self._startup_service,
         )
         api = self._api  # 线程只认这个局部引用：stop() 会先把 self._api 置空
         self._api_thread = threading.Thread(

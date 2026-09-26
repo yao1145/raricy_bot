@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
   import * as api from "./api";
+  import DesktopSettings from "./DesktopSettings.svelte";
   import Events from "./Events.svelte";
   import Recovery from "./Recovery.svelte";
   import Settings from "./Settings.svelte";
@@ -11,7 +12,7 @@
 
   let phase = $state<Phase>("boot");
   let status = $state<api.StatusSnapshot | null>(null);
-  let tab = $state<"status" | "settings" | "events">("status");
+  let tab = $state<"status" | "settings" | "events" | "desktop">("status");
   let notice = $state<string | null>(null);
   let error = $state<string | null>(null);
 
@@ -91,6 +92,7 @@
       <button class:active={tab === "status"} onclick={() => (tab = "status")}>状态</button>
       <button class:active={tab === "settings"} onclick={() => (tab = "settings")}>设置</button>
       <button class:active={tab === "events"} onclick={() => (tab = "events")}>近期事件</button>
+      <button class:active={tab === "desktop"} onclick={() => (tab = "desktop")}>桌面</button>
     </nav>
 
     {#if error}<div class="error">{error}</div>{/if}
@@ -106,6 +108,8 @@
       {/if}
     {:else if tab === "settings"}
       <Settings onchanged={refresh} />
+    {:else if tab === "desktop"}
+      <DesktopSettings onchanged={refresh} />
     {:else}
       <Events />
     {/if}

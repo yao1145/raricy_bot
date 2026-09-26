@@ -483,7 +483,11 @@ class ConfigService:
             self._write_document(paths.launcher_json_path(self._root), metadata)
 
     def start_bot_on_launch(self) -> bool:
-        """打开程序时是否启动 Bot（§5.2）；默认关闭，向导完成后由界面开启。"""
+        """档案里的**旧**启动偏好（只读口径）；桌面偏好的唯一来源是 `desktop.json`。
+
+        保留它是为了让升级用户的一次性导入与 N1 迁移读到当年实际生效的取值；
+        新提交不再写这个字段，新安装也读不到它（恒为 False）。
+        """
         saved = self.load_saved()
         return bool(saved.start_bot_on_launch) if saved is not None else False
 
@@ -638,12 +642,16 @@ class ConfigService:
         password: CredentialUpdate = CredentialUpdate(ACTION_KEEP),
         llm_api_key: CredentialUpdate = CredentialUpdate(ACTION_KEEP),
         account: str | None = None,
-        start_bot_on_launch: bool | None = None,
     ) -> int:
         """提交一份完整可用的正式配置，返回新 revision。
 
         顺序与失败语义严格按 §6.4：校验 → 登记脱敏 → 写新凭据并回读 → 写快照与
         原子替换。任一步失败都不动旧版本；新建但未被引用的凭据会被清理。
+
+        正式配置**不再**承载桌面偏好：`start_bot_on_launch` 的唯一来源是
+        `desktop.json`（§58、D-142/D-149）。历史快照里的同名字段只读保留
+        （`SavedConfig.start_bot_on_launch`、`start_bot_on_launch()`），供升级
+        导入与迁移判定使用，新提交不再写入。
         """
         with self._lock:
             profile = self.profile()
@@ -685,11 +693,6 @@ class ConfigService:
             #    校验在写任何东西之前完成，因此失败不会留下半份新配置。
             self._validate(merged, credentials=new_secrets, allow_missing_required=False)
             self._validate_policy(merged, profile)
-            start_bot = (
-                bool(start_bot_on_launch)
-                if start_bot_on_launch is not None
-                else bool(saved.start_bot_on_launch if saved else False)
-            )
 
             # 4) 凭据：先登记脱敏（内存），再写库并回读确认；旧引用此时仍然有效。
             credentials_ref = saved.credentials_ref if saved is not None else None
@@ -713,7 +716,6 @@ class ConfigService:
                     "revision": revision,
                     "credentials_ref": credentials_ref,
                     "account": new_account,
-                    "start_bot_on_launch": start_bot,
                 },
                 **merged,
             }

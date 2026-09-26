@@ -57,3 +57,23 @@ TRAY_STATUS_QUITTING: str = "正在退出"
 
 # tooltip 只由应用名与状态标签组成，不含账号、pid、路径或原始错误（§61）。
 TRAY_TOOLTIP_FORMAT: str = "{app} - {status}"
+# 登录启动（N4 §8、§59）：错误响应按既有 ApiError(message=...) 机制带这些固定文案。
+STARTUP_COMMAND_TOO_LONG: str = (
+    "启动项命令超过 260 个字符，Windows 的启动项容纳不下；"
+    "请把应用目录移到更短的路径后重试。"
+)
+STARTUP_PATH_UNUSABLE: str = (
+    "当前形态或程序路径不能用于登录启动（开发形态、路径不存在或不可用）；"
+    "请使用安装版，并确认程序文件仍在原位置。"
+)
+STARTUP_REGISTRATION_CONFLICT: str = (
+    "注册表里同名的启动项不是本程序写入的；为避免破坏其他应用，"
+    "程序不会覆盖或删除它，请先在系统的「启动应用」列表里确认该项来源。"
+)
+STARTUP_APPLY_FAILED: str = (
+    "启动项操作没有完成：可能是权限或系统策略拒绝，也可能暂时读不到注册表；"
+    "桌面偏好保持不变，可稍后重试。"
+)
+DESKTOP_SETTING_MOVED: str = (
+    "「打开程序时启动机器人」已移到「桌面」页的桌面设置；请在那一页修改。"
+)
