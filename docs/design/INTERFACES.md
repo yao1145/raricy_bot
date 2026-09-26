@@ -904,13 +904,64 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 [API](../../src/raricy_launcher/api.py)、
 [进程管理](../../src/raricy_launcher/process_manager.py)、[IPC 协议](../../src/raricy_launcher/ipc.py)、
 [事件](../../src/raricy_launcher/events.py)、[状态聚合](../../src/raricy_launcher/status_service.py)、
-[生命周期门](../../src/raricy_launcher/lifecycle_gate.py)、[控制器](../../src/raricy_launcher/controller.py)。
+[生命周期门](../../src/raricy_launcher/lifecycle_gate.py)、[控制器](../../src/raricy_launcher/controller.py)、
+[启动项服务](../../src/raricy_launcher/startup_service.py)、
+[启动项适配层](../../src/raricy_launcher/platform/startup_windows.py)、
+[桌面设置](../../src/raricy_launcher/desktop_settings.py)。
 
 - **入口参数与来源提示**（§9.4）：`--worker` 仍优先按 Worker 分派，其后参数原样透传；
   否则按 Controller 入口解析，只识别字面量 `--startup`（可出现在任意位置），其余参数
   照旧忽略。`--startup` 只是来源提示、**不是权限边界**（互斥体、生命周期门与授权偏好
   的判定都不放宽）；已有实例时静默去重退出并记一条 `launcher.startup_deduped`，
   不沿用 `open_admin` 激活分支、不打开浏览器，激活协议与命令集合不变。
+- **登录启动项**（§8、D-148）：只碰当前用户 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+  下本产品自己的值名 `RaricyBotLight`（`REG_SZ`），值内容固定为
+  `"<绝对 EXE 路径>" --startup`（引号包围路径、一个空格、恰好一个固定参数；
+  `startup_service.build_startup_command()`）。命令按 `len(command)` 计上限 260 字符，
+  超限拒绝、**不静默截断**；非冻结发行形态（防止把 `python.exe --startup` 写进 Run）、
+  EXE 路径为空、非绝对或不存在也一律拒绝，且拒绝在**写入之前**判定。**归属判定只用命令
+  格式**：只有形如上述格式的值才认为本产品持有、可以覆盖与修复；其他形态（别的应用写在
+  同名值里的命令行）一律 `registration_conflict`，不覆盖、不删除，原值一个字节都不动。
+  不枚举其他启动项（只按固定值名访问），也不读、不写 `StartupApproved` —— 系统侧
+  （任务管理器、设置页、企业策略）的禁用决定没有受支持的读取方式，程序不覆盖它。
+- **启动项读写边界**（§8）：`platform/startup_windows.py` 的 `StartupRegistry`
+  （`runtime_checkable` Protocol，三个方法 `read_value(name) -> (bool, str | None)`、
+  `write_value(name, command)`、`delete_value(name)`，删除幂等、键或值不存在不算错误）
+  是唯一通道。`WinRegistryStartup` 是标准库 `winreg` 实现：根只用 `HKEY_CURRENT_USER`，
+  读取用 `KEY_READ`、写入用 `KEY_SET_VALUE`（`CreateKeyEx` + `SetValueEx(REG_SZ)`）。
+  `get_startup_registry()` 在 win32 下惰性导入实现，其他平台抛
+  `PlatformError("unsupported_platform")`（与 `get_platform()` 同风格）。适配层错误
+  `StartupRegistryError` 的消息是内部类别码（`startup_registry_read_failed` /
+  `_write_failed` / `_delete_failed`），不透传 `WinError` 原文；服务层把它映射为
+  `read_failed` / `apply_failed`，这几个内部码不出现在 API 响应里。**自动化测试只注入
+  内存替身，不打开真实注册表**（N4 全局约束）。
+- **启动项事实与状态**（§8、D-148）：`StartupService(settings, registry, *, executable,
+  frozen, path_exists=os.path.isfile)` 的三个入口 —— `status()`（只看不写）、`apply()`
+  （按当前意图登记/注销，写前判定、写后回读、把结果写回设置文件）、
+  `repair(expected_revision)`（revision 不符抛 `DesktopSettingsConflict`）—— 都返回
+  `StartupFacts`（frozen dataclass，可直接 `dataclasses.asdict`）。字段就是五项分离事实
+  `requested_enabled`（`desktop.json` 的 `launch_at_sign_in`）、`registration_present`、
+  `command_matches`（读到的内容与 `expected_command` 逐字相等）、`executable_exists`、
+  `last_apply_result`，加上 `effective_state`、`divergence`、`expected_command`（本程序
+  算出的命令，算不出来时是空串）与 `pending_apply`。**不回显注册表里读到的原始命令
+  内容**：只给本程序算出的命令与布尔事实，别的应用写在同名值里的命令行不会被带回本机
+  页面。`status()` 不回写设置文件；注册表读不到或同名值非本产品持有时，返回的事实里
+  `last_apply_result` 是**本次观测**的结论（`read_failed` / `registration_conflict`，
+  连同待应用诊断），文件里保留上一次真实应用的结果。
+- **`effective_state` 判定**（确切值总表；判定只有一处实现，各任务不得各写一套）：
+  `unknown` **优先** ——
+  注册表读不到、同名值无法确认是本产品持有、或上次结果是 `apply_failed` / `read_failed`
+  且未回读一致（含「意图为关但值未删掉」，**不假报关闭成功**）；`enabled` =
+  `requested_enabled=true` 且三条事实全为真且 `last_apply_result ∈ {ok, not_attempted}`
+  —— 语义只是「登记完整且路径有效」，**不表示「下次登录必定启动」**（界面文案不得出现
+  这类承诺）；`needs_repair` = 意图为开但登记不完整（值被删、搬目录、EXE 不在原位置）；
+  `disabled` = 意图为关且值已不在。`divergence` = 意图与登记事实不一致
+  （`requested_enabled != registration_present`，或意图为开而 `command_matches=false`），
+  或 `last_apply_result ∈ {apply_failed, read_failed}`。`apply()` 写完必须回读：命令发出
+  去了不等于事实成立；应用失败**不回滚意图**（意图是用户要的、结果由 `record_apply_result`
+  单独记录）。`repair()` 一律按**当前** EXE 路径重新生成命令，**永不重放**
+  `pending_startup_apply`：它只是「上次想写什么」的诊断记录，重放会把搬目录前的旧路径
+  写回注册表。
 - **会话**（§8.1）：引导令牌单次、限时（120 秒），经 URL fragment 交付；兑换成功即发放
   HttpOnly + SameSite=Strict 的会话 Cookie，并回一个会话绑定的 CSRF 值。兑换按 60 秒窗口限次，
   窗口会滚动，本机他人刷满也不能把用户永久挡在门外。会话只存内存，Controller 重启即全部失效。
