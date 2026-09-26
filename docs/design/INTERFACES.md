@@ -1014,6 +1014,39 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   类型不对、`startup_profile_id` 不是合法档案 id、超过字节上限）、`desktop_unsupported_version`
   （`schema_version` 大于本程序）、`desktop_settings_write_failed`（写盘失败）。`str(exc)`
   就是码，不含路径、命令或异常原文。
+- **操作记录**（`operations/<id>.json`、§5.2、N2、D-143）：协调器操作的**最小恢复记录**，
+  形状固定，由 `lifecycle_service.OperationRecord.to_document()` 生成（键顺序固定）：
+
+  | 字段 | 含义 |
+  |---|---|
+  | `schema_version` | 记录版本，当前 `OPERATION_SCHEMA_VERSION = 1` |
+  | `operation_id` | `op-` + 12 位小写十六进制；同时是文件名（`paths.operation_record_path()` 按形状校验，`operations/` 里的迁移记录因此不会被认成操作记录） |
+  | `kind` | `activate` / `remove` / `credentials_clear`；**单次启停不写恢复记录**（D-143） |
+  | `state` | `reserved` / `running` / `finished` / `failed` / `cancelled` / `interrupted` |
+  | `stage` | 固定阶段码（见 §59）；成功收尾停在 `finished`，失败/取消保留出事时的阶段 |
+  | `profile_id` | 目标档案；`from_profile_id` / `to_profile_id` 是提交前后的指针（恢复时据此判断「已切到谁」） |
+  | `target_revision` / `target_epoch` | 本次操作钉住的配置 revision，以及**预留时**断言的活动代次 |
+  | `idempotency_key` / `retry_of` | 幂等键；`retry_of` 指向同一档案同一 `kind` 的最近失败/取消/中断记录（**纯诊断**，服务层的续做靠档案状态与阶段，不重放它） |
+  | `started_at` / `updated_at` / `finished_at` | ISO 时间；`finished_at` 非空即终态 |
+  | `error` / `result` | 固定错误码 / 结果码（取值见 §59）；`error` 与 `result` 不同时出现 |
+  | `credentials` | `[{"ref": <不透明引用>, "state": <清理状态>}]`；**不含取值** |
+  | `managed_paths` | 受管相对路径（移除/清除用），不含绝对路径 |
+
+  写入与配置提交同一手法（同目录临时文件 + flush + fsync + `os.replace`），**关键副作用之前**
+  先落盘；写不进去就让操作失败（`record_write_failed`），绝不在没有记录的情况下继续做副作用。
+  记录里**不得**出现聊天、System Prompt、KB/记忆正文、密码、模型 Key 或原始异常文本。
+  读记录只认 `operations/` 下形状合法的文件名：读不出来的**只记名字**，不改写、不删除。
+  清理只对 `state == "finished"` 生效（最多 `MAX_OPERATION_RECORDS = 50` 条，先删最旧），
+  `failed` / `interrupted` / `cancelled` 永不自动丢弃 —— 未完成的清理任务不能随日志轮转丢失。
+- **协调器要的两个档案写入口**（N2、D-143）：`LifecycleService` 经 `ProfileService` 的
+  `commit_activation(profile_id, *, expected_epoch)` 提交活动指针（写锁内「读—校验
+  `active_epoch`—一次写入 `active_profile` / `active_epoch + 1` / `catalog_revision + 1`」，
+  不符抛 `revision_conflict`），经 `set_state(profile_id, *, state,
+  expected_profile_revision=None)` 改档案生命周期状态（`state` ∈ `{active, detached,
+  deleting}`，其他值抛 `invalid_profile_state`；写 `profile_revision + 1`，带期望值时不符抛
+  `revision_conflict`）。N1 的 `activate()` 保留原样（低层语义不变）；这两个方法是
+  **N2 接线任务要补写的目标形状**（必须原子、走配置写锁），补上之前 `activate()` 仍是
+  唯一的指针写入口，N4 的启动路径届时改用 `commit_activation()`。
 
 ## 59. Light 控制面（会话、API、进程与事件）
 
@@ -1021,7 +1054,9 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 [API](../../src/raricy_launcher/api.py)、
 [进程管理](../../src/raricy_launcher/process_manager.py)、[IPC 协议](../../src/raricy_launcher/ipc.py)、
 [事件](../../src/raricy_launcher/events.py)、[状态聚合](../../src/raricy_launcher/status_service.py)、
-[生命周期门](../../src/raricy_launcher/lifecycle_gate.py)、[控制器](../../src/raricy_launcher/controller.py)、
+[生命周期门](../../src/raricy_launcher/lifecycle_gate.py)、
+[生命周期协调器](../../src/raricy_launcher/lifecycle_service.py)、
+[控制器](../../src/raricy_launcher/controller.py)、
 [启动项服务](../../src/raricy_launcher/startup_service.py)、
 [启动项适配层](../../src/raricy_launcher/platform/startup_windows.py)、
 [桌面设置](../../src/raricy_launcher/desktop_settings.py)。
@@ -1249,6 +1284,79 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   profile_epoch=)` 可选；`_test_view()` 的过期判定改为：档案 id 不同即 `stale`（两边都是
   `None` 时退回按数字 revision 比较），代次只在两边都记录了它时参与比较，数字 revision
   仍参与 —— 身份键是 `(profile_id, config_revision, profile_epoch)`（§5.1 第 6 条）。
+- **生命周期协调器**（§5.1、§5.2，N2、D-143）：`lifecycle_service.LifecycleService` 管
+  **跨操作**的串行化、取消代次与 A→B 事务，与 `lifecycle_gate` 的**单次操作短租约**是
+  两层（协调器不重写门，也不绕过门：触碰 `WorkerManager` 的那一小段仍取租约，只是取不到时
+  在门外有界等待 30 秒、每 0.2 秒重试一次，仍未取得就让操作 `failed` / `error="lifecycle_busy"`，
+  可重试）。它注入 `ProfileService`、`WorkerManager`、进程内唯一的 `LifecycleGate`、
+  可选 `EventService`；时钟、sleep 与 `exit_confirm_timeout` 可注入（测试不做真实等待）。
+  - **串行化与不排队**：任一时刻最多一个协调器操作（`activate` / `remove` /
+    `credentials_clear`）。`submit()` 在锁内检查「是否已有未完成操作」，有就抛
+    `ConfigServiceError("lifecycle_busy")`（HTTP 409），**不排队、不等待**；持锁期间只记录
+    操作租约与不可变输入（档案、revision、代次基线），绝不等 Worker、网络、keyring 或文件系统。
+    `stop` / `quit` **不进**这条队列：它们只提高取消代次，因此停止意图永远追得上在途的切换。
+  - **取消代次与停止意图优先**（§5.1 第 1 条）：`request_stop()` 先 `_generation += 1` 再
+    `manager.stop()`；`request_quit()` `+= 1` 并**永久关闭本次实例的启动入口**（此后
+    `submit()` 回 `lifecycle_busy`、`start_bot` / `restart_bot` 回 `quitting`），但它**不**调
+    `manager.begin_quit()` —— `WorkerManager.shutdown()` 已经会调。每个操作在预留时记下代次
+    基线，在**提交指针之前**与**启动 B 之前**各比较一次；本操作自己派发的停止会把基线推进
+    一格（外部停止因此不会被自己的 `+1` 吞掉）。代次变了就按位置落
+    `cancelled_by_stop`（提交前，保留 A）或 `selected_only`（提交后，保留 B），**两种情况都不
+    启动 Worker**（§5.2 故障表第 5 行）。所有影响活动 Worker 的命令都带代次：
+    `start_bot` / `restart_bot` 的 `expected_epoch` 与 `catalog().active_epoch` 不符时抛
+    `revision_conflict`（`None` 表示「用当前值」，托盘与本地调用走这条）。
+  - **A→B 六阶段与确定结果**（§5.2）：`validate_target → reserve_operation → stop_A →
+    confirm_A_exited → commit_active_B → invalidate_old_views → [start_B] → finished`。
+    `validate_target` 是**同步**的（在预留记录与停 A 之前）：目标必须是 `state="active"` 的
+    档案（否则 `profile_state_conflict`），代次/目录 revision 过期是 `revision_conflict`，
+    `start=True` 时还要求目标 `configured`、`expected_site_user_id()` 非空、`target_revision`
+    等于该档案已保存的 revision 且凭据可解析（任一不满足 → `target_not_ready`，A 完全不动）；
+    `start=False`（「只选中以修复」）跳过后一组检查。故障表八行的确定结果：
+
+    | 故障/用户动作 | 确定结果 |
+    |---|---|
+    | B 不完整或凭据不可用 | 启动式切换在停 A 前 `target_not_ready`；`start=false` 可选中而不启动 |
+    | A 无法确认退出 | `failed` / `error="stop_unconfirmed"`，阶段停在 `confirm_A_exited`，不切指针、不启动 B |
+    | 写活动指针失败 | `failed` / `error="catalog_write_failed"`：A 仍是活动档案但已停止，B 不启动 |
+    | 指针已提交、B 启动失败 | `finished` / `result="start_failed"`：B 保持选中，不回退到 A，失败原因由管理器操作承载 |
+    | stop 在切换期间到达 | 提交前 `cancelled_by_stop`（保留 A）、提交后 `selected_only`（保留 B）；两种都不启动 |
+    | quit 在任何阶段到达 | 同上一行（记录保留到足以恢复）；Worker 由 `manager.shutdown()` 收回，启动入口永久关闭 |
+    | 响应丢失/重复提交 | 同键同摘要回同一 `operation_id`；同键不同摘要 409 `idempotency_conflict` |
+    | Controller 崩溃 | `recover()` 把 `reserved`/`running` 改成 `interrupted` / `error="controller_restart"` 并补 `finished_at`；**只对账**，不重放、不启动、不改指针、不清除 |
+
+    「A 已退出」的判据是**进程句柄层面**的回收：`manager.worker is None` 且
+    `manager.status()["pid"] is None` 且停止结果 ∈ `{stopped, cancelled, forced_stop}`；
+    超时（`EXIT_CONFIRM_TIMEOUT_SECONDS = 2 × STOP_BUDGET_MS + 5 秒 = 45`，可注入）或结果不在
+    集合内都算未确认。目标与当前活动档案是同一个时跳过停与提交，退化成一次普通启动
+    （不写指针、不 bump epoch，结果码仍用 `started` / `selected`）。`invalidate_old_views`
+    发布事件 **`launcher.profile_activated`**（字段 `profile_id` 与代次；N1 的测试结果按身份键
+    自然过期），不重写任何状态。
+  - **幂等键**（§4.2、总表）：形状 `[A-Za-z0-9_-]{8,64}`（`IDEMPOTENCY_KEY_MIN_CHARS` /
+    `_MAX_CHARS`），摘要 = 规范化请求字段的 JSON 排序键 + sha256，**输入不含秘密、摘要不落盘**。
+    内存表保留最近 50 个键；服务重启后回落到记录级比较（同一键、同一 `kind`、同一目标档案、
+    同一 revision 与代次）。**命中即返回，连 `validate()` 都不再跑**（响应丢失后的重复提交
+    不产生第二次副作用，已失败/已取消的操作也回同一个 `operation_id`）；同键不同摘要回
+    `idempotency_conflict`。重试**必须换新键**：发现同一档案同一 `kind` 有
+    `failed`/`cancelled`/`interrupted` 记录时，新记录的 `retry_of` 指向最近一条（纯诊断）。
+    键缺失、形状不合格由 API 层回 422 `idempotency_key_required`（`field="idempotency_key"`）。
+  - **记录与恢复**（§58 的形状）：关键副作用之前先落盘；`state` / `stage` / `result` / `error`
+    的取值就是 §58 与上面的表。`recover()` 在 `Controller.start()` 的迁移门之后、
+    `_auto_start()` 之前调用，返回摘要 `{examined, interrupted, committed, write_failed,
+    unreadable, active_profile_id}`：`committed` 是被中断的操作里指针**已经**落到它的目标档案
+    上的那些（页面据此提示「已切到 B」还是「仍停在 A」），`unreadable` 只报文件名、不改现场。
+  - **托盘端口要绑定的签名**（N3 已合并，本节冻结；接线只做委派，签名与
+    `TrayCommandError` 稳定码不变）：`start_bot(*, expected_epoch: int | None = None) -> str`、
+    `stop_bot() -> str`、`restart_bot(*, expected_epoch: int | None = None) -> str`，都返回
+    **管理器的** `operation_id`。`stop_bot()` 走代次 + `manager.stop()`，**不受**「有未完成的
+    协调器操作」阻挡（停止意图优先）；`start_bot` / `restart_bot` 在切换事务在途时回
+    `lifecycle_busy`（不允许第二个启动与 A→B 并行）。三者都用**非阻塞**的短租约（与
+    §9.2 的启停入口同一口径），门被站点测试占住时回 `lifecycle_busy`。
+  - **状态与操作视图**：`current_operation()` 给 `StatusService` 的 `pending_operation`
+    （协调器有未完成操作时优先于管理器的在途操作，形状为记录字段 + `stage`）；
+    `operation(operation_id)` 给 `GET /api/operations/{id}`（先查协调器、再查管理器，两者都无
+    才 404），视图字段见 `OperationRecord.as_operation_view()`。旧结果按身份键归属，**不匹配就
+    丢弃**：协调器派发时固定 `profile_id` 与目标 revision，收尾只对仍是未完成态的记录生效，
+    迟到或重复的收尾不覆盖当前状态。
 
 ## 60. 管理页与发行（`frontend/`、`packaging/light/`）
 

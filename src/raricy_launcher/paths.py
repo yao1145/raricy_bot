@@ -57,6 +57,10 @@ ERROR_LOGS_SUBDIR: str = "errors"
 # 档案 id：**只允许小写**（Windows 目录名不区分大小写，大小写混写会让同一个目录
 # 出现两个指针），并排除 Windows 保留设备名。
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+# 协调器操作 id：随机生成、形状固定（`op-` + 12 位小写十六进制），校验它是为了让
+# 「记录路径」不接受调用方拼出来的名字 —— 同一个 `operations/` 目录里还有迁移记录，
+# 按形状识别名字也顺带把两者分开。
+_OPERATION_ID_RE = re.compile(r"^op-[0-9a-f]{12}$")
 _RESERVED_STEMS: frozenset[str] = frozenset(
     {"con", "prn", "aux", "nul"}
     | {f"com{index}" for index in range(1, 10)}
@@ -99,6 +103,22 @@ def operations_dir(data_root: Path) -> Path:
 def migration_dir(data_root: Path) -> Path:
     """v1 迁移的备份与清单目录（只计算路径，不创建）。"""
     return Path(data_root) / MIGRATION_DIR
+
+
+def operation_record_path(data_root: Path, operation_id: str) -> Path:
+    """一次协调器操作的最小恢复记录位置（只计算路径，不创建）。
+
+    `operation_id` 必须先过形状校验：它来自内部生成，但读取路径也要能用同一判据
+    从 `operations/` 里认出「这是协调器的记录」，因此拒绝任何不符合 `op-` 形状的名字
+    （迁移记录与手工放进来的文件都不认）。再按档案目录同一口径做包含检查。
+    """
+    if not isinstance(operation_id, str) or not _OPERATION_ID_RE.match(operation_id):
+        raise ValueError("invalid_operation_id")
+    root = normalize_path(data_root)
+    path = normalize_path(root / OPERATIONS_DIR / f"{operation_id}.json")
+    if not is_within(root, path):
+        raise ValueError("operation_outside_data_root")
+    return path
 
 
 def profiles_root(data_root: Path) -> Path:
