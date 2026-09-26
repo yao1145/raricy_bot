@@ -329,7 +329,14 @@ def _remove_tree(profile: Path, *, data_dir: Path) -> _TreeOutcome:
     )
     if reason is not None:
         return _TreeOutcome(complete=False, error=reason, removed=tuple(removed))
-    if _lstat_directory(data_dir) is not None:
+    if os.path.lexists(data_dir):
+        # `data/` 被排除在上面的循环之外（要留下它本身），因此在这里单独判定：
+        # 它是指向别处的链接/重解析点、或不是目录，都按拒绝处理 —— 跳过它会让
+        # 「彻底删除」在数据其实还挂在档案外面的时候报成功。
+        if _lstat_directory(data_dir) is None:
+            return _TreeOutcome(
+                complete=False, error=ERROR_REMOVAL_UNSAFE_PATH, removed=tuple(removed)
+            )
         reason = _prune_directory(
             data_dir,
             root_dev=top.st_dev,
