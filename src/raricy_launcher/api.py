@@ -16,10 +16,14 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
 import json
 import queue
+import re
 import threading
 import time
+from collections import OrderedDict
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
@@ -45,6 +49,12 @@ from .config_service import (
     ConfigServiceError,
     CredentialUpdate,
 )
+from .credential_lifecycle import (
+    STATE_OWNED,
+    STATE_PENDING_REMOVAL,
+    STATE_REVOKED,
+    CredentialLifecycle,
+)
 from .credential_store import CredentialStoreError
 from .desktop_settings import (
     DESKTOP_SETTINGS_CONFLICT,
@@ -54,6 +64,31 @@ from .desktop_settings import (
     DesktopSettingsService,
 )
 from .lifecycle_gate import LifecycleGate, Ticket
+from .lifecycle_service import (
+    CODE_CONFIG_NOT_READY,
+    CODE_IDEMPOTENCY_KEY_REQUIRED,
+    CODE_LIFECYCLE_BUSY,
+    CODE_QUITTING,
+    ERROR_CREDENTIAL_BACKEND_UNAVAILABLE,
+    ERROR_STOP_UNCONFIRMED,
+    KIND_CREDENTIALS_CLEAR,
+    OP_STATE_FAILED,
+    OP_STATE_FINISHED,
+    OP_STATE_RUNNING,
+    STAGE_CLEAR_CREDENTIALS,
+    STAGE_COMMIT_CONFIG,
+    STAGE_STOP,
+    CredentialRef,
+    LifecycleService,
+)
+from .profile_removal import REMOVAL_SCOPES, RemovalService
+from .profile_service import (
+    IDENTITY_VERIFIED,
+    PROFILE_STATE_ACTIVE,
+    PROFILE_STATE_DELETING,
+    PROFILE_STATE_DETACHED,
+    ProfileError,
+)
 from .session import CSRF_HEADER, SESSION_COOKIE, Session, SessionManager
 from .startup_service import (
     RESULT_APPLY_FAILED,
@@ -65,6 +100,7 @@ from .startup_service import (
     StartupFacts,
     StartupService,
 )
+from .verification import VerificationStore
 
 # 请求体上限：配置表单很小；知识库导入文件另有自己的上限（§13.2）。
 MAX_JSON_BYTES: int = 256 * 1024
@@ -114,12 +150,97 @@ _STARTUP_REJECTION_MESSAGES: dict[str, str] = {
     "startup_apply_failed": texts.STARTUP_APPLY_FAILED,
 }
 
+# --- 账号 API 的固定值（§59 的确切值总表，各任务共用，不各写一套） -------------
+
+# 凭据清除的结果码（总表「结果码」表）；`lifecycle_service` 只定义到 remove 为止，
+# 这一组的唯一出口是本模块的清除命令。
+RESULT_CLEARED: str = "cleared"
+RESULT_CLEARED_PARTIAL: str = "cleared_partial"
+RESULT_CLEAR_FAILED: str = "clear_failed"
+# 清除命令的配置窄写失败：凭据已经清了，但新引用没能写进配置（停在 `pending`）。
+ERROR_CONFIG_WRITE_FAILED: str = "config_write_failed"
+
+# 凭据清除可以单独勾选的类别；与 `credential_lifecycle` 的两种凭据一致。
+CREDENTIAL_KINDS: tuple[str, ...] = ("password", "llm_api_key")
+
+# 幂等键形状（§59 总表）：与协调器同一套规则。创建档案不写恢复记录，幂等表因此留在
+# 本模块；校验规则必须逐字一致，不能各写一套。
+_IDEMPOTENCY_KEY_RE = re.compile(r"[A-Za-z0-9_-]{8,64}\Z")
+# 创建档案的幂等表容量：与协调器的「最近 50 个键」同量级。
+MAX_CREATE_KEYS: int = 50
+
+# `ApiError.details` 允许并入错误信封的键（§59）。服务层不得借这个通道夹带
+# 别的字段（路径、凭据引用、异常文本都不是这里该出现的东西）。
+_DETAIL_KEYS: frozenset[str] = frozenset(
+    {"existing_profile_id", "profile_id", "operation_id", "scope"}
+)
+
+# 账号 API 的严格字段白名单：未列出的键一律 400 `bad_request`（§59）。
+_PROFILE_CREATE_KEYS: frozenset[str] = frozenset(
+    {"display_name", "expected_catalog_revision", "idempotency_key"}
+)
+_PROFILE_DRAFT_KEYS: frozenset[str] = frozenset(
+    {"expected_revision", "expected_profile_revision", "values"}
+)
+_PROFILE_CONFIG_KEYS: frozenset[str] = frozenset(
+    {
+        "expected_revision",
+        "expected_profile_revision",
+        "verification_id",
+        "values",
+        "credentials",
+        "account",
+        "display_name",
+    }
+)
+_VERIFY_KEYS: frozenset[str] = frozenset({"account", "password"})
+_ACTIVATE_KEYS: frozenset[str] = frozenset(
+    {
+        "expected_catalog_revision",
+        "expected_epoch",
+        "target_revision",
+        "start",
+        "idempotency_key",
+    }
+)
+_REMOVAL_PREVIEW_KEYS: frozenset[str] = frozenset({"scope"})
+_REMOVE_KEYS: frozenset[str] = frozenset(
+    {"scope", "confirmation_token", "idempotency_key"}
+)
+_CREDENTIALS_CLEAR_KEYS: frozenset[str] = frozenset({"kinds", "idempotency_key"})
+
+# 单个显示名的字符上限：只是防呆，显示名不参与任何判定。
+MAX_DISPLAY_NAME_CHARS: int = 120
+
+# 账号 API 的稳定码 → 固定文案（`texts.py` 是唯一来源）。只列本阶段新增、且
+# 「码本身不足以说明接下来做什么」的码；其余保持只有码的既有形状。
+_ACCOUNT_CODE_MESSAGES: dict[str, str] = {
+    "client_upgrade_required": texts.CLIENT_UPGRADE_REQUIRED,
+    "verification_required": texts.VERIFICATION_REQUIRED,
+    "verification_invalid": texts.VERIFICATION_INVALID,
+    "verification_mismatch": texts.VERIFICATION_MISMATCH,
+    "profile_identity_taken": texts.PROFILE_IDENTITY_TAKEN,
+    "profile_identity_mismatch": texts.PROFILE_IDENTITY_MISMATCH,
+    "profile_state_conflict": texts.PROFILE_STATE_CONFLICT,
+    "profile_revision_conflict": texts.PROFILE_REVISION_CONFLICT,
+    "target_not_ready": texts.TARGET_NOT_READY,
+    "idempotency_key_required": texts.IDEMPOTENCY_KEY_REQUIRED,
+    "idempotency_conflict": texts.IDEMPOTENCY_CONFLICT,
+    "credential_scope_required": texts.CREDENTIAL_SCOPE_REQUIRED,
+    "credentials_index_corrupt": texts.CREDENTIALS_INDEX_BROKEN,
+    "credentials_index_unreadable": texts.CREDENTIALS_INDEX_BROKEN,
+    "credentials_index_unsupported_version": texts.CREDENTIALS_INDEX_BROKEN,
+}
+# 档案 ID 的形态由 `paths.validate_profile_id()` 判定，这里不复制第二套规则。
+
 
 class ApiError(Exception):
     """把服务层异常映射成 HTTP 状态与稳定码（§11）。
 
     `message` 只在稳定码本身不足以说明用户能做什么时附带，取值来自
     `texts.py` 的固定文案；它不是第二种信封，也不透传服务层异常文本。
+    `details` 只承载少量**受控标识**（`_DETAIL_KEYS` 白名单）：页面据此指到
+    具体是哪个档案/操作，其余键在构造时就拒绝，服务层不能借它夹带别的字段。
     """
 
     def __init__(
@@ -129,12 +250,18 @@ class ApiError(Exception):
         *,
         field: str | None = None,
         message: str | None = None,
+        details: Mapping[str, str] | None = None,
     ) -> None:
         super().__init__(code)
         self.status = status
         self.code = code
         self.field = field
         self.message = message
+        if details:
+            extra = sorted(set(details) - _DETAIL_KEYS)
+            if extra:
+                raise ValueError(f"unsupported detail key: {extra[0]}")
+        self.details: dict[str, str] = dict(details or {})
 
     def payload(self) -> dict:
         body: dict[str, Any] = {"ok": False, "code": self.code}
@@ -142,6 +269,8 @@ class ApiError(Exception):
             body["field"] = self.field
         if self.message:
             body["message"] = self.message
+        for key, value in self.details.items():
+            body[key] = value
         return body
 
 
@@ -200,6 +329,10 @@ class LocalApi:
         lifecycle_gate: LifecycleGate | None = None,
         desktop_settings: DesktopSettingsService | None = None,
         startup_service: StartupService | None = None,
+        lifecycle_service: LifecycleService | None = None,
+        removal_service: RemovalService | None = None,
+        credential_lifecycle: CredentialLifecycle | None = None,
+        verification_store: VerificationStore | None = None,
     ) -> None:
         self._instance_id = instance_id
         self._data_root = Path(data_root)
@@ -231,6 +364,25 @@ class LocalApi:
             else DesktopSettingsService(self._data_root)
         )
         self._startup_service = startup_service
+        # 生命周期协调器（N2 Task 1）：账号 API 的命令（激活/移除/清除与启停）都经它
+        # 串行化。未装配时只有 `/api/bot/*` 退回管理局直调 —— 那是隔离测试的调用方，
+        # 生产装配（Controller）始终注入；账号 API 的其余端点没有退回路径，宁可如实
+        # 报「配置不可用」也不自己造一条绕过协调器的写路径。
+        self._lifecycle_service = lifecycle_service
+        # 移除服务（N2 Task 3）：预览令牌与六步删除都经它；与协调器共用同一个实例
+        # （令牌只在内存里，两个入口必须看到同一张表）。
+        self._removal = removal_service
+        # 凭据归属索引（N2 Task 2）：卡片的清理待办与清除命令用它。
+        self._credential_lifecycle = credential_lifecycle
+        # 一次性验证票据（N2 Task 4、D-146）：进程内、只存内存。
+        self._verification = (
+            verification_store if verification_store is not None else VerificationStore()
+        )
+        # 创建档案的幂等表（协调器的幂等表只覆盖写恢复记录的三种操作）。
+        self._creates = _CreateIdempotency()
+        # 同一进程内的创建串行化：查幂等表与建立档案必须在同一段临界区里，
+        # 否则两个同键请求会各建一个目录。
+        self._creates_lock = threading.Lock()
         self.app = self._build()
 
     def set_port(self, port: int) -> None:
@@ -251,6 +403,36 @@ class LocalApi:
         app.add_exception_handler(ConfigServiceError, self._service_error_response)
 
         app.add_api_route("/api/session/exchange", self._exchange, methods=["POST"])
+        app.add_api_route("/api/profiles", self._list_profiles, methods=["GET"])
+        app.add_api_route("/api/profiles", self._create_profile, methods=["POST"])
+        app.add_api_route(
+            "/api/profiles/{profile_id}/draft", self._get_profile_draft, methods=["GET"]
+        )
+        app.add_api_route(
+            "/api/profiles/{profile_id}/draft", self._put_profile_draft, methods=["PUT"]
+        )
+        app.add_api_route(
+            "/api/profiles/{profile_id}/verify", self._verify_profile, methods=["POST"]
+        )
+        app.add_api_route(
+            "/api/profiles/{profile_id}/config", self._put_profile_config, methods=["PUT"]
+        )
+        app.add_api_route(
+            "/api/profiles/{profile_id}/activate", self._activate_profile, methods=["POST"]
+        )
+        app.add_api_route(
+            "/api/profiles/{profile_id}/removal-preview",
+            self._removal_preview,
+            methods=["POST"],
+        )
+        app.add_api_route(
+            "/api/profiles/{profile_id}/remove", self._remove_profile, methods=["POST"]
+        )
+        app.add_api_route(
+            "/api/profiles/{profile_id}/credentials/clear",
+            self._clear_profile_credentials,
+            methods=["POST"],
+        )
         app.add_api_route("/api/config", self._get_config, methods=["GET"])
         app.add_api_route("/api/config", self._put_config, methods=["PUT"])
         app.add_api_route("/api/config/validate", self._validate_config, methods=["POST"])
@@ -354,15 +536,31 @@ class LocalApi:
         return body
 
     def _handle(self, exc: Exception) -> ApiError:
-        """把服务层错误映射成状态码与稳定码（§11）。"""
+        """把服务层错误映射成状态码与稳定码（§11）。
+
+        档案错误（`ProfileError`，继承 `ConfigServiceError`）默认仍是 409 + 稳定码；
+        只有三类需要显式分支：未知档案是 404、请求体缺幂等键与范围类参数是 422
+        （总表把它们的 HTTP 状态钉死在 422，服务层只负责给稳定码）。
+        """
         if isinstance(exc, ApiError):
             return exc
         if isinstance(exc, ConfigConflict):
             return ApiError(409, "revision_conflict")
         if isinstance(exc, ConfigInvalid):
             return ApiError(422, exc.code, field=exc.field)
+        if isinstance(exc, ProfileError):
+            code = str(exc)
+            if code == "not_found":
+                return ApiError(404, code)
+            if code == CODE_IDEMPOTENCY_KEY_REQUIRED:
+                return self._account_error(422, code, field="idempotency_key")
+            if code == "removal_scope_invalid":
+                return self._account_error(422, code, field="scope")
+            if code == "credential_scope_required":
+                return self._account_error(422, code, field="kinds")
+            return self._account_error(409, code)
         if isinstance(exc, ConfigServiceError):
-            return ApiError(409, str(exc))
+            return self._account_error(409, str(exc))
         if isinstance(exc, CredentialStoreError):
             return ApiError(503, str(exc))
         if isinstance(exc, DesktopSettingsConflict):
@@ -378,6 +576,11 @@ class LocalApi:
         if isinstance(exc, ConfigError):
             return ApiError(422, exc.kind, field=exc.field)
         return ApiError(500, "internal_error")
+
+    @staticmethod
+    def _account_error(status: int, code: str, *, field: str | None = None) -> ApiError:
+        """稳定码 + 该码的固定文案（没有专属文案就只有码，与既有机制一致）。"""
+        return ApiError(status, code, field=field, message=_ACCOUNT_CODE_MESSAGES.get(code))
 
     def _service_error_response(self, _request: Request, exc: Exception) -> JSONResponse:
         """应用级兜底：与逐路由的 `_handle` 用同一套状态码、JSON 信封与稳定码。"""
@@ -545,16 +748,32 @@ class LocalApi:
             session = self._require_session(request)
             self._require_write(request, session)
             body = await self._json_body(request)
+            # 过渡入口的活动代次门（§59、D-146）：旧页面不带上下文时明确要求升级，
+            # 绝不把一次「当时看着 A」的提交落到刚刚切过去的 B 上。门返回的门里
+            # 核过的档案与代次必须一路带进写路径，不能在工作线程里重新解析指针。
+            target_profile_id, epoch = self._transition_gate(body)
         except ApiError as exc:
             return self._json(exc.status, exc.payload())
         try:
-            revision = await asyncio.to_thread(self._commit_config, body)
+            revision = await asyncio.to_thread(
+                self._commit_config, body, target_profile_id, epoch
+            )
         except Exception as exc:
             mapped = self._handle(exc)
             return self._json(mapped.status, mapped.payload())
         return self._json(200, {"ok": True, "revision": revision})
 
-    def _commit_config(self, body: dict) -> int:
+    def _commit_config(
+        self, body: dict, target_profile_id: str | None, expected_epoch: int
+    ) -> int:
+        """提交到**门里核过的那个档案**，并在写前复核代次（§59、D-146）。
+
+        `target_profile_id` 由 `_transition_gate()` 在事件循环里核过；工作线程绝不
+        重新解析活动指针 —— 从门校验到真正落盘之间，协调器的 `commit_active_B`
+        完全可能把指针切到别的账号，那时按指针解析就会把这次编辑写进另一个档案
+        （用户看不见的串账号写入，含凭据替换）。因此这里只对钉住的档案写，
+        并在写前复核代次：指针变过就如实回 409，而不是写到一个已经不该写的地方。
+        """
         if "start_bot_on_launch" in body:
             # 桌面偏好已移出配置面（§58）：如实回稳定码与去向，而不是静默忽略
             # 或多写一份会与 desktop.json 打架的副本。
@@ -574,10 +793,21 @@ class LocalApi:
         account = body.get("account")
         if account is not None and not isinstance(account, str):
             raise ApiError(400, "bad_request")
-        # 写路径才允许创建：无档案时在这里建立首个档案（profile.json 一并补齐），
-        # 请求体本身的错误已经在上面拒绝，不会因为一次坏请求留下新档案。
-        profile_id = self._profile_id(create=True)
-        return self._bound(profile_id).commit(
+        # 写前复核：门之后活动代次变过（切换提交、删除清指针、新建首个档案）就拒绝。
+        catalog = self._profiles.catalog()
+        if catalog.active_epoch != expected_epoch:
+            raise ApiError(
+                409, "revision_conflict", field="expected_profile_epoch"
+            )
+        if target_profile_id is None:
+            # 首次设置：门核过「当时没有档案」，写路径才允许建立首个档案
+            # （profile.json 一并补齐）；请求体本身的错误已经在上面拒绝。
+            target_profile_id = self._profiles.ensure_first_profile()
+        elif catalog.active_profile_id == target_profile_id:
+            # 指针在场但档案目录可能还没建（N1 的首次写入语义）：补齐记录，
+            # 已存在时不覆盖现场。
+            self._profiles.ensure_first_profile()
+        return self._bound(target_profile_id).commit(
             values,
             expected_revision=expected,
             password=updates.get("password", CredentialUpdate.keep()),
@@ -805,28 +1035,15 @@ class LocalApi:
             session = self._require_session(request)
             self._require_write(request, session)
             body = await self._json_body(request)
+            self._transition_gate(body)
         except ApiError as exc:
             return self._json(exc.status, exc.payload())
         try:
-            profile_id = self._profile_id()
-        except ApiError:
-            # 还没有档案：与「没有可启动的配置」同一结果码（既有语义），
-            # 且不得派发任何启动（§59）。元数据故障是 ConfigServiceError，
-            # 仍由应用级处理器映射成 409 + 稳定码，不在这里被吞掉。
-            return self._json(409, {"ok": False, "code": "config_not_ready"})
-        revision = self._target_revision(body, profile_id)
-        if revision is None:
-            return self._json(409, {"ok": False, "code": "config_not_ready"})
-        ticket = self._lifecycle.begin_operation("start")
-        if ticket is None:
-            return self._json(409, {"ok": False, "code": "lifecycle_busy"})
-        try:
-            operation = self._manager.start(revision=revision, profile_id=profile_id)
-        finally:
-            # 租约只覆盖派发本身：启动后的并发由 `manager.state`（starting 等）
-            # 在测试入口的租约内兜住，长等待一律留在门外（§59、D-132）。
-            self._lifecycle.end(ticket)
-        return self._json(202, {"ok": True, "operation_id": operation.operation_id})
+            operation_id = await asyncio.to_thread(self._start_bot_command, body)
+        except Exception as exc:
+            mapped = self._handle(exc)
+            return self._json(mapped.status, mapped.payload())
+        return self._json(202, {"ok": True, "operation_id": operation_id})
 
     async def _bot_stop(self, request: Request):
         try:
@@ -835,38 +1052,106 @@ class LocalApi:
             await self._json_body(request)
         except ApiError as exc:
             return self._json(exc.status, exc.payload())
-        ticket = self._lifecycle.begin_operation("stop")
-        if ticket is None:
-            return self._json(409, {"ok": False, "code": "lifecycle_busy"})
         try:
-            operation = self._manager.stop()
-        finally:
-            self._lifecycle.end(ticket)
-        return self._json(202, {"ok": True, "operation_id": operation.operation_id})
+            if self._lifecycle_service is not None:
+                operation_id = await asyncio.to_thread(self._lifecycle_service.stop_bot)
+            else:
+                operation_id = await asyncio.to_thread(self._manager_stop)
+        except Exception as exc:
+            mapped = self._handle(exc)
+            return self._json(mapped.status, mapped.payload())
+        return self._json(202, {"ok": True, "operation_id": operation_id})
 
     async def _bot_restart(self, request: Request):
         try:
             session = self._require_session(request)
             self._require_write(request, session)
             body = await self._json_body(request)
+            self._transition_gate(body)
         except ApiError as exc:
             return self._json(exc.status, exc.payload())
         try:
+            operation_id = await asyncio.to_thread(self._restart_bot_command, body)
+        except Exception as exc:
+            mapped = self._handle(exc)
+            return self._json(mapped.status, mapped.payload())
+        return self._json(202, {"ok": True, "operation_id": operation_id})
+
+    def _start_bot_command(self, body: dict) -> str:
+        """启动命令：经协调器派发（代次在门内比较）；未装配协调器时退回管理局直调。"""
+        if self._lifecycle_service is not None:
+            return self._lifecycle_service.start_bot(
+                expected_epoch=body["expected_profile_epoch"]
+            )
+        return self._dispatch_legacy("start", body)
+
+    def _restart_bot_command(self, body: dict) -> str:
+        if self._lifecycle_service is not None:
+            return self._lifecycle_service.restart_bot(
+                expected_epoch=body["expected_profile_epoch"]
+            )
+        return self._dispatch_legacy("restart", body)
+
+    def _dispatch_legacy(self, kind: str, body: dict) -> str:
+        """不装配协调器的调用方（隔离测试）：沿用 N1 的直调，但仍要过租约与代次门。
+
+        请求里的 `revision` 不再参与：启动绑定的版本一律取该档案当前已保存的那一版
+        （协调器一侧 `_saved_revision()`），旧页面发来的版本没有任何作用。
+        """
+        try:
             profile_id = self._profile_id()
         except ApiError:
-            # 与 `_bot_start` 同一口径：没有档案就没有可重启的配置。
-            return self._json(409, {"ok": False, "code": "config_not_ready"})
-        revision = self._target_revision(body, profile_id)
+            # 还没有档案：与「没有可启动的配置」同一结果码（既有语义）。
+            raise ConfigServiceError(CODE_CONFIG_NOT_READY) from None
+        revision = self._target_revision({}, profile_id)
         if revision is None:
-            return self._json(409, {"ok": False, "code": "config_not_ready"})
-        ticket = self._lifecycle.begin_operation("restart")
+            raise ConfigServiceError(CODE_CONFIG_NOT_READY)
+        ticket = self._lifecycle.begin_operation(kind)
         if ticket is None:
-            return self._json(409, {"ok": False, "code": "lifecycle_busy"})
+            raise ConfigServiceError(CODE_LIFECYCLE_BUSY)
         try:
-            operation = self._manager.restart(revision=revision, profile_id=profile_id)
+            if kind == "start":
+                operation = self._manager.start(revision=revision, profile_id=profile_id)
+            else:
+                operation = self._manager.restart(revision=revision, profile_id=profile_id)
         finally:
             self._lifecycle.end(ticket)
-        return self._json(202, {"ok": True, "operation_id": operation.operation_id})
+        return str(operation.operation_id)
+
+    def _manager_stop(self) -> str:
+        ticket = self._lifecycle.begin_operation("stop")
+        if ticket is None:
+            raise ConfigServiceError(CODE_LIFECYCLE_BUSY)
+        try:
+            operation = self._manager.stop()
+        finally:
+            self._lifecycle.end(ticket)
+        return str(operation.operation_id)
+
+    def _transition_gate(self, body: dict) -> tuple[str | None, int]:
+        """过渡入口的活动代次门（§59、D-146）；返回门里核过的 `(档案, 代次)`。
+
+        两个字段都必须在场：缺失说明调用方还是 N2 之前的页面，回
+        `client_upgrade_required`（明确要求升级，**不**透明转发到刚切过去的账号）；
+        在场但与当前不符是「拿着过期上下文」，回 `revision_conflict` 并指出是哪个
+        字段过期。首次设置（还没有任何档案）时正确的取值是 `profile_id: null`、
+        `expected_profile_epoch: 0`。
+
+        返回值不是装饰：写路径必须带着它落到**同一个**档案上（见 `_commit_config()`），
+        否则门只是把竞态窗口挪了个位置。
+
+        元数据故障（N0 的四个码）在**判上下文之前**如实抛出：恢复态下「页面该刷新
+        配置」比「页面该升级」更接近事实，且四个码是既有契约。
+        """
+        catalog = self._profiles.catalog()
+        if "profile_id" not in body or "expected_profile_epoch" not in body:
+            raise self._account_error(409, "client_upgrade_required")
+        if body["profile_id"] != catalog.active_profile_id:
+            raise ApiError(409, "revision_conflict", field="profile_id")
+        epoch = body["expected_profile_epoch"]
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch != catalog.active_epoch:
+            raise ApiError(409, "revision_conflict", field="expected_profile_epoch")
+        return catalog.active_profile_id, catalog.active_epoch
 
     def _target_revision(self, body: dict, profile_id: str) -> int | None:
         """启动/重启的目标版本：请求指定优先，否则用该档案已保存的版本（§6.5）。
@@ -884,9 +1169,16 @@ class LocalApi:
         return saved.revision
 
     async def _get_operation(self, request: Request, operation_id: str):
+        """操作查询：先查协调器（带 `stage`），再查管理局（既有形状 + `stage=null`）。"""
         session = self._session(request)
         if session is None:
             return self._json(401, {"ok": False, "code": "unauthenticated"})
+        if self._lifecycle_service is not None:
+            record = self._lifecycle_service.operation(operation_id)
+            if record is not None:
+                return self._json(
+                    200, {"ok": True, "operation": record.as_operation_view()}
+                )
         operation = self._manager.operation(operation_id)
         if operation is None:
             return self._json(404, {"ok": False, "code": "not_found"})
@@ -898,6 +1190,8 @@ class LocalApi:
                     "id": operation.operation_id,
                     "kind": operation.kind,
                     "state": operation.state,
+                    # 单次启停不写恢复记录、没有事务阶段：如实回 null。
+                    "stage": None,
                     "result": operation.result,
                     "revision": operation.target_revision,
                     # 操作属于哪个档案：同号 revision 换档案时页面据此区分结果。
@@ -954,32 +1248,39 @@ class LocalApi:
             raise
         return self._json(status, result)
 
+    def _site_test_blocker(self) -> str | None:
+        """站点测试与身份验证共用的两条判据；不满足时返回稳定码。
+
+        只有 `state` 还不够：restart 的停止阶段会先把状态写回 stopped / failed
+        （`process_manager._stop_synchronously`），之后才写 starting
+        （`_do_restart`），中间那段空档里 `state` 是测试允许的取值，而组合操作尚未
+        完成 —— 光看状态会放行测试，让它与随即启动的新 Worker 并行。在途操作存在
+        就拒绝：宁可保守地多拒一次，也不让测试和启动并行。判据不等待、不排队。
+        """
+        state = self._manager.state
+        if state == "running":
+            # 机器人确实在运行：保留既有语义与稳定码（验证身份由页面先停止）。
+            return "bot_running"
+        if state not in ("stopped", "failed"):
+            # starting / stopping：生命周期操作在途，不是「正在运行」。
+            return "lifecycle_busy"
+        pending = self._manager.current_operation()
+        if pending is not None and pending.finished_at is None:
+            return "lifecycle_busy"
+        return None
+
     def _run_site_test_under_lease(
         self, ticket: Ticket, credentials_override: Secrets | None = None
     ) -> tuple[dict, int]:
         """在租约覆盖内检查进程状态并执行站点测试；租约只在本线程释放（D-132）。
 
         调用 `manager.state` 与派发测试之间没有释放动作，所以「看到 stopped」
-        之后不会再有新的启动溜进来；看到 `starting` / `stopping` 或有在途操作，
-        说明生命周期操作已经先行派发，测试让位（在途操作判据见下面的注释）。
+        之后不会再有新的启动溜进来。
         """
         try:
-            state = self._manager.state
-            if state == "running":
-                # 机器人确实在运行：保留既有语义与稳定码。
-                return {"ok": False, "code": "bot_running"}, 409
-            if state not in ("stopped", "failed"):
-                # starting / stopping：生命周期操作在途，不是「正在运行」。
-                return {"ok": False, "code": "lifecycle_busy"}, 409
-            pending = self._manager.current_operation()
-            if pending is not None and pending.finished_at is None:
-                # 只有 state 还不够：restart 的停止阶段会先把状态写回 stopped /
-                # failed（process_manager 的 `_stop_synchronously`），之后才写
-                # starting（`_do_restart`），中间那段空档里 `state` 是测试允许的
-                # 取值，而组合操作尚未完成 —— 光看状态会在这里放行测试，让它与
-                # 随即启动的新 Worker 并行。在途操作存在就拒绝：宁可保守地多拒
-                # 一次测试，也不让测试和启动并行。判据仍在租约内、不等待。
-                return {"ok": False, "code": "lifecycle_busy"}, 409
+            blocker = self._site_test_blocker()
+            if blocker is not None:
+                return {"ok": False, "code": blocker}, 409
             return self._run_site_test(credentials_override)
         finally:
             self._lifecycle.end(ticket)
@@ -1219,6 +1520,800 @@ class LocalApi:
         finally:
             await client.aclose()
 
+    # --- 账号 API（N2 Task 4、§59） ---------------------------------------
+
+    async def _list_profiles(self, request: Request):
+        """账号列表：只读，绝不创建（空根目录回 200 + 空数组，D-135、§59）。"""
+        session = self._session(request)
+        if session is None:
+            return self._json(401, {"ok": False, "code": "unauthenticated"})
+        try:
+            body = await asyncio.to_thread(self._profiles_view)
+        except Exception as exc:
+            mapped = self._handle(exc)
+            return self._json(mapped.status, mapped.payload())
+        return self._json(200, body)
+
+    def _profiles_view(self) -> dict:
+        """一次请求内每个档案只解析一次上下文（§4.1 末句）。"""
+        catalog = self._profiles.catalog()
+        running_profile_id = self._manager.status().get("running_profile_id")
+        startup_profile_id = self._startup_target()
+        cards = [
+            self._profile_card(
+                record,
+                catalog=catalog,
+                running_profile_id=running_profile_id,
+                startup_profile_id=startup_profile_id,
+            )
+            for record in self._profiles.list_profiles()
+        ]
+        return {
+            "ok": True,
+            "catalog": {
+                "active_profile_id": catalog.active_profile_id,
+                "active_epoch": catalog.active_epoch,
+                "catalog_revision": catalog.catalog_revision,
+                "schema_version": catalog.schema_version,
+            },
+            "profiles": cards,
+        }
+
+    def _profile_card(
+        self, record, *, catalog, running_profile_id: str | None, startup_profile_id: str | None
+    ) -> dict:
+        """一张账号卡片（§59 的 ProfileCard）：字段名固定，动作由服务端判定。"""
+        service = self._profiles.config_service(record.profile_id)
+        status = service.status()
+        try:
+            saved = service.load_saved()
+        except ConfigServiceError:
+            # 配置读不出来：`config.state` 已经如实报错，卡片不再重复一次并让整个
+            # 列表请求失败（一个坏档案不该挡住别的账号）。
+            saved = None
+        is_active = catalog.active_profile_id == record.profile_id
+        return {
+            "profile_id": record.profile_id,
+            "display_name": record.display_name,
+            "account": saved.account if saved is not None else None,
+            "site_user_id": record.site_user_id,
+            "identity_state": record.identity_state,
+            "state": record.state,
+            "profile_revision": record.profile_revision,
+            "config": {
+                "state": status.state,
+                "revision": status.revision,
+                "error": status.error,
+            },
+            "is_active": is_active,
+            "is_running": running_profile_id == record.profile_id,
+            "is_startup_target": startup_profile_id == record.profile_id,
+            "credentials": self._credentials_summary(record.profile_id),
+            "actions": _card_actions(
+                record, is_active=is_active, config_state=status.state
+            ),
+        }
+
+    def _credentials_summary(self, profile_id: str) -> dict:
+        """卡片的凭据摘要：后端可用性、清理待办与受管历史引用数。"""
+        backend = self._credentials.describe()
+        summary = {
+            "backend": {"name": backend.name, "available": backend.available},
+            "cleanup_pending": False,
+            "historical_managed": 0,
+            "unknown_ownership": False,
+        }
+        if self._credential_lifecycle is None:
+            return summary
+        try:
+            managed = self._credential_lifecycle.managed_refs(profile_id)
+            pending = profile_id in self._credential_lifecycle.pending_profiles()
+            unreadable = self._credential_lifecycle.unreadable_documents(profile_id)
+        except ConfigServiceError:
+            # 索引读不出来：归属不完整，必须显示成「有清理待办」，不能假装干净。
+            summary["cleanup_pending"] = True
+            summary["unknown_ownership"] = True
+            return summary
+        summary["cleanup_pending"] = pending
+        summary["historical_managed"] = len(managed)
+        summary["unknown_ownership"] = bool(unreadable)
+        return summary
+
+    def _startup_target(self) -> str | None:
+        """桌面设置里的启动目标；读不出来按 None（列表不因一个坏文件失败）。"""
+        try:
+            return self._desktop.read().startup_profile_id
+        except DesktopSettingsError:
+            return None
+
+    async def _create_profile(self, request: Request):
+        """建立**非活动**账号：经协调器的串行化口径（不排队），幂等键保证只建一次。"""
+        try:
+            session = self._require_session(request)
+            self._require_write(request, session)
+            body = await self._json_body(request)
+            intent = self._create_intent(body)
+        except ApiError as exc:
+            return self._json(exc.status, exc.payload())
+        try:
+            result = await asyncio.to_thread(self._run_create, intent)
+        except Exception as exc:
+            mapped = self._handle(exc)
+            return self._json(mapped.status, mapped.payload())
+        return self._json(200, result)
+
+    def _create_intent(self, body: dict) -> dict:
+        _strict_keys(body, _PROFILE_CREATE_KEYS)
+        expected = _require_int(
+            body, "expected_catalog_revision", code="invalid_revision"
+        )
+        key = _require_idempotency_key(body)
+        display_name = body.get("display_name", "")
+        if not isinstance(display_name, str):
+            raise ApiError(422, "invalid_value", field="display_name")
+        display_name = display_name.strip()
+        if len(display_name) > MAX_DISPLAY_NAME_CHARS:
+            raise ApiError(422, "invalid_value", field="display_name")
+        return {
+            "display_name": display_name,
+            "expected_catalog_revision": expected,
+            "idempotency_key": key,
+        }
+
+    def _run_create(self, intent: dict) -> dict:
+        """创建档案：串行化 + 幂等。返回响应信封（不含任何凭据材料）。"""
+        self._require_not_quitting()
+        ticket = self._lifecycle.begin_operation("create")
+        if ticket is None:
+            # 站点测试持有租约：与其它写入口同一口径，不排队。
+            raise ConfigServiceError(CODE_LIFECYCLE_BUSY)
+        try:
+            return self._create_locked(intent)
+        finally:
+            self._lifecycle.end(ticket)
+
+    def _require_not_quitting(self) -> None:
+        """退出流程已开始（`request_quit()` 之后）不再接受新的写命令。
+
+        与协调器 `_require_launch_context()` 的 `quitting` 判定同口径、同一个标志位；
+        协调器没有公开这个只读状态（它只在启停与切换路径内部判），因此这里按属性读取
+        同一个标志而不是另存一份状态 —— 两份状态迟早会不一致。缺属性（未装配协调器
+        的隔离调用方、替身）按「未退出」处理。
+        """
+        service = self._lifecycle_service
+        if service is not None and getattr(service, "_quitting", False):
+            raise ConfigServiceError(CODE_QUITTING)
+
+    def _create_locked(self, intent: dict) -> dict:
+        with self._creates_lock:
+            key = intent["idempotency_key"]
+            digest = _request_digest(
+                {
+                    "display_name": intent["display_name"],
+                    "expected_catalog_revision": intent["expected_catalog_revision"],
+                }
+            )
+            replayed = self._creates.lookup(key, digest)
+            if replayed is not None:
+                return {
+                    "ok": True,
+                    "profile_id": replayed,
+                    "catalog_revision": self._profiles.catalog().catalog_revision,
+                }
+            self._require_no_operation()
+            catalog = self._profiles.catalog()
+            if catalog.catalog_revision != intent["expected_catalog_revision"]:
+                raise ProfileError("revision_conflict")
+            profile_id = self._profiles.create_profile(
+                display_name=intent["display_name"]
+            )
+            self._creates.remember(key, digest, profile_id)
+            return {
+                "ok": True,
+                "profile_id": profile_id,
+                "catalog_revision": self._profiles.catalog().catalog_revision,
+            }
+
+    def _require_no_operation(self) -> None:
+        """协调器有未完成的切换/删除/清除时不接受新的写命令（不排队）。"""
+        if self._lifecycle_service is None:
+            return
+        if self._lifecycle_service.current_operation() is not None:
+            raise ConfigServiceError(CODE_LIFECYCLE_BUSY)
+
+    # --- 账号草稿与配置 -----------------------------------------------------
+
+    async def _get_profile_draft(self, request: Request, profile_id: str):
+        session = self._session(request)
+        if session is None:
+            return self._json(401, {"ok": False, "code": "unauthenticated"})
+        try:
+            body = await asyncio.to_thread(self._profile_draft_view, profile_id)
+        except Exception as exc:
+            mapped = self._handle(exc)
+            return self._json(mapped.status, mapped.payload())
+        return self._json(200, body)
+
+    def _profile_draft_view(self, profile_id: str) -> dict:
+        record = self._require_record(profile_id)
+        self._reject_deleting(record)
+        draft = self._profiles.config_service(profile_id).load_draft()
+        if draft is None:
+            return {"ok": True, "revision": 0, "values": {}}
+        return {
+            "ok": True,
+            "revision": draft.revision,
+            "values": {
+                key: _get_path(draft.mapping, key) for key in sorted(EDITABLE_FIELDS)
+            },
+        }
+
+    async def _put_profile_draft(self, request: Request, profile_id: str):
+        try:
+            session = self._require_session(request)
+            self._require_write(request, session)
+            body = await self._json_body(request)
+            _strict_keys(body, _PROFILE_DRAFT_KEYS)
+            expected = _require_int(body, "expected_revision", code="invalid_revision")
+            values = body.get("values", {})
+            if not isinstance(values, dict):
+                raise ApiError(400, "bad_request", field="values")
+            expected_profile_revision = _optional_int(
+                body, "expected_profile_revision", code="invalid_revision"
+            )
+        except ApiError as exc:
+            return self._json(exc.status, exc.payload())
+        try:
+            revision = await asyncio.to_thread(
+                self._save_profile_draft,
+                profile_id,
+                values,
+                expected,
+                expected_profile_revision,
+            )
+        except Exception as exc:
+            mapped = self._handle(exc)
+            return self._json(mapped.status, mapped.payload())
+        return self._json(200, {"ok": True, "revision": revision})
+
+    def _save_profile_draft(
+        self,
+        profile_id: str,
+        values: dict,
+        expected_revision: int,
+        expected_profile_revision: int | None,
+    ) -> int:
+        record = self._require_record(profile_id)
+        self._reject_deleting(record)
+        if (
+            expected_profile_revision is not None
+            and record.profile_revision != expected_profile_revision
+        ):
+            raise ProfileError("revision_conflict")
+        return self._profiles.config_service(profile_id).save_draft(
+            values, expected_revision=expected_revision
+        )
+
+    async def _put_profile_config(self, request: Request, profile_id: str):
+        """保存该档案的配置；首次绑定身份必须消费验证票据（§4.2、§59）。"""
+        try:
+            session = self._require_session(request)
+            self._require_write(request, session)
+            body = await self._json_body(request)
+        except ApiError as exc:
+            return self._json(exc.status, exc.payload())
+        try:
+            payload = await asyncio.to_thread(
+                self._save_profile_config, profile_id, session.session_id, body
+            )
+        except Exception as exc:
+            mapped = self._handle(exc)
+            return self._json(mapped.status, mapped.payload())
+        return self._json(200, payload)
+
+    def _save_profile_config(
+        self, profile_id: str, session_id: str, body: dict
+    ) -> dict:
+        """提交配置并在成功之后写身份；票据在提交前消费，绝不落盘。
+
+        顺序固定：字段与状态校验 → 消费票据（一次性，改输入即失效）→ 写配置
+        （`commit()` 的原子事务）→ 写身份（`bind_identity()`）→ 需要时把 `detached`
+        恢复成 `active`。`detached → active` 只在这条路径上发生：必须用**同一稳定 ID**
+        的票据重新保存一次（§6.2、§59）。
+        """
+        _strict_keys(body, _PROFILE_CONFIG_KEYS)
+        expected = _require_int(body, "expected_revision", code="invalid_revision")
+        expected_profile_revision = _require_int(
+            body, "expected_profile_revision", code="invalid_revision"
+        )
+        values = body.get("values", {})
+        if not isinstance(values, dict):
+            raise ApiError(400, "bad_request", field="values")
+        record = self._require_record(profile_id)
+        self._reject_deleting(record)
+        if record.profile_revision != expected_profile_revision:
+            raise ApiError(409, "profile_revision_conflict", field="expected_profile_revision")
+        updates = self._credential_updates(body)
+        account = body.get("account")
+        if account is not None and not isinstance(account, str):
+            raise ApiError(400, "bad_request", field="account")
+        display_name = body.get("display_name")
+        if display_name is not None and not isinstance(display_name, str):
+            raise ApiError(400, "bad_request", field="display_name")
+
+        verification_id = body.get("verification_id")
+        ticket = None
+        if verification_id is not None:
+            if not isinstance(verification_id, str) or not verification_id:
+                raise ApiError(422, "invalid_value", field="verification_id")
+            password = updates.get("password")
+            password_value = password.value if password is not None else None
+            if password is not None and password.action != ACTION_REPLACE:
+                password_value = None
+            ticket = self._verification.consume(
+                verification_id,
+                session_id=session_id,
+                profile_id=profile_id,
+                account=account,
+                password=password_value,
+            )
+            if record.site_user_id and record.site_user_id != ticket.site_user_id:
+                # 票据绑的稳定 ID 不是这个档案已绑定的那一个：拒绝，不悄悄改绑。
+                raise ProfileError("verification_mismatch")
+            conflict = self._identity_conflict(profile_id, ticket.site_user_id)
+            if conflict is not None:
+                raise ApiError(
+                    409,
+                    "profile_identity_taken",
+                    message=texts.PROFILE_IDENTITY_TAKEN,
+                    details={"existing_profile_id": conflict},
+                )
+        elif record.identity_state != IDENTITY_VERIFIED:
+            # 没有票据、身份又没验证过：这次保存只能改草稿式内容，不能落配置。
+            raise ApiError(409, "verification_required")
+        was_detached = record.state == PROFILE_STATE_DETACHED
+
+        revision = self._profiles.config_service(profile_id).commit(
+            values,
+            expected_revision=expected,
+            password=updates.get("password", CredentialUpdate.keep()),
+            llm_api_key=updates.get("llm_api_key", CredentialUpdate.keep()),
+            account=account,
+        )
+        profile_revision = record.profile_revision
+        if ticket is not None:
+            saved_record = self._profiles.bind_identity(
+                profile_id,
+                site_user_id=ticket.site_user_id,
+                display_name=display_name,
+            )
+            profile_revision = saved_record.profile_revision
+        elif display_name is not None and record.site_user_id:
+            # 改名不需要票据（身份没变），但写的必须是存档里的那一个 `site_user_id`。
+            saved_record = self._profiles.bind_identity(
+                profile_id,
+                site_user_id=record.site_user_id,
+                display_name=display_name,
+            )
+            profile_revision = saved_record.profile_revision
+        if ticket is not None and was_detached:
+            saved_record = self._profiles.set_state(
+                profile_id, state=PROFILE_STATE_ACTIVE
+            )
+            profile_revision = saved_record.profile_revision
+        return {"ok": True, "revision": revision, "profile_revision": profile_revision}
+
+    def _identity_conflict(self, profile_id: str, site_user_id: str) -> str | None:
+        """另一个非 `detached` 档案是否已占用该稳定 ID（占用则返回它的 id）。"""
+        for other in self._profiles.list_profiles():
+            if other.profile_id == profile_id:
+                continue
+            if other.state == PROFILE_STATE_DETACHED:
+                continue
+            if other.site_user_id == site_user_id:
+                return other.profile_id
+        return None
+
+    # --- 身份验证 -----------------------------------------------------------
+
+    async def _verify_profile(self, request: Request, profile_id: str):
+        """用一次性输入登录站点、确认稳定 ID 并签发票据；整段持有站点测试租约。"""
+        try:
+            session = self._require_session(request)
+            self._require_write(request, session)
+            body = await self._json_body(request)
+        except ApiError as exc:
+            return self._json(exc.status, exc.payload())
+        try:
+            _strict_keys(body, _VERIFY_KEYS)
+        except ApiError as exc:
+            return self._json(exc.status, exc.payload())
+        account = body.get("account")
+        password = body.get("password")
+        if (
+            not isinstance(account, str)
+            or not account.strip()
+            or len(account) > 256
+            or not isinstance(password, str)
+            or not password
+            or len(password) > 4096
+        ):
+            return self._json(422, {"ok": False, "code": "invalid_test_input"})
+        ticket = self._lifecycle.begin_test()
+        if ticket is None:
+            return self._json(409, {"ok": False, "code": "lifecycle_busy"})
+        try:
+            result, status = await asyncio.shield(
+                asyncio.to_thread(
+                    self._run_verify_under_lease,
+                    ticket,
+                    profile_id,
+                    session.session_id,
+                    account,
+                    password,
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            # 与 `/api/test/site` 同一口径：线程仍在跑，租约留给它自己释放。
+            self._lifecycle.end(ticket)
+            raise
+        return self._json(status, result)
+
+    def _run_verify_under_lease(
+        self,
+        ticket: Ticket,
+        profile_id: str,
+        session_id: str,
+        account: str,
+        password: str,
+    ) -> tuple[dict, int]:
+        """在租约内判定进程状态并执行验证；租约只在本线程释放（D-132）。"""
+        try:
+            blocker = self._site_test_blocker()
+            if blocker is not None:
+                return {"ok": False, "code": blocker}, 409
+            return self._verify_profile_identity(profile_id, session_id, account, password)
+        finally:
+            self._lifecycle.end(ticket)
+
+    def _verify_profile_identity(
+        self, profile_id: str, session_id: str, account: str, password: str
+    ) -> tuple[dict, int]:
+        """登录站点并签发/拒绝票据；不写档案、不落盘任何输入。"""
+        try:
+            record = self._require_record(profile_id)
+            self._reject_deleting(record)
+            service = self._profiles.config_service(profile_id)
+            profile = service.profile_or_none()
+            # 站点地址取 Light 固定基线（与向导测试同一条路径）：验证身份时页面还
+            # 没有保存配置，能相信的只有站点合同本身；模型部分用一次性占位值。
+            mapping = light_base_mapping(profile)
+            mapping["model"] = {
+                "base_url": "https://draft.invalid/v1",
+                "model": "draft-model",
+            }
+            credentials = Secrets(username=account, password=password, llm_api_key="")
+            config = parse_config(
+                mapping,
+                config_dir=str(profile if profile is not None else self._data_root),
+                secrets=credentials,
+            )
+            outcome, detail, site_user_id = asyncio.run(
+                self._probe_site_identity(config, credentials)
+            )
+            if site_user_id is None:
+                # 登录都没成功（账号或密码错、网络失败）：与 `/api/test/site` 同形。
+                return {"ok": False, "detail": detail}, 200
+            conflict = self._identity_conflict(profile_id, site_user_id)
+            if conflict is not None:
+                raise ApiError(
+                    409,
+                    "profile_identity_taken",
+                    message=texts.PROFILE_IDENTITY_TAKEN,
+                    details={"existing_profile_id": conflict},
+                )
+            expected = self._profiles.expected_site_user_id(profile_id)
+            if (
+                record.state == PROFILE_STATE_DETACHED
+                and expected is not None
+                and expected != site_user_id
+            ):
+                # 已移除（保留数据）的档案只能重新绑定**同一个**账号：稳定 ID 不符时
+                # 拒绝，避免把它的历史数据接到另一个账号上。
+                raise ApiError(409, "profile_identity_mismatch")
+            verification_id = self._verification.issue(
+                session_id=session_id,
+                profile_id=profile_id,
+                account=account,
+                password=password,
+                site_user_id=site_user_id,
+            )
+        except Exception as exc:
+            mapped = self._handle(exc)
+            return mapped.payload(), mapped.status
+        return (
+            {
+                "ok": True,
+                "verification_id": verification_id,
+                "site_user_id": site_user_id,
+                # 聊天探测失败不影响签发票据：身份以登录结果为准（§4.2）。
+                "chat_ready": outcome,
+                "expires_in": int(self._verification.ttl),
+            },
+            200,
+        )
+
+    # --- 切换、移除与清除 ---------------------------------------------------
+
+    async def _activate_profile(self, request: Request, profile_id: str):
+        try:
+            session = self._require_session(request)
+            self._require_write(request, session)
+            body = await self._json_body(request)
+            intent = self._activate_intent(body)
+        except ApiError as exc:
+            return self._json(exc.status, exc.payload())
+        try:
+            operation_id = await asyncio.to_thread(
+                self._run_activate_command, profile_id, intent
+            )
+        except Exception as exc:
+            mapped = self._handle(exc)
+            return self._json(mapped.status, mapped.payload())
+        return self._json(202, {"ok": True, "operation_id": operation_id})
+
+    def _activate_intent(self, body: dict) -> dict:
+        _strict_keys(body, _ACTIVATE_KEYS)
+        intent = {
+            "expected_catalog_revision": _require_int(
+                body, "expected_catalog_revision", code="invalid_revision"
+            ),
+            "expected_epoch": _require_int(body, "expected_epoch", code="invalid_revision"),
+            "start": _optional_bool(body, "start", default=True),
+            "target_revision": _optional_int(
+                body, "target_revision", code="invalid_revision"
+            ),
+            "idempotency_key": _require_idempotency_key(body),
+        }
+        return intent
+
+    def _run_activate_command(self, profile_id: str, intent: dict) -> str:
+        if self._lifecycle_service is None:
+            raise ConfigServiceError(CODE_CONFIG_NOT_READY)
+        target_revision = intent["target_revision"]
+        if target_revision is None and intent["start"]:
+            # 没指定版本时绑定该档案当前已保存的那一版（与启停同一口径）：指定/求得的
+            # 版本必须与档案当下一致，否则协调器直接回 `target_not_ready`。
+            saved = self._profiles.config_service(profile_id).load_saved()
+            target_revision = saved.revision if saved is not None else None
+        return self._lifecycle_service.activate(
+            profile_id,
+            expected_epoch=intent["expected_epoch"],
+            expected_catalog_revision=intent["expected_catalog_revision"],
+            target_revision=target_revision,
+            start=intent["start"],
+            idempotency_key=intent["idempotency_key"],
+        )
+
+    async def _removal_preview(self, request: Request, profile_id: str):
+        """删除预览（只读）：签发只存内存的确认令牌，不做任何删除（§6.2、§59）。"""
+        try:
+            session = self._require_session(request)
+            self._require_write(request, session)
+            body = await self._json_body(request)
+            _strict_keys(body, _REMOVAL_PREVIEW_KEYS)
+        except ApiError as exc:
+            return self._json(exc.status, exc.payload())
+        scope = body.get("scope")
+        if not isinstance(scope, str) or scope not in REMOVAL_SCOPES:
+            return self._json(422, {"ok": False, "code": "removal_scope_invalid", "field": "scope"})
+        try:
+            preview = await asyncio.to_thread(self._preview_removal, profile_id, scope, session.session_id)
+        except Exception as exc:
+            mapped = self._handle(exc)
+            return self._json(mapped.status, mapped.payload())
+        return self._json(
+            200,
+            {
+                "ok": True,
+                "preview": preview.to_document(),
+                "confirmation_token": preview.confirmation_token,
+                "expires_in": preview.expires_in,
+            },
+        )
+
+    def _preview_removal(self, profile_id: str, scope: str, session_id: str):
+        if self._removal is None:
+            raise ConfigServiceError(CODE_CONFIG_NOT_READY)
+        return self._removal.preview(profile_id, scope=scope, session_id=session_id)
+
+    async def _remove_profile(self, request: Request, profile_id: str):
+        """按确认令牌发起删除；令牌在预留记录之前校验并消耗（§6.2、§59）。"""
+        try:
+            session = self._require_session(request)
+            self._require_write(request, session)
+            body = await self._json_body(request)
+            _strict_keys(body, _REMOVE_KEYS)
+        except ApiError as exc:
+            return self._json(exc.status, exc.payload())
+        scope = body.get("scope")
+        if not isinstance(scope, str) or scope not in REMOVAL_SCOPES:
+            return self._json(422, {"ok": False, "code": "removal_scope_invalid", "field": "scope"})
+        token = body.get("confirmation_token")
+        if not isinstance(token, str) or not token:
+            return self._json(422, {"ok": False, "code": "removal_token_invalid", "field": "confirmation_token"})
+        key = body.get("idempotency_key")
+        if not isinstance(key, str) or not key:
+            return self._json(422, {"ok": False, "code": "idempotency_key_required", "field": "idempotency_key"})
+        try:
+            operation_id = await asyncio.to_thread(
+                self._run_remove_command, profile_id, scope, token, session.session_id, key
+            )
+        except Exception as exc:
+            mapped = self._handle(exc)
+            return self._json(mapped.status, mapped.payload())
+        return self._json(202, {"ok": True, "operation_id": operation_id})
+
+    def _run_remove_command(
+        self, profile_id: str, scope: str, token: str, session_id: str, key: str
+    ) -> str:
+        if self._lifecycle_service is None:
+            raise ConfigServiceError(CODE_CONFIG_NOT_READY)
+        return self._lifecycle_service.remove(
+            profile_id,
+            scope=scope,
+            confirmation_token=token,
+            session_id=session_id,
+            idempotency_key=key,
+        )
+
+    async def _clear_profile_credentials(self, request: Request, profile_id: str):
+        """清除该档案受管凭据的一个子集；破坏性操作走 202 + operation_id（§6.1）。"""
+        try:
+            session = self._require_session(request)
+            self._require_write(request, session)
+            body = await self._json_body(request)
+            _strict_keys(body, _CREDENTIALS_CLEAR_KEYS)
+        except ApiError as exc:
+            return self._json(exc.status, exc.payload())
+        kinds = body.get("kinds")
+        if (
+            not isinstance(kinds, list)
+            or not kinds
+            or not all(isinstance(item, str) and item in CREDENTIAL_KINDS for item in kinds)
+        ):
+            return self._json(422, {"ok": False, "code": "credential_scope_required", "field": "kinds"})
+        key = body.get("idempotency_key")
+        if not isinstance(key, str) or not key:
+            return self._json(422, {"ok": False, "code": "idempotency_key_required", "field": "idempotency_key"})
+        try:
+            operation_id = await asyncio.to_thread(
+                self._submit_credentials_clear, profile_id, tuple(sorted(set(kinds))), key
+            )
+        except Exception as exc:
+            mapped = self._handle(exc)
+            return self._json(mapped.status, mapped.payload())
+        return self._json(202, {"ok": True, "operation_id": operation_id})
+
+    def _submit_credentials_clear(
+        self, profile_id: str, kinds: tuple[str, ...], idempotency_key: str
+    ) -> str:
+        """经协调器预留并派发一次凭据清除（串行化、幂等键、写恢复记录）。
+
+        命令体（`_run_credentials_clear`）住在 API 层：协调器只提供串行化、记录与
+        阶段钩子，不定义清除动作本身；这与 Task 2 的交接一致（清除的范围、保留项与
+        结果码由凭据生命周期服务给出）。
+        """
+        if self._lifecycle_service is None:
+            raise ConfigServiceError(CODE_CONFIG_NOT_READY)
+        lifecycle = self._credential_lifecycle
+        if lifecycle is None:
+            raise ConfigServiceError(CODE_CONFIG_NOT_READY)
+        request = {"profile_id": profile_id, "kinds": list(kinds)}
+
+        def validate() -> None:
+            # 破坏性操作拒绝推进：坏索引在预留之前就失败（§6.1）。
+            lifecycle.ensure_readable()
+            record = self._require_record(profile_id)
+            self._reject_deleting(record)
+
+        def body(context) -> None:
+            self._run_credentials_clear(context, profile_id, kinds, lifecycle)
+
+        return self._lifecycle_service.submit(
+            kind=KIND_CREDENTIALS_CLEAR,
+            profile_id=profile_id,
+            idempotency_key=idempotency_key,
+            request=request,
+            body=body,
+            validate=validate,
+            to_profile_id=profile_id,
+        )
+
+    def _run_credentials_clear(self, context, profile_id, kinds, lifecycle) -> None:
+        """清除命令体：`stop` → `clear_credentials` → `commit_config`（§59 阶段码）。
+
+        只要 `clear()` 正常返回就继续写配置：`ok=False` 只影响结果码
+        （`cleared_partial`）与卡片的清理待办，不表示什么都没清 —— 只有 `clear()`
+        抛异常才是「凭据库这一侧完全没动」。
+        """
+        with context.stage(STAGE_STOP, state=OP_STATE_RUNNING):
+            if context.running_profile_id() == profile_id:
+                stop_operation = context.stop_worker()
+                if not context.await_exit(stop_operation):
+                    context.finish(
+                        state=OP_STATE_FAILED,
+                        result=RESULT_CLEAR_FAILED,
+                        error=ERROR_STOP_UNCONFIRMED,
+                    )
+                    return
+        service = self._profiles.config_service(profile_id)
+        saved = service.load_saved()
+        if saved is None:
+            context.finish(
+                state=OP_STATE_FAILED, result=RESULT_CLEAR_FAILED, error=CODE_CONFIG_NOT_READY
+            )
+            return
+        with context.stage(STAGE_CLEAR_CREDENTIALS):
+            # 关键副作用之前先落记录：哪些引用属于这个档案（只有不透明引用）。
+            managed = lifecycle.managed_refs(profile_id)
+            context.record_details(
+                credentials=tuple(CredentialRef(ref, STATE_OWNED) for ref in managed)
+            )
+            try:
+                result = lifecycle.clear(profile_id, kinds=kinds)
+            except (CredentialStoreError, ConfigServiceError):
+                # 凭据阶段整体失败（后端不可用、索引坏掉）：一件都没做。
+                context.finish(
+                    state=OP_STATE_FAILED,
+                    result=RESULT_CLEAR_FAILED,
+                    error=ERROR_CREDENTIAL_BACKEND_UNAVAILABLE,
+                )
+                return
+            entries = [CredentialRef(ref, STATE_REVOKED) for ref in result.revoked]
+            entries += [
+                CredentialRef(ref, STATE_PENDING_REMOVAL) for ref in result.pending_refs
+            ]
+            if result.new_ref is not None:
+                # 新引用要等配置窄写成功才由 `commit_credentials_clear()` 标成 owned，
+                # 这里如实写 `pending`（没写上就是 `cleared_partial`）。
+                entries.append(CredentialRef(result.new_ref, "pending"))
+            context.record_details(credentials=tuple(entries))
+        with context.stage(STAGE_COMMIT_CONFIG):
+            try:
+                service.commit_credentials_clear(
+                    expected_revision=saved.revision,
+                    credentials_ref=result.new_ref,
+                    account=saved.account,
+                )
+            except (ConfigServiceError, KeyError):
+                # 凭据清了，但这一版配置没写进去：部分完成，如实报。
+                context.finish(
+                    state=OP_STATE_FINISHED,
+                    result=RESULT_CLEARED_PARTIAL,
+                    error=ERROR_CONFIG_WRITE_FAILED,
+                )
+                return
+        context.finish(
+            state=OP_STATE_FINISHED,
+            result=RESULT_CLEARED if result.ok else RESULT_CLEARED_PARTIAL,
+        )
+
+    def _require_record(self, profile_id: str):
+        """按 id 取档案记录；未知、已删除（墓碑）一律 404 `not_found`。"""
+        for record in self._profiles.list_profiles():
+            if record.profile_id == profile_id:
+                return record
+        raise ApiError(404, "not_found")
+
+    @staticmethod
+    def _reject_deleting(record) -> None:
+        """`deleting` 档案拒绝配置与草稿写入（§6.2 第 1 步，判定落在路由上）。"""
+        if record.state == PROFILE_STATE_DELETING:
+            raise ApiError(409, "profile_state_conflict")
+
     # --- 事件流 -----------------------------------------------------------
 
     async def _logs_stream(self, request: Request):
@@ -1371,6 +2466,104 @@ class LocalApi:
         response = StreamingResponse(iter([target.read_bytes()]), media_type=media_type)
         response.headers["Cache-Control"] = "no-store"
         return response
+
+
+class _CreateIdempotency:
+    """创建档案的幂等表：内存、有界、不落盘。
+
+    协调器的幂等表只覆盖写恢复记录的三种操作（`activate` / `remove` /
+    `credentials_clear`），创建档案不写恢复记录，因此这一张表留在 API 层。规则与
+    协调器逐条一致：同键 + 同摘要永远回同一 `profile_id`；同键 + 不同摘要抛
+    `idempotency_conflict`；只保留最近 `MAX_CREATE_KEYS` 个键。
+    """
+
+    def __init__(self, capacity: int = MAX_CREATE_KEYS) -> None:
+        self._capacity = capacity
+        self._entries: "OrderedDict[str, tuple[str, str]]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def lookup(self, key: str, digest: str) -> str | None:
+        """幂等命中返回 `profile_id`；同键不同摘要抛 `idempotency_conflict`。"""
+        with self._lock:
+            entry = self._entries.get(key)
+        if entry is None:
+            return None
+        profile_id, stored = entry
+        if stored != digest:
+            raise ProfileError("idempotency_conflict")
+        return profile_id
+
+    def remember(self, key: str, digest: str, profile_id: str) -> None:
+        with self._lock:
+            self._entries[key] = (profile_id, digest)
+            while len(self._entries) > self._capacity:
+                self._entries.popitem(last=False)
+
+
+def _strict_keys(body: dict, allowed: frozenset[str]) -> None:
+    """严格字段白名单：未列出的键一律 400 `bad_request`（§59）。"""
+    extra = sorted(set(body) - allowed)
+    if extra:
+        raise ApiError(400, "bad_request", field=extra[0])
+
+
+def _require_int(body: dict, key: str, *, code: str) -> int:
+    """必填的非负整数；缺失或类型不对 → 422 + 稳定码（含 `field`）。"""
+    value = body.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ApiError(422, code, field=key)
+    return value
+
+
+def _optional_int(body: dict, key: str, *, code: str) -> int | None:
+    if key not in body or body[key] is None:
+        return None
+    return _require_int(body, key, code=code)
+
+
+def _optional_bool(body: dict, key: str, *, default: bool) -> bool:
+    if key not in body:
+        return default
+    value = body[key]
+    if not isinstance(value, bool):
+        raise ApiError(422, "invalid_value", field=key)
+    return value
+
+
+def _require_idempotency_key(body: dict) -> str:
+    """幂等键：缺失或形状不符是一样的结果码与状态（§59 总表）。"""
+    key = body.get("idempotency_key")
+    if not isinstance(key, str) or not _IDEMPOTENCY_KEY_RE.match(key):
+        raise ApiError(422, CODE_IDEMPOTENCY_KEY_REQUIRED, field="idempotency_key")
+    return key
+
+
+def _request_digest(fields: Mapping[str, Any]) -> str:
+    """请求摘要：排序键、无秘密的 sha256（幂等比较只在内存里发生）。"""
+    payload = json.dumps(dict(sorted(fields.items())), ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _card_actions(record, *, is_active: bool, config_state: str) -> list[str]:
+    """卡片的可行动作（服务端判定，页面不自己推断，§59 的 ProfileCard）。
+
+    - `deleting`：删除事务没做完，只能重新预览并继续；
+    - `detached`：已经移除（保留数据），只能彻底删除或用同一账号重新绑定；
+    - 其余（`active`）：编辑、清除凭据、移除与验身份总是可用；非活动档案在
+      身份已验证且配置就绪时才多出「选中」与「选中并启动」。
+    """
+    if record.state == PROFILE_STATE_DELETING:
+        return ["remove", "purge"]
+    if record.state == PROFILE_STATE_DETACHED:
+        return ["purge", "rebind"]
+    actions = ["edit", "clear_credentials", "remove", "purge", "verify"]
+    if (
+        not is_active
+        and record.identity_state == IDENTITY_VERIFIED
+        and config_state == STATE_CONFIGURED
+    ):
+        actions = ["activate", "activate_and_start", *actions]
+    return actions
 
 
 def _desktop_intent(

@@ -5,7 +5,8 @@
 1. 读 `--run-config`：Controller 在配置锁内生成的**只含非敏感字段**的运行快照；
 2. 凭据只从子进程环境取（§7），与快照一起交给 `parse_config()` 走公共校验；
 3. 再验证发行策略：Light 里 MCP 与定时发文必须关闭（§4.2，不能只靠界面没有开关）；
-4. 打开 Store/Memory/归档**之前**取得数据档案锁（§9.5），拿不到就以退出码 4 结束；
+4. 打开 Store/Memory/归档**之前**取得数据档案锁（§9.5），拿不到、或档案已被彻底
+   删除（存在墓碑 `removed.json`，§6.2、D-145）就以退出码 4 结束；
 5. 以 Light 形态装配 `BotApp`（没有工厂 → 无工具实现，§56），把控制通道的 `stop`
    帧与父端 EOF 都转换成 `app.stop()`；
 6. 上报 `ready` / `status` / `log` 帧；原始 stdout/stderr 由父进程排空丢弃（§12）。
@@ -17,7 +18,7 @@
 不新增退出码。绑定身份的唯一入口是 `ProfileService.bind_identity()`，绝不信任前端
 自报的 `account_id`，也不把校验推迟到 `ready` 上报之后。
 
-退出码：0 正常，1 运行期致命，2 配置错误，4 数据目录不可用或被占用。
+退出码：0 正常，1 运行期致命，2 配置错误，4 数据目录不可用、被占用或档案已删除。
 """
 
 from __future__ import annotations
@@ -43,7 +44,12 @@ from raricy_bot.config import (
     parse_config,
     read_config_yaml,
 )
-from raricy_bot.data_lock import DataLockError, acquire_data_lock, data_lock_dir
+from raricy_bot.data_lock import (
+    DataLockError,
+    acquire_data_lock,
+    data_lock_dir,
+    refuse_removed_profile,
+)
 from raricy_bot.logging_setup import event_payload, get_logger, log_event
 
 from . import ipc
@@ -305,6 +311,31 @@ async def _serve(app: BotApp, reporter: _Reporter, control_fd: int) -> int:
     return EXIT_OK
 
 
+def _profile_root(config_dir: str | None, db_path: str) -> Path:
+    """档案根：`--config-dir` 就是档案目录；缺省由数据库所在目录上溯一层。
+
+    数据库文件在 `profiles/<id>/data/` 下（§13.1），因此它的父目录的父目录就是档案
+    根 —— 唯一会漏的情形是手工把 `storage.db_path` 改到档案内更深的位置（D-145 的
+    已知边界），Controller 生成的运行快照不会那样写。
+    """
+    if config_dir:
+        return Path(config_dir)
+    return data_lock_dir(db_path).parent
+
+
+def _data_locked(reporter: _Reporter, reason: str) -> int:
+    """数据目录不可用/被占用/档案已删除的统一上报路径：既有事件 + 退出码 4。"""
+    reporter.report(
+        "log",
+        {
+            "event": "worker.data_locked",
+            "level": "ERROR",
+            "fields": {"reason": reason},
+        },
+    )
+    return EXIT_DATA_LOCKED
+
+
 def _run(
     config: Config,
     reporter: _Reporter,
@@ -370,15 +401,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         lock = acquire_data_lock(data_lock_dir(config.storage.db_path))
     except DataLockError as exc:
-        reporter.report(
-            "log",
-            {
-                "event": "worker.data_locked",
-                "level": "ERROR",
-                "fields": {"reason": str(exc)},
-            },
-        )
-        return EXIT_DATA_LOCKED
+        return _data_locked(reporter, str(exc))
+
+    # 已删除的档案（墓碑）：**取得数据锁之后、打开 Store 与归档之前**拒绝（§6.2、
+    # D-145）。上报沿用既有的 `worker.data_locked` 事件与 `reason` 字段，退出码不变。
+    try:
+        refuse_removed_profile(_profile_root(args.config_dir, config.storage.db_path))
+    except DataLockError as exc:
+        lock.release()
+        return _data_locked(reporter, str(exc))
 
     try:
         fd = _open_handle_fd(args.control_handle, os.O_RDONLY)

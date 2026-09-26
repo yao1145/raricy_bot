@@ -12,8 +12,13 @@
 HTTP 服务、激活管道与互斥体（§9.3）。
 
 托盘的启停命令**不经过 HTTP**：`Controller` 自己实现 `DesktopCommands`，与
-`/api/bot/*` 走同一把生命周期门、同一个管理器、同一套稳定错误码；窗口回调只把
-结构化命令投进 `TrayCoordinator` 的队列，耗时动作在协调器线程里执行（§7.2）。
+`/api/bot/*` 走同一把生命周期门、同一个管理器、同一套稳定错误码，启停本身经
+生命周期协调器（`lifecycle_service.LifecycleService`）委派；窗口回调只把结构化
+命令投进 `TrayCoordinator` 的队列，耗时动作在托盘协调器线程里执行（§7.2、§61.2）。
+
+协调器还负责跨操作的串行化与退出意图：`start()` 在迁移对账之后、自动启动之前
+调用一次它的 `recover()`（只对账，不重放）；`request_quit()` 通知它关闭启动
+入口，让在途切换按「停止意图优先」收敛（§5.1、§5.2、D-143）。
 """
 
 from __future__ import annotations
@@ -42,10 +47,12 @@ from .config_service import (
     ConfigServiceError,
     ConfigStatus,
 )
+from .credential_lifecycle import CredentialLifecycle
 from .credential_store import CredentialStore, SessionMemoryStore, SystemKeyringStore
 from .desktop_settings import DesktopSettings, DesktopSettingsError, DesktopSettingsService
 from .events import EventService
 from .lifecycle_gate import LifecycleGate
+from .lifecycle_service import LifecycleService
 from .migration import MigrationResult, MigrationService
 from .platform import (
     InstanceGuard,
@@ -63,6 +70,7 @@ from .process_manager import (
     WorkerSpec,
     default_worker_spec,
 )
+from .profile_removal import RemovalService
 from .profile_service import ProfileService
 from .session import SessionManager
 from .startup_service import StartupService
@@ -70,8 +78,17 @@ from .status_service import StatusService
 from .tray_model import TrayView
 from .tray_service import CODE_CONFIG_NOT_READY, CODE_LIFECYCLE_BUSY, CODE_QUITTING
 from .tray_service import TrayCommandError, TrayCoordinator
+from .verification import VerificationStore
 
 _RUNTIME_FILE = "launcher-runtime.json"
+
+# 协调器的稳定码 → 托盘端口的稳定码（§61.2）。表外的一律按「配置不可用」报告：
+# 托盘的启停只经协调器抛出配置/目录类故障，这一侧与 N3 的既有口径一致。
+_TRAY_COMMAND_CODES: dict[str, str] = {
+    CODE_CONFIG_NOT_READY: CODE_CONFIG_NOT_READY,
+    CODE_LIFECYCLE_BUSY: CODE_LIFECYCLE_BUSY,
+    CODE_QUITTING: CODE_QUITTING,
+}
 
 
 def _default_open_path(path: Path) -> None:
@@ -165,8 +182,16 @@ class Controller:
                     status="session_only",
                     error="SystemKeyringStore",
                 )
+        # 凭据引用归属索引（N2 Task 2、D-144）：提交、清除与卡片查询共用同一个实例；
+        # 与配置服务分开的写锁，调用顺序固定为「配置锁 → 生命周期锁」。
+        self._credential_lifecycle = CredentialLifecycle(
+            self._data_root, store=self._credentials
+        )
         self._config = ConfigService(
-            self._data_root, credential_store=self._credentials, profile_id=profile_id
+            self._data_root,
+            credential_store=self._credentials,
+            profile_id=profile_id,
+            credential_lifecycle=self._credential_lifecycle,
         )
         # 桌面偏好与登录启动项（§58、§59）：装配一次，API 与后续的自动运行解析共用；
         # 注册表适配器在这里惰性取得，测试用替身注入 `LocalApi`，不碰真实注册表。
@@ -177,6 +202,23 @@ class Controller:
         self._profiles = ProfileService(
             self._data_root, base_config_service=self._config
         )
+        # 移除服务（N2 Task 3、D-145）：预览令牌只存内存，HTTP 入口与协调器的删除
+        # 命令必须看到同一张表，所以只装配一个实例、两边共用。
+        self._removal = RemovalService(
+            self._data_root,
+            profiles=self._profiles,
+            credentials=self._credential_lifecycle,
+            desktop_settings=self._desktop_settings,
+            # 判据与状态聚合一致：进程句柄在场才算「这个档案在跑」（延迟取值，
+            # 协调器在它之后才装配）。
+            running_profile=lambda: (
+                self._lifecycle_service.running_profile_id()
+                if self._lifecycle_service is not None
+                else None
+            ),
+        )
+        # 一次性验证票据（N2 Task 4、D-146）：只存内存，`stop()` 里全部作废。
+        self._verification = VerificationStore()
         # v1 迁移（§10）：服务在装配期构造，真正的迁移在 `start()` 的第一步跑；
         # 结果留在这里供 `_auto_start()` 判断（迁移未完成不自动运行机器人）。
         self._migration = MigrationService(
@@ -195,15 +237,33 @@ class Controller:
             stop_budget_ms=stop_budget_ms,
             on_event=self._on_worker_event,
         )
+        # 站点测试与启停共用的生命周期门：进程内单实例，随控制器一起装配
+        # （§59、D-132）。互斥范围就是这个对象，所以只能有一个。
+        self._lifecycle = LifecycleGate()
+        # 跨操作的串行化、取消代次与 A→B 事务（§5.1、§5.2、D-143）：与上面的单次
+        # 操作短租约是**两层**，共用同一个门对象（协调器不重写门、也不绕过门）。
+        # 托盘命令经它委派，`start()` 与 `request_quit()` 也在下面接上它。
+        self._lifecycle_service = LifecycleService(
+            data_root=self._data_root,
+            profiles=self._profiles,
+            manager=self._manager,
+            gate=self._lifecycle,
+            events=self._events,
+            logger=self._logger,
+            # 阶段事件带目标档案（§59）：钩子只拿到 operation_id 与阶段码，
+            # 档案由控制器按记录补上。
+            stage_hook=self._on_lifecycle_stage,
+            # 删除命令经同一个移除服务（令牌表只有一张）。
+            removal=self._removal,
+        )
         self._status = StatusService(
             instance_id=self._instance_id,
             config_service=self._config,
             manager=self._manager,
             profile_service=self._profiles,
+            # 未完成操作优先取协调器：切换事务的阶段只有它知道（§5.2、§59）。
+            lifecycle_service=self._lifecycle_service,
         )
-        # 站点测试与启停共用的生命周期门：进程内单实例，随控制器一起装配
-        # （§59、D-132）。互斥范围就是这个对象，所以只能有一个。
-        self._lifecycle = LifecycleGate()
         self._api: LocalApi | None = None
         self._server = None
         self._api_thread: threading.Thread | None = None
@@ -268,6 +328,9 @@ class Controller:
         """绑定回环端口、启动 API 与激活管道、发布运行元数据。"""
         # 第一步是 v1 迁移：它在任何对外接口起来之前把数据根接管完（§10.6）。
         self._run_migration()
+        # 第二步是协调器的启动对账（§5.2 故障表第 8 行）：必须在 `_auto_start()`
+        # 之前完成，页面从接口可用那一刻读到的操作状态就已是已对账的。
+        self._recover_lifecycle()
         self._start_api()
         self._listener = self._platform.create_activation_listener()
         self._listener.start(self._handle_activation)
@@ -325,6 +388,9 @@ class Controller:
 
     def _stop_locked(self) -> None:
         """真正的关闭步骤；只在 `stop()` 的关闭锁里执行。"""
+        # 拆机路径也要关闭协调器的启动入口（`stop()` 可以直接被调用、不经过
+        # `request_quit()`）：先提高取消代次、置 `_quitting`，再回收 Worker（§5.1 第 1 条）。
+        self._lifecycle_service.request_quit()
         self._manager.shutdown()
         # 停托盘协调器（有界等待），再关图标：窗口与图标的真正释放在拥有它的
         # 线程上完成（Task 4），这里只登记关闭意图。
@@ -340,6 +406,8 @@ class Controller:
         if watcher is not None and watcher is not threading.current_thread():
             watcher.join(timeout=2)
         self._sessions.revoke_all()
+        # 验证票据同样作废：进程退出后必须重新登录站点验证身份（§59、D-146）。
+        self._verification.revoke_all()
         self._events.close()
         if self._server is not None:
             self._server.should_exit = True
@@ -371,8 +439,15 @@ class Controller:
         self._api = None
 
     def request_quit(self) -> None:
-        """请求退出；有托盘就同时请它关闭消息循环（线程安全，幂等）。"""
+        """请求退出；通知生命周期协调器，有托盘就同时请它关闭消息循环。
+
+        顺序（§5.1 第 1 条）：先通知协调器再关托盘 —— 退出意图一落，排队中的启动/
+        重启/切换后的启动就再也追不上它（`submit()` 与 `start_bot()` 回 `quitting`），
+        在途切换会在提交指针前后分别落 `cancelled_by_stop` / `selected_only`，两种情况
+        都不再启动 Worker。线程安全、幂等。
+        """
         self._quit.set()
+        self._lifecycle_service.request_quit()
         tray = self._tray
         if tray is not None:
             tray.request_close()
@@ -405,6 +480,33 @@ class Controller:
             "launcher.migration",
             status=result.stage,
             error=result.metadata_fault or result.error,
+        )
+
+    def _recover_lifecycle(self) -> None:
+        """协调器的启动对账：把在途的 `activate` / `remove` / `credentials_clear` 记录
+        标成 `interrupted` / `error="controller_restart"`（§5.2 故障表第 8 行）。
+
+        **只对账，不重放**：不启动 Worker、不改活动指针、不清除任何东西；要不要继续
+        由用户在看到操作记录后显式发起。对账失败不阻断控制面启动（管理页与恢复入口
+        仍要能打开），只记一条可区分的日志；记录本身留在 `operations/` 里不动。
+        """
+        try:
+            summary = self._lifecycle_service.recover()
+        except Exception as exc:
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "launcher.lifecycle_recover",
+                status="failed",
+                error=type(exc).__name__,
+            )
+            return
+        log_event(
+            self._logger,
+            logging.INFO,
+            "launcher.lifecycle_recover",
+            status="ok",
+            count=len(summary["interrupted"]),
         )
 
     def _auto_start(self) -> None:
@@ -701,6 +803,12 @@ class Controller:
             lifecycle_gate=self._lifecycle,
             desktop_settings=self._desktop_settings,
             startup_service=self._startup_service,
+            # 账号 API 的依赖（N2 Task 4、§59）：协调器、移除服务（与协调器同一个
+            # 实例）、凭据归属索引与只存内存的验证票据。
+            lifecycle_service=self._lifecycle_service,
+            removal_service=self._removal,
+            credential_lifecycle=self._credential_lifecycle,
+            verification_store=self._verification,
         )
         api = self._api  # 线程只认这个局部引用：stop() 会先把 self._api 置空
         self._api_thread = threading.Thread(
@@ -769,53 +877,38 @@ class Controller:
     # --- 托盘命令端口（§61.2） --------------------------------------------
 
     def start_bot(self) -> str:
-        """托盘入口：启动已保存版本；没有已保存配置就是 `config_not_ready`。"""
-        saved = self._load_saved_for_operation()
-        return self._dispatch_bot_operation("start", saved)
+        """托盘入口：经协调器启动活动档案的已保存版本，返回管理器 operation_id。
+
+        协调器内部仍**先取生命周期门**再调管理器（`_dispatch_single()`，租约只覆盖
+        派发本身），取不到门或切换事务在途就是 `lifecycle_busy`；没有已保存配置是
+        `config_not_ready`（D-132、§59）。
+        """
+        return self._tray_command(self._lifecycle_service.start_bot)
 
     def stop_bot(self) -> str:
-        """托盘入口：停止 Worker；不要求已保存配置（与 `/api/bot/stop` 一致）。"""
-        return self._dispatch_bot_operation("stop", None)
+        """托盘入口：经协调器停止 Worker；不要求已保存配置（与 `/api/bot/stop` 一致）。
+
+        停止也不受「有未完成的协调器操作」阻挡：它只提高取消代次（停止意图优先）。
+        """
+        return self._tray_command(self._lifecycle_service.stop_bot)
 
     def restart_bot(self) -> str:
-        """托盘入口：重启到已保存版本；没有已保存配置就是 `config_not_ready`。"""
-        saved = self._load_saved_for_operation()
-        return self._dispatch_bot_operation("restart", saved)
+        """托盘入口：经协调器重启到活动档案的已保存版本，返回管理器 operation_id。"""
+        return self._tray_command(self._lifecycle_service.restart_bot)
 
-    def _load_saved_for_operation(self) -> int:
-        """启停要的目标版本；读不到已保存配置时抛稳定码，不把原文带出去。"""
-        try:
-            saved = self._config.load_saved()
-        except ConfigServiceError:
-            # 元数据损坏与「还没配置」在托盘这一侧都是「配置不可用」。
-            raise TrayCommandError(CODE_CONFIG_NOT_READY) from None
-        if saved is None:
-            raise TrayCommandError(CODE_CONFIG_NOT_READY)
-        return saved.revision
+    def _tray_command(self, action: Callable[[], str]) -> str:
+        """协调器的稳定码 → 托盘端口的稳定码（§61.2）；成功原样返回 operation_id。
 
-    def _dispatch_bot_operation(self, kind: str, revision: int | None) -> str:
-        """先取生命周期租约再派发，`finally` 释放：与 `api.py` 的 HTTP 路径完全同形。
-
-        租约只覆盖派发本身，不跨长等待；取不到门就是 `lifecycle_busy`，绝不另开
-        一条不过门的控制路径（D-132、§59）。
+        协调器抛的 `ConfigServiceError`（含档案的 `ProfileError`）消息就是稳定码：
+        表内的三种原样转出；其余档案/目录故障在托盘这一侧与「配置不可用」同一结果
+        （真实原因由状态聚合的 `config.state` 承载），异常原文不进日志或页面事件。
         """
-        ticket = self._lifecycle.begin_operation(kind)
-        if ticket is None:
-            raise TrayCommandError(CODE_LIFECYCLE_BUSY)
         try:
-            if kind == "start":
-                operation = self._manager.start(revision=revision)
-            elif kind == "stop":
-                operation = self._manager.stop()
-            else:
-                operation = self._manager.restart(revision=revision)
-        finally:
-            self._lifecycle.end(ticket)
-        if operation.result == "quitting":  # 管理器的结果码：退出流程已经开始
-            raise TrayCommandError(CODE_QUITTING)
-        if operation.state == OP_FAILED:  # 例如上一次重启还在途，管理器拒绝这一次
-            raise TrayCommandError(CODE_LIFECYCLE_BUSY)
-        return operation.operation_id
+            return action()
+        except ConfigServiceError as exc:
+            raise TrayCommandError(
+                _TRAY_COMMAND_CODES.get(str(exc), CODE_CONFIG_NOT_READY)
+            ) from None
 
     def status_snapshot(self) -> dict:
         """完整状态快照；可能阻塞（读凭据库），退出流程开始后抛 `quitting`。"""
@@ -931,12 +1024,34 @@ class Controller:
         )
 
     def _on_worker_event(self, name: str, fields: dict, level: str = "info") -> None:
-        """把进程阶段与 Worker 上报折进事件缓冲（§12）。
+        """把进程阶段与 Worker 上报折进事件缓冲（§12），并标上事件归属（§59）。
 
         帧本身由管理器消费（它负责最近状态快照）；控制器只把事件转发出去，
         不再自己抽帧 —— 两边都抽会让快照永远空着（审查 I3）。
+
+        归属取管理器**在途操作**的目标档案（`Operation.profile_id`，派发时就固定）：
+        全局事件（没有在途操作）保持 `None`。帧里同名的字段先拿掉 —— 归属是控制器
+        的事实，不由上游帧自报，也避免与显式关键字参数撞名。
         """
-        self._events.publish(name, level=level, **fields)
+        operation = self._manager.current_operation()
+        tagged = {key: value for key, value in fields.items() if key != "profile_id"}
+        self._events.publish(
+            name,
+            level=level,
+            profile_id=operation.profile_id if operation is not None else None,
+            **tagged,
+        )
+
+    def _on_lifecycle_stage(self, operation_id: str, stage: str) -> None:
+        """协调器的阶段事件（§59）：带目标档案，页面据此只显示当前账号的进度。"""
+        record = self._lifecycle_service.operation(operation_id)
+        self._events.publish(
+            "launcher.lifecycle_stage",
+            profile_id=record.profile_id if record is not None else None,
+            kind=record.kind if record is not None else None,
+            stage=stage,
+            status=record.state if record is not None else None,
+        )
 
     # --- 元数据 -----------------------------------------------------------
 

@@ -1,8 +1,26 @@
 <script lang="ts">
   import * as api from "./api";
-  import { conflictNotice } from "./texts";
+  import {
+    CONFIG_STATE_LABELS,
+    IDENTITY_LABELS,
+    PROFILE_STATE_LABELS,
+    accountCodeNotice,
+    conflictNotice,
+  } from "./texts";
 
-  let { status, onchanged }: { status: api.StatusSnapshot; onchanged: () => void } = $props();
+  let {
+    status,
+    profile = null,
+    epoch = null,
+    onchanged,
+  }: {
+    status: api.StatusSnapshot;
+    /** 当前活动档案的卡片（来自 `GET /api/profiles`），没有选中时为 null。 */
+    profile?: api.ProfileCard | null;
+    /** 状态 DTO 的活动代次；过渡写入口要原样带上（§59、D-146）。 */
+    epoch?: number | null;
+    onchanged: () => void;
+  } = $props();
 
   let busy = $state(false);
   let message = $state<string | null>(null);
@@ -24,6 +42,7 @@
     needs_setup: "尚未配置",
     needs_credentials: "需要重新填写凭据",
     invalid: "配置无效",
+    no_selection: "没有选中账号",
   };
 
   async function act(action: "start" | "stop" | "restart"): Promise<void> {
@@ -31,7 +50,12 @@
     failure = null;
     message = null;
     try {
-      const operation = await api.botAction(action, status.config.revision ?? undefined);
+      // 启停的过渡门：请求要带当前活动档案与代次，缺字段会被服务端回
+      // 409 client_upgrade_required（§59、D-146）；停止不需要这两个字段。
+      const operation = await api.botAction(action, {
+        profileId: status.active_profile_id ?? null,
+        epoch,
+      });
       await poll(operation.operation_id);
     } catch (error) {
       failure = describe(error);
@@ -63,7 +87,7 @@
       if (error.status === 401) return "会话已失效，请重新打开管理页。";
       if (error.code === "config_not_ready") return "还没有可用的正式配置，请先在设置里保存。";
       // 固定文案集中在 texts.ts；未命中的码才回退到原始码。
-      return conflictNotice(error.code) ?? `操作被拒绝：${error.code}`;
+      return conflictNotice(error.code) ?? accountCodeNotice(error.code) ?? `操作被拒绝：${error.code}`;
     }
     return "操作失败；请查看近期事件里的固定事件码。";
   }
@@ -92,6 +116,41 @@
   const memory = $derived(snapshot("memory"));
   const archive = $derived(snapshot("archive"));
 </script>
+
+<div class="panel">
+  <h2>当前账号</h2>
+  {#if profile}
+    <dl class="kv">
+      <dt>标签</dt>
+      <dd>{profile.display_name || "（未设置）"}</dd>
+      <dt>账号</dt>
+      <dd>{profile.account ?? "（未填写）"}</dd>
+      <dt>稳定 ID</dt>
+      <dd>{profile.site_user_id ?? "（未验证）"}</dd>
+      <dt>档案</dt>
+      <dd>
+        <span class="state" class:ok={profile.state === "active"} class:warn={profile.state !== "active"}>
+          {PROFILE_STATE_LABELS[profile.state] ?? profile.state}
+        </span>
+        <span class="state" class:ok={profile.identity_state === "verified"} class:warn={profile.identity_state !== "verified"}>
+          {IDENTITY_LABELS[profile.identity_state] ?? profile.identity_state}
+        </span>
+        {#if profile.is_active}<span class="state ok">当前选中</span>{/if}
+        {#if profile.is_running}<span class="state ok">运行中</span>{/if}
+        {#if profile.is_startup_target}<span class="state warn">启动目标</span>{/if}
+      </dd>
+      <dt>配置状态</dt>
+      <dd>
+        <span class="state" class:ok={profile.config.state === "configured"} class:warn={profile.config.state !== "configured"}>
+          {CONFIG_STATE_LABELS[profile.config.state] ?? profile.config.state}
+        </span>
+      </dd>
+    </dl>
+    <p class="hint">账号的添加、切换与移除都在「账号」页；这里只显示当前选中档案的事实。</p>
+  {:else}
+    <p class="hint">当前没有选中的账号档案；到「账号」页选择或添加一个。</p>
+  {/if}
+</div>
 
 <div class="panel">
   <h2>机器人</h2>

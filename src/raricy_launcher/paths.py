@@ -36,6 +36,8 @@ from pathlib import Path
 from uuid import uuid4
 
 LAUNCHER_FILE: str = "launcher.json"
+# 凭据引用归属索引：与 launcher.json 同级，**不含任何秘密取值**（§7、D-144）。
+CREDENTIALS_INDEX_FILE: str = "credentials-index.json"
 # 桌面偏好：与 launcher.json 同级，独立于任何档案（§8、D-142）。
 DESKTOP_FILE: str = "desktop.json"
 RUNTIME_DIR: str = "runtime"
@@ -44,6 +46,10 @@ OPERATIONS_DIR: str = "operations"
 MIGRATION_DIR: str = "migration"
 PROFILES_DIR: str = "profiles"
 PROFILE_FILE: str = "profile.json"
+# 彻底删除后的墓碑（§6.2）：档案目录里只留它、`data/` 与锁文件。名字与
+# `raricy_bot.data_lock.REMOVED_MARKER_FILE` 必须逐字相同 —— 核心包不能依赖
+# Launcher 包，两边各有一份定义，共享入口按同一文件名判定（D-145）。
+REMOVED_FILE: str = "removed.json"
 CONFIG_FILE: str = "config.yaml"
 DRAFT_FILE: str = "draft.yaml"
 REVISIONS_DIR: str = "revisions"
@@ -57,6 +63,10 @@ ERROR_LOGS_SUBDIR: str = "errors"
 # 档案 id：**只允许小写**（Windows 目录名不区分大小写，大小写混写会让同一个目录
 # 出现两个指针），并排除 Windows 保留设备名。
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+# 协调器操作 id：随机生成、形状固定（`op-` + 12 位小写十六进制），校验它是为了让
+# 「记录路径」不接受调用方拼出来的名字 —— 同一个 `operations/` 目录里还有迁移记录，
+# 按形状识别名字也顺带把两者分开。
+_OPERATION_ID_RE = re.compile(r"^op-[0-9a-f]{12}$")
 _RESERVED_STEMS: frozenset[str] = frozenset(
     {"con", "prn", "aux", "nul"}
     | {f"com{index}" for index in range(1, 10)}
@@ -76,6 +86,11 @@ def default_data_root() -> Path:
 def launcher_json_path(data_root: Path) -> Path:
     """活动档案指针与 Launcher schema 的位置（非敏感）。"""
     return Path(data_root) / LAUNCHER_FILE
+
+
+def credentials_index_path(data_root: Path) -> Path:
+    """凭据引用归属与清理状态的位置（非敏感，只计算路径、不创建；§7、D-144）。"""
+    return Path(data_root) / CREDENTIALS_INDEX_FILE
 
 
 def desktop_json_path(data_root: Path) -> Path:
@@ -99,6 +114,22 @@ def operations_dir(data_root: Path) -> Path:
 def migration_dir(data_root: Path) -> Path:
     """v1 迁移的备份与清单目录（只计算路径，不创建）。"""
     return Path(data_root) / MIGRATION_DIR
+
+
+def operation_record_path(data_root: Path, operation_id: str) -> Path:
+    """一次协调器操作的最小恢复记录位置（只计算路径，不创建）。
+
+    `operation_id` 必须先过形状校验：它来自内部生成，但读取路径也要能用同一判据
+    从 `operations/` 里认出「这是协调器的记录」，因此拒绝任何不符合 `op-` 形状的名字
+    （迁移记录与手工放进来的文件都不认）。再按档案目录同一口径做包含检查。
+    """
+    if not isinstance(operation_id, str) or not _OPERATION_ID_RE.match(operation_id):
+        raise ValueError("invalid_operation_id")
+    root = normalize_path(data_root)
+    path = normalize_path(root / OPERATIONS_DIR / f"{operation_id}.json")
+    if not is_within(root, path):
+        raise ValueError("operation_outside_data_root")
+    return path
 
 
 def profiles_root(data_root: Path) -> Path:
@@ -138,6 +169,11 @@ def profile_dir(data_root: Path, profile_id: str) -> Path:
 def profile_json_path(profile: Path) -> Path:
     """档案记录（稳定身份、生命周期状态与 revision）的位置（只计算路径，不创建）。"""
     return Path(profile) / PROFILE_FILE
+
+
+def removed_json_path(profile: Path) -> Path:
+    """彻底删除后的墓碑位置（只计算路径、不创建；§6.2、D-145）。"""
+    return Path(profile) / REMOVED_FILE
 
 
 def config_path(profile: Path) -> Path:

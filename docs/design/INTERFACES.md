@@ -1014,14 +1014,159 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   类型不对、`startup_profile_id` 不是合法档案 id、超过字节上限）、`desktop_unsupported_version`
   （`schema_version` 大于本程序）、`desktop_settings_write_failed`（写盘失败）。`str(exc)`
   就是码，不含路径、命令或异常原文。
+- **操作记录**（`operations/<id>.json`、§5.2、N2、D-143）：协调器操作的**最小恢复记录**，
+  形状固定，由 `lifecycle_service.OperationRecord.to_document()` 生成（键顺序固定）：
 
+  | 字段 | 含义 |
+  |---|---|
+  | `schema_version` | 记录版本，当前 `OPERATION_SCHEMA_VERSION = 1` |
+  | `operation_id` | `op-` + 12 位小写十六进制；同时是文件名（`paths.operation_record_path()` 按形状校验，`operations/` 里的迁移记录因此不会被认成操作记录） |
+  | `kind` | `activate` / `remove` / `credentials_clear`；**单次启停不写恢复记录**（D-143） |
+  | `state` | `reserved` / `running` / `finished` / `failed` / `cancelled` / `interrupted` |
+  | `stage` | 固定阶段码（见 §59）；成功收尾停在 `finished`，失败/取消保留出事时的阶段 |
+  | `profile_id` | 目标档案；`from_profile_id` / `to_profile_id` 是提交前后的指针（恢复时据此判断「已切到谁」） |
+  | `target_revision` / `target_epoch` | 本次操作钉住的配置 revision，以及**预留时**断言的活动代次 |
+  | `idempotency_key` / `retry_of` | 幂等键；`retry_of` 指向同一档案同一 `kind` 的最近失败/取消/中断记录（**纯诊断**，服务层的续做靠档案状态与阶段，不重放它） |
+  | `started_at` / `updated_at` / `finished_at` | ISO 时间；`finished_at` 非空即终态 |
+  | `error` / `result` | 固定错误码 / 结果码（取值见 §59）；`error` 与 `result` 不同时出现 |
+  | `credentials` | `[{"ref": <不透明引用>, "state": <清理状态>}]`；**不含取值** |
+  | `managed_paths` | 受管相对路径（移除/清除用），不含绝对路径 |
+
+  写入与配置提交同一手法（同目录临时文件 + flush + fsync + `os.replace`），**关键副作用之前**
+  先落盘；写不进去就让操作失败（`record_write_failed`），绝不在没有记录的情况下继续做副作用。
+  记录里**不得**出现聊天、System Prompt、KB/记忆正文、密码、模型 Key 或原始异常文本。
+  读记录只认 `operations/` 下形状合法的文件名：读不出来的**只记名字**，不改写、不删除。
+  清理只对 `state == "finished"` 生效（最多 `MAX_OPERATION_RECORDS = 50` 条，先删最旧），
+  `failed` / `interrupted` / `cancelled` 永不自动丢弃 —— 未完成的清理任务不能随日志轮转丢失。
+- **协调器的两个档案写入口**（N2、D-143）：`LifecycleService` 经 `ProfileService` 的
+  `commit_activation(profile_id, *, expected_epoch=None) -> int` 提交活动指针（写锁内「读—
+  校验 `active_epoch`—一次写入 `active_profile` / `active_epoch + 1` / `catalog_revision + 1`」，
+  不符抛 `revision_conflict`，返回新代次）；目录 revision 因此跟着前进，旧页面拿旧值再提交
+  会被 `revision_conflict` 挡住。N1 的 `activate()` 保留原样（低层语义不变：只写指针与代次，
+  **不** bump `catalog_revision`），两个入口共用同一段「读—校验—一次写入」，不产生第二份
+  实现。`set_state(profile_id, *, state, expected_profile_revision=None)` 改档案生命周期
+  状态（`state` ∈ `{active, detached, deleting}`，其他值抛 `invalid_profile_state`；写
+  `profile_revision + 1`，带期望值时不符抛 `revision_conflict`）**尚未实现**，是删除路径
+  （N2 Task 3）要补的目标形状（必须原子、走配置写锁）。
+
+- **凭据引用归属索引**（N2、D-144）：`credentials-index.json` 与 `launcher.json` 同级
+  （`paths.CREDENTIALS_INDEX_FILE` / `credentials_index_path()`），UTF-8 JSON，写入用
+  同目录临时文件 + flush + fsync + `os.replace`。形状固定：顶层
+  `{"schema_version": 1, "index_revision": 4, "entries": [...]}`，条目为
+  `{"ref": "…", "profile_id": "p-…", "kinds": ["password", "llm_api_key"], "state": "owned",
+  "revision": 7, "created_at": "…", "updated_at": "…", "last_error": null}`。
+  `index_revision` 每次写入 +1；`kinds` 只取 `password` / `llm_api_key`（账号名不在其中）；
+  `revision` 是引用它的配置 revision，未被引用时为 `null`；`last_error` 是稳定类别码。
+  文档**不含**任何秘密取值（密码、模型 Key、账号名都不写）。五种 `state`：`pending`
+  （已登记、凭据库写入未确认，或写入成功但还没有 revision 引用）、`owned`（已被某个
+  revision 引用）、`revoked`（已从凭据库删除）、`pending_removal`（申请删除但后端失败，
+  可重试）、`orphan`（创建失败且回滚删除也失败）。读取分级与 D-130 同口径：文件不存在 →
+  空索引；`OSError` → `credentials_index_unreadable`；JSON 或结构非法 →
+  `credentials_index_corrupt`（含超体积、顶层不是对象、版本类型不对、条目字段形状不对）；
+  `schema_version` 大于本程序 → `credentials_index_unsupported_version`。三种故障都
+  **不覆盖现场**，并让破坏性操作（`clear()` 与 Task 3 的移除）在写任何东西之前失败。
+- **先登记后写库**（§6.3、D-144）：`CredentialLifecycle.reserve(profile_id=…, kinds=…)`
+  先把 `pending` 条目落盘并返回新引用，调用方才写凭据库；提交成功后 `confirm(ref,
+  profile_id=…, revision=…)` 标成 `owned`，提交失败则 `abandon(ref)` 尽力删除（删不掉
+  留 `orphan` + `last_error`）。回读不一致仍抛 `credential_readback_mismatch`，且**不删除**
+  不确定的引用（D-127），只把条目留在 `pending` 并记 `last_error`。`ConfigService.commit()`
+  的凭据步骤因此是 reserve → put → 回读 → confirm/abandon；构造参数新增
+  `credential_lifecycle=None`（缺省保持旧路径，仅供不装配索引的孤立测试），`for_profile()`
+  的签名与共享语义不变，只把该对象一并传给绑定实例。
+- **历史引用并集**（§6.1、D-144）：`reconcile(profile_id)` 读该档案 `config.yaml` 与
+  `revisions/*.yaml` 里出现过的 `credentials_ref`，与索引并集：未见过的引用按 `owned`
+  登记（`revision` 取引用它的最大版本），已经是 `pending` 但配置里确实引用了它的条目
+  **认领回 `owned`**（确认前崩溃的恢复路径），并返回 `{"registered", "claimed",
+  "unreadable"}` 计数。`reconcile_all(profile_ids)` 在 `Controller.start()` 的 `recover()`
+  之后跑一次，只读 YAML + 写索引、**不碰凭据库**。`clear()` 撤销的是这个并集（当前版本
+  与全部历史快照），不是当前那一条。**读不出来的历史快照不当成「没有引用」**（与 D-130
+  同口径）：它记录的引用既登记不了也撤销不了，因此照常推进能做的删除，但把这类文档
+  记入 `ClearResult.unreadable_documents`（相对数据根的路径）并让 `ok=False`，
+  `reconcile` / `reconcile_all` 的摘要带 `unreadable` 计数，只读的
+  `unreadable_documents(profile_id)` 供卡片与移除预览判断 `unknown_ownership`；
+  清除因此可能仍有残留，调用方必须显示 `credentials_cleanup_pending` 与人工核对提示，
+  不得显示成「已清干净」。旧版本留下的、完全失去引用的 `RaricyBotLight` 条目**不枚举、
+  不批量删除**（归属未知），只在页面与使用手册里提示到 Windows 凭据管理器人工清理。
+- **清除范围与 `needs_credentials` 的新判据**（§6.1、D-144）：`clear(profile_id, kinds=…)`
+  的 `kinds` 是 `{password, llm_api_key}` 的非空子集，空集或未知类别 →
+  `credential_scope_required`。还有保留项时先把保留项复制到**新引用**（先登记后写库），
+  再逐个撤销该档案的受管旧引用；两类都清时不建新引用（`credentials_ref=None`）。
+  单条删除失败不中止其余：失败的条目标 `pending_removal` + `last_error` 并留在索引里。
+  `ClearResult(new_ref, revoked, pending_refs, ok, unreadable_documents)`：`pending_refs`
+  是删除失败、可重试的引用，`unreadable_documents` 是读不出来的历史文档（可能有残留），
+  `ok` 只在两者都空时为真；`ok=False` 时调用方必须把档案留在不可启动态并显示
+  `credentials_cleanup_pending`（不谎报已清除）。`retry_pending(profile_id)` 重试
+  `pending_removal` / `orphan`（口径与 `clear()` 一致：重试成功也不等于已清干净）；
+  `pending_profiles()` 供卡片与预览查询（含 `pending`：写过、还没有 revision 引用的
+  条目也算清理待办）。
+  `ConfigService.commit_credentials_clear(expected_revision=…, credentials_ref=…, account=…)`
+  只改 `_launcher.credentials_ref`（`account` 非空时一并写账号名，其余键原样保留），写
+  `revisions/<n>.yaml` + 原子替换（沿用 `_write_document`），字段与策略校验用
+  `allow_missing_required=True`：清除后**配置结构仍然有效**，能否启动交给 `status()` ——
+  `store.get()` 成功后 `username` / `password` / `llm_api_key` 任一为空即
+  `needs_credentials`（`error=None`，与「没有引用」同形）。`_validate(allow_missing_required=
+  False)` 的必填语义不变；`PUT /api/config` 的 `{"action":"delete"}` 仍回 409
+  `credential_delete_unavailable`（D-131 不变，文案改成指向新的独立清除入口）。
+- **档案状态与删除墓碑**（N2 Task 3、§6.2、D-145）：`profile.json` 的 `state` 取
+  `active`（可用档案）/ `detached`（保留数据的移除：凭据已撤销、不再参与启动与查重，
+  可以重新绑定同一账号）/ `deleting`（删除事务已登记：拒绝启动、拒绝配置与草稿写入，
+  → `profile_state_conflict`，判定落在激活校验与账号页路由上）。
+  `ProfileService.set_state(profile_id, state=…, expected_profile_revision=None)` 是状态
+  的唯一写入口（非法值 → `invalid_profile_state`，期望值不符 → `revision_conflict`，
+  写成功 `profile_revision` +1）；`clear_activation()` 是删除活动档案时的清空指针入口
+  （一次写入 `active_profile=None`、`active_epoch` +1 与 `catalog_revision` +1，**不**
+  自动选中别的档案）。**活动指针的显式 null 是合法状态**：`active_profile` 键存在且值
+  为 `null` 表示「当前没有选中档案」，`_resolve_pointer()` 返回 `None` 而不抛错，
+  `status()` 因此返回新增状态 **`no_selection`**（既不是 `needs_setup` 也不是
+  `recovery`）；键缺失或取值非法仍是 `metadata_pointer_invalid`（F2、D-130 不变）。
+  写路径（`ensure_first_profile()` / `require_profile()`）在没有选中档案时抛
+  `no_active_profile`，**不**自动建立并选中一个新档案。`update_catalog()` 的
+  `active_profile` 接受 `None`（清空），其余取值仍走 `validate_profile_id`。
+  **墓碑**：彻底删除后在 `profiles/<id>/removed.json` 留一份最小记录
+  `{"schema_version": 1, "profile_id": "p-…", "state": "deleted", "removed_at": "…",
+  "scope": "purge_data", "catalog_revision": n}`（`catalog_revision` 是预览时确认过的
+  目录 revision）—— 不含正文、账号或任何秘密；`data/`
+  目录与锁文件一起保留。`list_profiles()` **跳过**含墓碑的目录（不报错、不删除、不影响
+  `catalog`）；`raricy_bot.data_lock.refuse_removed_profile(profile_root)` 在共享入口
+  **取得数据锁之后、打开 Store/归档之前**拒绝已删除档案（`DataLockError("profile_removed")`），
+  两边的文件名常量 `paths.REMOVED_FILE` / `REMOVED_MARKER_FILE` 必须逐字一致。
+  边界（D-145）：旧版本程序不认识墓碑，且手工把 `storage.db_path` 改到档案内更深层时
+  `raricy_bot/__main__.py` 的检查会漏 —— 不宣称对任意旧 CLI 的保护。
+  **墓碑判定只看 `lstat`**：`ENOENT` 才是「没有墓碑」，其余（权限、占用、无法解析、
+  悬空链接）一律按有墓碑处理 —— `Path.exists()` 会把这些吞成 False，让读不出来的墓碑
+  把已删除账号重新放回 `list_profiles()`。同理，档案内的类别目标（含 `data/`）**在
+  预览、取数据锁与删除三处同一判定里拒绝链接/重解析点**：`acquire_data_lock()` 会
+  `mkdir` 并写锁文件，操作系统会穿过 junction 解析，`data/` 被指到别处时锁会落在
+  **外部目录**里；预览的大小统计对读不出来的类别把 `size_complete` 置假而不是报成
+  0 字节的完整统计。移除的操作记录里，收尾阶段的记账失败**不改写结果码**
+  （数据已删净/保留完成就是成功），只把 `record_write_failed` 记进记录的 `error`。
+
+- **验证票据**（N2 Task 4、§4.2 第 3 条、D-146）：`VerificationStore`（
+  [verification.py](../../src/raricy_launcher/verification.py)）只在**内存**里保存票据，
+  有效期 600 秒；绑定 `session_id + profile_id + 精确账号 + 精确密码 + 服务端登录得到的
+  `site_user_id`；`consume()` 一次性（成功即作废），未知/过期/已用 → `verification_invalid`，
+  会话、档案、账号或密码不符 → `verification_mismatch`（不消耗，可改正后再提交）。
+  票据对象只在 `verify` 与 `config` 两个调用之间持有密码，不落盘、不写日志、不进事件、不进
+  操作记录；`Controller.stop()` 调 `revoke_all()`，进程重启后必须重新验证。
+  `verify` 与 `/api/test/site` 共用两条判据（`manager.state ∈ {stopped, failed}` 且无未完成
+  在途操作）与同一个站点登录路径；机器人运行时不代为停止，回 409 `bot_running`，由账号页先
+  提示、再由用户调用 `/api/bot/stop`。**绝不采信前端自报的 `account_id`**：稳定 ID 一律取
+  登录结果。
+- **`detached → active` 的唯一路径**（N2 Task 4、§6.2、§59）：`detached`（保留数据的移除）
+  档案不能用 `/activate` 回到可用列表 —— 唯一路径是 `PUT /api/profiles/{id}/config` 用**同一
+  稳定 ID**的验证票据重新保存一次配置（登录得到的 ID 与存档不符时 `verify` 就回
+  `profile_identity_mismatch`）。对**已绑定**档案改名不需要票据，写的是存档里的那一个
+  `site_user_id`（`bind_identity(id, site_user_id=<存档 ID>, display_name=<新值>)`，
+  `profile_revision` +1），不新增改名方法或端点。
 ## 59. Light 控制面（会话、API、进程与事件）
 
 入口：[桌面入口](../../src/raricy_launcher/main.py)、[会话](../../src/raricy_launcher/session.py)、
 [API](../../src/raricy_launcher/api.py)、
 [进程管理](../../src/raricy_launcher/process_manager.py)、[IPC 协议](../../src/raricy_launcher/ipc.py)、
 [事件](../../src/raricy_launcher/events.py)、[状态聚合](../../src/raricy_launcher/status_service.py)、
-[生命周期门](../../src/raricy_launcher/lifecycle_gate.py)、[控制器](../../src/raricy_launcher/controller.py)、
+[生命周期门](../../src/raricy_launcher/lifecycle_gate.py)、
+[生命周期协调器](../../src/raricy_launcher/lifecycle_service.py)、
+[控制器](../../src/raricy_launcher/controller.py)、
 [启动项服务](../../src/raricy_launcher/startup_service.py)、
 [启动项适配层](../../src/raricy_launcher/platform/startup_windows.py)、
 [桌面设置](../../src/raricy_launcher/desktop_settings.py)。
@@ -1249,6 +1394,237 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   profile_epoch=)` 可选；`_test_view()` 的过期判定改为：档案 id 不同即 `stale`（两边都是
   `None` 时退回按数字 revision 比较），代次只在两边都记录了它时参与比较，数字 revision
   仍参与 —— 身份键是 `(profile_id, config_revision, profile_epoch)`（§5.1 第 6 条）。
+- **生命周期协调器**（§5.1、§5.2，N2、D-143）：`lifecycle_service.LifecycleService` 管
+  **跨操作**的串行化、取消代次与 A→B 事务，与 `lifecycle_gate` 的**单次操作短租约**是
+  两层（协调器不重写门，也不绕过门：触碰 `WorkerManager` 的那一小段仍取租约，只是取不到时
+  在门外有界等待 30 秒、每 0.2 秒重试一次，仍未取得就让操作 `failed` / `error="lifecycle_busy"`，
+  可重试）。它注入 `ProfileService`、`WorkerManager`、进程内唯一的 `LifecycleGate`、
+  可选 `EventService`；时钟、sleep 与 `exit_confirm_timeout` 可注入（测试不做真实等待）。
+  - **串行化与不排队**：任一时刻最多一个协调器操作（`activate` / `remove` /
+    `credentials_clear`）。`submit()` 在锁内检查「是否已有未完成操作」，有就抛
+    `ConfigServiceError("lifecycle_busy")`（HTTP 409），**不排队、不等待**；持锁期间只记录
+    操作租约与不可变输入（档案、revision、代次基线），绝不等 Worker、网络、keyring 或文件系统。
+    `stop` / `quit` **不进**这条队列：它们只提高取消代次，因此停止意图永远追得上在途的切换。
+  - **取消代次与停止意图优先**（§5.1 第 1 条）：`request_stop()` 先 `_generation += 1` 再
+    `manager.stop()`；`request_quit()` `+= 1` 并**永久关闭本次实例的启动入口**（此后
+    `submit()` 回 `lifecycle_busy`、`start_bot` / `restart_bot` 回 `quitting`），但它**不**调
+    `manager.begin_quit()` —— `WorkerManager.shutdown()` 已经会调。每个操作在预留时记下代次
+    基线，在**提交指针之前**与**启动 B 之前**各比较一次；本操作自己派发的停止会把基线推进
+    一格，**但只在预留之后没有别的停止到达时才推进**（从预留到派停之间有落盘与线程启动，
+    外部停止完全可能落在这一段；无条件推进会把那次意图抹掉，让事务照常提交并启动 B）。
+    代次变了就按位置落
+    `cancelled_by_stop`（提交前，保留 A）或 `selected_only`（提交后，保留 B），**两种情况都不
+    启动 Worker**（§5.2 故障表第 5 行）。所有影响活动 Worker 的命令都带代次：
+    `start_bot` / `restart_bot` 的 `expected_epoch` 与 `catalog().active_epoch` 不符时抛
+    `revision_conflict`（`None` 表示「用当前值」，托盘与本地调用走这条）。
+  - **A→B 六阶段与确定结果**（§5.2）：`validate_target → reserve_operation → stop_A →
+    confirm_A_exited → commit_active_B → invalidate_old_views → [start_B] → finished`。
+    `validate_target` 是**同步**的（在预留记录与停 A 之前）：目标必须是 `state="active"` 的
+    档案（否则 `profile_state_conflict`），代次/目录 revision 过期是 `revision_conflict`，
+    `start=True` 时还要求目标 `configured`、`expected_site_user_id()` 非空、`target_revision`
+    等于该档案已保存的 revision 且凭据可解析（任一不满足 → `target_not_ready`，A 完全不动）；
+    `start=False`（「只选中以修复」）跳过后一组检查。故障表八行的确定结果：
+
+    | 故障/用户动作 | 确定结果 |
+    |---|---|
+    | B 不完整或凭据不可用 | 启动式切换在停 A 前 `target_not_ready`；`start=false` 可选中而不启动 |
+    | A 无法确认退出 | `failed` / `error="stop_unconfirmed"`，阶段停在 `confirm_A_exited`，不切指针、不启动 B |
+    | 写活动指针失败 | `failed` / `error="catalog_write_failed"`：A 仍是活动档案但已停止，B 不启动 |
+    | 指针已提交、B 启动失败 | `finished` / `result="start_failed"`：B 保持选中，不回退到 A，失败原因由管理器操作承载 |
+    | stop 在切换期间到达 | 提交前 `cancelled_by_stop`（保留 A）、提交后 `selected_only`（保留 B）；两种都不启动 |
+    | quit 在任何阶段到达 | 同上一行（记录保留到足以恢复）；Worker 由 `manager.shutdown()` 收回，启动入口永久关闭 |
+    | 响应丢失/重复提交 | 同键同摘要回同一 `operation_id`；同键不同摘要 409 `idempotency_conflict` |
+    | Controller 崩溃 | `recover()` 把 `reserved`/`running` 改成 `interrupted` / `error="controller_restart"` 并补 `finished_at`；**只对账**，不重放、不启动、不改指针、不清除 |
+
+    「A 已退出」的判据是**进程句柄层面**的回收：`manager.worker is None` 且
+    `manager.status()["pid"] is None` 且停止结果 ∈ `{stopped, cancelled, forced_stop}`；
+    超时（`EXIT_CONFIRM_TIMEOUT_SECONDS = 2 × STOP_BUDGET_MS + 5 秒 = 45`，可注入）或结果不在
+    集合内都算未确认。目标与当前活动档案是同一个时跳过停与提交，退化成一次普通启动
+    （不写指针、不 bump epoch，结果码仍用 `started` / `selected`）。`invalidate_old_views`
+    发布事件 **`launcher.profile_activated`**（N2 Task 4 起 `profile_id` 已随
+    `FIELD_KINDS` 登记进事件，见本节的「事件归属」条；N1 的测试结果按身份键自然过期），
+    不重写任何状态。
+  - **幂等键**（§4.2、总表）：形状 `[A-Za-z0-9_-]{8,64}`（`IDEMPOTENCY_KEY_MIN_CHARS` /
+    `_MAX_CHARS`），摘要 = 规范化请求字段的 JSON 排序键 + sha256，**输入不含秘密、摘要不落盘**。
+    内存表保留最近 50 个键；服务重启后回落到记录级比较（同一键、同一 `kind`、同一目标档案、
+    同一 revision 与代次）。**命中即返回，连 `validate()` 都不再跑**（响应丢失后的重复提交
+    不产生第二次副作用，已失败/已取消的操作也回同一个 `operation_id`）；同键不同摘要回
+    `idempotency_conflict`。重试**必须换新键**：发现同一档案同一 `kind` 有
+    `failed`/`cancelled`/`interrupted` 记录时，新记录的 `retry_of` 指向最近一条（纯诊断）。
+    键缺失、形状不合格由 API 层回 422 `idempotency_key_required`（`field="idempotency_key"`）。
+  - **记录与恢复**（§58 的形状）：关键副作用之前先落盘；`state` / `stage` / `result` / `error`
+    的取值就是 §58 与上面的表。`recover()` 在 `Controller.start()` 的迁移门之后、
+    `_auto_start()` 之前调用，返回摘要 `{examined, interrupted, committed, write_failed,
+    unreadable, active_profile_id}`：`committed` 是被中断的操作里指针**已经**落到它的目标档案
+    上的那些（页面据此提示「已切到 B」还是「仍停在 A」），`unreadable` 只报文件名、不改现场。
+  - **托盘端口要绑定的签名**（N3 已合并，本节冻结；接线只做委派，签名与
+    `TrayCommandError` 稳定码不变）：`start_bot(*, expected_epoch: int | None = None) -> str`、
+    `stop_bot() -> str`、`restart_bot(*, expected_epoch: int | None = None) -> str`，都返回
+    **管理器的** `operation_id`。`stop_bot()` 走代次 + `manager.stop()`，**不受**「有未完成的
+    协调器操作」阻挡（停止意图优先）；`start_bot` / `restart_bot` 在切换事务在途时回
+    `lifecycle_busy`（不允许第二个启动与 A→B 并行）。三者都用**非阻塞**的短租约（与
+    §9.2 的启停入口同一口径），门被站点测试占住时回 `lifecycle_busy`。
+  - **状态与操作视图**：`current_operation()` 给 `StatusService` 的 `pending_operation`
+    （协调器有未完成操作时优先于管理器的在途操作，形状为记录字段 + `stage`）；
+    `operation(operation_id)` 给 `GET /api/operations/{id}`（先查协调器、再查管理器，两者都无
+    才 404），视图字段见 `OperationRecord.as_operation_view()`。旧结果按身份键归属，**不匹配就
+    丢弃**：协调器派发时固定 `profile_id` 与目标 revision，收尾只对仍是未完成态的记录生效，
+    迟到或重复的收尾不覆盖当前状态。
+  - **生产接线**（N2 Task 1b，接在 N3 之后）：`Controller` 装配进程内唯一的
+    `LifecycleService`（注入同一个 `ProfileService`、`WorkerManager`、`LifecycleGate` 与
+    `EventService`），并在 `start()` 的迁移之后、`_auto_start()` 之前调用一次 `recover()`
+    （只对账；对账失败只记日志，不阻断控制面启动）。`request_quit()` 先通知协调器
+    （关闭启动入口、提高取消代次）再关托盘消息循环；`stop()` 的拆机路径不变。
+    托盘的 `start_bot` / `stop_bot` / `restart_bot` 就是委派协调器的三个同名方法：
+    成功原样返回管理器的 `operation_id`，失败把稳定码转成 `TrayCommandError`
+    （表内三种原样，其余档案/目录故障按 `config_not_ready` 报告）。**只换入口，不换门**：
+    协调器内部对启停仍先 `begin_operation()` 取短租约再调管理器，租约不跨长等待，
+    与 `/api/bot/*` 的 HTTP 路径完全同形；托盘路径自此也在派发时固定 `profile_id`
+    与目标 revision（`_build_spec` 不再从可变活动指针推导）。
+
+- **凭据清除的稳定码**（N2、§6.1、D-144）：清除是一次独立的协调器操作
+  （`kind="credentials_clear"`），阶段固定 `stop` → `clear_credentials` → `commit_config`；
+  结果码 `cleared` / `cleared_partial` / `clear_failed`。停止未确认 → `clear_failed` /
+  `error="stop_unconfirmed"`，**什么都不清**（先停止机器人、清除凭据、移除账号是三件
+  不同的事）。`cleared_partial` 覆盖两种情形：凭据撤了但配置没写上（档案不可启动、
+  记录清理待办），配置写上了但 keyring 里有失败项。请求的 `kinds` 缺失或非法 → 422
+  `credential_scope_required`。归属索引的三种故障（`credentials_index_corrupt` /
+  `credentials_index_unreadable` / `credentials_index_unsupported_version`）→ 409，且
+  这些故障下不写任何东西；清理待办的显示码是 `credentials_cleanup_pending`，页面必须
+  如实展示并可重试，不谎报已清除。`PUT /api/config` 的 `{"action":"delete"}` 仍回 409
+  `credential_delete_unavailable`（`message` 指向新的独立清除入口）。
+- **移除服务与确认令牌**（N2 Task 3、§6.2、D-145）：`profile_removal.RemovalService`
+  只接受**档案 ID**（内部一律 `paths.profile_dir()` 解析，绝不接受调用方给的路径），
+  并把删除分成两种范围：`keep_data`（移除账号、保留本地数据 → 档案转 `detached`）与
+  `purge_data`（彻底删除 → 删业务数据、留墓碑）。`detached` 档案只允许 `purge_data`，
+  `deleting` 档案允许继续预览（重试）。
+  - **预览**（`preview(profile_id, scope=…, session_id=…)`，只读）：返回类别与大小
+    （`config` / `revisions` / `runtime` / `database` / `memory` / `knowledge` / `logs` /
+    `credentials`，有界扫描最多 20000 个条目，超出时 `size_complete=false`）、
+    `credentials` 归属摘要（`managed` / `cleanup_pending` / `unknown_ownership`，后者为真
+    表示有读不出来的历史快照，归属不完整）、`is_active` / `running` / `is_startup_target`
+    与两个 revision，并在内存里签发 `confirmation_token`（`expires_in = 300`）。
+    预览**不改任何文件、不删凭据、不写记录**；未知或已删除（墓碑）档案 →
+    `not_found`，范围非法 → `removal_scope_invalid`，路径有链接/重解析点 →
+    `removal_unsafe_path`。
+  - **令牌**：绑定 `session_id + profile_id + scope + profile_revision +
+    catalog_revision`，只存内存、一次性、不落盘不写日志；同一会话对同一档案重新预览
+    使旧令牌失效。未知/过期/已用/会话或档案不符 → `removal_token_invalid`；scope 或两个
+    revision 与预览时不同 → `removal_preview_stale`。校验在**预留记录之前**同步完成，
+    幂等命中（同键同摘要）不重跑校验，因此重复提交不会第二次消耗令牌。
+  - **执行体**（协调器命令 `LifecycleService.remove(profile_id, scope=…,
+    confirmation_token=…, session_id=…, idempotency_key=…)`，202）：阶段固定
+    `preview`（落 `deleting`、写受管路径）→ `stop`（停运行中的该档案并确认退出、**非
+    阻塞**取数据排他锁、清启动目标与活动指针）→ `clear_credentials`（先落引用与归属，
+    再撤销全部受管引用）→ `detach` / `purge_data` → `finalize`。结果码
+    `removed_detached` / `removed_purged` / `removed_partial` / `remove_failed`；
+    错误码 `data_in_use`（数据被占用，停在 `stop`）/ `stop_unconfirmed` /
+    `credential_backend_unavailable`（停在 `clear_credentials`，**不进入数据清理**）/
+    `removal_unsafe_path`（删除被拒绝：重解析点、跨卷、身份不一致、解析失败或墓碑写不
+    进去）。三种错误都表示「已清理的部分不回滚、档案留在 `deleting`、重新预览后可
+    重试」；请求范围全部完成才算成功，部分完成要如实显示已清理/未完成类别。
+  - **删除器**：逐层 `os.lstat`（绝不跟随），链接/重解析点、非普通文件、跨卷（`st_dev`
+    不同）与身份变化（`(st_dev, st_ino)` 不符）一律停止推进；`OSError` 同样拒绝，**不
+    退回字符串路径**。删除顺序是叶子文件 → 目录；`data/` 里只留 `.raricy-data.lock`，
+  档案目录里只留 `removed.json` 与 `data/`。墓碑**先于** `profile.json` 落盘，崩溃后不
+  会留下「没有记录也没有墓碑」的僵尸档案；`operations/<id>.json` 记录不随档案删除。
+  两种模式都**不提供撤销**。
+  - **记录里的受管路径**：开始阶段写本次范围（`purge_data` 的类别路径，`keep_data` 为
+  空），收尾阶段改写为**仍未完成**的路径；`credentials` 数组在动 keyring 之前先写归属
+  （`owned`），清完之后按结果写 `revoked` / `pending_removal`。
+  - **共享入口拒绝**：`raricy_bot.data_lock.refuse_removed_profile()` 在 `worker_main`
+  与完整版 CLI 取得数据锁之后、打开 Store/归档之前调用；失败沿用既有事件
+  `worker.data_locked`（`reason="profile_removed"`）与退出码 `EXIT_DATA_LOCKED = 4`，
+  不新增退出码。
+
+- **账号 API**（N2 Task 4、§4.2、§9、[verification.py](../../src/raricy_launcher/verification.py)、D-146）：
+  全部沿用既有会话（`_require_session`）、写请求校验（精确 Origin / Fetch Metadata / CSRF /
+  JSON 内容类型 / 256 KiB 上限）与**严格字段白名单**：请求体出现未列出的键 → 400
+  `bad_request`（`field` 指向第一个多余键），类型与长度错误 → 422 + 对应稳定码。
+  成功信封一律 `{"ok": true, …}`，失败信封与既有形状相同（`ok`/`code`，可选 `field`、
+  `message`、`details`）。
+
+  | 方法与路径 | 请求字段（白名单） | 成功响应 | 失败（稳定码，HTTP） |
+  |---|---|---|---|
+  | `GET /api/profiles` | — | 200 `{"ok":true,"catalog":{active_profile_id,active_epoch,catalog_revision,schema_version},"profiles":[ProfileCard…]}` | 409 元数据故障码（N0） |
+  | `POST /api/profiles` | `display_name?`、`expected_catalog_revision`、`idempotency_key` | 200 `{"ok":true,"profile_id":"p-…","catalog_revision":n}` | 409 `revision_conflict` / `idempotency_conflict` / `lifecycle_busy`；422 `invalid_value` / `invalid_revision` / `idempotency_key_required` |
+  | `GET /api/profiles/{id}/draft` | — | 200 `{"ok":true,"revision":n,"values":{…}}` | 404 `not_found`；409 `profile_state_conflict` |
+  | `PUT /api/profiles/{id}/draft` | `expected_revision`、`values`、`expected_profile_revision?` | 200 `{"ok":true,"revision":n}` | 404 `not_found`；409 `revision_conflict` / `profile_state_conflict`；422 |
+  | `POST /api/profiles/{id}/verify` | `account`（1–256 字符）、`password`（1–4096 字符） | 200 `{"ok":true,"verification_id":"…","site_user_id":"…","chat_ready":bool,"expires_in":600}`；登录失败是 200 `{"ok":false,"detail":"…"}`（与 `/api/test/site` 同形，不签发票据） | 409 `bot_running` / `lifecycle_busy` / `profile_state_conflict` / `profile_identity_taken` / `profile_identity_mismatch`；422 `invalid_test_input` |
+  | `PUT /api/profiles/{id}/config` | `expected_revision`、`expected_profile_revision`、`verification_id?`、`values`、`credentials`、`account?`、`display_name?` | 200 `{"ok":true,"revision":n,"profile_revision":n}` | 404 `not_found`；409 `verification_required` / `verification_invalid` / `verification_mismatch` / `profile_revision_conflict` / `revision_conflict` / `profile_state_conflict`；422 |
+  | `POST /api/profiles/{id}/activate` | `expected_catalog_revision`、`expected_epoch`、`target_revision?`、`start`（默认 true）、`idempotency_key` | 202 `{"ok":true,"operation_id":"op-…"}` | 409 `revision_conflict` / `target_not_ready` / `profile_state_conflict` / `lifecycle_busy` / `idempotency_conflict`；422 `idempotency_key_required` |
+  | `POST /api/profiles/{id}/removal-preview` | `scope` | 200 `{"ok":true,"preview":{…},"confirmation_token":"…","expires_in":300}` | 404 `not_found`；409 `removal_unsafe_path`；422 `removal_scope_invalid` |
+  | `POST /api/profiles/{id}/remove` | `scope`、`confirmation_token`、`idempotency_key` | 202 `{"ok":true,"operation_id":"op-…"}` | 409 `removal_token_invalid` / `removal_preview_stale` / `removal_unsafe_path` / `profile_state_conflict` / `lifecycle_busy` / `idempotency_conflict`；422 |
+  | `POST /api/profiles/{id}/credentials/clear` | `kinds`（`["password","llm_api_key"]` 的非空子集）、`idempotency_key` | 202 `{"ok":true,"operation_id":"op-…"}` | 409 `lifecycle_busy` / `idempotency_conflict` / 三种索引故障码 / `profile_state_conflict`；422 `credential_scope_required` / `idempotency_key_required` |
+  | `GET /api/operations/{id}` | — | 200 `{"ok":true,"operation":{id,kind,state,stage,result,profile_id,revision,finished}}` | 404 `not_found`（协调器与管理局都没有） |
+
+  - **202 语义**：破坏性与长操作（`activate` / `remove` / `credentials/clear`）只预留并派发，
+    立刻回 `operation_id`；页面用 `GET /api/operations/{id}` 轮询，协调器记录带 `stage`
+    （`reserve_operation` / `stop_A` / … / `finished` 等固定阶段码），管理局的单次启停 `stage` 为 `null`。
+  - **404 / 422 的映射**：服务层对未知或已删除（墓碑）档案抛 `ProfileError("not_found")`，
+    由 `api._handle()` 映射成 **404**；`idempotency_key_required` / `removal_scope_invalid` /
+    `credential_scope_required` 映射成 **422**（各自带 `field`）。其余 `ProfileError` 与
+    `ConfigServiceError` 仍是 **409** + 稳定码。
+  - **`details` 白名单**：错误信封只并入 `existing_profile_id` / `profile_id` / `operation_id` /
+    `scope` 四个键（`ApiError(details=…)` 在构造时拒绝其余键），服务层不能借它夹带路径、
+    凭据引用或异常文本。
+  - **只读语义**：`GET /api/profiles` 在空数据根回 200 + 空数组，**不创建**任何档案或指针；
+    卡片的 `config` 取自该档案自己的 `ProfileService.config_service(id).status()`，一次请求
+    内每个档案只解析一次上下文（§4.1）。`actions` 由服务端判定：`deleting` →
+    `["remove","purge"]`；`detached` → `["purge","rebind"]`；其余 → `["edit","clear_credentials",
+    "remove","purge","verify"]`，非活动档案在身份已验证且配置就绪时前面再加
+    `["activate","activate_and_start"]`。页面不自己推断可行动作（§60）。
+  - **创建与幂等**：`POST /api/profiles` 建立**非活动**档案（首个档案在全新数据根上会同时
+    写入活动指针，与 N1 的 `create_profile()` 口径一致），并立即补齐 `profile.json`。
+    串行化取生命周期门的短租约、并在协调器有未完成操作或退出流程已开始时分别回
+    `lifecycle_busy` / `quitting`（与协调器 `_require_launch_context()` 同一个标志位）。
+    幂等键的形状与比较规则和协调器一致（`[A-Za-z0-9_-]{8,64}`、锚点 `\A…\Z`；同键同摘要
+    永远回同一 `profile_id`，同键不同摘要 → 409 `idempotency_conflict`），但**幂等表只在
+    内存、没有记录级回退**：协调器的表覆盖的是写恢复记录的三种操作（`operations/<id>.json`
+    在重启后仍能按按键+摘要复用），创建不写记录，因此**进程重启后同键同体重发会再建一个
+    档案**。这是一处如实记录的缺口，不是「逐字一致」：多出来的档案是空的，可用常规移除
+    流程删掉；进程内的重复提交不受影响。迁移方向见 D-146。
+  - **清除命令的阶段与结果码**：`credentials/clear` 经协调器的 `submit()` 预留（记录写盘、
+    串行化、幂等键），执行体阶段固定 `stop` → `clear_credentials` → `commit_config`；结果码
+    `cleared` / `cleared_partial` / `clear_failed`，错误码沿用 `stop_unconfirmed` /
+    `credential_backend_unavailable` 与 `config_write_failed`（凭据清了但配置窄写失败）。
+    `clear()` 正常返回就照常 `commit_credentials_clear()`：`ok=false` 只影响结果码与卡片的
+    清理待办，不表示什么都没清；只有 `clear()` 抛异常才是「凭据库这一侧完全没动」。
+    **执行体目前住在 `api.py`**（不是计划里的 `LifecycleService.clear_credentials()`）：
+    `KIND_CREDENTIALS_CLEAR` 与阶段码仍从 `lifecycle_service` 导入，结果码
+    `cleared` / `cleared_partial` / `clear_failed` 与总表里没有的 `config_write_failed`
+    由 `api.py` 定义 —— 这是本阶段唯一的定义处，迁移目标见 D-146。
+  - **保存失败会消耗票据**：`PUT /api/profiles/{id}/config` 在 `commit()` **之前**消费
+    票据（先钉死身份，再写配置），因此提交阶段的失败（例如 `expected_revision` 与已保存
+    配置不符的 `revision_conflict`）也会让这张票据作废 —— 重试要先重新验证身份。
+    改成「提交成功后再消费」会把「验证过的那份输入」与「写进配置的那份输入」重新分开，
+    所以这是有意的取舍。输入不符（`verification_mismatch`）与状态/版本类前置拒绝
+    （`verification_required`、`profile_revision_conflict`）发生在消费之前，不消耗票据。
+- **过渡入口的活动代次门**（N2 Task 4、§9.4、D-146）：`PUT /api/config` 与
+  `POST /api/bot/{start,restart}` 的请求体必须另带 `profile_id`（等于当前活动档案）与
+  `expected_profile_epoch`（等于 `catalog().active_epoch`）：缺任一 → 409
+  `client_upgrade_required`（明确要求页面升级，**不**把改动透明转发到刚切过去的账号）；
+  在场但与当前不符 → 409 `revision_conflict`（`field` 指向 `profile_id` 或
+  `expected_profile_epoch`）。首次设置（还没有任何档案）时正确取值是
+  `profile_id: null`、`expected_profile_epoch: 0`。元数据故障（N0 的四个码）在判上下文之前
+  如实抛出。`POST /api/bot/stop` 不变（停止不受代次门限制）。
+  **门核过的档案必须一路带进写路径**：`PUT /api/config` 的工作线程只对门里核过的
+  `profile_id` 写（不在线程里重新解析活动指针），并在写前复核 `active_epoch`；门之后
+  指针被切换/删除提交改过就回 409 `revision_conflict`（`field="expected_profile_epoch"`），
+  **绝不**把这次编辑（含凭据替换）落到另一个账号上。只校验一次门、写路径再按指针解析
+  等于把竞态窗口挪了个位置 —— 两个档案 revision 同号时连 `expected_revision` 都挡不住。
+  `POST /api/bot/{start,stop,restart}` 一律经协调器的 `start_bot(expected_epoch=…)` /
+  `stop_bot()` / `restart_bot(expected_epoch=…)`：启停因此共用同一条串行化与取消代次
+  （`stop` 会提高代次，在途切换据此收敛）。请求体里的 `revision` 不再参与判定 —— 启动绑定的
+  版本一律取该档案当前已保存的那一版（`start=False` 的「只选中」不需要版本）。
+- **事件归属**（N2 Task 4、§12、D-146）：`EventService.publish(name, …, profile_id=None, **fields)`
+  把 `profile_id` 经 `logging_setup.build_event()` 的同一份白名单清洗（`FIELD_KINDS` 的
+  `TOKEN` 类型），`Event.as_dict()` 顶层带 `"profile_id"`（全局事件为 `null`，不是缺键），
+  SSE 帧因此天然携带。`Controller._on_worker_event()` 用
+  `manager.current_operation().profile_id` 给进程与 Worker 事件打标；协调器的阶段事件
+  （`launcher.lifecycle_stage`）与 `launcher.profile_activated` 带目标档案。**前端默认只展示
+  `profile_id` 为空或等于当前活动档案的事件**（Task 5）；切换档案时清掉旧表单、密码输入、
+  测试结果与待提交动作，服务端不代做这件事。
 
 ## 60. 管理页与发行（`frontend/`、`packaging/light/`）
 
@@ -1306,6 +1682,62 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   凭据后端可用 → 退出 → 元数据清理」，运行时本机不能再有另一个 Light 实例（激活通道与
   互斥体按当前用户命名）。**干净 Windows 清单（§17.2）与真实站点/模型验收仍未执行**，
   见使用手册 §7。
+- **账号页要用的字段**（N2 Task 4；服务端形状见 §59 的 ProfileCard）：页面只用
+  `GET /api/profiles` 的 `catalog`（`active_epoch` 给 `activate` 的 `expected_epoch`、
+  `catalog_revision` 给 `expected_catalog_revision`）与每张卡片的
+  `profile_id` / `display_name` / `account` / `site_user_id` / `identity_state` / `state` /
+  `profile_revision` / `config{state,revision,error}` / `is_active` / `is_running` /
+  `is_startup_target` / `credentials{backend,cleanup_pending,historical_managed,
+  unknown_ownership}` / `actions`。页面**不自己推断可行动作**，按 `actions` 呈现按钮：
+  `activate`/`activate_and_start` 只用 `catalog.active_epoch` 与 `catalog_revision`、
+  `edit` 走草稿与 `PUT …/config`、`verify` 先 `POST …/verify`（机器人运行时先提示并调用
+  `/api/bot/stop`）、`clear_credentials` 走 202、`remove`/`purge` 必须先
+  `POST …/removal-preview` 拿令牌、`rebind` 走 `PUT …/config` + 同一稳定 ID 的新票据。
+  `credentials.cleanup_pending` 为真时必须显示清理待办与重试入口（§58）。
+  切换账号后清空旧表单、密码输入、测试结果与待提交动作，并按事件归属过滤日志流（§59）。
+  `PUT /api/config` 与 `POST /api/bot/{start,restart}` 的过渡门字段由页面从 `catalog` 读出后
+  原样带上（首次设置是 `null` / `0`）。
+  **文案**：账号页的稳定码文案与 `src/raricy_launcher/texts.py` 的新增常量一一对应
+  （`client_upgrade_required` / `verification_*` / `profile_identity_*` /
+  `profile_state_conflict` / `profile_revision_conflict` / `target_not_ready` /
+  `idempotency_*` / `credential_scope_required`），页面不得另写一套说法。
+- **账号页与四个主区**（N2 Task 5、§9、D-147）：页签顺序是「状态（概览）/ 设置（当前账号
+  设置）/ 近期事件 / 桌面（桌面设置）/ 账号」——「账号」在既有页签之后新增，**不重排**
+  已有页面；「近期事件」保留入口。概览页在「有档案但一个都没选中」（`no_selection`）时
+  自动切到账号页；`needs_credentials` / `invalid` / 身份未验证各有独立提示面板与行动按钮，
+  `recovery` 仍是只读面板（不加修复按钮）。首次设置向导只在 `GET /api/profiles` 为空且
+  `config.state == needs_setup` 时出现，出现后锁定到用户保存或取消为止（保存过程中档案
+  已经建立，不能把向导从用户脚下撤走）。向导保存时先经 `POST /api/profiles` 建立首个
+  档案（空数据根上它同时成为活动档案），再用一次性票据走 `PUT /api/profiles/{id}/config`
+  绑定身份 —— **N2 起身份只能经票据写入**，无票据的 `PUT /api/config` 路径不绑定身份，
+  因此首次设置不能再只靠它完成。
+- **账号卡片与动作渲染**（N2 Task 5）：账号页是 `frontend/src/Accounts.svelte`，卡片字段
+  逐个来自 `GET /api/profiles` 的 `ProfileCard`（标签、账号、稳定 ID、身份/档案/配置三个
+  徽标、选中/运行/启动目标标记、`credentials` 摘要）；**页面不自己推断可行动作**，按钮一律
+  按服务端给的 `actions` 渲染，标签取自 `texts.ts` 的 `PROFILE_ACTION_LABELS`。动作语义：
+  `activate` / `activate_and_start` 带 `catalog.active_epoch` 与 `catalog_revision`；
+  `edit` 只对当前选中档案切到设置页（未选中时只提示先选中，避免改到别的账号）；
+  `verify` / `rebind` 用账号+密码走 `POST …/verify` 再 `PUT …/config`（`values` 只提交
+  与装载快照不同的字段；`rebind` 的账号字段锁定），运行中的机器人在获得用户确认后先
+  `/api/bot/stop`、等状态变成 `stopped` / `failed` 再验证，**不自动重启**；
+  `clear_credentials` 与 `remove` / `purge` 是独立入口（停止机器人 / 清除凭据 / 移除账号
+  三件事不共用按钮）。`credentials.cleanup_pending` 与 `unknown_ownership` 为真时卡片如实
+  显示待办与重试，不谎报已清理。
+- **删除对话框的两步确认**（N2 Task 5、§6.2）：点「移除账号（保留数据）」或「彻底删除」→
+  `POST …/removal-preview` 拿只读预览与一次性令牌 → 对话框列出类别与大小（`size_complete`
+  为假时标注估计值）、是否运行 / 是否启动目标 / 是否当前选中、凭据归属提醒与「没有撤销、
+  不影响站点已发内容」→ 勾选确认复选框（彻底删除用醒目文案）→ `POST …/remove` → 用
+  `GET /api/operations/{id}` 轮询 `stage` 到收尾。**参数（scope）变化必须重新预览**：令牌
+  绑定 scope 与两个 revision，`removal_preview_stale` / `removal_token_invalid` 一律要求
+  重新生成预览，页面不自动重试。部分完成（`removed_partial` / `remove_failed`）时如实显示
+  结果与停在的阶段，并给「重新预览」入口（已清理的类别不会回滚）。
+- **切换档案时的页面状态**（N2 Task 5、§9 末段、D-146）：账号页、设置页与向导在活动档案
+  变化时按 `{#key active_profile_id}` 重建组件，旧表单、密码输入、测试结果与待提交动作
+  随之作废；「近期事件」默认只展示全局事件与当前活动档案的事件（`Event.profile_id`）。
+  异步动作期间禁用重复提交，但**不做前端假同步**：202 + `operation_id` 是唯一依据，
+  轮询没结束就如实显示「进行中」。
+- **构建产物与页面目标**（N2 Task 5）：`npm run check` 与 `npm run build` 之后 `static/`
+  的产物**必须重新构建并提交**（N2 的前端活只归 Task 5）。
 
 ## 61. Windows 托盘
 

@@ -4,9 +4,28 @@
   // 服务端对 delete 一律回 409 `credential_delete_unavailable`，见 D-131）。
   import * as api from "./api";
   import { FIELDS, LEVELS, fromInput, toInput, type FieldSpec } from "./fields";
-  import { conflictNotice } from "./texts";
+  import {
+    CREDENTIALS_CLEANUP_PENDING,
+    CREDENTIALS_CLEAR_CONFIRM,
+    CREDENTIALS_CLEAR_RESULTS,
+    CREDENTIALS_UNKNOWN_OWNERSHIP,
+    accountCodeNotice,
+    conflictNotice,
+  } from "./texts";
 
-  let { onchanged }: { onchanged: () => void } = $props();
+  type ClearScope = "password" | "llm_api_key" | "both";
+
+  let {
+    profile = null,
+    epoch = null,
+    onchanged,
+  }: {
+    /** 当前活动档案的卡片（来自 `GET /api/profiles`）：清理待办与重试入口从这里来。 */
+    profile?: api.ProfileCard | null;
+    /** 状态 DTO 的活动代次；过渡写入口要原样带上（§59、D-146）。 */
+    epoch?: number | null;
+    onchanged: () => void;
+  } = $props();
 
   let view = $state<api.ConfigView | null>(null);
   let texts = $state<Record<string, string>>({}); // 非布尔字段的输入框文本
@@ -26,6 +45,11 @@
   let kbContent = $state("");
   let kbFiles = $state<number | null>(null);
   let testResult = $state<Record<string, string>>({});
+
+  let clearScope = $state<ClearScope>("password");
+  let clearConfirmed = $state(false);
+  let clearFailure = $state<string | null>(null);
+  let clearBusy = $state(false);
 
   async function load(): Promise<void> {
     try {
@@ -92,6 +116,10 @@
         expected_revision: view.revision ?? 0,
         values: collect(),
         credentials,
+        // 过渡入口的活动代次门（§59、D-146）：档案用加载这份表单时的那一个，
+        // 指针已经切走时服务端会回 409，而不是把改动写到刚切过去的账号上。
+        profile_id: view.profile_id,
+        expected_profile_epoch: epoch ?? 0,
       };
       if (!view.account && account.trim() !== "") body.account = account.trim();
       const result = await api.saveConfig(body);
@@ -141,6 +169,34 @@
     }
   }
 
+  /** 清除保存的凭据：先停止机器人、撤销受管历史引用，再把档案置为待重填（§6.1）。 */
+  async function clearSavedCredentials(): Promise<void> {
+    if (!view?.profile_id || !clearConfirmed) return;
+    clearBusy = true;
+    clearFailure = null;
+    message = null;
+    failure = null;
+    try {
+      const selected =
+        clearScope === "both" ? ["password", "llm_api_key"] : [clearScope];
+      const body = await api.clearCredentials(view.profile_id, {
+        kinds: selected,
+        idempotency_key: api.newIdempotencyKey("clear"),
+      });
+      const operation = await api.waitForOperation(body.operation_id);
+      message =
+        CREDENTIALS_CLEAR_RESULTS[operation.result ?? ""] ??
+        `清除已结束（${operation.result ?? operation.state}）。`;
+      clearConfirmed = false;
+      await load();
+      onchanged();
+    } catch (error) {
+      clearFailure = describe(error);
+    } finally {
+      clearBusy = false;
+    }
+  }
+
   // 409 在不同接口上有不同含义，按稳定码分别说明（不把「重启中」说成「另一个页面改过」）。
   const CONFLICT_TEXT: Record<string, string> = {
     revision_conflict: "配置已被另一个页面改过，请刷新后重试。",
@@ -159,6 +215,7 @@
         return (
           CONFLICT_TEXT[error.code] ??
           conflictNotice(error.code) ??
+          accountCodeNotice(error.code) ??
           error.detail ??
           `操作冲突：${error.code}`
         );
@@ -253,6 +310,49 @@
       <button class="action" disabled={busy} onclick={() => runTest("site")}>测试站点</button>
       {#if testResult.site}<span class="hint">站点：{testResult.site}</span>{/if}
     </div>
+  </div>
+
+  <div class="panel">
+    <h2>清除保存的凭据</h2>
+    {#if view.profile_id}
+      <p class="hint">{CREDENTIALS_CLEAR_CONFIRM}</p>
+      {#if profile?.credentials.cleanup_pending}
+        <div class="error">
+          {CREDENTIALS_CLEANUP_PENDING}
+          <button class="ghost" disabled={clearBusy} onclick={clearSavedCredentials}>重试清除</button>
+        </div>
+      {/if}
+      {#if profile?.credentials.unknown_ownership}
+        <div class="error">{CREDENTIALS_UNKNOWN_OWNERSHIP}</div>
+      {/if}
+      <div class="grid">
+        <label class="checkbox">
+          <input type="radio" bind:group={clearScope} value="password" disabled={clearBusy} />
+          只清站点密码
+        </label>
+        <label class="checkbox">
+          <input type="radio" bind:group={clearScope} value="llm_api_key" disabled={clearBusy} />
+          只清模型 Key
+        </label>
+        <label class="checkbox">
+          <input type="radio" bind:group={clearScope} value="both" disabled={clearBusy} />
+          两者都清
+        </label>
+      </div>
+      <label class="checkbox">
+        <input type="checkbox" bind:checked={clearConfirmed} disabled={clearBusy} />
+        我确认清除所选的凭据，并明白没有撤销；清除后这个账号要重新填写凭据才能启动。
+      </label>
+      <div class="row" style="margin-top:12px">
+        <button class="action danger" disabled={clearBusy || !clearConfirmed} onclick={clearSavedCredentials}>
+          清除所选凭据
+        </button>
+        <span class="hint">清除与「停止机器人」「移除账号」是三件不同的事，各有自己的入口。</span>
+      </div>
+    {:else}
+      <p class="hint">还没有可清除的账号档案。</p>
+    {/if}
+    {#if clearFailure}<div class="error">{clearFailure}</div>{/if}
   </div>
 
   <div class="panel">
