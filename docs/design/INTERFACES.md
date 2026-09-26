@@ -1042,21 +1042,29 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 - **历史引用并集**（§6.1、D-144）：`reconcile(profile_id)` 读该档案 `config.yaml` 与
   `revisions/*.yaml` 里出现过的 `credentials_ref`，与索引并集：未见过的引用按 `owned`
   登记（`revision` 取引用它的最大版本），已经是 `pending` 但配置里确实引用了它的条目
-  **认领回 `owned`**（确认前崩溃的恢复路径），并返回 `{"registered", "claimed"}` 计数。
-  `reconcile_all(profile_ids)` 在 `Controller.start()` 的 `recover()` 之后跑一次，只读
-  YAML + 写索引、**不碰凭据库**。`clear()` 撤销的是这个并集（当前版本与全部历史快照），
-  不是当前那一条；读不出来的历史快照跳过（不删除、不覆盖），不阻止用户清除凭据。
-  旧版本留下的、完全失去引用的 `RaricyBotLight` 条目**不枚举、不批量删除**（归属未知），
-  只在页面与使用手册里提示到 Windows 凭据管理器人工清理。
+  **认领回 `owned`**（确认前崩溃的恢复路径），并返回 `{"registered", "claimed",
+  "unreadable"}` 计数。`reconcile_all(profile_ids)` 在 `Controller.start()` 的 `recover()`
+  之后跑一次，只读 YAML + 写索引、**不碰凭据库**。`clear()` 撤销的是这个并集（当前版本
+  与全部历史快照），不是当前那一条。**读不出来的历史快照不当成「没有引用」**（与 D-130
+  同口径）：它记录的引用既登记不了也撤销不了，因此照常推进能做的删除，但把这类文档
+  记入 `ClearResult.unreadable_documents`（相对数据根的路径）并让 `ok=False`，
+  `reconcile` / `reconcile_all` 的摘要带 `unreadable` 计数，只读的
+  `unreadable_documents(profile_id)` 供卡片与移除预览判断 `unknown_ownership`；
+  清除因此可能仍有残留，调用方必须显示 `credentials_cleanup_pending` 与人工核对提示，
+  不得显示成「已清干净」。旧版本留下的、完全失去引用的 `RaricyBotLight` 条目**不枚举、
+  不批量删除**（归属未知），只在页面与使用手册里提示到 Windows 凭据管理器人工清理。
 - **清除范围与 `needs_credentials` 的新判据**（§6.1、D-144）：`clear(profile_id, kinds=…)`
   的 `kinds` 是 `{password, llm_api_key}` 的非空子集，空集或未知类别 →
   `credential_scope_required`。还有保留项时先把保留项复制到**新引用**（先登记后写库），
-  再逐个撤销该档案的受管旧引用；两类都清时不建新引用（`credentials_ref=None`）。单条
-  删除失败不中止其余：失败的条目标 `pending_removal` + `last_error` 并留在索引里，
-  `ClearResult.ok=False` 时调用方必须把档案留在不可启动态并显示
+  再逐个撤销该档案的受管旧引用；两类都清时不建新引用（`credentials_ref=None`）。
+  单条删除失败不中止其余：失败的条目标 `pending_removal` + `last_error` 并留在索引里。
+  `ClearResult(new_ref, revoked, pending_refs, ok, unreadable_documents)`：`pending_refs`
+  是删除失败、可重试的引用，`unreadable_documents` 是读不出来的历史文档（可能有残留），
+  `ok` 只在两者都空时为真；`ok=False` 时调用方必须把档案留在不可启动态并显示
   `credentials_cleanup_pending`（不谎报已清除）。`retry_pending(profile_id)` 重试
-  `pending_removal` / `orphan`；`pending_profiles()` 供卡片与预览查询（含 `pending`：
-  写过、还没有 revision 引用的条目也算清理待办）。
+  `pending_removal` / `orphan`（口径与 `clear()` 一致：重试成功也不等于已清干净）；
+  `pending_profiles()` 供卡片与预览查询（含 `pending`：写过、还没有 revision 引用的
+  条目也算清理待办）。
   `ConfigService.commit_credentials_clear(expected_revision=…, credentials_ref=…, account=…)`
   只改 `_launcher.credentials_ref`（`account` 非空时一并写账号名，其余键原样保留），写
   `revisions/<n>.yaml` + 原子替换（沿用 `_write_document`），字段与策略校验用
