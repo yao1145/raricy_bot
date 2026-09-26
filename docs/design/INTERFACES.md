@@ -1038,15 +1038,16 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   读记录只认 `operations/` 下形状合法的文件名：读不出来的**只记名字**，不改写、不删除。
   清理只对 `state == "finished"` 生效（最多 `MAX_OPERATION_RECORDS = 50` 条，先删最旧），
   `failed` / `interrupted` / `cancelled` 永不自动丢弃 —— 未完成的清理任务不能随日志轮转丢失。
-- **协调器要的两个档案写入口**（N2、D-143）：`LifecycleService` 经 `ProfileService` 的
-  `commit_activation(profile_id, *, expected_epoch)` 提交活动指针（写锁内「读—校验
-  `active_epoch`—一次写入 `active_profile` / `active_epoch + 1` / `catalog_revision + 1`」，
-  不符抛 `revision_conflict`），经 `set_state(profile_id, *, state,
-  expected_profile_revision=None)` 改档案生命周期状态（`state` ∈ `{active, detached,
-  deleting}`，其他值抛 `invalid_profile_state`；写 `profile_revision + 1`，带期望值时不符抛
-  `revision_conflict`）。N1 的 `activate()` 保留原样（低层语义不变）；这两个方法是
-  **N2 接线任务要补写的目标形状**（必须原子、走配置写锁），补上之前 `activate()` 仍是
-  唯一的指针写入口，N4 的启动路径届时改用 `commit_activation()`。
+- **协调器的两个档案写入口**（N2、D-143）：`LifecycleService` 经 `ProfileService` 的
+  `commit_activation(profile_id, *, expected_epoch=None) -> int` 提交活动指针（写锁内「读—
+  校验 `active_epoch`—一次写入 `active_profile` / `active_epoch + 1` / `catalog_revision + 1`」，
+  不符抛 `revision_conflict`，返回新代次）；目录 revision 因此跟着前进，旧页面拿旧值再提交
+  会被 `revision_conflict` 挡住。N1 的 `activate()` 保留原样（低层语义不变：只写指针与代次，
+  **不** bump `catalog_revision`），两个入口共用同一段「读—校验—一次写入」，不产生第二份
+  实现。`set_state(profile_id, *, state, expected_profile_revision=None)` 改档案生命周期
+  状态（`state` ∈ `{active, detached, deleting}`，其他值抛 `invalid_profile_state`；写
+  `profile_revision + 1`，带期望值时不符抛 `revision_conflict`）**尚未实现**，是删除路径
+  （N2 Task 3）要补的目标形状（必须原子、走配置写锁）。
 
 ## 59. Light 控制面（会话、API、进程与事件）
 
@@ -1357,6 +1358,17 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
     才 404），视图字段见 `OperationRecord.as_operation_view()`。旧结果按身份键归属，**不匹配就
     丢弃**：协调器派发时固定 `profile_id` 与目标 revision，收尾只对仍是未完成态的记录生效，
     迟到或重复的收尾不覆盖当前状态。
+  - **生产接线**（N2 Task 1b，接在 N3 之后）：`Controller` 装配进程内唯一的
+    `LifecycleService`（注入同一个 `ProfileService`、`WorkerManager`、`LifecycleGate` 与
+    `EventService`），并在 `start()` 的迁移之后、`_auto_start()` 之前调用一次 `recover()`
+    （只对账；对账失败只记日志，不阻断控制面启动）。`request_quit()` 先通知协调器
+    （关闭启动入口、提高取消代次）再关托盘消息循环；`stop()` 的拆机路径不变。
+    托盘的 `start_bot` / `stop_bot` / `restart_bot` 就是委派协调器的三个同名方法：
+    成功原样返回管理器的 `operation_id`，失败把稳定码转成 `TrayCommandError`
+    （表内三种原样，其余档案/目录故障按 `config_not_ready` 报告）。**只换入口，不换门**：
+    协调器内部对启停仍先 `begin_operation()` 取短租约再调管理器，租约不跨长等待，
+    与 `/api/bot/*` 的 HTTP 路径完全同形；托盘路径自此也在派发时固定 `profile_id`
+    与目标 revision（`_build_spec` 不再从可变活动指针推导）。
 
 ## 60. 管理页与发行（`frontend/`、`packaging/light/`）
 

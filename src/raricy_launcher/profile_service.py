@@ -9,7 +9,9 @@
 - 创建只有两个入口：向导写路径的 `ensure_first_profile()` 与账号页的
   `create_profile()`（§4.2）；
 - `activate()` 是低层激活，调用方负责先停稳 Worker 并确认退出（§5.1 第 2 条），
-  N1 不把它暴露成 HTTP 路由；
+  N1 不把它暴露成 HTTP 路由；`commit_activation()` 是生命周期协调器在 A→B 事务的
+  `commit_active_B` 阶段用的提交入口：与 `activate()` 同语义，另把 `catalog_revision`
+  一起 +1（§58），使旧页面持有的目录 revision 自然过期；
 - `bind_identity()` 是绑定站点稳定 ID 的唯一入口：一个稳定 ID 只属于一个可用档案。
 
 本模块不复制账号名：登录账号仍以 `config.yaml` 的 `_launcher.account` 为唯一来源，
@@ -252,14 +254,40 @@ class ProfileService:
         不符时抛 `revision_conflict`，不写任何东西。N1 不把它暴露成 HTTP 路由；
         本方法也不校验目标档案是否存在（调用方给的是解析出来的档案 id）。
         """
+        return self._write_active_pointer(
+            profile_id, expected_epoch=expected_epoch, bump_catalog_revision=False
+        )
+
+    def commit_activation(self, profile_id: str, *, expected_epoch: int | None = None) -> int:
+        """协调器提交活动指针：与 `activate()` 同语义，另把 `catalog_revision` +1。
+
+        `LifecycleService` 的 A→B 事务在 `commit_active_B` 阶段经它提交（§5.2、§58）。
+        写锁内一次写入 `active_profile` / `active_epoch + 1` / `catalog_revision + 1`：
+        要么三个字段一起生效，要么一个都不动（`update_catalog()` 的原子写）。目录
+        revision 因此跟着前进，别的页面拿旧值再提交会被 `revision_conflict` 挡住。
+        `expected_epoch` 与当前代次不符时抛 `revision_conflict`，不写任何东西；返回
+        写入后的新代次（与 `activate()` 一致）。`activate()` 的既有行为不变。
+        """
+        return self._write_active_pointer(
+            profile_id, expected_epoch=expected_epoch, bump_catalog_revision=True
+        )
+
+    def _write_active_pointer(
+        self, profile_id: str, *, expected_epoch: int | None, bump_catalog_revision: bool
+    ) -> int:
+        """两个激活入口共用的「读—校验代次—一次写入」；差异只有目录 revision。"""
         with self._lock:
             catalog = self.catalog()
             if expected_epoch is not None and catalog.active_epoch != expected_epoch:
                 raise ProfileError("revision_conflict")
             epoch = catalog.active_epoch + 1
-            self._base.update_catalog(
-                {"active_profile": profile_id, "active_epoch": epoch}
-            )
+            changes: dict[str, Any] = {
+                "active_profile": profile_id,
+                "active_epoch": epoch,
+            }
+            if bump_catalog_revision:
+                changes["catalog_revision"] = catalog.catalog_revision + 1
+            self._base.update_catalog(changes)
             return epoch
 
     # --- 身份 -------------------------------------------------------------

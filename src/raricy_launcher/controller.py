@@ -12,8 +12,13 @@
 HTTP 服务、激活管道与互斥体（§9.3）。
 
 托盘的启停命令**不经过 HTTP**：`Controller` 自己实现 `DesktopCommands`，与
-`/api/bot/*` 走同一把生命周期门、同一个管理器、同一套稳定错误码；窗口回调只把
-结构化命令投进 `TrayCoordinator` 的队列，耗时动作在协调器线程里执行（§7.2）。
+`/api/bot/*` 走同一把生命周期门、同一个管理器、同一套稳定错误码，启停本身经
+生命周期协调器（`lifecycle_service.LifecycleService`）委派；窗口回调只把结构化
+命令投进 `TrayCoordinator` 的队列，耗时动作在托盘协调器线程里执行（§7.2、§61.2）。
+
+协调器还负责跨操作的串行化与退出意图：`start()` 在迁移对账之后、自动启动之前
+调用一次它的 `recover()`（只对账，不重放）；`request_quit()` 通知它关闭启动
+入口，让在途切换按「停止意图优先」收敛（§5.1、§5.2、D-143）。
 """
 
 from __future__ import annotations
@@ -46,6 +51,7 @@ from .credential_store import CredentialStore, SessionMemoryStore, SystemKeyring
 from .desktop_settings import DesktopSettings, DesktopSettingsError, DesktopSettingsService
 from .events import EventService
 from .lifecycle_gate import LifecycleGate
+from .lifecycle_service import LifecycleService
 from .migration import MigrationResult, MigrationService
 from .platform import (
     InstanceGuard,
@@ -72,6 +78,14 @@ from .tray_service import CODE_CONFIG_NOT_READY, CODE_LIFECYCLE_BUSY, CODE_QUITT
 from .tray_service import TrayCommandError, TrayCoordinator
 
 _RUNTIME_FILE = "launcher-runtime.json"
+
+# 协调器的稳定码 → 托盘端口的稳定码（§61.2）。表外的一律按「配置不可用」报告：
+# 托盘的启停只经协调器抛出配置/目录类故障，这一侧与 N3 的既有口径一致。
+_TRAY_COMMAND_CODES: dict[str, str] = {
+    CODE_CONFIG_NOT_READY: CODE_CONFIG_NOT_READY,
+    CODE_LIFECYCLE_BUSY: CODE_LIFECYCLE_BUSY,
+    CODE_QUITTING: CODE_QUITTING,
+}
 
 
 def _default_open_path(path: Path) -> None:
@@ -204,6 +218,17 @@ class Controller:
         # 站点测试与启停共用的生命周期门：进程内单实例，随控制器一起装配
         # （§59、D-132）。互斥范围就是这个对象，所以只能有一个。
         self._lifecycle = LifecycleGate()
+        # 跨操作的串行化、取消代次与 A→B 事务（§5.1、§5.2、D-143）：与上面的单次
+        # 操作短租约是**两层**，共用同一个门对象（协调器不重写门、也不绕过门）。
+        # 托盘命令经它委派，`start()` 与 `request_quit()` 也在下面接上它。
+        self._lifecycle_service = LifecycleService(
+            data_root=self._data_root,
+            profiles=self._profiles,
+            manager=self._manager,
+            gate=self._lifecycle,
+            events=self._events,
+            logger=self._logger,
+        )
         self._api: LocalApi | None = None
         self._server = None
         self._api_thread: threading.Thread | None = None
@@ -268,6 +293,9 @@ class Controller:
         """绑定回环端口、启动 API 与激活管道、发布运行元数据。"""
         # 第一步是 v1 迁移：它在任何对外接口起来之前把数据根接管完（§10.6）。
         self._run_migration()
+        # 第二步是协调器的启动对账（§5.2 故障表第 8 行）：必须在 `_auto_start()`
+        # 之前完成，页面从接口可用那一刻读到的操作状态就已是已对账的。
+        self._recover_lifecycle()
         self._start_api()
         self._listener = self._platform.create_activation_listener()
         self._listener.start(self._handle_activation)
@@ -371,8 +399,15 @@ class Controller:
         self._api = None
 
     def request_quit(self) -> None:
-        """请求退出；有托盘就同时请它关闭消息循环（线程安全，幂等）。"""
+        """请求退出；通知生命周期协调器，有托盘就同时请它关闭消息循环。
+
+        顺序（§5.1 第 1 条）：先通知协调器再关托盘 —— 退出意图一落，排队中的启动/
+        重启/切换后的启动就再也追不上它（`submit()` 与 `start_bot()` 回 `quitting`），
+        在途切换会在提交指针前后分别落 `cancelled_by_stop` / `selected_only`，两种情况
+        都不再启动 Worker。线程安全、幂等。
+        """
         self._quit.set()
+        self._lifecycle_service.request_quit()
         tray = self._tray
         if tray is not None:
             tray.request_close()
@@ -405,6 +440,33 @@ class Controller:
             "launcher.migration",
             status=result.stage,
             error=result.metadata_fault or result.error,
+        )
+
+    def _recover_lifecycle(self) -> None:
+        """协调器的启动对账：把在途的 `activate` / `remove` / `credentials_clear` 记录
+        标成 `interrupted` / `error="controller_restart"`（§5.2 故障表第 8 行）。
+
+        **只对账，不重放**：不启动 Worker、不改活动指针、不清除任何东西；要不要继续
+        由用户在看到操作记录后显式发起。对账失败不阻断控制面启动（管理页与恢复入口
+        仍要能打开），只记一条可区分的日志；记录本身留在 `operations/` 里不动。
+        """
+        try:
+            summary = self._lifecycle_service.recover()
+        except Exception as exc:
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "launcher.lifecycle_recover",
+                status="failed",
+                error=type(exc).__name__,
+            )
+            return
+        log_event(
+            self._logger,
+            logging.INFO,
+            "launcher.lifecycle_recover",
+            status="ok",
+            count=len(summary["interrupted"]),
         )
 
     def _auto_start(self) -> None:
@@ -769,53 +831,38 @@ class Controller:
     # --- 托盘命令端口（§61.2） --------------------------------------------
 
     def start_bot(self) -> str:
-        """托盘入口：启动已保存版本；没有已保存配置就是 `config_not_ready`。"""
-        saved = self._load_saved_for_operation()
-        return self._dispatch_bot_operation("start", saved)
+        """托盘入口：经协调器启动活动档案的已保存版本，返回管理器 operation_id。
+
+        协调器内部仍**先取生命周期门**再调管理器（`_dispatch_single()`，租约只覆盖
+        派发本身），取不到门或切换事务在途就是 `lifecycle_busy`；没有已保存配置是
+        `config_not_ready`（D-132、§59）。
+        """
+        return self._tray_command(self._lifecycle_service.start_bot)
 
     def stop_bot(self) -> str:
-        """托盘入口：停止 Worker；不要求已保存配置（与 `/api/bot/stop` 一致）。"""
-        return self._dispatch_bot_operation("stop", None)
+        """托盘入口：经协调器停止 Worker；不要求已保存配置（与 `/api/bot/stop` 一致）。
+
+        停止也不受「有未完成的协调器操作」阻挡：它只提高取消代次（停止意图优先）。
+        """
+        return self._tray_command(self._lifecycle_service.stop_bot)
 
     def restart_bot(self) -> str:
-        """托盘入口：重启到已保存版本；没有已保存配置就是 `config_not_ready`。"""
-        saved = self._load_saved_for_operation()
-        return self._dispatch_bot_operation("restart", saved)
+        """托盘入口：经协调器重启到活动档案的已保存版本，返回管理器 operation_id。"""
+        return self._tray_command(self._lifecycle_service.restart_bot)
 
-    def _load_saved_for_operation(self) -> int:
-        """启停要的目标版本；读不到已保存配置时抛稳定码，不把原文带出去。"""
-        try:
-            saved = self._config.load_saved()
-        except ConfigServiceError:
-            # 元数据损坏与「还没配置」在托盘这一侧都是「配置不可用」。
-            raise TrayCommandError(CODE_CONFIG_NOT_READY) from None
-        if saved is None:
-            raise TrayCommandError(CODE_CONFIG_NOT_READY)
-        return saved.revision
+    def _tray_command(self, action: Callable[[], str]) -> str:
+        """协调器的稳定码 → 托盘端口的稳定码（§61.2）；成功原样返回 operation_id。
 
-    def _dispatch_bot_operation(self, kind: str, revision: int | None) -> str:
-        """先取生命周期租约再派发，`finally` 释放：与 `api.py` 的 HTTP 路径完全同形。
-
-        租约只覆盖派发本身，不跨长等待；取不到门就是 `lifecycle_busy`，绝不另开
-        一条不过门的控制路径（D-132、§59）。
+        协调器抛的 `ConfigServiceError`（含档案的 `ProfileError`）消息就是稳定码：
+        表内的三种原样转出；其余档案/目录故障在托盘这一侧与「配置不可用」同一结果
+        （真实原因由状态聚合的 `config.state` 承载），异常原文不进日志或页面事件。
         """
-        ticket = self._lifecycle.begin_operation(kind)
-        if ticket is None:
-            raise TrayCommandError(CODE_LIFECYCLE_BUSY)
         try:
-            if kind == "start":
-                operation = self._manager.start(revision=revision)
-            elif kind == "stop":
-                operation = self._manager.stop()
-            else:
-                operation = self._manager.restart(revision=revision)
-        finally:
-            self._lifecycle.end(ticket)
-        if operation.result == "quitting":  # 管理器的结果码：退出流程已经开始
-            raise TrayCommandError(CODE_QUITTING)
-        if operation.state == OP_FAILED:  # 例如上一次重启还在途，管理器拒绝这一次
-            raise TrayCommandError(CODE_LIFECYCLE_BUSY)
-        return operation.operation_id
+            return action()
+        except ConfigServiceError as exc:
+            raise TrayCommandError(
+                _TRAY_COMMAND_CODES.get(str(exc), CODE_CONFIG_NOT_READY)
+            ) from None
 
     def status_snapshot(self) -> dict:
         """完整状态快照；可能阻塞（读凭据库），退出流程开始后抛 `quitting`。"""
