@@ -872,11 +872,17 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 
 ## 59. Light 控制面（会话、API、进程与事件）
 
-入口：[会话](../../src/raricy_launcher/session.py)、[API](../../src/raricy_launcher/api.py)、
+入口：[桌面入口](../../src/raricy_launcher/main.py)、[会话](../../src/raricy_launcher/session.py)、
+[API](../../src/raricy_launcher/api.py)、
 [进程管理](../../src/raricy_launcher/process_manager.py)、[IPC 协议](../../src/raricy_launcher/ipc.py)、
 [事件](../../src/raricy_launcher/events.py)、[状态聚合](../../src/raricy_launcher/status_service.py)、
 [生命周期门](../../src/raricy_launcher/lifecycle_gate.py)、[控制器](../../src/raricy_launcher/controller.py)。
 
+- **入口参数与来源提示**（§9.4）：`--worker` 仍优先按 Worker 分派，其后参数原样透传；
+  否则按 Controller 入口解析，只识别字面量 `--startup`（可出现在任意位置），其余参数
+  照旧忽略。`--startup` 只是来源提示、**不是权限边界**（互斥体、生命周期门与授权偏好
+  的判定都不放宽）；已有实例时静默去重退出并记一条 `launcher.startup_deduped`，
+  不沿用 `open_admin` 激活分支、不打开浏览器，激活协议与命令集合不变。
 - **会话**（§8.1）：引导令牌单次、限时（120 秒），经 URL fragment 交付；兑换成功即发放
   HttpOnly + SameSite=Strict 的会话 Cookie，并回一个会话绑定的 CSRF 值。兑换按 60 秒窗口限次，
   窗口会滚动，本机他人刷满也不能把用户永久挡在门外。会话只存内存，Controller 重启即全部失效。

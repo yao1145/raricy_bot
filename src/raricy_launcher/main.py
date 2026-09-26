@@ -2,10 +2,14 @@
 
 分派顺序：``--worker`` → Worker 执行入口；否则先抢单实例互斥体——
 
-- 未取得所有权：经激活管道请已有实例给出管理页 URL，打开浏览器后退出，
-  不跟随主实例常驻；
+- 未取得所有权：默认经激活管道请已有实例给出管理页 URL，打开浏览器后退出，
+  不跟随主实例常驻；入口带 ``--startup``（登录自启动）时改走静默去重，只记
+  一条事件就退出，不请求激活、不弹页面（INTERFACES §59）；
 - 取得所有权：成为 Controller。L0 原型尚无配置概念，启动后打开一次
   管理页；静默启动与凭据检查在 L2/L3 接入。
+
+``--startup`` 只是来源提示，不是权限边界：互斥体、生命周期门与授权偏好的
+判定都不因它而放宽。
 """
 
 from __future__ import annotations
@@ -13,6 +17,8 @@ from __future__ import annotations
 import logging
 import sys
 import webbrowser
+from collections.abc import Callable
+from dataclasses import dataclass
 
 from raricy_bot.logging_setup import log_event
 
@@ -20,11 +26,40 @@ from . import activation, diagnostics, texts, worker_main
 from .activation import ActivationError
 from .controller import Controller
 from .paths import default_data_root
-from .platform import PlatformError, get_platform
+from .platform import LauncherPlatform, PlatformError, get_platform
 
 EXIT_OK = 0
 EXIT_RUNTIME = 1
 EXIT_UNSUPPORTED = 2
+
+# 登录自启动入口的固定参数（INTERFACES §59）：只是来源提示，不携带任何凭据或目标。
+STARTUP_FLAG = "--startup"
+
+
+@dataclass(frozen=True)
+class EntryArgs:
+    """一次入口调用的解析结果。
+
+    `kind` 取 `worker` / `controller`；`startup` 只表示「由登录启动拉起」这一
+    来源事实。`worker_argv` 仅在 `kind == "worker"` 时有内容，是 `--worker`
+    之后的原样参数。
+    """
+
+    kind: str
+    startup: bool
+    worker_argv: tuple[str, ...] = ()
+
+
+def parse_entry_args(argv: list[str]) -> EntryArgs:
+    """纯函数：只看字面量，不读环境、不打印。
+
+    首个参数为 `--worker` 时优先按 Worker 分派，其余参数原样透传（保持现状）；
+    否则按 Controller 分派，`--startup` 可出现在任意位置，其余未知参数照旧
+    忽略 —— 不为它们新增失败模式。
+    """
+    if argv and argv[0] == "--worker":
+        return EntryArgs(kind="worker", startup=False, worker_argv=tuple(argv[1:]))
+    return EntryArgs(kind="controller", startup=STARTUP_FLAG in argv)
 
 
 def _console_line(text: str) -> None:
@@ -34,8 +69,12 @@ def _console_line(text: str) -> None:
         print(text, file=stream)
 
 
-def _activate_existing(logger: logging.Logger) -> int:
-    platform = get_platform()
+def _activate_existing(
+    logger: logging.Logger,
+    platform: LauncherPlatform,
+    open_url: Callable[[str], None],
+) -> int:
+    """已有实例：请它给出管理页地址，再交给浏览器打开。"""
     try:
         data = platform.request_activation(
             activation.encode_request("open_admin"), timeout_ms=2000
@@ -55,29 +94,45 @@ def _activate_existing(logger: logging.Logger) -> int:
         log_event(logger, logging.WARNING, "launcher.activate", status="rejected")
         _console_line(texts.ENTRY_ACTIVATE_FAILED)
         return EXIT_RUNTIME
-    # 调用期才取 webbrowser.open：无浏览器环境的替代与测试注入都才有意义。
-    webbrowser.open(response["url"])
+    open_url(response["url"])
     _console_line(texts.ENTRY_ACTIVATED)
     return EXIT_OK
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    platform: LauncherPlatform | None = None,
+    open_url: Callable[[str], None] | None = None,
+) -> int:
+    """入口分派。
+
+    `platform` 与 `open_url` 只服务测试注入，缺省回落真实实现；真实运行不传它们。
+    """
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments and arguments[0] == "--worker":
-        return worker_main.main(arguments[1:])
+    entry = parse_entry_args(arguments)
+    if entry.kind == "worker":
+        return worker_main.main(list(entry.worker_argv))
 
     data_root = default_data_root()
     logger = diagnostics.install(data_root)
-    try:
-        platform = get_platform()
-    except PlatformError:
-        _console_line(texts.ENTRY_UNSUPPORTED_PLATFORM)
-        return EXIT_UNSUPPORTED
+    if platform is None:
+        try:
+            platform = get_platform()
+        except PlatformError:
+            _console_line(texts.ENTRY_UNSUPPORTED_PLATFORM)
+            return EXIT_UNSUPPORTED
+    # 调用期才取 webbrowser.open：无浏览器环境的替代与测试注入都才有意义。
+    activate_open = open_url if open_url is not None else webbrowser.open
 
     guard = platform.acquire_instance_guard()
     if not guard.owned():
         guard.close()
-        return _activate_existing(logger)
+        if entry.startup:
+            # 登录自启动撞上已有实例：静默去重，不沿用请求激活/弹页面那条分支。
+            log_event(logger, logging.INFO, "launcher.startup_deduped", status="ok")
+            return EXIT_OK
+        return _activate_existing(logger, platform, activate_open)
 
     try:
         controller = Controller(
@@ -85,6 +140,8 @@ def main(argv: list[str] | None = None) -> int:
             guard=guard,
             data_root=data_root,
             logger=logger,
+            open_url=open_url,
+            startup_launch=entry.startup,
         )
         try:
             controller.run()

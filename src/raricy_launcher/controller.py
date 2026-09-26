@@ -63,6 +63,7 @@ class Controller:
         credential_store: CredentialStore | None = None,
         profile_id: str | None = None,
         open_url: Callable[[str], None] | None = None,
+        startup_launch: bool = False,
         clock: Callable[[], float] = time.monotonic,
         start_timeout: float = START_TIMEOUT_SECONDS,
         stop_budget_ms: int = STOP_BUDGET_MS,
@@ -74,6 +75,8 @@ class Controller:
         self._data_root = Path(data_root)
         self._logger = logger
         self._open_url = open_url or (lambda url: webbrowser.open(url))
+        # 登录自启动来源提示（INTERFACES §59）：本任务只保存，自动运行解析在 N4 Task 5。
+        self._startup_launch = startup_launch
         self._clock = clock
         self._instance_id = uuid4().hex[:12]
         self._started_at = clock()
