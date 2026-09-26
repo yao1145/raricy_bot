@@ -10,6 +10,7 @@
 | 快速启动、功能概览 | [根 README](../README.md)、[配置示例](../config.example.yaml) |
 | 开发约定 | [AGENTS.md](../AGENTS.md) |
 | Light 独立发行版、首次配置与后台静默运行（L0–L5 已实现；干净 Windows 与真实站点验收待做） | [LIGHT_EDITION_DESIGN.md](design/LIGHT_EDITION_DESIGN.md)：完整版保留，包含架构、配置/凭据、进程控制、API、打包与验收设计 |
+| Light 下一代方案（尚未实施）：账号更换/删除、托盘与 Windows 登录启动 | [LIGHT_NEXT_GENERATION.md](design/LIGHT_NEXT_GENERATION.md)：现有代码审查、复现证据、档案事务、桌面集成、迁移与验收 |
 | 跨模块行为与代码入口 | [INTERFACES.md](design/INTERFACES.md) |
 | 本次代码审查四项修复的问题、理由与替代关系 | [DESIGN_DECISIONS.md](design/DESIGN_DECISIONS.md) 的 D-115–D-118；已实施，一次性计划见[归档索引](ARCHIVE.md) |
 | 行为的理由、例外与取舍 | [DESIGN_DECISIONS.md](design/DESIGN_DECISIONS.md)（D-1–D-129） |
