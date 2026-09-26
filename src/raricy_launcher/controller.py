@@ -34,6 +34,7 @@ from .api import LocalApi
 from .config_service import ConfigService, ConfigServiceError
 from .credential_store import CredentialStore, SessionMemoryStore, SystemKeyringStore
 from .events import EventService
+from .lifecycle_gate import LifecycleGate
 from .platform import InstanceGuard, LauncherPlatform
 from .process_manager import (
     START_TIMEOUT_SECONDS,
@@ -117,6 +118,9 @@ class Controller:
             config_service=self._config,
             manager=self._manager,
         )
+        # 站点测试与启停共用的生命周期门：进程内单实例，随控制器一起装配
+        # （§59、D-132）。互斥范围就是这个对象，所以只能有一个。
+        self._lifecycle = LifecycleGate()
         self._api: LocalApi | None = None
         self._server = None
         self._api_thread: threading.Thread | None = None
@@ -282,6 +286,7 @@ class Controller:
             static_dir=Path(__file__).parent / "static",
             port=self._port,
             on_quit=self.request_quit,
+            lifecycle_gate=self._lifecycle,
         )
         api = self._api  # 线程只认这个局部引用：stop() 会先把 self._api 置空
         self._api_thread = threading.Thread(

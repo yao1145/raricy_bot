@@ -46,6 +46,7 @@ from .config_service import (
     CredentialUpdate,
 )
 from .credential_store import CredentialStoreError
+from .lifecycle_gate import LifecycleGate, Ticket
 from .session import CSRF_HEADER, SESSION_COOKIE, Session, SessionManager
 
 # 请求体上限：配置表单很小；知识库导入文件另有自己的上限（§13.2）。
@@ -150,12 +151,16 @@ class LocalApi:
         model_transport=None,
         on_quit: Callable[[], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        lifecycle_gate: LifecycleGate | None = None,
     ) -> None:
         self._instance_id = instance_id
         self._data_root = Path(data_root)
         self._config = config_service
         self._manager = manager
         self._status = status_service
+        # 站点测试与启停共用的生命周期门（§59、D-132）。控制器装配一个进程内
+        # 单实例；缺省只用于不共享进程的调用方，互斥范围就是这个对象。
+        self._lifecycle = lifecycle_gate if lifecycle_gate is not None else LifecycleGate()
         self._events = events
         self._sessions = sessions
         self._credentials = credential_store
@@ -547,7 +552,15 @@ class LocalApi:
         revision = self._target_revision(body)
         if revision is None:
             return self._json(409, {"ok": False, "code": "config_not_ready"})
-        operation = self._manager.start(revision=revision)
+        ticket = self._lifecycle.begin_operation("start")
+        if ticket is None:
+            return self._json(409, {"ok": False, "code": "lifecycle_busy"})
+        try:
+            operation = self._manager.start(revision=revision)
+        finally:
+            # 租约只覆盖派发本身：启动后的并发由 `manager.state`（starting 等）
+            # 在测试入口的租约内兜住，长等待一律留在门外（§59、D-132）。
+            self._lifecycle.end(ticket)
         return self._json(202, {"ok": True, "operation_id": operation.operation_id})
 
     async def _bot_stop(self, request: Request):
@@ -557,7 +570,13 @@ class LocalApi:
             await self._json_body(request)
         except ApiError as exc:
             return self._json(exc.status, exc.payload())
-        operation = self._manager.stop()
+        ticket = self._lifecycle.begin_operation("stop")
+        if ticket is None:
+            return self._json(409, {"ok": False, "code": "lifecycle_busy"})
+        try:
+            operation = self._manager.stop()
+        finally:
+            self._lifecycle.end(ticket)
         return self._json(202, {"ok": True, "operation_id": operation.operation_id})
 
     async def _bot_restart(self, request: Request):
@@ -570,7 +589,13 @@ class LocalApi:
         revision = self._target_revision(body)
         if revision is None:
             return self._json(409, {"ok": False, "code": "config_not_ready"})
-        operation = self._manager.restart(revision=revision)
+        ticket = self._lifecycle.begin_operation("restart")
+        if ticket is None:
+            return self._json(409, {"ok": False, "code": "lifecycle_busy"})
+        try:
+            operation = self._manager.restart(revision=revision)
+        finally:
+            self._lifecycle.end(ticket)
         return self._json(202, {"ok": True, "operation_id": operation.operation_id})
 
     def _target_revision(self, body: dict) -> int | None:
@@ -612,15 +637,13 @@ class LocalApi:
     # --- 测试 -------------------------------------------------------------
 
     async def _test_site(self, request: Request):
-        """站点测试：只在 Bot 停止时执行，避免与运行会话互相影响（§8.2）。"""
+        """站点测试：只在 Bot 停止时执行，整段执行期间持有生命周期门（§8.2、D-132）。"""
         try:
             session = self._require_session(request)
             self._require_write(request, session)
             body = await self._json_body(request)
         except ApiError as exc:
             return self._json(exc.status, exc.payload())
-        if self._manager.state not in ("stopped", "failed"):
-            return self._json(409, {"ok": False, "code": "bot_running"})
         credentials = None
         if body:
             username = body.get("username")
@@ -636,8 +659,48 @@ class LocalApi:
             ):
                 return self._json(422, {"ok": False, "code": "invalid_test_input"})
             credentials = Secrets(username=username, password=password, llm_api_key="")
-        result, status = await asyncio.to_thread(self._run_site_test, credentials)
+        ticket = self._lifecycle.begin_test()
+        if ticket is None:
+            # 另一个站点测试或一次启停操作正持有门：不排队，直接拒绝（§59）。
+            return self._json(409, {"ok": False, "code": "lifecycle_busy"})
+        # 状态检查与测试都交给工作线程、都在租约覆盖内完成：检查之后不会再有新的
+        # 启动被派发。租约也只由该线程的 `finally` 释放——请求协程被取消时线程
+        # 仍在跑，协程侧释放等于把门开在测试进行中；`shield` 保证取消不传导给
+        # 这个任务，线程照常跑完并释放。
+        try:
+            result, status = await asyncio.shield(
+                asyncio.to_thread(self._run_site_test_under_lease, ticket, credentials)
+            )
+        except asyncio.CancelledError:
+            # 请求协程被取消：线程仍在跑站点测试，租约只能留给它自己释放。
+            raise
+        except BaseException:
+            # 其余异常只在线程结束时才抛回来（或线程根本没被调度，例如事件循环
+            # 已关闭）；end() 幂等，线程释放过时这次是无操作。
+            self._lifecycle.end(ticket)
+            raise
         return self._json(status, result)
+
+    def _run_site_test_under_lease(
+        self, ticket: Ticket, credentials_override: Secrets | None = None
+    ) -> tuple[dict, int]:
+        """在租约覆盖内检查进程状态并执行站点测试；租约只在本线程释放（D-132）。
+
+        调用 `manager.state` 与派发测试之间没有释放动作，所以「看到 stopped」
+        之后不会再有新的启动溜进来；看到 `starting` / `stopping` 说明生命周期
+        操作已经先行派发，测试让位。
+        """
+        try:
+            state = self._manager.state
+            if state == "running":
+                # 机器人确实在运行：保留既有语义与稳定码。
+                return {"ok": False, "code": "bot_running"}, 409
+            if state not in ("stopped", "failed"):
+                # starting / stopping：生命周期操作在途，不是「正在运行」。
+                return {"ok": False, "code": "lifecycle_busy"}, 409
+            return self._run_site_test(credentials_override)
+        finally:
+            self._lifecycle.end(ticket)
 
     def _run_site_test(self, credentials_override: Secrets | None = None) -> tuple[dict, int]:
         try:
