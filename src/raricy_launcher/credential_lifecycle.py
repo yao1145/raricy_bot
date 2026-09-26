@@ -734,13 +734,8 @@ class CredentialLifecycle:
         （与 D-130「读不出来不当成没有」同口径）。跳过期间不删除、不覆盖任何现场。
         """
         profile = paths.profile_dir(self._root, profile_id)
-        candidates = [paths.config_path(profile)]
         unreadable: list[str] = []
-        try:
-            candidates.extend(sorted(paths.revisions_dir(profile).glob("*.yaml")))
-        except OSError:
-            # 连目录都列不出来：整段历史读不出来，同样如实记账。
-            unreadable.append(self._relative_document(profile, paths.revisions_dir(profile)))
+        candidates = [paths.config_path(profile), *self._revision_documents(profile, unreadable)]
         found: dict[str, int] = {}
         for path in candidates:
             reference, revision, usable = self._document_ref(path)
@@ -765,6 +760,42 @@ class CredentialLifecycle:
             _refs, unreadable = self._historical_refs(profile_id)
         return unreadable
 
+    def _revision_documents(self, profile: Path, unreadable: list[str]) -> list[Path]:
+        """列出 `revisions/*.yaml`；列不出来就记账，不能当成「没有历史」。
+
+        不能用 `Path.glob()`：`pathlib` 在列目录失败时会把 `OSError` 吞掉（本机
+        3.13 实测，且项目 `requires-python >=3.12`），于是一个列不出来的目录会
+        静默变成「没有历史」—— 正是本次要修的 fail-open。这里显式 `os.scandir`
+        并自己区分三种情形：
+
+        - 目录不存在 → 还没有历史（不是故障）；
+        - 目录存在但列不出来（权限、占用、被做成普通文件等）→ 整段历史读不出来，
+          按受管相对路径记入未读文档；
+        - 条目不是普通文件（同名目录、链接等）→ 它可能是被改坏的历史，同样记账。
+        """
+        revisions = paths.revisions_dir(profile)
+        documents: list[Path] = []
+        try:
+            with os.scandir(revisions) as entries:
+                for entry in entries:
+                    if not entry.name.lower().endswith(".yaml"):
+                        continue
+                    path = Path(entry.path)
+                    try:
+                        if entry.is_file():
+                            documents.append(path)
+                            continue
+                    except OSError:
+                        pass
+                    unreadable.append(self._relative_document(profile, path))
+        except FileNotFoundError:
+            # 还没有 revisions/：没有历史可读，也不是「读不出来」。
+            return []
+        except OSError:
+            unreadable.append(self._relative_document(profile, revisions))
+            return []
+        return sorted(documents)
+
     @staticmethod
     def _relative_document(profile: Path, path: Path) -> str:
         """文档相对数据根的受管路径（如 `profiles/p-x/revisions/3.yaml`），不含绝对路径。"""
@@ -778,13 +809,17 @@ class CredentialLifecycle:
         """读一份 Launcher 文档里的 `_launcher.credentials_ref` 与 `revision`。
 
         返回 `(引用, revision, 可用)`；`可用=False` 表示这份文档读不出来或结构不可用
-        （读失败、超体积、解码或 YAML 解析失败、顶层/`_launcher` 不是映射、
+        （权限/占用失败、超体积、解码或 YAML 解析失败、顶层/`_launcher` 不是映射、
         `credentials_ref` 不是字符串），调用方必须把它计入「可能有残留」。
-        读得到但没有引用（`引用=None, 可用=True`）才是「这份文档没有引用」。
+        读得到但没有引用（`引用=None, 可用=True`）才是「这份文档没有引用」——
+        **文档不存在也算这一种**：新建但还没保存过设置的档案没有 `config.yaml`，
+        与 `_current()` 区分 `no_active_config` / `config_unreadable` 同口径。
         """
         try:
             with path.open("rb") as handle:
                 raw = handle.read(core_config.MAX_CONFIG_BYTES + 1)
+        except FileNotFoundError:
+            return None, None, True
         except OSError:
             return None, None, False
         if len(raw) > core_config.MAX_CONFIG_BYTES:
