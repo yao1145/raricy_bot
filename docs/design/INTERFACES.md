@@ -968,3 +968,52 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   凭据后端可用 → 退出 → 元数据清理」，运行时本机不能再有另一个 Light 实例（激活通道与
   互斥体按当前用户命名）。**干净 Windows 清单（§17.2）与真实站点/模型验收仍未执行**，
   见使用手册 §7。
+
+## 61. Windows 托盘
+
+入口：[视图模型](../../src/raricy_launcher/tray_model.py)、[文案](../../src/raricy_launcher/texts.py)、
+[状态聚合](../../src/raricy_launcher/status_service.py)。协调器的命令端口与降级路径、
+窗口层的系统事件合同随对应实现补入本节；本节的词表是这些实现共用的唯一来源，
+窗口层不认识别的字符串，未列入词表的命令与事件一律忽略。
+
+### 61.1 状态与图标
+
+`tray_model.py` 是纯逻辑模块：不 import win32、不 import `platform/`、不做任何 I/O，
+只依赖 `texts` 与 `status_service` 的常量/纯函数，因此全部映射可离线验证。
+
+- **图标三态与判定顺序**（`icon_for()`，按顺序取第一条命中；`attention` 只表示
+  「需要用户动作」）：
+  1. 配置状态 ∈ `needs_setup` / `needs_credentials` / `recovery` / `invalid` → `attention`；
+  2. 进程 `failed` → `attention`；
+  3. 进程 `stopped` 且 `forced_stop` → `attention`；
+  4. 电源 `awaiting_report`（睡眠恢复后无新上报）→ `attention`；
+  5. `quitting`、进程 `stopped` / `stopping`、或电源 `suspended` → `stopped`；
+  6. 其余（`starting` / `running`）→ `normal`。
+  **运行中但上报过期/缺失不升级成 `attention`**：此刻没有可执行的动作，只改状态文案。
+- **状态标签**（`status_label()`，同一套「第一条命中」顺序，文案全部来自 `texts.py`）：
+  `quitting` → 正在退出；`recovery` / `invalid` / `needs_setup` / `needs_credentials` →
+  对应配置文案；进程 `failed` → 启动失败；`stopped` 且 `forced_stop` → 上次运行被强制结束；
+  电源 `suspended` → 睡眠中（未在线）；`awaiting_report` → 已恢复，等待新上报；
+  `starting` / `stopping` → 启动中 / 正在停止；`running` 按 `worker_freshness` 取
+  运行中 / 运行中（状态过期）/ 运行中（暂无上报）；其余 → 已停止。
+- **新鲜度判据只有一处**：`worker_freshness` 必须来自
+  `status_service.snapshot_freshness(snapshot, now=...)`，默认阈值复用
+  `SNAPSHOT_STALE_SECONDS`（30 秒）；不得复制常量或另写判据。`StatusService.snapshot()`
+  内部调用同一个函数，二者不产生第二个真相。
+- **菜单**（`menu_for()`，顺序固定）：打开管理页（`open_admin`，始终可用）｜账号行｜状态行｜
+  启动机器人（`start`）｜停止机器人（`stop`）｜重启机器人（`restart`）｜打开诊断目录
+  （`open_diagnostics`，始终可用）｜退出 Light（`quit`，始终可用）。账号行为
+  `TRAY_ACCOUNT_PREFIX + (account or TRAY_ACCOUNT_UNSET)`，状态行为 `TRAY_STATUS_PREFIX + 状态标签`；
+  两条展示行 `command` 是空串且 `enabled is False`。分隔符不占独立菜单项，而是挂在紧随其后
+  的项上（`separator_before`），窗口层按序渲染。可用性：`start` = 配置 `configured` 且进程
+  `stopped` / `failed` 且非 `quitting`；`stop` = 进程 `running` / `starting` 且非 `quitting`；
+  `restart` = 配置 `configured` 且进程 `running` / `stopped` / `failed` 且非 `quitting`。
+  禁用只是交互提示，服务端仍然自己判。N3 **不**放切换账号（等 N2 的页面）与登录启动设置
+  （N4），也不放任何「未实现」占位项。
+- **tooltip** 固定为 `TRAY_TOOLTIP_FORMAT.format(app=APP_NAME, status=状态标签)`，按
+  `NOTIFYICONDATA.szTip` 上限截断到 127 字符，**不含**账号、pid、路径或原始错误。
+- **词表**：命令常量 `open_admin` / `start` / `stop` / `restart` / `open_diagnostics` /
+  `quit` 与事件常量 `taskbar_created` / `power_suspend` / `power_resume` / `session_query` /
+  `session_end` 定义在 `tray_model.py`；配置与进程状态字面量（`configured`、`needs_setup`、
+  `needs_credentials`、`recovery`、`invalid`；`stopped`、`starting`、`running`、`stopping`、
+  `failed`）与该模块的本地常量必须与 ConfigService / WorkerManager（§59）逐字一致。

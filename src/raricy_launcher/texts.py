@@ -24,3 +24,36 @@ CREDENTIAL_DELETE_UNAVAILABLE: str = (
     "当前版本暂不支持删除已保存的凭据，清除功能将在后续版本提供；"
     "需要立即撤销时，请在 Windows「凭据管理器」中删除 RaricyBotLight 的条目。"
 )
+
+# 托盘菜单（N3）：顺序与可用性由 tray_model 固定，文案只在这里维护。
+TRAY_MENU_OPEN_ADMIN: str = "打开管理页"
+TRAY_MENU_START: str = "启动机器人"
+TRAY_MENU_STOP: str = "停止机器人"
+TRAY_MENU_RESTART: str = "重启机器人"
+TRAY_MENU_OPEN_DIAGNOSTICS: str = "打开诊断目录"
+TRAY_MENU_QUIT: str = "退出 Light"
+
+# 托盘的账号行与状态行（展示行，不可点击）。
+TRAY_ACCOUNT_PREFIX: str = "账号："
+TRAY_ACCOUNT_UNSET: str = "未设置"
+TRAY_STATUS_PREFIX: str = "状态："
+
+# 托盘状态标签：同一时刻只显示一条，判定顺序见 tray_model.status_label()。
+TRAY_STATUS_NEEDS_SETUP: str = "未设置账号"
+TRAY_STATUS_NEEDS_CREDENTIALS: str = "需重新填写凭据"
+TRAY_STATUS_RECOVERY: str = "配置需要修复"
+TRAY_STATUS_INVALID: str = "配置不可用"
+TRAY_STATUS_STOPPED: str = "已停止"
+TRAY_STATUS_STARTING: str = "启动中"
+TRAY_STATUS_RUNNING: str = "运行中"
+TRAY_STATUS_STOPPING: str = "正在停止"
+TRAY_STATUS_FAILED: str = "启动失败"
+TRAY_STATUS_FORCED_STOP: str = "上次运行被强制结束"
+TRAY_STATUS_RUNNING_STALE: str = "运行中（状态过期）"
+TRAY_STATUS_RUNNING_UNKNOWN: str = "运行中（暂无上报）"
+TRAY_STATUS_SUSPENDED: str = "睡眠中（未在线）"
+TRAY_STATUS_AWAITING_REPORT: str = "已恢复，等待新上报"
+TRAY_STATUS_QUITTING: str = "正在退出"
+
+# tooltip 只由应用名与状态标签组成，不含账号、pid、路径或原始错误（§61）。
+TRAY_TOOLTIP_FORMAT: str = "{app} - {status}"

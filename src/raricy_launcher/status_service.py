@@ -22,6 +22,22 @@ STALE: str = "stale"
 UNKNOWN: str = "unknown"
 
 
+def snapshot_freshness(
+    snapshot: dict | None, *, now: float, stale_seconds: float = SNAPSHOT_STALE_SECONDS
+) -> str:
+    """按采样时间判定快照新鲜度，返回 `FRESH` / `STALE` / `UNKNOWN`。
+
+    这是「快照还能不能代表当前事实」的**唯一**判据：托盘视图模型不复制阈值，
+    调用本函数并默认复用 `SNAPSHOT_STALE_SECONDS`（§61）。
+    """
+    if snapshot is None:
+        return UNKNOWN
+    sampled = snapshot.get("sampled_at")
+    if not isinstance(sampled, (int, float)) or now - float(sampled) > stale_seconds:
+        return STALE
+    return FRESH
+
+
 @dataclass(frozen=True)
 class TestResult:
     """一次显式测试的结果：只有分类与时间，不含任何凭据或生成内容。"""
@@ -76,16 +92,8 @@ class StatusService:
         process = self._manager.status()
         worker = self._manager.last_status
         revision = config_status.revision
-        if worker is None:
-            freshness = UNKNOWN
-        else:
-            sampled = worker.get("sampled_at")
-            if not isinstance(sampled, (int, float)) or (
-                time.time() - float(sampled) > SNAPSHOT_STALE_SECONDS
-            ):
-                freshness = STALE
-            else:
-                freshness = FRESH
+        # 与托盘共用同一条新鲜度判据（§61），阈值只有 SNAPSHOT_STALE_SECONDS 一处。
+        freshness = snapshot_freshness(worker, now=time.time())
         running_revision = process.get("running_revision")
         return {
             "instance_id": self._instance_id,
