@@ -452,7 +452,11 @@ START_CANCEL_JOIN_SECONDS: float = 5.0
 
 @dataclass(frozen=True)
 class Operation:
-    """一次启停操作的结果快照；阶段与结果都是固定码（§9.2、§11）。"""
+    """一次启停操作的结果快照；阶段与结果都是固定码（§9.2、§11）。
+
+    `profile_id` 是派发时就固定的目标档案（§5.2 的输入固定）：启动线程不再
+    重新解析活动指针，操作记录也带着它，页面据此判断结果属于哪个档案。
+    """
 
     operation_id: str
     kind: str
@@ -461,6 +465,7 @@ class Operation:
     target_revision: int | None
     started_at: float
     finished_at: float | None = None
+    profile_id: str | None = None
 
 
 class WorkerManager:
@@ -511,8 +516,10 @@ class WorkerManager:
         self._exit_reason: str | None = None
         self._monitor: threading.Thread | None = None
         self._last_status: dict | None = None
-        # 正在运行的 Worker 是用哪个 revision 起的；停止后清空（§6.5 的 running_revision）。
+        # 正在运行的 Worker 是用哪个 revision、哪个档案起的；停止后一起清空
+        # （§6.5 的 running_revision、§5.1 第 6 条的 running_profile_id）。
         self._running_revision: int | None = None
+        self._running_profile_id: str | None = None
         self._run_seq = 0
 
     # --- 查询 -------------------------------------------------------------
@@ -548,6 +555,8 @@ class WorkerManager:
                 "state": self._state,
                 "pid": worker.pid if worker is not None else None,
                 "running_revision": self._running_revision,
+                # 运行中的档案与活动指针分开报：同号 revision 换档案靠它区分（§5.1 第 6 条）。
+                "running_profile_id": self._running_profile_id,
                 # 记住最后一次停止是否只能强制完成；Worker 已经回收时也要如实报告。
                 "forced_stop": bool(
                     (worker is not None and worker.forced_stop) or self._forced_stop
@@ -558,11 +567,15 @@ class WorkerManager:
 
     # --- 操作 -------------------------------------------------------------
 
-    def start(self, *, revision: int | None) -> Operation:
-        """启动 Worker；处于 starting/running/stopping 时返回当前在途操作（幂等）。"""
+    def start(self, *, revision: int | None, profile_id: str | None = None) -> Operation:
+        """启动 Worker；处于 starting/running/stopping 时返回当前在途操作（幂等）。
+
+        `profile_id` 是本次启动固定的档案：调用方在派发前解析一次，之后启动
+        线程与 `spec_factory` 都只用它，不再读可变的活动指针（§5.2）。
+        """
         with self._lock:
             if self._quitting:
-                return self._refused("start", revision, "quitting")
+                return self._refused("start", revision, "quitting", profile_id)
             if self._restart_in_progress:
                 active = self._operations.get(self._restart_operation_id or "")
                 if active is not None:
@@ -572,7 +585,7 @@ class WorkerManager:
                 if in_flight is not None:
                     return in_flight
             self._cancel_start.clear()
-            operation = self._new_operation("start", revision)
+            operation = self._new_operation("start", revision, profile_id)
             self._state = STATE_STARTING
             self._start_complete.clear()
             self._active_start_operation_id = operation.operation_id
@@ -624,20 +637,24 @@ class WorkerManager:
             self._spawn(self._do_stop, operation, cancelled_start)
             return operation
 
-    def restart(self, *, revision: int | None) -> Operation:
-        """先停后启；返回整个组合操作的快照（§9.2）。"""
+    def restart(self, *, revision: int | None, profile_id: str | None = None) -> Operation:
+        """先停后启；返回整个组合操作的快照（§9.2）。
+
+        `profile_id` 与 `start()` 同一口径：新 Worker 用调用方固定的档案，
+        停止阶段与启动阶段都不重新解析活动指针（§5.2）。
+        """
         with self._lock:
             if self._quitting:
-                return self._refused("restart", revision, "quitting")
+                return self._refused("restart", revision, "quitting", profile_id)
             if self._restart_in_progress:
                 active = self._operations.get(self._restart_operation_id or "")
                 if active is not None:
                     return active
             if self._state in (STATE_STARTING, STATE_STOPPING):
                 # 不和其他生命周期操作并行；调用方可在当前操作完成后再次重启。
-                return self._refused("restart", revision, "operation_in_progress")
+                return self._refused("restart", revision, "operation_in_progress", profile_id)
             self._restart_in_progress = True
-            operation = self._new_operation("restart", revision)
+            operation = self._new_operation("restart", revision, profile_id)
             self._restart_operation_id = operation.operation_id
             epoch = self._stop_epoch
             self._state = STATE_STOPPING
@@ -690,7 +707,8 @@ class WorkerManager:
             self._run_seq += 1
             run_id = f"{self._instance_id}-{self._run_seq}"
         try:
-            spec = self._spec_factory(revision, run_id)
+            # 三参工厂：本次启动固定的档案一路传到规格构造，启动线程不读活动指针（§5.2）。
+            spec = self._spec_factory(revision, run_id, operation.profile_id)
             worker = WorkerProcess(
                 self._platform, spec, instance_id=self._instance_id, run_id=run_id
             )
@@ -754,6 +772,9 @@ class WorkerManager:
                 self._exit_reason = None
                 self._forced_stop = False
                 self._running_revision = revision
+                # 与 running_revision 同点设置：两者一起描述「现在跑的是哪一版、
+                # 哪个档案」（§5.1 第 6 条）。
+                self._running_profile_id = operation.profile_id
         if cancelled:
             self._reap(worker)
             with self._lock:
@@ -847,6 +868,7 @@ class WorkerManager:
                 self._state = STATE_STOPPED
                 self._exit_reason = None
                 self._running_revision = None
+                self._running_profile_id = None
             self._finish(operation, OP_FINISHED, "cancelled")
             self._on_event("worker.stopped", {"result": "cancelled"}, "info")
             return
@@ -880,6 +902,7 @@ class WorkerManager:
                 result=None,
                 target_revision=revision,
                 started_at=operation.started_at,
+                profile_id=operation.profile_id,
             )
             self._run_start(start_op)
             with self._lock:
@@ -897,6 +920,7 @@ class WorkerManager:
                     target_revision=revision,
                     started_at=operation.started_at,
                     finished_at=finished.finished_at,
+                    profile_id=operation.profile_id,
                 )
                 self._operations[operation.operation_id] = final
                 # 收尾期间可能已发布了新操作（例如新 Worker 刚 running 就到达的 stop）：
@@ -954,6 +978,7 @@ class WorkerManager:
                 result = "stopped"
         self._last_status = None
         self._running_revision = None
+        self._running_profile_id = None
         return result
 
     def _reap(self, worker: WorkerProcess) -> None:
@@ -986,10 +1011,11 @@ class WorkerManager:
                     return
                 self._state = STATE_FAILED
                 self._exit_reason = f"exit_{code}"
-                # 进程没了：快照与运行版本不能再冒充当前事实（复审 N-5）。
+                # 进程没了：快照、运行版本与运行档案不能再冒充当前事实（复审 N-5）。
                 self._worker = None
                 self._last_status = None
                 self._running_revision = None
+                self._running_profile_id = None
             # 已退出的 Worker 不再有其它线程负责回收；不要让后续 start 覆盖掉最后
             # 一个引用而泄漏 Job、进程与管道句柄。
             self.drain(worker)
@@ -1007,7 +1033,9 @@ class WorkerManager:
 
     # --- 内部：操作记录 ---------------------------------------------------
 
-    def _new_operation(self, kind: str, revision: int | None) -> Operation:
+    def _new_operation(
+        self, kind: str, revision: int | None, profile_id: str | None = None
+    ) -> Operation:
         operation = Operation(
             operation_id=uuid4().hex[:12],
             kind=kind,
@@ -1015,6 +1043,7 @@ class WorkerManager:
             result=None,
             target_revision=revision,
             started_at=self._clock(),
+            profile_id=profile_id,
         )
         with self._lock:
             self._operations[operation.operation_id] = operation
@@ -1030,6 +1059,7 @@ class WorkerManager:
             target_revision=operation.target_revision,
             started_at=operation.started_at,
             finished_at=self._clock(),
+            profile_id=operation.profile_id,
         )
         with self._lock:
             self._operations[final.operation_id] = final
@@ -1037,9 +1067,15 @@ class WorkerManager:
                 self._operation = final
         return final
 
-    def _refused(self, kind: str, revision: int | None, reason: str) -> Operation:
+    def _refused(
+        self,
+        kind: str,
+        revision: int | None,
+        reason: str,
+        profile_id: str | None = None,
+    ) -> Operation:
         """退出流程中的拒绝：立刻完成、结果码固定（§9.2）。"""
-        operation = self._new_operation(kind, revision)
+        operation = self._new_operation(kind, revision, profile_id)
         return self._finish(operation, OP_FINISHED, reason)
 
     def _spawn(self, target, *args) -> None:

@@ -140,6 +140,7 @@ class LocalApi:
         instance_id: str,
         data_root: Path,
         config_service,
+        profile_service,
         manager,
         status_service,
         events,
@@ -156,6 +157,9 @@ class LocalApi:
         self._instance_id = instance_id
         self._data_root = Path(data_root)
         self._config = config_service
+        # 档案级入口（`ProfileService`）：只读解析活动档案、按 id 取绑定服务。
+        # 一次请求只解析一次，之后所有读写都用同一个绑定实例（§4.1 末句）。
+        self._profiles = profile_service
         self._manager = manager
         self._status = status_service
         # 站点测试与启停共用的生命周期门（§59、D-132）。控制器装配一个进程内
@@ -371,6 +375,37 @@ class LocalApi:
         )
         return response
 
+    # --- 档案上下文 -------------------------------------------------------
+
+    def _profile_id(self, *, create: bool = False) -> str:
+        """解析本次请求的档案：只读解析，或经写路径建立首个档案（D-135）。
+
+        `create=False`（查询与纯校验）经 `active_profile_id()` 只读解析，没有
+        档案就抛 409 `no_active_profile`，绝不建立目录或指针；`create=True`
+        只允许写路径使用，经 `ensure_first_profile()` 建立或复用首个档案。
+        元数据故障仍由 N0 的应用级处理器映射成 409 + 四个既有码。
+        """
+        if create:
+            return self._profiles.ensure_first_profile()
+        profile_id = self._profiles.active_profile_id()
+        if profile_id is None:
+            raise ApiError(409, "no_active_profile")
+        return profile_id
+
+    def _bound(self, profile_id: str):
+        """该档案的绑定 `ConfigService`：本次请求的读写都用这一个实例（§4.1 末句）。"""
+        return self._profiles.config_service(profile_id)
+
+    def _read_service(self, profile_id: str | None):
+        """只读上下文的配置服务：有档案用绑定实例，没有就用数据根级实例。
+
+        数据根级实例的读路径同样不创建（D-133），因此「还没有档案」的查询与
+        向导临时校验不会在真正空的根目录上留下任何文件。
+        """
+        if profile_id is None:
+            return self._profiles.base_config_service()
+        return self._bound(profile_id)
+
     # --- 配置 -------------------------------------------------------------
 
     async def _get_config(self, request: Request):
@@ -385,22 +420,29 @@ class LocalApi:
         return self._json(200, body)
 
     def _config_view(self) -> dict:
-        saved = self._config.load_saved()
+        """配置视图：只用只读上下文，绝不建立首个档案（D-133、D-135）。"""
+        profile_id = self._profiles.active_profile_id()
+        service = self._read_service(profile_id)
+        saved = service.load_saved()
         values: dict[str, Any] = {}
         if saved is not None:
             for key in sorted(EDITABLE_FIELDS):
                 values[key] = _get_path(saved.mapping, key)
-        status = self._config.status()
+        status = service.status()
         return {
             "ok": True,
+            # 视图属于哪个档案：没有档案时是 None，与 revision 的 None 各自表达
+            # 「还没有档案」与「还没有配置」两件事。
+            "profile_id": profile_id,
             "revision": saved.revision if saved is not None else None,
             "state": status.state,
             "account": saved.account if saved is not None else None,
             "values": values,
             # 向导的初始值来自 Launcher 基线（含默认 System Prompt 模板），
-            # 只含非敏感字段，且与提交时的基线同源（§5.1 第 3 点）。
+            # 只含非敏感字段，且与提交时的基线同源（§5.1 第 3 点）；无档案时
+            # 基线省略档案内路径字段，只回这份模板，不建目录、不写指针。
             "defaults": {
-                key: _get_path(light_base_mapping(self._config.profile()), key)
+                key: _get_path(light_base_mapping(service.profile_or_none()), key)
                 for key in sorted(EDITABLE_FIELDS)
                 if key == "system_prompt"
             },
@@ -453,7 +495,10 @@ class LocalApi:
         start_bot = body.get("start_bot_on_launch")
         if start_bot is not None and not isinstance(start_bot, bool):
             raise ApiError(400, "bad_request")
-        return self._config.commit(
+        # 写路径才允许创建：无档案时在这里建立首个档案（profile.json 一并补齐），
+        # 请求体本身的错误已经在上面拒绝，不会因为一次坏请求留下新档案。
+        profile_id = self._profile_id(create=True)
+        return self._bound(profile_id).commit(
             values,
             expected_revision=expected,
             password=updates.get("password", CredentialUpdate.keep()),
@@ -477,11 +522,15 @@ class LocalApi:
         return self._json(200, {"ok": True})
 
     def _validate_values(self, body: dict) -> None:
-        """静态校验：不写文件、不调外部网络（§11）。"""
+        """静态校验：不写文件、不建档案、不调外部网络（§11）。
+
+        无档案时用数据根级实例，`validate_values()` 内部按
+        `light_base_mapping(None)` 校验（D-133）：真正空的根目录上不产生文件。
+        """
         values = body.get("values") or {}
         if not isinstance(values, dict):
             raise ApiError(400, "bad_request")
-        self._config.validate_values(values)
+        self._read_service(self._profiles.active_profile_id()).validate_values(values)
 
     async def _get_draft(self, request: Request):
         session = self._session(request)
@@ -519,13 +568,18 @@ class LocalApi:
         if not isinstance(values, dict):
             return self._json(400, {"ok": False, "code": "bad_request"})
         try:
-            revision = await asyncio.to_thread(
-                self._config.save_draft, values, expected_revision=expected
-            )
+            revision = await asyncio.to_thread(self._save_draft, values, expected)
         except Exception as exc:
             mapped = self._handle(exc)
             return self._json(mapped.status, mapped.payload())
         return self._json(200, {"ok": True, "revision": revision})
+
+    def _save_draft(self, values: dict, expected_revision: int) -> int:
+        """草稿是写路径：无档案时在这里建立首个档案（D-133、D-135）。"""
+        profile_id = self._profile_id(create=True)
+        return self._bound(profile_id).save_draft(
+            values, expected_revision=expected_revision
+        )
 
     # --- 状态与进程 -------------------------------------------------------
 
@@ -549,14 +603,21 @@ class LocalApi:
             body = await self._json_body(request)
         except ApiError as exc:
             return self._json(exc.status, exc.payload())
-        revision = self._target_revision(body)
+        try:
+            profile_id = self._profile_id()
+        except ApiError:
+            # 还没有档案：与「没有可启动的配置」同一结果码（既有语义），
+            # 且不得派发任何启动（§59）。元数据故障是 ConfigServiceError，
+            # 仍由应用级处理器映射成 409 + 稳定码，不在这里被吞掉。
+            return self._json(409, {"ok": False, "code": "config_not_ready"})
+        revision = self._target_revision(body, profile_id)
         if revision is None:
             return self._json(409, {"ok": False, "code": "config_not_ready"})
         ticket = self._lifecycle.begin_operation("start")
         if ticket is None:
             return self._json(409, {"ok": False, "code": "lifecycle_busy"})
         try:
-            operation = self._manager.start(revision=revision)
+            operation = self._manager.start(revision=revision, profile_id=profile_id)
         finally:
             # 租约只覆盖派发本身：启动后的并发由 `manager.state`（starting 等）
             # 在测试入口的租约内兜住，长等待一律留在门外（§59、D-132）。
@@ -586,25 +647,31 @@ class LocalApi:
             body = await self._json_body(request)
         except ApiError as exc:
             return self._json(exc.status, exc.payload())
-        revision = self._target_revision(body)
+        try:
+            profile_id = self._profile_id()
+        except ApiError:
+            # 与 `_bot_start` 同一口径：没有档案就没有可重启的配置。
+            return self._json(409, {"ok": False, "code": "config_not_ready"})
+        revision = self._target_revision(body, profile_id)
         if revision is None:
             return self._json(409, {"ok": False, "code": "config_not_ready"})
         ticket = self._lifecycle.begin_operation("restart")
         if ticket is None:
             return self._json(409, {"ok": False, "code": "lifecycle_busy"})
         try:
-            operation = self._manager.restart(revision=revision)
+            operation = self._manager.restart(revision=revision, profile_id=profile_id)
         finally:
             self._lifecycle.end(ticket)
         return self._json(202, {"ok": True, "operation_id": operation.operation_id})
 
-    def _target_revision(self, body: dict) -> int | None:
-        """启动/重启的目标版本：请求指定优先，否则用当前已保存版本（§6.5）。
+    def _target_revision(self, body: dict, profile_id: str) -> int | None:
+        """启动/重启的目标版本：请求指定优先，否则用该档案已保存的版本（§6.5）。
 
-        指定的版本必须是当前已保存的那一版：别的版本没有可用的运行快照，
-        应当立刻回 409，而不是先答应再异步失败（审查 M8）。
+        只读这一次解析出来的档案：活动指针在这之后变化也不影响本次启动
+        （§5.2 的输入固定）。指定的版本必须是该档案当前已保存的那一版：别的
+        版本没有可用的运行快照，应当立刻回 409，而不是先答应再异步失败（审查 M8）。
         """
-        saved = self._config.load_saved()
+        saved = self._bound(profile_id).load_saved()
         if saved is None:
             return None
         requested = body.get("revision")
@@ -629,6 +696,8 @@ class LocalApi:
                     "state": operation.state,
                     "result": operation.result,
                     "revision": operation.target_revision,
+                    # 操作属于哪个档案：同号 revision 换档案时页面据此区分结果。
+                    "profile_id": operation.profile_id,
                     "finished": operation.finished_at is not None,
                 },
             },
@@ -712,26 +781,36 @@ class LocalApi:
             self._lifecycle.end(ticket)
 
     def _run_site_test(self, credentials_override: Secrets | None = None) -> tuple[dict, int]:
+        """执行站点测试；档案上下文整段只解析一次（§4.1 末句）。"""
         try:
+            profile_id = self._profiles.active_profile_id()
+            service = self._read_service(profile_id)
             if credentials_override is None:
-                status = self._config.status()
-                saved = self._config.load_saved()
+                status = service.status()
+                saved = service.load_saved()
                 if saved is None or status.state != STATE_CONFIGURED:
                     # 配置无效时连测试都不做：地址规则与凭据都没通过校验（审查 I7）。
                     return {"ok": False, "code": "config_not_ready"}, 409
-                credentials = self._config.credentials_for(saved.revision)
+                credentials = service.credentials_for(saved.revision)
                 mapping = saved.mapping
                 revision = saved.revision
+                profile = service.profile()
             else:
                 # 向导测试仅在内存中构造一次性配置；站点 URL 仍来自 Light 固定基线。
-                mapping = light_base_mapping(self._config.profile())
+                # 无档案时基线省略档案内路径字段，config_dir 落到数据根，全程不创建文件。
+                profile = service.profile_or_none()
+                mapping = light_base_mapping(profile)
                 mapping["model"] = {
                     "base_url": "https://draft.invalid/v1",
                     "model": "draft-model",
                 }
                 credentials = credentials_override
                 revision = None
-            config = parse_config(mapping, config_dir=str(self._config.profile()), secrets=credentials)
+            config = parse_config(
+                mapping,
+                config_dir=str(profile if profile is not None else self._data_root),
+                secrets=credentials,
+            )
         except Exception as exc:
             mapped = self._handle(exc)
             return mapped.payload(), mapped.status
@@ -745,9 +824,17 @@ class LocalApi:
             )
         elapsed = int((self._clock() - started) * 1000)
         if revision is not None:
-            self._status.record_test("site", ok=outcome, detail=detail, revision=revision)
+            # 结果带档案身份：A、B 同为 rev 1 时不能互相顶替（§5.1 第 6 条）。
+            self._status.record_test(
+                "site",
+                ok=outcome,
+                detail=detail,
+                revision=revision,
+                profile_id=profile_id,
+            )
         result = {"ok": outcome, "detail": detail, "elapsed_ms": elapsed}
         if account_id is not None:
+            # 前端自报的 ID 不落盘、也不回填档案记录（§4.2 第 3 条）。
             result["account_id"] = account_id
         return result, 200
 
@@ -845,16 +932,22 @@ class LocalApi:
         return self._json(status, result)
 
     def _run_model_test(self, transient_values: dict[str, str] | None = None) -> tuple[dict, int]:
+        """执行模型测试；档案上下文整段只解析一次（§4.1 末句）。"""
         try:
+            profile_id = self._profiles.active_profile_id()
+            service = self._read_service(profile_id)
             if transient_values is None:
-                saved = self._config.load_saved()
+                saved = service.load_saved()
                 if saved is None:
                     return {"ok": False, "code": "config_not_ready"}, 409
-                credentials = self._config.credentials_for(saved.revision)
+                credentials = service.credentials_for(saved.revision)
                 mapping = saved.mapping
                 revision = saved.revision
+                profile = service.profile()
             else:
-                mapping = light_base_mapping(self._config.profile())
+                # 向导临时值只在内存里；无档案时 config_dir 落到数据根，不创建文件。
+                profile = service.profile_or_none()
+                mapping = light_base_mapping(profile)
                 mapping["model"] = {
                     "base_url": transient_values["base_url"],
                     "model": transient_values["model"],
@@ -868,18 +961,20 @@ class LocalApi:
             return mapped.payload(), mapped.status
         started = self._clock()
         outcome, detail = asyncio.run(
-            self._probe_model_mapping(mapping, self._config.profile(), credentials)
+            self._probe_model_mapping(
+                mapping, profile if profile is not None else self._data_root, credentials
+            )
         )
         elapsed = int((self._clock() - started) * 1000)
         if revision is not None:
-            self._status.record_test("model", ok=outcome, detail=detail, revision=revision)
+            self._status.record_test(
+                "model",
+                ok=outcome,
+                detail=detail,
+                revision=revision,
+                profile_id=profile_id,
+            )
         return {"ok": outcome, "detail": detail, "elapsed_ms": elapsed}, 200
-
-    async def _probe_model(self, saved, credentials: Secrets) -> tuple[bool, str]:
-        """固定样例、短超时、小输出；只回分类，不回生成内容（§8.2）。"""
-        return await self._probe_model_mapping(
-            saved.mapping, self._config.profile(), credentials
-        )
 
     async def _probe_model_mapping(
         self, mapping: dict, config_dir: Path, credentials: Secrets
@@ -978,9 +1073,12 @@ class LocalApi:
         if session is None:
             return self._json(401, {"ok": False, "code": "unauthenticated"})
         try:
-            profile = self._config.profile()
-        except ConfigServiceError:
-            return self._json(409, {"ok": False, "code": "no_active_profile"})
+            # 只读解析：无档案时如实回 409 `no_active_profile`，不建目录（D-135）。
+            # 元数据故障是另一类事实（ConfigServiceError），由应用级处理器回它
+            # 自己的稳定码，不再被折成「没有档案」。
+            profile = self._bound(self._profile_id()).profile()
+        except ApiError as exc:
+            return self._json(exc.status, exc.payload())
         directory = paths.knowledge_dir(profile)
         files = 0
         if directory.is_dir():
@@ -1021,7 +1119,9 @@ class LocalApi:
         payload = content.encode("utf-8")
         if len(payload) > MAX_IMPORT_BYTES:
             raise ApiError(413, "file_too_large")
-        profile = self._config.profile()
+        # 导入是写路径，但目标档案必须是**已有**的：没有档案时回 409
+        # `no_active_profile`，不在这里顺手建一个（D-135）。
+        profile = self._bound(self._profile_id()).profile()
         directory = paths.knowledge_dir(profile)
         if not paths.is_within(profile, directory):
             raise ApiError(500, "path_outside_profile")

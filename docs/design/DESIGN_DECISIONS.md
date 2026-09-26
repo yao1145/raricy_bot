@@ -18,6 +18,7 @@ D-129 前端本地打包与冻结发行，D-130 配置元数据的恢复状态�
 D-131 凭据删除先摘入口（N2 再交付完整清除），D-132 Light 控制面的站点测试与启停共用生命周期门，
 D-133 固定档案的 ConfigService（查询不创建、显式创建入口与分离的 launcher schema），
 D-134 档案记录的降级读取、账号名归属与由调用方停机的低层激活，
+D-135 控制面的档案身份（只读路径不创建、状态 DTO 身份键与启动固定档案），
 D-142 桌面偏好独立成文件（`desktop.json`）与独立 settings revision（N4）。
 后续变更沿用编号注明替代关系，不叠加互相矛盾的补丁段落。
 
@@ -1274,6 +1275,53 @@ N1 Task 2 的落地口径（[下一代设计](LIGHT_NEXT_GENERATION.md) §4.1、
   `active_epoch`、schema 写进**同一次**写入：只写计数会留下一个没有指针的文件，
   此后所有读都判 `metadata_pointer_invalid`，而 `ensure_first_profile()` 按 F2 拒绝修复它。
   文件存在时本模块只改 `catalog_revision`，绝不改指针。
+
+## D-135 控制面的档案身份：只读路径不创建、状态 DTO 身份键与启动固定档案
+
+N1 Task 3 的落地口径（[下一代设计](LIGHT_NEXT_GENERATION.md) §4.1、§5.1 第 6 条、§5.2、§9）。
+`LocalApi` 注入 `ProfileService`，每个请求只解析一次档案上下文（`_profile_id` 解析、
+`_bound` 取绑定实例，另有一个只读上下文的私有助手 `_read_service`）；
+`WorkerManager` 的启动/重启与
+`Operation` 携带 `profile_id`；`StatusService` 的 DTO 暴露五个档案字段。契约见 §59。
+
+- **为什么身份键是 `(profile_id, config_revision, profile_epoch)` 而不是只比数字
+  revision**：`running_revision` 与 `saved_revision` 同为 1 并不说明它们属于同一个档案
+  —— A、B 各自从 rev 1 开始时，只比数字会把 A 的测试结果、待重启判断和操作结果当成 B
+  的当前事实。`profile_id` 区分档案，`config_revision` 区分同一档案内的版本变化，
+  `active_epoch` 区分活动指针的代次（同一档案被重新选中、指针被手工改动）。三者合起来
+  才能回答「这份结果属于现在这一刻的哪个档案的哪一版」。
+- **为什么 `profile_epoch` 只在记录方给出时才参与测试结果的过期判定**：活动指针每切换
+  一次 `active_epoch` 就 +1，**切回原档案也一样**（`activate()` 的语义就是推进代次）。
+  把「当前代次」当作测试结果的严格相等键，会让同一档案的旧结果在任意一次切换往返后
+  永久过期 —— 那是误报，不是串档案。因此 API 记录测试结果时带 `profile_id` 与
+  `revision`（同号 revision 不串档案靠前者），`record_test` 与 `TestResult` 保留
+  `profile_epoch` 供需要更严格判定的调用方使用；代次进 DTO 的主要用途是 N2 的写入冲突
+  判定（`expected_profile_epoch`）。
+- **为什么元数据故障在 `snapshot()` 里降级为 `None` 而不是抛**：`/api/status` 是管理页
+  定位问题时的第一个请求，它自己 500 会把「元数据损坏」这个已经诊断清楚的事实变成一个
+  空白页。`config.state == "recovery"` 与它的稳定码（D-130）已经承载原因，档案字段如实
+  报「读不出来就是 None」即可；不猜、也不触发任何修复动作。
+- **为什么查询路径彻底不创建**：N0 路由过来的缺陷是「读一次配置就顺手把首个档案建出来」，
+  于是页面刷新、知识库状态查询甚至一次纯校验都会在真正空的根目录上留下 `launcher.json`
+  与 `profiles/`，把「还没设置」变成「设置了一半」。现在只有 `PUT /api/config` 与
+  `PUT /api/config/draft` 经 `ProfileService.ensure_first_profile()` 建首个档案；
+  `GET /api/config`、`GET /api/kb/status`、`POST /api/config/validate`、向导临时测试
+  （`/api/test/site`、`/api/test/model` 带显式输入的分支）都用只读上下文，`no_active_profile`
+  只在需要已有档案的 `GET /api/kb/status`、`POST /api/kb/import` 出现，启动/重启无档案
+  仍是既有的 `config_not_ready`。
+- **为什么启动档案要在派发前固定**：启动线程里重新解析活动指针会造出「配置属于 A、目录
+  已经指向 B」的 Worker，而这类错配只能在消费消息之后才被发现。`_bot_start` / `_bot_restart`
+  与 `_auto_start` 因此都在派发前解析一次并显式传 `profile_id`；`_build_spec` 用该档案的
+  绑定实例取快照与凭据，`Operation.profile_id` 让异步结果也能归位（N1 只做「固定」，
+  切换事务在 N2）。
+- **`startup_profile_id` 的过渡口径与 N4 的替换点**：N1 还没有 `desktop.json` 的启动目标
+  （N4 交付），因此暂以「活动档案 + 档案内 `start_bot_on_launch` 为真」表示启动目标；
+  N4 换成桌面设置里的 `startup_profile_id` 时，这里的判据与来源一起改，前端不再读档案内
+  偏好（D-142 已记录该字段只保留在历史快照与迁移的只读口径里）。
+- **为什么事件归属打标留给 N2**：N1 没有任何切换或删除入口（`activate()` 是低层 API，
+  不暴露成路由），事件只可能属于当前活动档案；唯一会出现「旧归属」的情形是有人手工编辑
+  `launcher.json` 的指针，此时任何打标都建立在一个不可信的输入上。N2 引入账号页与
+  `LifecycleService` 后，切换事务才有明确的「旧上下文」需要标记与清理（§9 的事件归属）。
 
 ## 实施期编号兼容
 

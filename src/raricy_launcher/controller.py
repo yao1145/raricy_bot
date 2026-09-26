@@ -44,6 +44,7 @@ from .process_manager import (
     WorkerSpec,
     default_worker_spec,
 )
+from .profile_service import ProfileService
 from .session import SessionManager
 from .status_service import StatusService
 
@@ -104,6 +105,11 @@ class Controller:
         self._config = ConfigService(
             self._data_root, credential_store=self._credentials, profile_id=profile_id
         )
+        # 档案级入口：控制面按档案取绑定服务（一次请求只解析一次档案上下文），
+        # 状态聚合也经它读活动档案与代次（§4.1、D-135）。
+        self._profiles = ProfileService(
+            self._data_root, base_config_service=self._config
+        )
         # 事件时间要与管理页显示的墙钟一致（同一处时钟时基缺陷，复审指出）。
         self._events = EventService(instance_id=self._instance_id, clock=time.time)
         self._sessions = SessionManager(instance_id=self._instance_id, clock=time.monotonic)
@@ -120,6 +126,7 @@ class Controller:
             instance_id=self._instance_id,
             config_service=self._config,
             manager=self._manager,
+            profile_service=self._profiles,
         )
         # 站点测试与启停共用的生命周期门：进程内单实例，随控制器一起装配
         # （§59、D-132）。互斥范围就是这个对象，所以只能有一个。
@@ -242,7 +249,11 @@ class Controller:
             status = None
         configured = status is not None and status.state == "configured"
         if configured and self._config.start_bot_on_launch():
-            operation = self._manager.start(revision=status.revision)
+            # 启动档案在派发前固定一次：之后启动线程与规格工厂都不再读活动指针（§5.2）。
+            operation = self._manager.start(
+                revision=status.revision,
+                profile_id=self._profiles.active_profile_id(),
+            )
             watcher = threading.Thread(
                 target=self._watch_auto_start,
                 args=(operation.operation_id,),
@@ -281,6 +292,7 @@ class Controller:
             instance_id=self._instance_id,
             data_root=self._data_root,
             config_service=self._config,
+            profile_service=self._profiles,
             manager=self._manager,
             status_service=self._status,
             events=self._events,
@@ -357,16 +369,28 @@ class Controller:
 
     # --- Worker -----------------------------------------------------------
 
-    def _build_spec(self, revision: int | None, run_id: str) -> WorkerSpec:
-        """构造一次启动的完整输入：运行快照与凭据在配置锁内一次取得（§6.5）。"""
-        saved = self._config.load_saved()
+    def _build_spec(
+        self, revision: int | None, run_id: str, profile_id: str | None
+    ) -> WorkerSpec:
+        """构造一次启动的完整输入：运行快照与凭据在配置锁内一次取得（§6.5）。
+
+        `profile_id` 是派发时固定下来的档案（§5.2 的输入固定）：用它的绑定实例
+        取快照、凭据与目录，**不再**在启动线程里重新解析可变的活动指针 —— 否则
+        切换档案的瞬间会起出一个「配置属于 A、目录已经指向 B」的 Worker。
+        """
+        service = (
+            self._config
+            if profile_id is None
+            else self._profiles.config_service(profile_id)
+        )
+        saved = service.load_saved()
         if saved is None:
             raise ConfigServiceError("no_active_config")
         target = saved.revision if revision is None else revision
-        launch = self._config.build_run_launch(target)
+        launch = service.build_run_launch(target)
         return default_worker_spec(
             run_config=str(launch.config_path),
-            config_dir=str(self._config.profile()),
+            config_dir=str(service.profile()),
             credentials=launch.credentials,
             instance_id=self._instance_id,
             run_id=run_id,

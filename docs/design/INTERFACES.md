@@ -992,6 +992,22 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   读接口显式构造响应：只含可编辑字段、revision、账号与「凭据已配置/后端可用」三态，
   不返回凭据取值，也不返回可用于读取凭据的引用。校验失败回 422（`field` + 稳定码），
   revision 冲突回 409。
+- **查询与纯校验不创建**（N1、D-135）：`LocalApi` 注入 `ProfileService`，每个请求
+  只解析一次档案上下文 —— `_profile_id(create=False)` 经 `active_profile_id()` 只读解析、
+  `_bound(profile_id)` 取该档案的绑定 `ConfigService`，之后所有读写都用这一实例
+  （§4.1 末句）。`GET /api/config` 因此不建立首个档案：无档案时 `profile_id` 为 `null`、
+  `state` 仍是 `needs_setup`、`values` 为空、`defaults` 只回 System Prompt 默认模板
+  （基线按 `light_base_mapping(None)` 省略四个档案内路径字段）；有档案时取值不变。
+  `POST /api/config/validate` 无档案时用数据根级实例（`light_base_mapping(None)` 基线），
+  合法输入仍回 `200 {"ok": true}`、字段错误仍回 422 + 稳定码。`POST /api/test/site` 与
+  `/api/test/model` 的**带显式输入**分支同样用 `light_base_mapping(None)`、`config_dir`
+  取数据根，响应形状不变（`account_id` 仍不落盘）。真正空的根目录上这些查询都不产生
+  `launcher.json`、`profiles/` 或任何新文件。**`no_active_profile`（409）只由需要已有档案
+  的入口回**：`GET /api/kb/status`、`POST /api/kb/import`；启动/重启无档案仍回既有的
+  `config_not_ready`。写路径 `PUT /api/config`、`PUT /api/config/draft` 才经
+  `_profile_id(create=True)` → `ProfileService.ensure_first_profile()` 建立首个档案
+  （`profile.json` 同时补齐）。读取档案时的元数据故障仍由应用级处理器映射成 409 +
+  四个既有码，不再被折成「没有档案」。
 - **凭据删除**（§7，D-131）：提交只接受 `keep` / `replace`；凭据项写成
   `{"action": "delete"}` 时，在任何写入之前立即回 409 `credential_delete_unavailable`，
   `field` 是该凭据名，响应另带 `message`（`texts.py` 的固定文案）说明暂不可用与手工撤销
@@ -1008,6 +1024,19 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 - **进程面**（§9.2）：`POST /api/bot/{start,stop,restart}` 立刻返回 `operation_id`（202），
   长等待在后台操作里；`GET /api/operations/{id}` 查固定阶段与结果码。指定版本必须是当前
   已保存的版本，否则立刻 409。退出流程开始后拒绝一切启动。
+- **启动固定档案**（N1、D-135，§5.2 的输入固定）：`_bot_start` / `_bot_restart` 先
+  `_profile_id()` 解析一次档案，再用该档案绑定实例的 `load_saved()` 校验 revision
+  （请求指定时仍必须等于该档案已保存的版本，否则 409 `config_not_ready`）；生命周期门
+  （`lifecycle_busy`）与 202 + `operation_id` 的既有顺序不变。`profile_id` 一路传到
+  `WorkerManager.start/restart(profile_id=...)`、`Operation.profile_id`、
+  `GET /api/operations/{id}` 响应的 `operation["profile_id"]`，以及
+  **`spec_factory(revision, run_id, profile_id)` 三参签名**（`WorkerManager` 的
+  `_spec_factory` 调用点已改成三参）。`Controller._build_spec(revision, run_id, profile_id)`
+  用 `self._profiles.config_service(profile_id)` 取 `load_saved()` / `build_run_launch()` /
+  `profile()`，**不再**在启动线程里重新解析活动指针；`Controller._auto_start` 与
+  `api._bot_start/_bot_restart` 都显式传它。`WorkerManager.status()` 新增
+  `running_profile_id`：与 `running_revision` 同点设置（`state=running`）、同点清空
+  （停止、失败、回收、`shutdown`）。
 - **生命周期门**（F3、D-132）：站点测试与启停共用一把进程内、非阻塞的租约门
   （`lifecycle_gate.py`；控制器装配一个实例，`LocalApi` 构造注入，互斥范围就是这个对象）。
   `POST /api/test/site` 在整段执行期间持有租约，`manager.state` 检查与派发都在租约覆盖内
@@ -1027,6 +1056,23 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   过期或缺失如实报 `stale` / `unknown`，不从日志猜。显式测试结果绑定 revision，配置一变
   即标为过期。事件环形缓冲 500 条、订阅者有上限；游标过旧或来自别的实例时发 `gap` 提示；
   SSE 心跳 15 秒、慢消费者丢帧而不拖住发布方。
+- **状态 DTO 的档案身份**（N1、D-135）：`StatusService.__init__` 新增 `profile_service=None`
+  （缺省只供不装配档案视图的测试；正式装配由 Controller 注入 `ProfileService`）。
+  `snapshot()` 顶层新增五个字段：`active_profile_id`、`running_profile_id`、
+  `startup_profile_id`、`profile_epoch`、`pending_operation`。
+  `active_profile_id` / `profile_epoch` 取自 `profile_service.catalog()`（活动指针与
+  `active_epoch`）；`running_profile_id` 取自 `manager.status()`；`startup_profile_id` 是
+  「活动档案且 `config.start_bot_on_launch()` 为真」的过渡口径（N4 换成 `desktop.json`
+  的启动目标）；`pending_operation` 在 `manager.current_operation()` 未完成时给出
+  `{"operation_id", "kind", "state", "profile_id", "revision"}`，否则 `null`。
+  `catalog()` 或配置读取抛 `ConfigServiceError` 时这三个档案字段**降级为 `None`**，不抛：
+  元数据损坏时 `/api/status` 必须仍是 200，原因由 `config.state == "recovery"` 与它的
+  稳定码承载。`restart_required` 的判据扩为「已运行且（`running_revision != saved_revision`
+  **或** `running_profile_id != active_profile_id`）」—— 同号 revision 换档案也要提示重启。
+  `TestResult` 新增 `profile_id` / `profile_epoch`，`record_test(..., profile_id=,
+  profile_epoch=)` 可选；`_test_view()` 的过期判定改为：档案 id 不同即 `stale`（两边都是
+  `None` 时退回按数字 revision 比较），代次只在两边都记录了它时参与比较，数字 revision
+  仍参与 —— 身份键是 `(profile_id, config_revision, profile_epoch)`（§5.1 第 6 条）。
 
 ## 60. 管理页与发行（`frontend/`、`packaging/light/`）
 
