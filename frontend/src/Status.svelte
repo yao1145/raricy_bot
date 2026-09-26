@@ -1,5 +1,6 @@
 <script lang="ts">
   import * as api from "./api";
+  import { conflictNotice } from "./texts";
 
   let { status, onchanged }: { status: api.StatusSnapshot; onchanged: () => void } = $props();
 
@@ -61,7 +62,8 @@
     if (error instanceof api.ApiError) {
       if (error.status === 401) return "会话已失效，请重新打开管理页。";
       if (error.code === "config_not_ready") return "还没有可用的正式配置，请先在设置里保存。";
-      return `操作被拒绝：${error.code}`;
+      // 固定文案集中在 texts.ts；未命中的码才回退到原始码。
+      return conflictNotice(error.code) ?? `操作被拒绝：${error.code}`;
     }
     return "操作失败；请查看近期事件里的固定事件码。";
   }

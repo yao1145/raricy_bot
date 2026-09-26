@@ -687,8 +687,8 @@ class LocalApi:
         """在租约覆盖内检查进程状态并执行站点测试；租约只在本线程释放（D-132）。
 
         调用 `manager.state` 与派发测试之间没有释放动作，所以「看到 stopped」
-        之后不会再有新的启动溜进来；看到 `starting` / `stopping` 说明生命周期
-        操作已经先行派发，测试让位。
+        之后不会再有新的启动溜进来；看到 `starting` / `stopping` 或有在途操作，
+        说明生命周期操作已经先行派发，测试让位（在途操作判据见下面的注释）。
         """
         try:
             state = self._manager.state
@@ -697,6 +697,15 @@ class LocalApi:
                 return {"ok": False, "code": "bot_running"}, 409
             if state not in ("stopped", "failed"):
                 # starting / stopping：生命周期操作在途，不是「正在运行」。
+                return {"ok": False, "code": "lifecycle_busy"}, 409
+            pending = self._manager.current_operation()
+            if pending is not None and pending.finished_at is None:
+                # 只有 state 还不够：restart 的停止阶段会先把状态写回 stopped /
+                # failed（process_manager 的 `_stop_synchronously`），之后才写
+                # starting（`_do_restart`），中间那段空档里 `state` 是测试允许的
+                # 取值，而组合操作尚未完成 —— 光看状态会在这里放行测试，让它与
+                # 随即启动的新 Worker 并行。在途操作存在就拒绝：宁可保守地多拒
+                # 一次测试，也不让测试和启动并行。判据仍在租约内、不等待。
                 return {"ok": False, "code": "lifecycle_busy"}, 409
             return self._run_site_test(credentials_override)
         finally:

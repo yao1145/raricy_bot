@@ -821,7 +821,8 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 ## 58. `raricy_launcher` 的配置与凭据（L2）
 
 入口：[档案布局](../../src/raricy_launcher/paths.py)、[配置事务](../../src/raricy_launcher/config_service.py)、
-[凭据库](../../src/raricy_launcher/credential_store.py)、[数据档案锁](../../src/raricy_bot/data_lock.py)。
+[桌面设置](../../src/raricy_launcher/desktop_settings.py)、[凭据库](../../src/raricy_launcher/credential_store.py)、
+[数据档案锁](../../src/raricy_bot/data_lock.py)。
 
 - **档案布局**（§13.1）：`launcher.json` 只放活动档案指针与 schema；每个档案有
   `profile.json`、`config.yaml`、`draft.yaml`、`revisions/`、`data/`、`knowledge/`、
@@ -934,14 +935,47 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   规范化要**先解析数据库文件自身的链接**再取父目录 —— 否则指向同一个数据库的两条路径
   会各拿一把锁。完整版 CLI 与 Light Worker 因此天然争用同一个标识；`acquire_data_lock()`
   立即取得，被占用时 CLI 以退出码 4 结束（§17）。锁文件里的 pid 只用于诊断，不是夺锁依据。
+- **桌面设置**（§8、D-142）：数据根下与 `launcher.json` 同级的 `desktop.json` 是桌面偏好
+  的唯一持久来源，`schema_version=1`；字段与默认值：`settings_revision=0`（文件不存在时）、
+  `launch_at_sign_in=false`、`start_bot_on_launch=false`、`startup_profile_id=null`、
+  `pending_startup_apply=null`、`last_apply_result="not_attempted"`。`settings_revision` 只随
+  **用户意图**（前三个字段）改变而 +1，与档案配置的 revision **各自独立**；`last_apply_result`
+  （`ok` / `not_attempted` / `command_too_long` / `path_unusable` / `registration_conflict` /
+  `apply_failed` / `read_failed`）与 `pending_startup_apply`（`null` 或
+  `{"action": "register"|"unregister", "command": "<命令>"}`，只是诊断、不参与重放）只能由
+  `record_apply_result()` 写，**不改 revision** ——「意图 / 待应用 / 实际结果」三段式因此不会在
+  同一次写入里互相覆盖。`update(expected_revision, ...)` 省略某个参数表示本次不改它，
+  `startup_profile_id=None` 是显式清空（`_UNSET` 哨兵区分两者）；`expected_revision` 不符抛
+  `DesktopSettingsConflict`。写盘与配置提交同一手法（同目录临时文件 + flush + fsync +
+  `os.replace`），失败即「这一版没有生效」，旧文件不变。
+- **桌面设置的唯一来源**（§8、D-142）：桌面偏好只认 `desktop.json`，本模块不读档案
+  `config.yaml` 的 `start_bot_on_launch`（该字段只保留在历史快照与 N1 迁移的只读口径里）。
+  唯一例外是升级用户的一次性导入：`desktop.json` 不存在而 `launcher.json` 存在时，`read()`
+  读取当前档案的旧偏好并写入新文件（不递增 revision，紧随其后的 `update(expected_revision=0,
+  ...)` 仍然成立），写完即不再回退到档案；**N1 的 `migration.py` 落地后，这条回退仍是升级
+  用户的唯一导入路径**。查询不修复、不创建、不覆盖（与 D-130 同口径）：只有这一次导入会创建
+  文件，损坏、版本不认识或不支持时只报码、不动现场；全新实例（没有 `launcher.json`）连默认值
+  也不落盘。
+- **桌面设置的稳定码**（§8、§11）：`desktop_settings_conflict`（revision 不符）、
+  `invalid_desktop_settings`（参数类型/取值非法）、`desktop_unreadable`（读不到：权限、占用）、
+  `desktop_corrupt`（JSON 解析失败、顶层非映射、`settings_revision` 不是非负整数、布尔字段
+  类型不对、`startup_profile_id` 不是合法档案 id、超过字节上限）、`desktop_unsupported_version`
+  （`schema_version` 大于本程序）、`desktop_settings_write_failed`（写盘失败）。`str(exc)`
+  就是码，不含路径、命令或异常原文。
 
 ## 59. Light 控制面（会话、API、进程与事件）
 
-入口：[会话](../../src/raricy_launcher/session.py)、[API](../../src/raricy_launcher/api.py)、
+入口：[桌面入口](../../src/raricy_launcher/main.py)、[会话](../../src/raricy_launcher/session.py)、
+[API](../../src/raricy_launcher/api.py)、
 [进程管理](../../src/raricy_launcher/process_manager.py)、[IPC 协议](../../src/raricy_launcher/ipc.py)、
 [事件](../../src/raricy_launcher/events.py)、[状态聚合](../../src/raricy_launcher/status_service.py)、
 [生命周期门](../../src/raricy_launcher/lifecycle_gate.py)、[控制器](../../src/raricy_launcher/controller.py)。
 
+- **入口参数与来源提示**（§9.4）：`--worker` 仍优先按 Worker 分派，其后参数原样透传；
+  否则按 Controller 入口解析，只识别字面量 `--startup`（可出现在任意位置），其余参数
+  照旧忽略。`--startup` 只是来源提示、**不是权限边界**（互斥体、生命周期门与授权偏好
+  的判定都不放宽）；已有实例时静默去重退出并记一条 `launcher.startup_deduped`，
+  不沿用 `open_admin` 激活分支、不打开浏览器，激活协议与命令集合不变。
 - **会话**（§8.1）：引导令牌单次、限时（120 秒），经 URL fragment 交付；兑换成功即发放
   HttpOnly + SameSite=Strict 的会话 Cookie，并回一个会话绑定的 CSRF 值。兑换按 60 秒窗口限次，
   窗口会滚动，本机他人刷满也不能把用户永久挡在门外。会话只存内存，Controller 重启即全部失效。
@@ -975,11 +1009,13 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   `POST /api/test/site` 在整段执行期间持有租约，`manager.state` 检查与派发都在租约覆盖内
   由**工作线程**完成、租约只在该线程的 `finally` 释放（请求协程被取消时线程仍在跑，协程侧
   释放等于把门开在测试进行中）。`POST /api/bot/{start,stop,restart}` 先取租约再调用管理器，
-  取不到就 409 `lifecycle_busy` 且不派发，租约在管理器调用返回后立刻释放。测试入口的 409
-  分两个稳定码：进程确实 `running` 时沿用 `bot_running`（既有语义），门被占用或处于
-  `starting` / `stopping` 时回 `lifecycle_busy`。门内不等待 Worker、网络或 keyring；操作之间
-  不互斥，`WorkerManager` 对启停的串行化与 `stop` 抢占 `starting` 的语义不变 —— 门只解决
-  跨入口（测试 vs 启停）的竞态。
+  取不到就 409 `lifecycle_busy` 且不派发，租约在管理器调用返回后立刻释放。测试入口在**持租约
+  期间**按两条判据放行：进程处于 `stopped` / `failed`，且没有未完成的在途操作。在途操作这条
+  不可省：`restart` 的停止阶段会先把状态写回 `stopped` / `failed`、之后才写 `starting`，只看
+  `state` 会在那段空档放行测试。拒绝分两个稳定码：进程确实 `running` 时沿用 `bot_running`
+  （既有语义），门被占用、处于 `starting` / `stopping`、或仍有未完成操作时回 `lifecycle_busy`。
+  门内不等待 Worker、网络或 keyring；操作之间不互斥，`WorkerManager` 对启停的串行化与 `stop`
+  抢占 `starting` 的语义不变 —— 门只解决跨入口（测试 vs 启停）的竞态。
 - **IPC**（§10.1）：控制通道（父→子：`stop`、`status_request`）与上报通道（子→父：
   `ready`、`status`、`log`、`stopped`）分向；帧有长度前缀与上限，信封固定携带协议版本、
   实例 ID、运行 ID 与序号，身份不符即终止会话。日志帧只承载 `log_event` 的白名单事件。
