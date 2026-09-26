@@ -337,8 +337,8 @@ docker compose logs -f bot
 | 想了解 | 读 |
 |---|---|
 | 全部文档的索引 | [`docs/README.md`](docs/README.md) |
-| Light 独立发行版（L0–L5 已实现；干净 Windows 与真实服务验收待做） | [`docs/design/LIGHT_EDITION_DESIGN.md`](docs/design/LIGHT_EDITION_DESIGN.md)、[使用手册](docs/usage/LIGHT.md) |
-| Light 下一代方案（尚未实施）：账号管理、托盘与登录启动 | [`docs/design/LIGHT_NEXT_GENERATION.md`](docs/design/LIGHT_NEXT_GENERATION.md) |
+| Light 独立发行版（L0–L5 与下一代 N0–N4 已实现：账号档案、托盘、Windows 登录启动；干净 Windows、真实服务与桌面集成的人工验收待做） | [`docs/design/LIGHT_EDITION_DESIGN.md`](docs/design/LIGHT_EDITION_DESIGN.md)、[使用手册](docs/usage/LIGHT.md) |
+| Light 下一代方案（N0–N4 已实施；N5 发行验收未做）：账号管理、托盘与登录启动 | [`docs/design/LIGHT_NEXT_GENERATION.md`](docs/design/LIGHT_NEXT_GENERATION.md) |
 | 怎么部署、升级、排障 | [`docs/usage/DEPLOYMENT.md`](docs/usage/DEPLOYMENT.md) |
 | 站内用户会看到什么、怎么跟他们解释 | [`docs/usage/USAGE.md`](docs/usage/USAGE.md) |
 | Exa 多 Key 池与本地知识库怎么配、怎么看日志、怎么排障 | [`docs/usage/EXA_POOL_AND_KB.md`](docs/usage/EXA_POOL_AND_KB.md) |

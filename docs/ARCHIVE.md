@@ -4,6 +4,22 @@
 `docs/archive/` 按现有 `.gitignore` **不入库**；这里的链接指向本地副本，新克隆可能没有这些文件。
 不删除未入库的唯一副本；需要跨机器保存时另行备份。
 
+## 2026-09-27 登记：下一代 Light 设计暂不归档（在用）
+
+[LIGHT_NEXT_GENERATION.md](design/LIGHT_NEXT_GENERATION.md) 是 N0–N4 的设计来源，N0–N4 已实施
+（N0 = D-130–D-132、N1 = D-133–D-137、N3 = D-138–D-141、N2 = D-143–D-147、N4 = D-142 与
+D-148–D-150）。按[文档索引](README.md)的归档规则（设计与计划完成后移入 `archive/`，
+未完成的验收待办先留在 `usage/`），本文将设计稿与验收分开处理：N5 发行验收未做（用户取消），
+干净 Windows、真实站点/模型、托盘与登录启动的人工验收尚未完成，验收项按规则留在
+[LIGHT.md §8](usage/LIGHT.md#8-已知限制与发行验收状态)，设计稿不随验收一起隐藏。
+因此本文**暂不归档**，继续留在 `design/` 作为在用设计来源；实施后的现行行为以
+[INTERFACES.md](design/INTERFACES.md)、[DESIGN_DECISIONS.md](design/DESIGN_DECISIONS.md) 与
+使用手册为准，§1–§2 的审查记录是实施前的历史证据。本次登记不复制或移动文件。
+
+| 文件 | 状态与内容 |
+|---|---|
+| [LIGHT_NEXT_GENERATION.md](design/LIGHT_NEXT_GENERATION.md) | **未归档（在用）**。账号更换/删除、托盘、Windows 登录自启动的下一代设计来源；N0–N4 已实施、N5 发行验收未做 |
+
 ## 2026-09-21 归档
 
 代码审查四项修复（记忆提交授权、工具永久负缓存、配额结算抗取消、按可运行会话调度）实现并

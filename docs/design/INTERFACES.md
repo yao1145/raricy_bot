@@ -1046,8 +1046,8 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   **不** bump `catalog_revision`），两个入口共用同一段「读—校验—一次写入」，不产生第二份
   实现。`set_state(profile_id, *, state, expected_profile_revision=None)` 改档案生命周期
   状态（`state` ∈ `{active, detached, deleting}`，其他值抛 `invalid_profile_state`；写
-  `profile_revision + 1`，带期望值时不符抛 `revision_conflict`）**尚未实现**，是删除路径
-  （N2 Task 3）要补的目标形状（必须原子、走配置写锁）。
+  `profile_revision + 1`，带期望值时不符抛 `revision_conflict`），删除路径（N2 Task 3）
+  已按这个目标形状落地（必须原子、走配置写锁），见本节的「档案状态与删除墓碑」条。
 
 - **凭据引用归属索引**（N2、D-144）：`credentials-index.json` 与 `launcher.json` 同级
   （`paths.CREDENTIALS_INDEX_FILE` / `credentials_index_path()`），UTF-8 JSON，写入用
@@ -1079,8 +1079,8 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   **认领回 `owned`**（确认前崩溃的恢复路径），并返回 `{"registered", "claimed",
   "unreadable"}` 计数。`reconcile_all(profile_ids)` 在 `Controller.start()` 的 `recover()`
   之后跑一次，只读 YAML + 写索引、**不碰凭据库**。`clear()` 撤销的是这个并集（当前版本
-  与全部历史快照），不是当前那一条。**读不出来的历史快照不当成「没有引用」**（与 D-130
-  同口径）：它记录的引用既登记不了也撤销不了，因此照常推进能做的删除，但把这类文档
+  与**能读到的**全部历史快照），不是当前那一条。**读不出来的历史快照不当成「没有引用」**
+  （与 D-130 同口径）：它记录的引用既登记不了也撤销不了，因此照常推进能做的删除，但把这类文档
   记入 `ClearResult.unreadable_documents`（相对数据根的路径）并让 `ok=False`，
   `reconcile` / `reconcile_all` 的摘要带 `unreadable` 计数，只读的
   `unreadable_documents(profile_id)` 供卡片与移除预览判断 `unknown_ownership`；
@@ -1442,8 +1442,8 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
     集合内都算未确认。目标与当前活动档案是同一个时跳过停与提交，退化成一次普通启动
     （不写指针、不 bump epoch，结果码仍用 `started` / `selected`）。`invalidate_old_views`
     发布事件 **`launcher.profile_activated`**（N2 Task 4 起 `profile_id` 已随
-    `FIELD_KINDS` 登记进事件，见本节的「事件归属」条；N1 的测试结果按身份键自然过期），
-    不重写任何状态。
+    `FIELD_KINDS` 登记进事件，见本节的「事件归属」条；代次以 `revision=epoch` 发布，
+    `revision` 早已在白名单里；N1 的测试结果按身份键自然过期），不重写任何状态。
   - **幂等键**（§4.2、总表）：形状 `[A-Za-z0-9_-]{8,64}`（`IDEMPOTENCY_KEY_MIN_CHARS` /
     `_MAX_CHARS`），摘要 = 规范化请求字段的 JSON 排序键 + sha256，**输入不含秘密、摘要不落盘**。
     内存表保留最近 50 个键；服务重启后回落到记录级比较（同一键、同一 `kind`、同一目标档案、
@@ -1609,10 +1609,12 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   `profile_id: null`、`expected_profile_epoch: 0`。元数据故障（N0 的四个码）在判上下文之前
   如实抛出。`POST /api/bot/stop` 不变（停止不受代次门限制）。
   **门核过的档案必须一路带进写路径**：`PUT /api/config` 的工作线程只对门里核过的
-  `profile_id` 写（不在线程里重新解析活动指针），并在写前复核 `active_epoch`；门之后
-  指针被切换/删除提交改过就回 409 `revision_conflict`（`field="expected_profile_epoch"`），
-  **绝不**把这次编辑（含凭据替换）落到另一个账号上。只校验一次门、写路径再按指针解析
-  等于把竞态窗口挪了个位置 —— 两个档案 revision 同号时连 `expected_revision` 都挡不住。
+  `profile_id` 写（不在线程里重新解析活动指针），并在写前复核 `active_epoch`：复核不符
+  回 409 `revision_conflict`（`field="expected_profile_epoch"`）。复核与 `commit()` 不是
+  同一原子步骤，最后一条缝里指针被切换/删除提交改走时这次写入会得 200；写入因此只保证
+  「落在门里核过的那个档案上」，**绝不**落到另一个账号（含凭据替换）——这是尽力而为的
+  检测，不是「指针被切走必然回 409」的承诺。只校验一次门、写路径再按指针解析，才是把
+  竞态窗口挪了个位置 —— 两个档案 revision 同号时连 `expected_revision` 都挡不住。
   `POST /api/bot/{start,stop,restart}` 一律经协调器的 `start_bot(expected_epoch=…)` /
   `stop_bot()` / `restart_bot(expected_epoch=…)`：启停因此共用同一条串行化与取消代次
   （`stop` 会提高代次，在途切换据此收敛）。请求体里的 `revision` 不再参与判定 —— 启动绑定的
@@ -1681,7 +1683,7 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 - 验收边界：`tools/smoke_light.py` 覆盖「启动 → 激活 → 会话 → 状态 → 页面与构建产物 →
   凭据后端可用 → 退出 → 元数据清理」，运行时本机不能再有另一个 Light 实例（激活通道与
   互斥体按当前用户命名）。**干净 Windows 清单（§17.2）与真实站点/模型验收仍未执行**，
-  见使用手册 §7。
+  见使用手册 §8。
 - **账号页要用的字段**（N2 Task 4；服务端形状见 §59 的 ProfileCard）：页面只用
   `GET /api/profiles` 的 `catalog`（`active_epoch` 给 `activate` 的 `expected_epoch`、
   `catalog_revision` 给 `expected_catalog_revision`）与每张卡片的

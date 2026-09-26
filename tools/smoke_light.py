@@ -2,7 +2,7 @@
 
 它不连站点、不建机器人：只证明发行目录里的程序能自己跑起来、控制面可用、退出干净。
 干净 Windows 验收（无 Python/Node/Docker 的独立机器）仍需人工执行，见
-[docs/usage/LIGHT.md](../docs/usage/LIGHT.md) §7。
+[docs/usage/LIGHT.md](../docs/usage/LIGHT.md) §8。
 
 注意：激活通道与单实例互斥体都按**当前用户**命名，因此冒烟运行时本机不能同时
 有另一个 Light 实例（那会让冒烟拿到别的实例的端口并失败 —— 是安全失败，不是误报）。
