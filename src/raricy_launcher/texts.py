@@ -138,6 +138,7 @@ TRAY_STATUS_PREFIX: str = "状态："
 # 托盘状态标签：同一时刻只显示一条，判定顺序见 tray_model.status_label()。
 TRAY_STATUS_NEEDS_SETUP: str = "未设置账号"
 TRAY_STATUS_NEEDS_CREDENTIALS: str = "需重新填写凭据"
+TRAY_STATUS_NO_SELECTION: str = "未选择账号"
 TRAY_STATUS_RECOVERY: str = "配置需要修复"
 TRAY_STATUS_INVALID: str = "配置不可用"
 TRAY_STATUS_STOPPED: str = "已停止"

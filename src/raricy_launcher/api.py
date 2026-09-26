@@ -59,6 +59,7 @@ from .credential_store import CredentialStoreError
 from .desktop_settings import (
     DESKTOP_SETTINGS_CONFLICT,
     INVALID_DESKTOP_SETTINGS,
+    STARTUP_TARGET_UNKNOWN,
     DesktopSettingsConflict,
     DesktopSettingsError,
     DesktopSettingsService,
@@ -803,10 +804,14 @@ class LocalApi:
             # 首次设置：门核过「当时没有档案」，写路径才允许建立首个档案
             # （profile.json 一并补齐）；请求体本身的错误已经在上面拒绝。
             target_profile_id = self._profiles.ensure_first_profile()
-        elif catalog.active_profile_id == target_profile_id:
-            # 指针在场但档案目录可能还没建（N1 的首次写入语义）：补齐记录，
-            # 已存在时不覆盖现场。
-            self._profiles.ensure_first_profile()
+        else:
+            if catalog.active_profile_id == target_profile_id:
+                # 指针在场但档案目录可能还没建（N1 的首次写入语义）：补齐记录，
+                # 已存在时不覆盖现场。
+                self._profiles.ensure_first_profile()
+            # 通用配置入口同样要拦 `deleting`（§6.2 第 1 步）：门只核了指针与代次，
+            # 不核档案状态；正在删除的账号不接受任何新配置写入。
+            self._reject_deleting(self._require_record(target_profile_id))
         return self._bound(target_profile_id).commit(
             values,
             expected_revision=expected,
@@ -1009,8 +1014,13 @@ class LocalApi:
         return self._startup_service
 
     def _save_draft(self, values: dict, expected_revision: int) -> int:
-        """草稿是写路径：无档案时在这里建立首个档案（D-133、D-135）。"""
+        """草稿是写路径：无档案时在这里建立首个档案（D-133、D-135）。
+
+        解析出档案之后再拦一次 `deleting`：首次设置分支刚落下的记录是 `active`，
+        自然放行；已存在的 `deleting` 档案不接受草稿（§6.2 第 1 步）。
+        """
         profile_id = self._profile_id(create=True)
+        self._reject_deleting(self._require_record(profile_id))
         return self._bound(profile_id).save_draft(
             values, expected_revision=expected_revision
         )
@@ -1249,13 +1259,19 @@ class LocalApi:
         return self._json(status, result)
 
     def _site_test_blocker(self) -> str | None:
-        """站点测试与身份验证共用的两条判据；不满足时返回稳定码。
+        """站点测试与身份验证共用的判据；不满足时返回稳定码。
 
         只有 `state` 还不够：restart 的停止阶段会先把状态写回 stopped / failed
         （`process_manager._stop_synchronously`），之后才写 starting
         （`_do_restart`），中间那段空档里 `state` 是测试允许的取值，而组合操作尚未
         完成 —— 光看状态会放行测试，让它与随即启动的新 Worker 并行。在途操作存在
         就拒绝：宁可保守地多拒一次，也不让测试和启动并行。判据不等待、不排队。
+
+        协调器的未完成操作（切换/删除/清除事务）是**第三**条判据：事务在两次取门
+        之间有窗口（提交指针之前），只看管理器状态会把站点测试放进去，而事务随后
+        「指针已提交、B 未启动」的收尾会被门外的等待超时写成 `failed/lifecycle_busy`
+        （§5.2 故障表第 4 行要求 `finished/result=start_failed`）。与状态聚合的
+        `pending_operation` 同源（`current_operation()`），不另存一份判据。
         """
         state = self._manager.state
         if state == "running":
@@ -1266,6 +1282,11 @@ class LocalApi:
             return "lifecycle_busy"
         pending = self._manager.current_operation()
         if pending is not None and pending.finished_at is None:
+            return "lifecycle_busy"
+        if self._lifecycle_service is not None and (
+            self._lifecycle_service.current_operation() is not None
+        ):
+            # 协调器事务在途：与在途管理器操作同一结果码。
             return "lifecycle_busy"
         return None
 
@@ -1363,8 +1384,8 @@ class LocalApi:
             await client.probe_chat()
             return True, "chat_ready"
         except SiteError as exc:
-            # reason 是稳定类别；登录成功但探测失败要与登录失败分开报。
-            return False, exc.reason
+            # 稳定类别码；登录成功但探测失败要与登录失败分开报（§8.2）。
+            return False, _site_error_detail(exc)
         except Exception as exc:
             return False, type(exc).__name__
         finally:
@@ -1385,12 +1406,13 @@ class LocalApi:
             try:
                 user = await client.login()
             except SiteError as exc:
-                return False, exc.reason, None
+                return False, _site_error_detail(exc), None
             account_id = str(user.id)
             try:
                 await client.probe_chat()
             except SiteError as exc:
-                return False, exc.reason, account_id
+                # 登录已经成功：账号 ID 必须保留，票据照发（§4.2）。
+                return False, _site_error_detail(exc), account_id
             return True, "chat_ready", account_id
         except Exception as exc:
             return False, type(exc).__name__, None
@@ -1572,6 +1594,11 @@ class LocalApi:
             # 列表请求失败（一个坏档案不该挡住别的账号）。
             saved = None
         is_active = catalog.active_profile_id == record.profile_id
+        if startup_profile_id == STARTUP_TARGET_UNKNOWN:
+            # 桌面设置读不出来：无法判定，如实回 null 而不是 false（§59）。
+            is_startup_target: bool | None = None
+        else:
+            is_startup_target = startup_profile_id == record.profile_id
         return {
             "profile_id": record.profile_id,
             "display_name": record.display_name,
@@ -1587,7 +1614,7 @@ class LocalApi:
             },
             "is_active": is_active,
             "is_running": running_profile_id == record.profile_id,
-            "is_startup_target": startup_profile_id == record.profile_id,
+            "is_startup_target": is_startup_target,
             "credentials": self._credentials_summary(record.profile_id),
             "actions": _card_actions(
                 record, is_active=is_active, config_state=status.state
@@ -1620,11 +1647,16 @@ class LocalApi:
         return summary
 
     def _startup_target(self) -> str | None:
-        """桌面设置里的启动目标；读不出来按 None（列表不因一个坏文件失败）。"""
+        """桌面设置里的启动目标；读不出来回**可区分的**中性哨兵（列表不因一个坏文件失败）。
+
+        `None` 只表示「设置里没有启动目标」；`DesktopSettingsError` 必须走
+        `STARTUP_TARGET_UNKNOWN`，否则「读不出来」会被渲染成「不是启动目标」——
+        删除预览是不可逆动作前的检查，不能把未知说成否。
+        """
         try:
             return self._desktop.read().startup_profile_id
         except DesktopSettingsError:
-            return None
+            return STARTUP_TARGET_UNKNOWN
 
     async def _create_profile(self, request: Request):
         """建立**非活动**账号：经协调器的串行化口径（不排队），幂等键保证只建一次。"""
@@ -2303,14 +2335,29 @@ class LocalApi:
 
     def _require_record(self, profile_id: str):
         """按 id 取档案记录；未知、已删除（墓碑）一律 404 `not_found`。"""
+        record = self._record_or_none(profile_id)
+        if record is None:
+            raise ApiError(404, "not_found")
+        return record
+
+    def _record_or_none(self, profile_id: str):
+        """按 id 取档案记录；没有（含墓碑）返回 None。
+
+        只给 N1 语义下允许「指针在场、档案目录/记录还没建」的入口用（KB 导入），
+        其余写路径一律用 `_require_record()` 的 404 口径。
+        """
         for record in self._profiles.list_profiles():
             if record.profile_id == profile_id:
                 return record
-        raise ApiError(404, "not_found")
+        return None
 
     @staticmethod
     def _reject_deleting(record) -> None:
-        """`deleting` 档案拒绝配置与草稿写入（§6.2 第 1 步，判定落在路由上）。"""
+        """`deleting` 档案拒绝配置、草稿与知识库写入（§6.2 第 1 步）。
+
+        档案级路由与**通用入口**（`PUT /api/config`、`PUT /api/config/draft`、
+        `POST /api/kb/import`）都过这一条判据。
+        """
         if record.state == PROFILE_STATE_DELETING:
             raise ApiError(409, "profile_state_conflict")
 
@@ -2419,8 +2466,14 @@ class LocalApi:
         if len(payload) > MAX_IMPORT_BYTES:
             raise ApiError(413, "file_too_large")
         # 导入是写路径，但目标档案必须是**已有**的：没有档案时回 409
-        # `no_active_profile`，不在这里顺手建一个（D-135）。
-        profile = self._bound(self._profile_id()).profile()
+        # `no_active_profile`，不在这里顺手建一个（D-135）。删除中的档案同样拒绝：
+        # 往正在删除的账号里写知识库文件违反 §6.2 第 1 步。指针在场但档案记录
+        # 还没建（N1 的首次写入语义）仍照旧放行 —— 那不是「删除中」。
+        profile_id = self._profile_id()
+        record = self._record_or_none(profile_id)
+        if record is not None:
+            self._reject_deleting(record)
+        profile = self._bound(profile_id).profile()
         directory = paths.knowledge_dir(profile)
         if not paths.is_within(profile, directory):
             raise ApiError(500, "path_outside_profile")
@@ -2505,6 +2558,15 @@ def _strict_keys(body: dict, allowed: frozenset[str]) -> None:
     extra = sorted(set(body) - allowed)
     if extra:
         raise ApiError(400, "bad_request", field=extra[0])
+
+
+def _site_error_detail(exc: SiteError) -> str:
+    """站点错误的稳定类别码：有站点 code 回 `site_http_<code>`，网络层回 `site_network`。
+
+    `SiteError` 只有 `status` / `message` / `retry_after`（没有 `reason`），且站方
+    文本一律不进 `detail`（§8.2 的红线）—— 这里只回固定类别码。
+    """
+    return f"site_http_{exc.status}" if exc.status else "site_network"
 
 
 def _require_int(body: dict, key: str, *, code: str) -> int:

@@ -1109,8 +1109,9 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   `credential_delete_unavailable`（D-131 不变，文案改成指向新的独立清除入口）。
 - **档案状态与删除墓碑**（N2 Task 3、§6.2、D-145）：`profile.json` 的 `state` 取
   `active`（可用档案）/ `detached`（保留数据的移除：凭据已撤销、不再参与启动与查重，
-  可以重新绑定同一账号）/ `deleting`（删除事务已登记：拒绝启动、拒绝配置与草稿写入，
-  → `profile_state_conflict`，判定落在激活校验与账号页路由上）。
+  可以重新绑定同一账号）/ `deleting`（删除事务已登记：拒绝启动、拒绝配置/草稿/知识库
+  写入，→ `profile_state_conflict`；判定落在激活校验、**通用启停**（`start_bot` /
+  `restart_bot` 的活动上下文）、通用配置与草稿入口、KB 导入与账号页路由上）。
   `ProfileService.set_state(profile_id, state=…, expected_profile_revision=None)` 是状态
   的唯一写入口（非法值 → `invalid_profile_state`，期望值不符 → `revision_conflict`，
   写成功 `profile_revision` +1）；`clear_activation()` 是删除活动档案时的清空指针入口
@@ -1364,7 +1365,10 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   由**工作线程**完成、租约只在该线程的 `finally` 释放（请求协程被取消时线程仍在跑，协程侧
   释放等于把门开在测试进行中）。`POST /api/bot/{start,stop,restart}` 先取租约再调用管理器，
   取不到就 409 `lifecycle_busy` 且不派发，租约在管理器调用返回后立刻释放。测试入口在**持租约
-  期间**按两条判据放行：进程处于 `stopped` / `failed`，且没有未完成的在途操作。在途操作这条
+  期间**按两条判据放行：进程处于 `stopped` / `failed`，且没有未完成的在途操作 ——
+  管理器在途操作与**协调器未完成操作**（`LifecycleService.current_operation()`，与状态
+  聚合的 `pending_operation` 同源）都算，后者挡住的是测试插进 A→B 事务两次取门之间的窗口。
+  在途操作这条
   不可省：`restart` 的停止阶段会先把状态写回 `stopped` / `failed`、之后才写 `starting`，只看
   `state` 会在那段空档放行测试。拒绝分两个稳定码：进程确实 `running` 时沿用 `bot_running`
   （既有语义），门被占用、处于 `starting` / `stopping`、或仍有未完成操作时回 `lifecycle_busy`。
@@ -1382,11 +1386,12 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   `snapshot()` 顶层新增五个字段：`active_profile_id`、`running_profile_id`、
   `startup_profile_id`、`profile_epoch`、`pending_operation`。
   `active_profile_id` / `profile_epoch` 取自 `profile_service.catalog()`（活动指针与
-  `active_epoch`）；`running_profile_id` 取自 `manager.status()`；`startup_profile_id` 是
-  「活动档案且 `config.start_bot_on_launch()` 为真」的过渡口径（N4 换成 `desktop.json`
-  的启动目标）；`pending_operation` 在 `manager.current_operation()` 未完成时给出
+  `active_epoch`）；`running_profile_id` 取自 `manager.status()`；`startup_profile_id`
+  直接读 `desktop.json` 的启动目标（N4 起是唯一真相，不再从活动档案与档案内旧字段
+  `start_bot_on_launch` 推导）；`pending_operation` 在 `manager.current_operation()` 未完成时给出
   `{"operation_id", "kind", "state", "profile_id", "revision"}`，否则 `null`。
-  `catalog()` 或配置读取抛 `ConfigServiceError` 时这三个档案字段**降级为 `None`**，不抛：
+  `catalog()` 或配置读取抛 `ConfigServiceError` 时档案字段**降级为 `None`**、桌面设置抛
+  `DesktopSettingsError` 时 `startup_profile_id` 降级为 `None`，都不抛：
   元数据损坏时 `/api/status` 必须仍是 200，原因由 `config.state == "recovery"` 与它的
   稳定码承载。`restart_required` 的判据扩为「已运行且（`running_revision != saved_revision`
   **或** `running_profile_id != active_profile_id`）」—— 同号 revision 换档案也要提示重启。
@@ -1503,6 +1508,7 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
     `credentials`，有界扫描最多 20000 个条目，超出时 `size_complete=false`）、
     `credentials` 归属摘要（`managed` / `cleanup_pending` / `unknown_ownership`，后者为真
     表示有读不出来的历史快照，归属不完整）、`is_active` / `running` / `is_startup_target`
+    （桌面设置读不出来时是 `null`：无法判定，**不**说成「不是启动目标」）
     与两个 revision，并在内存里签发 `confirmation_token`（`expires_in = 300`）。
     预览**不改任何文件、不删凭据、不写记录**；未知或已删除（墓碑）档案 →
     `not_found`，范围非法 → `removal_scope_invalid`，路径有链接/重解析点 →
@@ -1550,7 +1556,7 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   | `POST /api/profiles` | `display_name?`、`expected_catalog_revision`、`idempotency_key` | 200 `{"ok":true,"profile_id":"p-…","catalog_revision":n}` | 409 `revision_conflict` / `idempotency_conflict` / `lifecycle_busy`；422 `invalid_value` / `invalid_revision` / `idempotency_key_required` |
   | `GET /api/profiles/{id}/draft` | — | 200 `{"ok":true,"revision":n,"values":{…}}` | 404 `not_found`；409 `profile_state_conflict` |
   | `PUT /api/profiles/{id}/draft` | `expected_revision`、`values`、`expected_profile_revision?` | 200 `{"ok":true,"revision":n}` | 404 `not_found`；409 `revision_conflict` / `profile_state_conflict`；422 |
-  | `POST /api/profiles/{id}/verify` | `account`（1–256 字符）、`password`（1–4096 字符） | 200 `{"ok":true,"verification_id":"…","site_user_id":"…","chat_ready":bool,"expires_in":600}`；登录失败是 200 `{"ok":false,"detail":"…"}`（与 `/api/test/site` 同形，不签发票据） | 409 `bot_running` / `lifecycle_busy` / `profile_state_conflict` / `profile_identity_taken` / `profile_identity_mismatch`；422 `invalid_test_input` |
+  | `POST /api/profiles/{id}/verify` | `account`（1–256 字符）、`password`（1–4096 字符） | 200 `{"ok":true,"verification_id":"…","site_user_id":"…","chat_ready":bool,"expires_in":600}`；登录失败是 200 `{"ok":false,"detail":"…"}`，`detail` 是稳定类别码（站点非 200 / 非成功 code → `site_http_<站点 code>`，网络层 → `site_network`；站方文本不回显。与 `/api/test/site` 同形，不签发票据） | 409 `bot_running` / `lifecycle_busy` / `profile_state_conflict` / `profile_identity_taken` / `profile_identity_mismatch`；422 `invalid_test_input` |
   | `PUT /api/profiles/{id}/config` | `expected_revision`、`expected_profile_revision`、`verification_id?`、`values`、`credentials`、`account?`、`display_name?` | 200 `{"ok":true,"revision":n,"profile_revision":n}` | 404 `not_found`；409 `verification_required` / `verification_invalid` / `verification_mismatch` / `profile_revision_conflict` / `revision_conflict` / `profile_state_conflict`；422 |
   | `POST /api/profiles/{id}/activate` | `expected_catalog_revision`、`expected_epoch`、`target_revision?`、`start`（默认 true）、`idempotency_key` | 202 `{"ok":true,"operation_id":"op-…"}` | 409 `revision_conflict` / `target_not_ready` / `profile_state_conflict` / `lifecycle_busy` / `idempotency_conflict`；422 `idempotency_key_required` |
   | `POST /api/profiles/{id}/removal-preview` | `scope` | 200 `{"ok":true,"preview":{…},"confirmation_token":"…","expires_in":300}` | 404 `not_found`；409 `removal_unsafe_path`；422 `removal_scope_invalid` |
@@ -1644,7 +1650,8 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   `{"base_url": string, "model": string, "api_key": string}`；空对象或无字段仍测试已保存配置。
   临时站点测试的 URL 取 Light 固定基线，不接受调用方传站点地址；站点登录成功时响应可含稳定
   `account_id`（即使后续聊天权限探测失败），仅此临时路径返回。响应只含 `ok`、固定类别
-  `detail`、`elapsed_ms`，不返回生成内容或凭据。测试输入只在本次调用内使用，不写入正式/草稿配置，
+  `detail`（稳定类别码：站点失败是 `site_http_<站点 code>` / `site_network`，成功是
+  `chat_ready`，绝不回显站方文本）、`elapsed_ms`，不返回生成内容或凭据。测试输入只在本次调用内使用，不写入正式/草稿配置，
   也不更新 revision 绑定的测试状态；已保存配置测试仍按原规则记录 revision 结果。模型测试仍受
   单次并发、固定样例、输出 token 上限和超时约束。
 - **桌面页签与文案约定**（§8、D-149）：导航在既有三页之后新增「桌面」页签（不重排现有页面），
@@ -1756,7 +1763,7 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 
 - **图标三态与判定顺序**（`icon_for()`，按顺序取第一条命中；`attention` 只表示
   「需要用户动作」）：
-  1. 配置状态 ∈ `needs_setup` / `needs_credentials` / `recovery` / `invalid` → `attention`；
+  1. 配置状态 ∈ `needs_setup` / `needs_credentials` / `no_selection` / `recovery` / `invalid` → `attention`；
   2. 进程 `failed` → `attention`；
   3. 进程 `stopped` 且 `forced_stop` → `attention`；
   4. 电源 `awaiting_report`（睡眠恢复后无新上报）→ `attention`；
@@ -1764,7 +1771,8 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   6. 其余（`starting` / `running`）→ `normal`。
   **运行中但上报过期/缺失不升级成 `attention`**：此刻没有可执行的动作，只改状态文案。
 - **状态标签**（`status_label()`，同一套「第一条命中」顺序，文案全部来自 `texts.py`）：
-  `quitting` → 正在退出；`recovery` / `invalid` / `needs_setup` / `needs_credentials` →
+  `quitting` → 正在退出；`recovery` / `invalid` / `needs_setup` / `needs_credentials` /
+  `no_selection`（未选择账号）→
   对应配置文案；进程 `failed` → 启动失败；`stopped` 且 `forced_stop` → 上次运行被强制结束；
   电源 `suspended` → 睡眠中（未在线）；`awaiting_report` → 已恢复，等待新上报；
   `starting` / `stopping` → 启动中 / 正在停止；`running` 按 `worker_freshness` 取
@@ -1790,8 +1798,8 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 - **词表**：命令常量 `open_admin` / `start` / `stop` / `restart` / `open_diagnostics` /
   `quit` 与事件常量 `taskbar_created` / `power_suspend` / `power_resume` / `session_query` /
   `session_end` 定义在 `tray_model.py`；配置与进程状态字面量（`configured`、`needs_setup`、
-  `needs_credentials`、`recovery`、`invalid`；`stopped`、`starting`、`running`、`stopping`、
-  `failed`）与该模块的本地常量必须与 ConfigService / WorkerManager（§59）逐字一致。
+  `needs_credentials`、`no_selection`、`recovery`、`invalid`；`stopped`、`starting`、`running`、
+  `stopping`、`failed`）与该模块的本地常量必须与 ConfigService / WorkerManager（§59）逐字一致。
 
 ### 61.2 协调器与命令端口（`tray_service.py`）
 

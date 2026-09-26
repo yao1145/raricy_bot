@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass
 
 from .config_service import ConfigServiceError
+from .desktop_settings import DesktopSettingsError
 
 # 快照失效阈值：超过它就不再声称这些事实仍然成立（§10.2）。
 SNAPSHOT_STALE_SECONDS: float = 30.0
@@ -78,6 +79,7 @@ class StatusService:
         manager,
         profile_service=None,
         lifecycle_service=None,
+        desktop_settings=None,
         clock=time.time,
     ) -> None:
         self._instance_id = instance_id
@@ -87,6 +89,9 @@ class StatusService:
         # 协调器（N2 Task 1）：它的未完成操作优先于管理器的在途操作 —— 切换事务的
         # 阶段（`stop_A` 等）只有协调器知道，管理器看到的是它自己派发的那一次停止。
         self._lifecycle = lifecycle_service
+        # 桌面偏好（N4）：启动目标的**唯一**来源；缺省只供不装配桌面视图的测试，
+        # 此时 `startup_profile_id` 恒为 None。
+        self._desktop = desktop_settings
         self._clock = clock
         self._lock = threading.Lock()
         self._tests: dict[str, TestResult] = {}
@@ -204,16 +209,19 @@ class StatusService:
                 catalog = self._profiles.catalog()
                 active_profile_id = catalog.active_profile_id
                 profile_epoch = catalog.active_epoch
-                if active_profile_id is not None and self._config.start_bot_on_launch():
-                    # N4 换成 desktop.json 的启动目标前的过渡口径（D-135）：
-                    # 「打开程序就启动」偏好为真时，启动档案就是当前活动档案。
-                    startup_profile_id = active_profile_id
             except ConfigServiceError:
-                # 元数据或配置读不出来时 /api/status 不能 500：三个档案字段
-                # 降级为 None，原因已由 config.state == "recovery" 与它的稳定码
-                # 承载（D-135）。
+                # 元数据或配置读不出来时 /api/status 不能 500：档案字段降级为
+                # None，原因已由 config.state == "recovery" 与它的稳定码承载（D-135）。
                 active_profile_id = None
                 profile_epoch = None
+        if self._desktop is not None:
+            try:
+                # 启动目标的唯一真相是 `desktop.json`（N4、§58）：不再从活动档案与
+                # 档案内旧字段 `start_bot_on_launch` 推导 —— 旧字段已不可写，按它
+                # 推导会让新装恒 null、升级装冻结旧值，与账号卡片显示的目标不一致。
+                startup_profile_id = self._desktop.read().startup_profile_id
+            except DesktopSettingsError:
+                # 读不出来同样降级为 None（与既有语义一致），不抛、不 500。
                 startup_profile_id = None
         pending_operation = self._pending_operation()
         return {

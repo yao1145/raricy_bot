@@ -68,6 +68,11 @@ DESKTOP_SETTINGS_WRITE_FAILED: str = "desktop_settings_write_failed"
 # `pending_startup_apply.action` 的取值（确切值总表）。
 PENDING_ACTIONS: frozenset[str] = frozenset({"register", "unregister"})
 
+# 启动目标「读不出来」的中性哨兵：与 `None`（设置里没有目标）严格分开，调用方
+# 不得把它当成「不是启动目标」——删除预览是不可逆动作前的检查，未知不能说成否
+# （D-150）。取值不可能是合法档案 id（`p-` 前缀），因此不会与真实目标相撞。
+STARTUP_TARGET_UNKNOWN: str = "<startup-target-unknown>"
+
 
 class DesktopSettingsError(Exception):
     """桌面设置的固定错误；消息是稳定类别码（不是中文文案）。"""

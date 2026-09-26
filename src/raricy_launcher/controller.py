@@ -71,7 +71,7 @@ from .process_manager import (
     default_worker_spec,
 )
 from .profile_removal import RemovalService
-from .profile_service import ProfileService
+from .profile_service import PROFILE_STATE_ACTIVE, ProfileError, ProfileService
 from .session import SessionManager
 from .startup_service import StartupService
 from .status_service import StatusService
@@ -263,6 +263,8 @@ class Controller:
             profile_service=self._profiles,
             # 未完成操作优先取协调器：切换事务的阶段只有它知道（§5.2、§59）。
             lifecycle_service=self._lifecycle_service,
+            # 启动目标只认 desktop.json（N4）：与账号卡片、桌面页同一份真相。
+            desktop_settings=self._desktop_settings,
         )
         self._api: LocalApi | None = None
         self._server = None
@@ -568,7 +570,19 @@ class Controller:
             if status is None or status.state != STATE_CONFIGURED:
                 self._open_entry_or_tray()
                 return
-            self._start_bot(status.revision, self._profiles.active_profile_id())
+            candidate = self._profiles.active_profile_id()
+            if not self._profile_is_active(candidate):
+                # 删除事务已登记（`deleting`）或档案已移除（保留数据）：不启动，
+                # 也不改写现场（§6.2 第 1 步）。
+                log_event(
+                    self._logger,
+                    logging.WARNING,
+                    "launcher.auto_start_skipped",
+                    status="target_not_active",
+                )
+                self._open_entry_or_tray()
+                return
+            self._start_bot(status.revision, candidate)
             return
         try:
             target_removed = not self._profile_exists(target)
@@ -588,6 +602,17 @@ class Controller:
         if target_removed:
             # 目标**真的**已被移除（不存在/已删除）：清空目标并关掉机器人自动启动偏好。
             self._clear_startup_target(settings)
+            self._open_entry_or_tray()
+            return
+        if not self._profile_is_active(target):
+            # 删除事务已登记（`deleting`）或档案已移除（保留数据）：保留目标与偏好，
+            # 本次不启动 —— 绝不能被自动运行重新拉起来（§6.2 第 1 步）。
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "launcher.auto_start_skipped",
+                status="target_not_active",
+            )
             self._open_entry_or_tray()
             return
         status = self._profile_status(target)
@@ -716,6 +741,23 @@ class Controller:
         except (FileNotFoundError, NotADirectoryError):
             return False
         return True
+
+    def _profile_is_active(self, profile_id: str | None) -> bool:
+        """档案记录是否处于可启动的 `active` 状态；读不出来一律按「否」处理。
+
+        `deleting`（删除事务已登记）与 `detached`（保留数据的移除）都不允许被自动
+        运行重新拉起来（§6.2 第 1 步）；记录读不出来时不猜，只让本次不启动。
+        """
+        if profile_id is None:
+            return False
+        try:
+            records = self._profiles.list_profiles()
+        except (ConfigServiceError, ProfileError, OSError):
+            return False
+        for record in records:
+            if record.profile_id == profile_id:
+                return record.state == PROFILE_STATE_ACTIVE
+        return False
 
     def _profile_status(self, profile_id: str | None) -> ConfigStatus | None:
         """按档案读配置就绪状态；读不出来返回 None（查询路径，不建立档案）。

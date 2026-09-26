@@ -1358,12 +1358,19 @@ class LifecycleService:
     # --- 内部：单次启停 ---------------------------------------------------
 
     def _require_launch_context(self, expected_epoch: int | None) -> str:
-        """启停命令的活动上下文：必须是当前活动档案，且代次（给了就）相符。"""
+        """启停命令的活动上下文：必须是当前活动档案、状态可用，且代次（给了就）相符。
+
+        档案记录不是 `active`（`deleting` / `detached` / 记录读不出来）一律拒绝：
+        删除事务已登记或档案已移除时，通用启停入口绝不能把它重新跑起来（§6.2 第 1 步）。
+        """
         catalog = self._profiles.catalog()
         if catalog.active_profile_id is None:
             raise ConfigServiceError(CODE_CONFIG_NOT_READY)
         if expected_epoch is not None and catalog.active_epoch != expected_epoch:
             raise ProfileError(CODE_REVISION_CONFLICT)
+        record = self._find_profile(catalog.active_profile_id)
+        if record is None or record.state != PROFILE_STATE_ACTIVE:
+            raise ConfigServiceError(CODE_PROFILE_STATE_CONFLICT)
         with self._lock:
             if self._quitting:
                 raise ConfigServiceError(CODE_QUITTING)

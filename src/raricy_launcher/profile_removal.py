@@ -53,7 +53,7 @@ from .credential_lifecycle import (
     STATE_REVOKED,
 )
 from .credential_store import CredentialStoreError
-from .desktop_settings import DesktopSettingsError
+from .desktop_settings import STARTUP_TARGET_UNKNOWN, DesktopSettingsError
 from .lifecycle_service import (
     ERROR_CATALOG_WRITE_FAILED,
     ERROR_CREDENTIAL_BACKEND_UNAVAILABLE,
@@ -150,7 +150,8 @@ class RemovalPreview:
     state: str
     is_active: bool
     running: bool
-    is_startup_target: bool
+    # `true` / `false` 是判定结果；`None` 表示桌面设置读不出来、无法判定（D-150）。
+    is_startup_target: bool | None
     scope: str
     allowed_scopes: tuple[str, ...]
     categories: tuple[Mapping[str, Any], ...]
@@ -454,6 +455,12 @@ class RemovalService:
             catalog_revision=catalog.catalog_revision,
         )
         token = self._issue_token(binding)
+        startup_target = self._startup_target()
+        is_startup_target = (
+            None
+            if startup_target == STARTUP_TARGET_UNKNOWN
+            else startup_target == profile_id
+        )
         return RemovalPreview(
             profile_id=profile_id,
             display_name=record.display_name,
@@ -461,7 +468,7 @@ class RemovalService:
             state=record.state,
             is_active=catalog.active_profile_id == profile_id,
             running=self._running(profile_id),
-            is_startup_target=self._startup_target() == profile_id,
+            is_startup_target=is_startup_target,
             scope=scope,
             allowed_scopes=allowed,
             categories=categories,
@@ -732,13 +739,18 @@ class RemovalService:
             return
 
     def _startup_target(self) -> str | None:
-        """桌面设置里的启动目标；读不出来按 None（预览不因此失败，D-150 兜底）。"""
+        """桌面设置里的启动目标；读不出来回**可区分的**中性哨兵（D-150）。
+
+        `None` 只表示「设置里没有启动目标」；`DesktopSettingsError` 必须走
+        `STARTUP_TARGET_UNKNOWN`，预览的 `is_startup_target` 才会回 `null` 而不是
+        `false` —— 删除不可逆，不能把「读不出来」渲染成「不是启动目标」。
+        """
         if self._desktop is None:
             return None
         try:
             return self._desktop.read().startup_profile_id
         except DesktopSettingsError:
-            return None
+            return STARTUP_TARGET_UNKNOWN
 
     def _running(self, profile_id: str) -> bool:
         if self._running_profile is None:

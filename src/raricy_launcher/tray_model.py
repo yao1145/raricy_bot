@@ -48,6 +48,8 @@ POWER_AWAITING_REPORT: str = "awaiting_report"
 # 改词表必须三处同步，见 §61。
 CONFIG_STATE_NEEDS_SETUP: str = "needs_setup"
 CONFIG_STATE_NEEDS_CREDENTIALS: str = "needs_credentials"
+# N2 新增：有档案但一个都没选中（D-145）——需要用户去账号页选中一个。
+CONFIG_STATE_NO_SELECTION: str = "no_selection"
 CONFIG_STATE_CONFIGURED: str = "configured"
 CONFIG_STATE_RECOVERY: str = "recovery"
 CONFIG_STATE_INVALID: str = "invalid"
@@ -58,11 +60,12 @@ PROCESS_STATE_RUNNING: str = "running"
 PROCESS_STATE_STOPPING: str = "stopping"
 PROCESS_STATE_FAILED: str = "failed"
 
-# 配置状态里需要用户动作的四种：图标升为 attention（§61 判定顺序第 1 条）。
+# 配置状态里需要用户动作的五种：图标升为 attention（§61 判定顺序第 1 条）。
 _ATTENTION_CONFIG_STATES: frozenset[str] = frozenset(
     {
         CONFIG_STATE_NEEDS_SETUP,
         CONFIG_STATE_NEEDS_CREDENTIALS,
+        CONFIG_STATE_NO_SELECTION,
         CONFIG_STATE_RECOVERY,
         CONFIG_STATE_INVALID,
     }
@@ -136,6 +139,8 @@ def status_label(state: TrayState) -> str:
         return texts.TRAY_STATUS_NEEDS_SETUP
     if state.config_state == CONFIG_STATE_NEEDS_CREDENTIALS:
         return texts.TRAY_STATUS_NEEDS_CREDENTIALS
+    if state.config_state == CONFIG_STATE_NO_SELECTION:
+        return texts.TRAY_STATUS_NO_SELECTION
     if state.process_state == PROCESS_STATE_FAILED:
         return texts.TRAY_STATUS_FAILED
     if state.process_state == PROCESS_STATE_STOPPED and state.forced_stop:

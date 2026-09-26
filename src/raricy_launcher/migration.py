@@ -103,6 +103,23 @@ _METADATA_FAULT_CODES: frozenset[str] = frozenset(
 # 迁移步骤失败的稳定码（不含路径与异常原文）：只报「这一次没有生效」。
 MIGRATION_WRITE_FAILED: str = "migration_write_failed"
 
+# 显式 `lstat` 的三态：`Path.exists()` 会把权限/占用错误吞成 False（fail-open），
+# 于是「元数据或档案目录读不出来」会被判成「没有迁移对象」。
+_PATH_PRESENT: str = "present"
+_PATH_ABSENT: str = "absent"
+_PATH_UNREADABLE: str = "unreadable"
+
+
+def _path_state(path: Path) -> str:
+    """显式 `lstat` 三态；只有「真的不存在」才是 absent，其余 OSError 都是读不出来。"""
+    try:
+        path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return _PATH_ABSENT
+    except OSError:
+        return _PATH_UNREADABLE
+    return _PATH_PRESENT
+
 
 class MigrationError(ConfigServiceError):
     """迁移的稳定错误；消息是稳定类别码，绝不携带原始异常或路径。"""
@@ -226,8 +243,21 @@ class MigrationService:
         record = self._read_record()
         backup_dir = self._recorded_backup_dir(record)
         metadata_path = paths.launcher_json_path(self._root)
-        profile_dirs = self._profile_dirs()
-        if not metadata_path.exists() and not profile_dirs:
+        metadata_state = _path_state(metadata_path)
+        if metadata_state == _PATH_UNREADABLE:
+            # 元数据存在与否都读不出来（权限、被占用）：不能当成「没有元数据」，
+            # 更不能报 `nothing_to_migrate`(ok=True) 让启动继续。
+            return MigrationStatus(
+                STAGE_BLOCKED_METADATA_FAULT, metadata_fault=METADATA_UNREADABLE
+            )
+        try:
+            profile_dirs = self._profile_dirs()
+        except OSError:
+            # `profiles/` 读不出来：同上，读不出来不等于没有。
+            return MigrationStatus(
+                STAGE_BLOCKED_METADATA_FAULT, metadata_fault=METADATA_UNREADABLE
+            )
+        if metadata_state == _PATH_ABSENT and not profile_dirs:
             # 既没有元数据也没有档案目录：不是迁移对象，更不该留下新文件。
             return MigrationStatus(STAGE_NOTHING_TO_MIGRATE)
         try:
@@ -257,12 +287,15 @@ class MigrationService:
         )
 
     def _profile_dirs(self) -> list[str]:
-        """`profiles/` 下的档案目录名（按名排序）；目录名非法或不是目录的跳过。"""
+        """`profiles/` 下的档案目录名（按名排序）；目录名非法或不是目录的跳过。
+
+        只有目录**不存在**（或根本不是目录）才返回空列表；其余 `OSError`（权限、
+        被占用等）向上抛，由 `inspect()` 判成 `blocked_metadata_fault` —— 把
+        「读不出来」折成「没有目录」会让现场 fail-open 成 `nothing_to_migrate`。
+        """
         try:
             entries = list(paths.profiles_root(self._root).iterdir())
         except (FileNotFoundError, NotADirectoryError):
-            return []
-        except OSError:
             return []
         names: list[str] = []
         for entry in entries:
