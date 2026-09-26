@@ -821,7 +821,8 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 ## 58. `raricy_launcher` 的配置与凭据（L2）
 
 入口：[档案布局](../../src/raricy_launcher/paths.py)、[配置事务](../../src/raricy_launcher/config_service.py)、
-[凭据库](../../src/raricy_launcher/credential_store.py)、[数据档案锁](../../src/raricy_bot/data_lock.py)。
+[桌面设置](../../src/raricy_launcher/desktop_settings.py)、[凭据库](../../src/raricy_launcher/credential_store.py)、
+[数据档案锁](../../src/raricy_bot/data_lock.py)。
 
 - **档案布局**（§13.1）：`launcher.json` 只放活动档案指针与 schema；每个档案有
   `config.yaml`、`draft.yaml`、`revisions/`、`data/`、`knowledge/`、`logs/{runtime,errors}/`。
@@ -855,6 +856,33 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   规范化要**先解析数据库文件自身的链接**再取父目录 —— 否则指向同一个数据库的两条路径
   会各拿一把锁。完整版 CLI 与 Light Worker 因此天然争用同一个标识；`acquire_data_lock()`
   立即取得，被占用时 CLI 以退出码 4 结束（§17）。锁文件里的 pid 只用于诊断，不是夺锁依据。
+- **桌面设置**（§8、D-142）：数据根下与 `launcher.json` 同级的 `desktop.json` 是桌面偏好
+  的唯一持久来源，`schema_version=1`；字段与默认值：`settings_revision=0`（文件不存在时）、
+  `launch_at_sign_in=false`、`start_bot_on_launch=false`、`startup_profile_id=null`、
+  `pending_startup_apply=null`、`last_apply_result="not_attempted"`。`settings_revision` 只随
+  **用户意图**（前三个字段）改变而 +1，与档案配置的 revision **各自独立**；`last_apply_result`
+  （`ok` / `not_attempted` / `command_too_long` / `path_unusable` / `registration_conflict` /
+  `apply_failed` / `read_failed`）与 `pending_startup_apply`（`null` 或
+  `{"action": "register"|"unregister", "command": "<命令>"}`，只是诊断、不参与重放）只能由
+  `record_apply_result()` 写，**不改 revision** ——「意图 / 待应用 / 实际结果」三段式因此不会在
+  同一次写入里互相覆盖。`update(expected_revision, ...)` 省略某个参数表示本次不改它，
+  `startup_profile_id=None` 是显式清空（`_UNSET` 哨兵区分两者）；`expected_revision` 不符抛
+  `DesktopSettingsConflict`。写盘与配置提交同一手法（同目录临时文件 + flush + fsync +
+  `os.replace`），失败即「这一版没有生效」，旧文件不变。
+- **桌面设置的唯一来源**（§8、D-142）：桌面偏好只认 `desktop.json`，本模块不读档案
+  `config.yaml` 的 `start_bot_on_launch`（该字段只保留在历史快照与 N1 迁移的只读口径里）。
+  唯一例外是升级用户的一次性导入：`desktop.json` 不存在而 `launcher.json` 存在时，`read()`
+  读取当前档案的旧偏好并写入新文件（不递增 revision，紧随其后的 `update(expected_revision=0,
+  ...)` 仍然成立），写完即不再回退到档案；**N1 的 `migration.py` 落地后，这条回退仍是升级
+  用户的唯一导入路径**。查询不修复、不创建、不覆盖（与 D-130 同口径）：只有这一次导入会创建
+  文件，损坏、版本不认识或不支持时只报码、不动现场；全新实例（没有 `launcher.json`）连默认值
+  也不落盘。
+- **桌面设置的稳定码**（§8、§11）：`desktop_settings_conflict`（revision 不符）、
+  `invalid_desktop_settings`（参数类型/取值非法）、`desktop_unreadable`（读不到：权限、占用）、
+  `desktop_corrupt`（JSON 解析失败、顶层非映射、`settings_revision` 不是非负整数、布尔字段
+  类型不对、`startup_profile_id` 不是合法档案 id、超过字节上限）、`desktop_unsupported_version`
+  （`schema_version` 大于本程序）、`desktop_settings_write_failed`（写盘失败）。`str(exc)`
+  就是码，不含路径、命令或异常原文。
 
 ## 59. Light 控制面（会话、API、进程与事件）
 
