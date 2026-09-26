@@ -165,6 +165,11 @@ class LocalApi:
         # 纯 ASGI 中间件而不是 BaseHTTPMiddleware：后者会把响应体缓冲一遍，
         # 无限的事件流因此永远发不出第一段（实测挂住）。
         app.add_middleware(_HostGuardMiddleware, api=self)
+        # 服务层稳定错误的应用级兜底：路由里漏接的 `ConfigServiceError`（含
+        # `ConfigConflict` / `ConfigInvalid`）同样回项目 JSON 信封与稳定码，而不是
+        # Starlette 的纯文本 500（恢复态下启动/重启与知识库导入会走到这条路）。
+        # 注册在应用上，将来新增的调用点自动覆盖，不靠逐处包 try。
+        app.add_exception_handler(ConfigServiceError, self._service_error_response)
 
         app.add_api_route("/api/session/exchange", self._exchange, methods=["POST"])
         app.add_api_route("/api/config", self._get_config, methods=["GET"])
@@ -276,6 +281,11 @@ class LocalApi:
         if isinstance(exc, ConfigError):
             return ApiError(422, exc.kind, field=exc.field)
         return ApiError(500, "internal_error")
+
+    def _service_error_response(self, _request: Request, exc: Exception) -> JSONResponse:
+        """应用级兜底：与逐路由的 `_handle` 用同一套状态码、JSON 信封与稳定码。"""
+        mapped = self._handle(exc)
+        return self._json(mapped.status, mapped.payload())
 
     def _credential_updates(self, body: dict) -> dict[str, CredentialUpdate]:
         updates: dict[str, CredentialUpdate] = {}
