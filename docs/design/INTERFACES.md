@@ -877,13 +877,17 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   （读失败直接抛、绝不覆盖现场），只接受 `active_profile`（`validate_profile_id` 校验）、
   `active_epoch` / `catalog_revision`（非负整数，拒绝 `bool`）与 `schema_version`
   （只允许升到 `LAUNCHER_SCHEMA_VERSION`，当前值必须更小；降级与同级都报
-  `invalid_catalog_change`）。
+  `invalid_catalog_change`）。**调用前提**：`launcher.json` 已存在，或本次 `changes`
+  显式带上 `active_profile`；文件不存在时调用会写出没有指针的元数据，此后所有读取都按
+  `metadata_pointer_invalid` 停在恢复态 —— 迁移的 catalog 步与 N2 的删除流程必须自己
+  保证指针在场。
 - **launcher schema 与档案内 schema 分开**（N1、D-133）：`CONFIG_SCHEMA_VERSION = 1` 仍是
   档案内 `config.yaml` / `draft.yaml` 的 `_launcher.schema_version`，取值与校验口径不变
   （`_to_saved()` 仍要求相等）；`LAUNCHER_SCHEMA_VERSION = 2` 是 `launcher.json` 本次写入的
   版本，读取侧接受 1 与 2（缺字段按旧文件）。**不得隐式升级**：`set_active_profile()`
-  写指针时原样保留已有 `schema_version`，只有文件不存在的新根目录才写
-  `LAUNCHER_SCHEMA_VERSION`；升级只经 `update_catalog()` 的显式入口。
+  写指针时原样保留文件已有的 `schema_version`（缺字段的旧文件保持缺失），只有文件
+  不存在的新根目录才写 `LAUNCHER_SCHEMA_VERSION`；升级只经 `update_catalog()` 的
+  显式入口。
   `light_base_mapping(profile=None)` 省略四个档案内路径字段
   （`storage.db_path`、`knowledge_base.root_dir`、`memory.root_dir`、
   `logging.archive.directory`），其余取值不变，仅供「还没有档案」的查询与向导临时校验；

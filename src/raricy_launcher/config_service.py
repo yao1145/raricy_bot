@@ -560,17 +560,20 @@ class ConfigService:
         """原子切换活动档案指针（§13.3：切换前必须确认旧 Worker 已退出，由调用方保证）。
 
         先读后写：读失败（损坏/不可读/版本不支持）必须直接失败，绝不把覆盖当成
-        「修复」，损坏现场保持字节不变（F2）。已有 `schema_version` 原样保留：
-        一次指针写入不会把旧版本根目录**隐式升级**成 `LAUNCHER_SCHEMA_VERSION`
-        （升级只经 `update_catalog()` 的显式入口）。
+        「修复」，损坏现场保持字节不变（F2）。**只有文件不存在的新根目录**才写
+        `LAUNCHER_SCHEMA_VERSION`；文件已存在时原样保留它已有的 `schema_version`
+        —— 包括「没有这个字段」的旧文件（`read_launcher_metadata()` 按正常旧文件
+        读取）：一次指针写入不会**隐式升级**，升级是迁移的职责，只经
+        `update_catalog()` 的显式入口。
         """
         paths.validate_profile_id(profile_id)
+        metadata_path = paths.launcher_json_path(self._root)
         with self._lock:
             metadata = self.read_launcher_metadata()
-            if "schema_version" not in metadata:
+            if not metadata_path.exists():
                 metadata["schema_version"] = LAUNCHER_SCHEMA_VERSION
             metadata["active_profile"] = profile_id
-            self._write_document(paths.launcher_json_path(self._root), metadata)
+            self._write_document(metadata_path, metadata)
 
     def update_catalog(self, changes: Mapping[str, Any]) -> dict[str, Any]:
         """目录字段的窄写入口：写锁内「读—改—原子写 `launcher.json`」（要求 5）。
@@ -581,6 +584,11 @@ class ConfigService:
         允许**升到** `LAUNCHER_SCHEMA_VERSION`（当前值必须更小），降级与同级同样
         拒绝 —— 版本迁移只从这个显式入口发生，不会藏在别的写路径里。
         返回写入后的完整元数据映射。
+
+        调用前提：`launcher.json` 已存在，或本次 `changes` 显式带上
+        `active_profile`。文件不存在时调用会写出**没有指针**的元数据，此后所有读取
+        都按 `metadata_pointer_invalid` 停在恢复态 —— 迁移的 catalog 步与 N2 的
+        删除流程必须自己保证指针在场（本入口只写它被要求写的字段）。
         """
         with self._lock:
             metadata = self.read_launcher_metadata()
