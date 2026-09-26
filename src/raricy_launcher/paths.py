@@ -5,18 +5,22 @@ Windows 默认 ``%LOCALAPPDATA%\\RaricyBotLight``（§13.1）；其他平台仅�
 
 ```text
 RaricyBotLight/
-  launcher.json      活动档案指针与 Launcher schema（非敏感）
-  desktop.json       桌面偏好与独立 settings revision（非敏感，§8）
-  runtime/           非敏感实例元数据，不是互斥锁的替代品
-  diagnostics/       有界 Launcher 诊断
+  launcher.json           活动档案指针与 Launcher schema（非敏感）
+  credentials-index.json  凭据引用归属与清理状态，不含秘密取值（N2 交付）
+  desktop.json            桌面偏好与独立 settings revision（非敏感，§8；N4 交付）
+  operations/<id>.json    切换/删除/迁移的最小恢复记录（迁移记录自 N1 起写入）
+  migration/               v1 迁移的非敏感备份与清单（离线、可重入）
+  runtime/                 非敏感实例元数据，不是互斥锁的替代品
+  diagnostics/             有界 Launcher 诊断
   profiles/<id>/
-    config.yaml      正式非敏感配置与凭据引用
-    draft.yaml       非敏感草稿
-    revisions/       受控的非敏感回退/运行快照
-    data/            bot.db（含 -wal/-shm）与 memory/
-    knowledge/       受管 Markdown 资料
-    logs/runtime/    有界运行日志
-    logs/errors/     可选永久错误归档，不自动清理
+    profile.json           稳定身份、生命周期状态与 profile_revision
+    config.yaml            正式非敏感配置与凭据引用
+    draft.yaml             非敏感草稿
+    revisions/             受控的非敏感回退/运行快照
+    data/                  bot.db（含 -wal/-shm）与 memory/
+    knowledge/             受管 Markdown 资料
+    logs/runtime/          有界运行日志
+    logs/errors/           可选永久错误归档，不自动清理
 ```
 
 路径规范化（`normalize_path` / `is_within`）覆盖相对路径、大小写与可识别的
@@ -36,7 +40,10 @@ LAUNCHER_FILE: str = "launcher.json"
 DESKTOP_FILE: str = "desktop.json"
 RUNTIME_DIR: str = "runtime"
 DIAGNOSTICS_DIR: str = "diagnostics"
+OPERATIONS_DIR: str = "operations"
+MIGRATION_DIR: str = "migration"
 PROFILES_DIR: str = "profiles"
+PROFILE_FILE: str = "profile.json"
 CONFIG_FILE: str = "config.yaml"
 DRAFT_FILE: str = "draft.yaml"
 REVISIONS_DIR: str = "revisions"
@@ -84,6 +91,16 @@ def diagnostics_dir(data_root: Path) -> Path:
     return Path(data_root) / DIAGNOSTICS_DIR
 
 
+def operations_dir(data_root: Path) -> Path:
+    """跨文件操作的最小恢复记录目录（只计算路径，不创建）。"""
+    return Path(data_root) / OPERATIONS_DIR
+
+
+def migration_dir(data_root: Path) -> Path:
+    """v1 迁移的备份与清单目录（只计算路径，不创建）。"""
+    return Path(data_root) / MIGRATION_DIR
+
+
 def profiles_root(data_root: Path) -> Path:
     return Path(data_root) / PROFILES_DIR
 
@@ -116,6 +133,11 @@ def profile_dir(data_root: Path, profile_id: str) -> Path:
     if not is_within(root, profile):
         raise ValueError("profile_outside_data_root")
     return profile
+
+
+def profile_json_path(profile: Path) -> Path:
+    """档案记录（稳定身份、生命周期状态与 revision）的位置（只计算路径，不创建）。"""
+    return Path(profile) / PROFILE_FILE
 
 
 def config_path(profile: Path) -> Path:

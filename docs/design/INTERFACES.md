@@ -263,6 +263,12 @@ resync 拉取按 message ID 去重，空 event ID 不抬水位。
 没有工厂而配置启用了对应子域则在**构造期**抛 `AssemblyError`（消息是稳定类别码），
 不进 `start()` 的软故障兜底。显式传入的 `mcp_manager` 实例优先于工厂。
 
+可选身份校验（设计 §4.2、§10.4）：`BotApp(..., expect_site_user_id=)` 默认 `None` 即
+**不校验**（完整版 CLI 行为不变）。非 `None` 时，校验发生在登录成功**之后**、账号锁与
+消费者装配（`acquire_account_lock`、`_start_after_login`）**之前**：真实 `user.id` 与
+期望值不符就关闭 `SiteClient` 与 `Store`、抛 `SiteIdentityMismatch("account_identity_mismatch")`
+（异常类型在 `assembly.py`，消息是稳定类别码）。此时 SSE、评论与记忆一条都还没起。
+
 ## 16.1 评论子系统
 
 入口：[发现器](../../src/raricy_bot/comments/discovery.py)、[路由](../../src/raricy_bot/comments/router.py)、
@@ -821,11 +827,13 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 ## 58. `raricy_launcher` 的配置与凭据（L2）
 
 入口：[档案布局](../../src/raricy_launcher/paths.py)、[配置事务](../../src/raricy_launcher/config_service.py)、
+[v1 迁移](../../src/raricy_launcher/migration.py)、
 [桌面设置](../../src/raricy_launcher/desktop_settings.py)、[凭据库](../../src/raricy_launcher/credential_store.py)、
 [数据档案锁](../../src/raricy_bot/data_lock.py)。
 
 - **档案布局**（§13.1）：`launcher.json` 只放活动档案指针与 schema；每个档案有
-  `config.yaml`、`draft.yaml`、`revisions/`、`data/`、`knowledge/`、`logs/{runtime,errors}/`。
+  `profile.json`、`config.yaml`、`draft.yaml`、`revisions/`、`data/`、`knowledge/`、
+  `logs/{runtime,errors}/`。
   路径判定一律先规范化（绝对、解析链接/重解析点、大小写）再做包含检查：档案内的存储、
   记忆、知识与归档目录必须落在当前档案目录内（D-122 的路径口径见 §9.5）。
 - **配置三个对象**（§6.1）：`EditableConfig` 是表单可编辑字段的白名单（`EDITABLE_FIELDS`），
@@ -853,14 +861,117 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   （返回空映射，首次运行要靠它）、`OSError`（`metadata_unreadable`，权限/占用错误不得当成
   空元数据）与「读到了但不能用」。后者再分三码：`metadata_corrupt`（非 UTF-8 字节、YAML
   语法错误、顶层不是映射、`schema_version` 类型不对）、`metadata_unsupported_version`
-  （`schema_version` 大于本程序的 `SCHEMA_VERSION`）、`metadata_pointer_invalid`（文件可读
-  且是映射，但 `active_profile` 缺失或不是合法档案 ID；元数据文件缺失但 `profiles/` 下已有
-  档案目录同样按此处理，因为指针无从解析）。缺 `schema_version` 是既有文件的正常形态，
-  不算版本未知。四种码互相可区分，经 `status()` 映射为 `recovery`（`error` 承载具体码，
-  不抛异常），不是 `needs_setup`。**查询不修复、不创建、不覆盖**：只有「元数据文件不存在
-  **且** `profiles/` 下没有任何既有档案目录」才允许 `require_profile()` 建立第一个档案；
+  （`schema_version` 大于本程序的 `LAUNCHER_SCHEMA_VERSION`）、`metadata_pointer_invalid`
+  （文件可读且是映射，但 `active_profile` 缺失或不是合法档案 ID；元数据文件缺失但
+  `profiles/` 下已有档案目录同样按此处理，因为指针无从解析）。缺 `schema_version` 是
+  既有文件的正常形态，不算版本未知。四种码互相可区分，经 `status()` 映射为
+  `recovery`（`error` 承载具体码，不抛异常），不是 `needs_setup`。**查询不修复、不创建、
+  不覆盖**：只有「元数据文件不存在
+  **且** `profiles/` 下没有任何既有档案目录」才允许 `ensure_first_profile()` 建立第一个
+  档案（`require_profile()` 保留并委托给它，既有调用方行为不变）；
   读取路径（`status()`、`load_saved()`、`load_draft()`）不改文件、不建目录、不改指针；
   `set_active_profile()` 与提交在读元数据失败时直接失败，损坏现场字节不变。
+- **固定档案绑定与查询不创建**（N1、D-133）：查询路径一律经只读的 `profile_or_none()`
+  解析档案目录（无档案返回 `None`），`load_saved()`、`load_draft()`、`validate_values()`、
+  `status()` 因此都不建目录、不写指针 —— 真正空的根目录上 `status()` 报 `needs_setup`
+  且根目录不出现任何新文件。唯一创建入口是写路径的 `ensure_first_profile()`：条件与
+  D-130 相同，且在同一次写入里落 `active_profile`、`active_epoch`（`(既有值 or 0) + 1`）
+  与 `catalog_revision`（同式），不产生「指针有了但目录字段没写」的中间态。
+  `ConfigService.for_profile(profile_id)` 返回绑定实例：共享数据根、凭据库与**同一把
+  进程内写锁**（构造参数 `lock=` 可注入，缺省自建）；绑定实例的 `profile()` 直接由
+  `profile_id` 求目录、完全不读 `launcher.json`，`status()` 只报该档案自身的状态。
+  目录字段的窄写入口是 `update_catalog(changes)`：写锁内「读—改—原子写」且先读后写
+  （读失败直接抛、绝不覆盖现场），只接受 `active_profile`（`validate_profile_id` 校验）、
+  `active_epoch` / `catalog_revision`（非负整数，拒绝 `bool`）与 `schema_version`
+  （只允许升到 `LAUNCHER_SCHEMA_VERSION`，当前值必须更小；降级与同级都报
+  `invalid_catalog_change`）。**调用前提**：`launcher.json` 已存在，或本次 `changes`
+  显式带上 `active_profile`；文件不存在时调用会写出没有指针的元数据，此后所有读取都按
+  `metadata_pointer_invalid` 停在恢复态 —— 迁移的 catalog 步与 N2 的删除流程必须自己
+  保证指针在场。
+- **launcher schema 与档案内 schema 分开**（N1、D-133）：`CONFIG_SCHEMA_VERSION = 1` 仍是
+  档案内 `config.yaml` / `draft.yaml` 的 `_launcher.schema_version`，取值与校验口径不变
+  （`_to_saved()` 仍要求相等）；`LAUNCHER_SCHEMA_VERSION = 2` 是 `launcher.json` 本次写入的
+  版本，读取侧接受 1 与 2（缺字段按旧文件）。**不得隐式升级**：`set_active_profile()`
+  写指针时原样保留文件已有的 `schema_version`（缺字段的旧文件保持缺失），只有文件
+  不存在的新根目录才写 `LAUNCHER_SCHEMA_VERSION`；升级只经 `update_catalog()` 的
+  显式入口。
+  `light_base_mapping(profile=None)` 省略四个档案内路径字段
+  （`storage.db_path`、`knowledge_base.root_dir`、`memory.root_dir`、
+  `logging.archive.directory`），其余取值不变，仅供「还没有档案」的查询与向导临时校验；
+  正式提交路径始终传真实档案目录。
+- **v1 迁移**（§10、D-137）：`migration.MigrationService` 把「单档案 + `launcher.json`
+  （schema 1 或缺 `schema_version`）+ `profiles/<id>/config.yaml`」的既有安装接管到 schema 2。
+  迁移在 `Controller.start()` 的**第一步**跑（§10.6），完全离线：不登录站点、不启动 Worker、
+  不请求数据档案锁（单实例互斥体已由 `main.py` 在构造 Controller 之前取得）；失败、阻塞或抛错
+  只记一条 `launcher.migration` 事件（字段 `status` 为阶段码、`error` 为稳定码或异常类名），
+  UI 照常启动、恢复态由 `status()` 如实报告，`_auto_start()` 在结果 `ok` 不为真时不启动机器人、
+  只打开管理页。
+  `inspect()` 只读，阶段码固定（缺省无写入、不建目录）：`nothing_to_migrate`（数据根不存在，
+  或既没有 `launcher.json` 也没有档案目录）、`already_migrated`（`schema_version == 2` 且迁移
+  记录已完成）、`blocked_metadata_fault`（N0 的四码之一，携带该码）、
+  `blocked_recovery_candidate`（没有可用指针：多个档案目录、指针损坏或根本没有指针；不选
+  「最新修改目录」、不合并同名目录、不自动接管）、`migratable`。
+  `migrate()` 先 `inspect()`，前四类直接返回（幂等、无写入）；`migratable` 时按固定顺序
+  执行四步，每步在 `<数据根>/operations/migration-v1-to-v2.json` 里落 `prepared` / `done`：
+  1. `backup`：复制 `launcher.json`、每个档案的 `config.yaml`、`draft.yaml` 与已有
+     `profile.json` 到 `migration/backup-<UTC 紧凑时间戳>/`（如 `backup-20260926T141530Z`），
+     保留相对目录结构；`manifest.json` **最后写**（`created_at`、`tool_version`、
+     `files[{path, sha256}]`、`schema_from: 1`、`schema_to: 2`），半份备份因此可识别；
+     同一时间戳已有完整清单则复用。
+  2. `profile_record`：补写 `profiles/<id>/profile.json`（`identity_state="unverified"`、
+     `site_user_id=null`、`state="active"`、`display_name` 取 `_launcher.account`，没有就空串；
+     **已存在不覆盖**）。
+  3. `catalog`：经 `update_catalog()` 写 `schema_version=2`、`catalog_revision=1`、
+     `active_epoch=1`；`active_profile` 不动，已有值不覆盖、同值不重写（同值 `schema_version`
+     会被该入口拒绝，见上一条）。
+  4. `record`：`operations/migration-v1-to-v2.json` 置 `stage="completed"` 并写
+     `completed_at`；失败保留已完成步骤码（`stage="in_progress"`），下次运行按阶段续跑，
+     已完成的步骤不重做（清单完整的备份目录原样复用）。
+  操作记录只保存 ID、revision、固定阶段码、受管相对路径与备份目录；备份与记录都只含非敏感
+  文件，**不含**密码、模型 Key、任何凭据取值、System Prompt、聊天/知识库/记忆正文或原始异常。
+  `identity_unverified` 的含义与解除路径：v1 档案没有可信的稳定站点 ID，身份校验因此不注入
+  期望值（§4.2、D-136），首次受控登录验证前不假定身份；迁移绝不写 `identity_state="verified"`，
+  解除只经 `bind_identity()`（N2 由一次性验证票据消费时调用）。旧程序读到 schema 2 会报
+  `metadata_unsupported_version` 并停在恢复态，因此不会误写；回退必须用升级前的停机备份恢复
+  整份数据目录（使用手册 §7）。
+- **档案记录与身份**（§4.1，D-134）：`profiles/<id>/profile.json` 是档案级记录
+  （UTF-8 JSON、键固定、`profile_revision` 每次写入 +1）：
+
+  | 字段 | 含义 |
+  |---|---|
+  | `schema_version` | 记录版本，当前 `PROFILE_SCHEMA_VERSION = 1` |
+  | `profile_id` | 随机不可变的档案 id（同目录名） |
+  | `display_name` | 可改的本地标签；N2 才提供改名 |
+  | `site_user_id` | 站点登录返回并验证过的稳定 ID；`null` 表示未验证 |
+  | `identity_state` | `unverified` / `verified`，只有 `verified` 会被信任 |
+  | `state` | 生命周期状态；N1 只写 `active`，`detached` / `deleting` 留给 N2，读到未知值原样保留 |
+  | `profile_revision` | 记录版本（本模块管理，不等同 `config.yaml` 的 revision） |
+  | `created_at` | 注入时钟的 ISO 时间，只用于显示与记录，不参与判定 |
+
+  登录账号名**不**进 `profile.json`：仍以 `config.yaml` 的 `_launcher.account` 为唯一来源。
+- **档案记录的读容错**（绝不把「读不出来」当成「没有」）：`profile.json` 不存在是
+  v1 档案与尚未迁移根目录的正常形态，读记录返回降级默认值（`identity_state="unverified"`、
+  `site_user_id=None`、`profile_revision=0`、`state="active"`）且**不补写文件**；存在但
+  非 UTF-8、非法 JSON、顶层不是对象或版本字段类型不对 → `profile_corrupt`，`OSError` →
+  `profile_unreadable`，`schema_version` 大于 1 → `profile_unsupported_version`；三种情况
+  都不得覆盖现场。`ProfileError` 继承 `ConfigServiceError`，经 `api._handle` 自动得到
+  409 + 稳定码。目录级的列表读（`list_profiles()`）跳过目录名非法或不是目录的条目，
+  但**不**跳过读不出来的记录（那会掩盖故障）。写盘失败沿用既有 `config_write_failed`。
+- **身份**（§4.2）：`unverified` 的档案跑起来**不注入**身份校验（Task 4 的接缝按
+  `expected_site_user_id()` 决定），首次受控登录验证前不假定身份。`bind_identity()` 是
+  绑定站点的唯一入口，写 `identity_state="verified"` 与 `site_user_id`；一个稳定 ID
+  只属于一个可用档案：另一个 `state != "detached"` 的档案占用同一 ID 时抛
+  `profile_identity_taken`（`detached` 不占用，供 N2 引导回已有档案）。
+  `create_profile(site_user_id=…)` 只是预占，未验证前不参与校验。
+- **创建与激活**：`ProfileService.ensure_first_profile()` 是首个档案的唯一入口
+  （内部经 `ConfigService.ensure_first_profile()`，并补写缺失的 `profile.json`）；
+  `create_profile()` 建立非活动档案并让 `catalog_revision` +1，已有指针不动 —— 只有
+  `launcher.json` 尚不存在的全新根目录会在同一次写入里显式带上 `active_profile`、
+  `active_epoch` 与 schema，避免留下没有指针的目录文件。
+  `activate(profile_id, *, expected_epoch)` 是低层激活：**调用方负责先停稳 Worker、
+  确认退出**（§5.1 第 2 条），`expected_epoch` 不符抛 `revision_conflict`；N1 不把它
+  暴露成 HTTP 路由。`catalog()`、`active_profile_id()`、`list_profiles()`、
+  `expected_site_user_id()` 只读，不创建、不补写。
 - **运行快照**（§6.5）：`build_run_launch(revision)` 在写锁内**一次**取到「指定版本的运行
   快照 + 对应凭据」（分开调用会拼出旧配置配新 Key）；`build_run_config()` / `credentials_for()`
   都**必须显式给 revision**，快照写在档案自己的 `runtime/` 下，换档案不会互相覆盖。
@@ -1041,6 +1152,22 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   读接口显式构造响应：只含可编辑字段、revision、账号与「凭据已配置/后端可用」三态，
   不返回凭据取值，也不返回可用于读取凭据的引用。校验失败回 422（`field` + 稳定码），
   revision 冲突回 409。
+- **查询与纯校验不创建**（N1、D-135）：`LocalApi` 注入 `ProfileService`，每个请求
+  只解析一次档案上下文 —— `_profile_id(create=False)` 经 `active_profile_id()` 只读解析、
+  `_bound(profile_id)` 取该档案的绑定 `ConfigService`，之后所有读写都用这一实例
+  （§4.1 末句）。`GET /api/config` 因此不建立首个档案：无档案时 `profile_id` 为 `null`、
+  `state` 仍是 `needs_setup`、`values` 为空、`defaults` 只回 System Prompt 默认模板
+  （基线按 `light_base_mapping(None)` 省略四个档案内路径字段）；有档案时取值不变。
+  `POST /api/config/validate` 无档案时用数据根级实例（`light_base_mapping(None)` 基线），
+  合法输入仍回 `200 {"ok": true}`、字段错误仍回 422 + 稳定码。`POST /api/test/site` 与
+  `/api/test/model` 的**带显式输入**分支同样用 `light_base_mapping(None)`、`config_dir`
+  取数据根，响应形状不变（`account_id` 仍不落盘）。真正空的根目录上这些查询都不产生
+  `launcher.json`、`profiles/` 或任何新文件。**`no_active_profile`（409）只由需要已有档案
+  的入口回**：`GET /api/kb/status`、`POST /api/kb/import`；启动/重启无档案仍回既有的
+  `config_not_ready`。写路径 `PUT /api/config`、`PUT /api/config/draft` 才经
+  `_profile_id(create=True)` → `ProfileService.ensure_first_profile()` 建立首个档案
+  （`profile.json` 同时补齐）。读取档案时的元数据故障仍由应用级处理器映射成 409 +
+  四个既有码，不再被折成「没有档案」。
 - **凭据删除**（§7，D-131）：提交只接受 `keep` / `replace`；凭据项写成
   `{"action": "delete"}` 时，在任何写入之前立即回 409 `credential_delete_unavailable`，
   `field` 是该凭据名，响应另带 `message`（`texts.py` 的固定文案）说明暂不可用与手工撤销
@@ -1057,6 +1184,30 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 - **进程面**（§9.2）：`POST /api/bot/{start,stop,restart}` 立刻返回 `operation_id`（202），
   长等待在后台操作里；`GET /api/operations/{id}` 查固定阶段与结果码。指定版本必须是当前
   已保存的版本，否则立刻 409。退出流程开始后拒绝一切启动。
+- **启动固定档案**（N1、D-135，§5.2 的输入固定）：`_bot_start` / `_bot_restart` 先
+  `_profile_id()` 解析一次档案，再用该档案绑定实例的 `load_saved()` 校验 revision
+  （请求指定时仍必须等于该档案已保存的版本，否则 409 `config_not_ready`）；生命周期门
+  （`lifecycle_busy`）与 202 + `operation_id` 的既有顺序不变。`profile_id` 一路传到
+  `WorkerManager.start/restart(profile_id=...)`、`Operation.profile_id`、
+  `GET /api/operations/{id}` 响应的 `operation["profile_id"]`，以及
+  **`spec_factory(revision, run_id, profile_id)` 三参签名**（`WorkerManager` 的
+  `_spec_factory` 调用点已改成三参）。`Controller._build_spec(revision, run_id, profile_id)`
+  用 `self._profiles.config_service(profile_id)` 取 `load_saved()` / `build_run_launch()` /
+  `profile()`，**不再**在启动线程里重新解析活动指针；`Controller._auto_start` 与
+  `api._bot_start/_bot_restart` 都显式传它。`WorkerManager.status()` 新增
+  `running_profile_id`：与 `running_revision` 同点设置（`state=running`）、同点清空
+  （停止、失败、回收、`shutdown`）。
+- **身份校验的注入与上报**（N1、D-136）：Controller 在 `_build_spec` 里取该档案的
+  `expected_site_user_id()`（只有 `identity_state="verified"` 且 ID 非空的档案才有值），
+  经 `default_worker_spec(..., expected_site_user_id=)` → `worker_env(...)` 写进子进程
+  环境变量 **`RARICY_LIGHT_EXPECTED_SITE_USER_ID`**（`EXPECTED_USER_ID_ENV`）；未验证身份的
+  档案取到 `None` 时**不注入该键**，Worker 因此不校验（§10.4 的 v1 档案口径）。Worker 侧
+  `worker_main._expected_site_user_id()` 把缺省或空串读成 `None`，转交
+  `BotApp(config, expect_site_user_id=...)`。登录后不符时 `app.start()` 抛
+  `SiteIdentityMismatch`，Worker 上报**既有 `log` 帧**承载的事件
+  **`worker.identity_mismatch`**（`level="ERROR"`、`fields.reason` 固定为
+  **`account_identity_mismatch`**，异常正文不进帧），并以既有 `EXIT_RUNTIME = 1` 结束 ——
+  **不新增退出码**，稳定码由事件承载。
 - **生命周期门**（F3、D-132）：站点测试与启停共用一把进程内、非阻塞的租约门
   （`lifecycle_gate.py`；控制器装配一个实例，`LocalApi` 构造注入，互斥范围就是这个对象）。
   `POST /api/test/site` 在整段执行期间持有租约，`manager.state` 检查与派发都在租约覆盖内
@@ -1076,6 +1227,23 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   过期或缺失如实报 `stale` / `unknown`，不从日志猜。显式测试结果绑定 revision，配置一变
   即标为过期。事件环形缓冲 500 条、订阅者有上限；游标过旧或来自别的实例时发 `gap` 提示；
   SSE 心跳 15 秒、慢消费者丢帧而不拖住发布方。
+- **状态 DTO 的档案身份**（N1、D-135）：`StatusService.__init__` 新增 `profile_service=None`
+  （缺省只供不装配档案视图的测试；正式装配由 Controller 注入 `ProfileService`）。
+  `snapshot()` 顶层新增五个字段：`active_profile_id`、`running_profile_id`、
+  `startup_profile_id`、`profile_epoch`、`pending_operation`。
+  `active_profile_id` / `profile_epoch` 取自 `profile_service.catalog()`（活动指针与
+  `active_epoch`）；`running_profile_id` 取自 `manager.status()`；`startup_profile_id` 是
+  「活动档案且 `config.start_bot_on_launch()` 为真」的过渡口径（N4 换成 `desktop.json`
+  的启动目标）；`pending_operation` 在 `manager.current_operation()` 未完成时给出
+  `{"operation_id", "kind", "state", "profile_id", "revision"}`，否则 `null`。
+  `catalog()` 或配置读取抛 `ConfigServiceError` 时这三个档案字段**降级为 `None`**，不抛：
+  元数据损坏时 `/api/status` 必须仍是 200，原因由 `config.state == "recovery"` 与它的
+  稳定码承载。`restart_required` 的判据扩为「已运行且（`running_revision != saved_revision`
+  **或** `running_profile_id != active_profile_id`）」—— 同号 revision 换档案也要提示重启。
+  `TestResult` 新增 `profile_id` / `profile_epoch`，`record_test(..., profile_id=,
+  profile_epoch=)` 可选；`_test_view()` 的过期判定改为：档案 id 不同即 `stale`（两边都是
+  `None` 时退回按数字 revision 比较），代次只在两边都记录了它时参与比较，数字 revision
+  仍参与 —— 身份键是 `(profile_id, config_revision, profile_epoch)`（§5.1 第 6 条）。
 
 ## 60. 管理页与发行（`frontend/`、`packaging/light/`）
 
@@ -1119,8 +1287,15 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   `_internal/raricy_launcher/assets/`）；`packaging/light/light.spec` 的 `datas` 与
   `packaging/light/pyproject.toml` 的 `[tool.setuptools.package-data]` **必须同步**，
   缺一处就会有一种安装形态少图标。取舍理由见 [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) D-138。
-- 首次启动路径：数据根还没有活动档案时，配置服务**按需建立第一个档案**（§5.1 第 1 步），
-  管理页因此读到 `needs_setup`、向导可以直接保存 —— 把「没有档案」当错误会让首次启动失败。
+- 首次启动路径（N1、D-133）：查询路径**不再创建**首个档案 —— 数据根还没有活动档案时，
+  管理页读到 `needs_setup`、`GET /api/config` 只回默认 System Prompt 模板，根目录不出现
+  任何新文件。首个档案只由写接口（`PUT /api/config`、`PUT /api/config/draft`）经
+  `ProfileService.ensure_first_profile()` 建立（§5.1 第 1 步），向导因此仍可直接保存 ——
+  把「没有档案」当错误会让首次启动失败，而把查询当写路径会让只读访问留下档案。
+- 升级路径（N1、D-137）：v1 安装首次启动时由迁移先接管数据根（§58），此后数据根新增
+  `profiles/<id>/profile.json`、`operations/` 与 `migration/backup-*/` 三处，都只含非敏感
+  内容（档案记录、固定恢复码与受管相对路径、配置类文件的副本与 sha256），不含密码、
+  模型 Key 或任何凭据取值。
 - 验收边界：`tools/smoke_light.py` 覆盖「启动 → 激活 → 会话 → 状态 → 页面与构建产物 →
   凭据后端可用 → 退出 → 元数据清理」，运行时本机不能再有另一个 Light 实例（激活通道与
   互斥体按当前用户命名）。**干净 Windows 清单（§17.2）与真实站点/模型验收仍未执行**，

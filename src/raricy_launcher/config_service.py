@@ -39,7 +39,12 @@ from .credential_store import (
     new_reference,
 )
 
-SCHEMA_VERSION: int = 1
+# 档案内 `config.yaml` / `draft.yaml` 的 `_launcher.schema_version`：取值与校验口径
+# 与拆分前完全一致（`_to_saved()` 仍要求等于它）。
+CONFIG_SCHEMA_VERSION: int = 1
+
+# `launcher.json` 本次写入的版本（N1 起为 2）；读取侧仍接受 1，见 `read_launcher_metadata()`。
+LAUNCHER_SCHEMA_VERSION: int = 2
 
 # `config.yaml` / `draft.yaml` 里的 Launcher 专属小节：Core 不认识它，
 # Launcher 解析后把纯 Core 映射交给公共校验（§6.3）。
@@ -136,6 +141,11 @@ _METADATA_FAULT_CODES: frozenset[str] = frozenset(
         METADATA_UNSUPPORTED_VERSION,
         METADATA_POINTER_INVALID,
     }
+)
+
+# `update_catalog()` 的窄写白名单：目录字段只有这四个，其余一律拒绝。
+_CATALOG_FIELDS: frozenset[str] = frozenset(
+    {"active_profile", "active_epoch", "catalog_revision", "schema_version"}
 )
 
 # 凭据操作（§7 的三种语义）。
@@ -255,25 +265,30 @@ class ConfigStatus:
     error: str | None = None
 
 
-def light_base_mapping(profile: Path) -> dict[str, Any]:
+def light_base_mapping(profile: Path | None = None) -> dict[str, Any]:
     """Launcher 掌控的非敏感基线（§5.3 的不可编辑项）。
 
     - 站点地址固定，首版不开放任意站点地址；
     - 数据库、记忆、知识与永久归档目录都落在本档案内（§13.1）；
     - 运维探针只监听回环；端口由 Launcher 运行参数控制，不写进 YAML（§10.3）；
     - MCP 与定时发文在 Light 里不存在（§4.2）。
+
+    `profile is None` 表示「还没有档案」：省略四个档案内路径字段，交给调用方
+    （无档案的查询与向导临时校验）在不创建目录的前提下继续；正式提交路径始终
+    传真实档案目录，取值与拆分前逐字节一致。
     """
-    return {
-        "site": {"base_url": LIGHT_SITE_BASE_URL},
-        "storage": {"db_path": str(paths.data_dir(profile) / "bot.db")},
-        "ops": {"host": "127.0.0.1"},
-        "knowledge_base": {"root_dir": str(paths.knowledge_dir(profile))},
-        "memory": {"root_dir": str(paths.data_dir(profile) / "memory")},
-        "logging": {"archive": {"directory": str(paths.error_logs_dir(profile))}},
-        "mcp": {"enabled": False},
-        "blog": {"enabled": False},
-        "system_prompt": DEFAULT_SYSTEM_PROMPT,
-    }
+    mapping: dict[str, Any] = {"site": {"base_url": LIGHT_SITE_BASE_URL}}
+    if profile is not None:
+        mapping["storage"] = {"db_path": str(paths.data_dir(profile) / "bot.db")}
+    mapping["ops"] = {"host": "127.0.0.1"}
+    if profile is not None:
+        mapping["knowledge_base"] = {"root_dir": str(paths.knowledge_dir(profile))}
+        mapping["memory"] = {"root_dir": str(paths.data_dir(profile) / "memory")}
+        mapping["logging"] = {"archive": {"directory": str(paths.error_logs_dir(profile))}}
+    mapping["mcp"] = {"enabled": False}
+    mapping["blog"] = {"enabled": False}
+    mapping["system_prompt"] = DEFAULT_SYSTEM_PROMPT
+    return mapping
 
 
 # 草稿校验用的占位取值：把「还没填」的必填项补成合法值，公共校验才能一路走到
@@ -307,6 +322,17 @@ def _parse_revision(launcher: Mapping[str, Any], *, broken_code: str) -> int:
     if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
         raise ConfigServiceError(broken_code)
     return raw
+
+
+def _catalog_counter(value: Any) -> int:
+    """读 launcher.json 里的非负计数；缺失或类型不对按 0 处理。
+
+    只用于「以既有值为起点自增」与版本比较：手工编辑出的坏值不让首次初始化或
+    版本升级变成 `ValueError`，写回时也会被替换成合法值。
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
 
 
 def _set_path(document: dict[str, Any], key: str, value: Any) -> None:
@@ -357,14 +383,31 @@ class ConfigService:
         *,
         credential_store: CredentialStore,
         profile_id: str | None = None,
+        lock: threading.RLock | None = None,
     ) -> None:
         self._root = Path(data_root)
         self._store = credential_store
         self._profile_id = profile_id
         self._bootstrap_lock = threading.Lock()
-        # 可重入：`require_profile()` 可能在已持锁的提交路径上建立第一个档案
-        # （§5.1 第 1 步），普通 Lock 会在那里自锁死（复审 N-1）。
-        self._lock = threading.RLock()
+        # 可重入：`ensure_first_profile()` 可能在已持锁的提交路径上建立第一个档案
+        # （§5.1 第 1 步），普通 Lock 会在那里自锁死（复审 N-1）。`for_profile()`
+        # 的绑定实例必须复用同一把锁：同一数据根只允许一把进程内写锁。
+        self._lock = lock if lock is not None else threading.RLock()
+
+    def for_profile(self, profile_id: str) -> ConfigService:
+        """绑定到指定档案的新实例：共享数据根、凭据库与同一把进程内写锁（要求 4）。
+
+        绑定实例的读路径由 `profile_id` 直接求档案目录，**完全不读 `launcher.json`**，
+        因此活动指针在别处切换也不会串档案（§4.1「一次请求内不反复从可变活动指针
+        推导目录」）。写锁共享是硬要求：分开的锁会让两个实例对同一数据根并发写。
+        """
+        paths.validate_profile_id(profile_id)
+        return ConfigService(
+            self._root,
+            credential_store=self._store,
+            profile_id=profile_id,
+            lock=self._lock,
+        )
 
     # --- 档案指针 ---------------------------------------------------------
 
@@ -374,6 +417,9 @@ class ConfigService:
         「不存在」「读不到」「读到了但不能用」必须分开：把权限/占用错误或损坏的
         YAML 当成空元数据，会让管理页走进首次设置流程并在界面之外覆盖活动档案指针
         （§13.3、F2）。四种故障各有一个稳定码，装载进 `status()` 的恢复状态。
+
+        `schema_version` 缺失是既有文件的正常形态（按旧文件读）；读取侧接受 1 与
+        `LAUNCHER_SCHEMA_VERSION`，大于它才报 `metadata_unsupported_version`。
         """
         path = paths.launcher_json_path(self._root)
         try:
@@ -398,7 +444,7 @@ class ConfigService:
             if isinstance(version, bool) or not isinstance(version, int):
                 # 版本字段类型不对：无法比较，按损坏处理（缺字段才等于「旧文件」）。
                 raise ConfigServiceError(METADATA_CORRUPT)
-            if version > SCHEMA_VERSION:
+            if version > LAUNCHER_SCHEMA_VERSION:
                 # 版本比本程序新就不猜：宁可停在恢复状态，也不按未知格式解释（§6.5）。
                 raise ConfigServiceError(METADATA_UNSUPPORTED_VERSION)
         return data
@@ -445,16 +491,25 @@ class ConfigService:
         return None
 
     def require_profile(self) -> str:
-        """当前档案 id；仅首次初始化时**建立第一个档案**并落指针（§5.1 第 1 步）。
+        """当前档案 id；保留既有语义，委托给 `ensure_first_profile()`（要求 3）。
 
-        向导的第一步是「读配置」（此时还没有任何档案），把它当错误会让首次启动
-        直接失败；初始化数据目录本来就属于启动流程的一部分。但只有「元数据文件
-        不存在且 `profiles/` 下没有任何既有档案目录」才是首次初始化：元数据损坏、
-        不可读、版本不支持或指针非法/缺失时一律不创建、不写指针，向上抛稳定错误
-        （F2：自动新建会把损坏现场当成首次运行并覆盖它）。
+        既有调用方（提交、运行快照、控制面）不改变行为：首次初始化仍会建立第一个
+        档案，其余四类元数据故障仍抛稳定错误。
+        """
+        return self.ensure_first_profile()
+
+    def ensure_first_profile(self) -> str:
+        """唯一允许建立首个档案的写入口（§5.1 第 1 步，要求 3）。
+
+        条件与 N0 的 `require_profile()` 完全一致：只有「元数据文件不存在 **且**
+        `profiles/` 下没有任何既有档案目录」才建立；元数据损坏、不可读、版本不支持
+        或指针非法/缺失时一律不创建、不写指针，向上抛稳定错误（F2：自动新建会把
+        损坏现场当成首次运行并覆盖它）。
 
         建立动作在专用锁内**重新检查**一次指针：并发首读如果各建一个档案，指针
         只会认最后一个，先建立的那些档案里的写入就再也看不见了（复审 N-2）。
+        指针、`active_epoch` 与 `catalog_revision` 在同一次写入里落盘，不产生
+        「指针有了但目录字段没写」的中间态。
         """
         profile_id = self._resolve_pointer()
         if profile_id is not None:
@@ -463,24 +518,103 @@ class ConfigService:
             profile_id = self._resolve_pointer()
             if profile_id is None:
                 profile_id = paths.new_profile_id()
-                self.set_active_profile(profile_id)
+                self._create_first_profile(profile_id)
         return profile_id
 
+    def _create_first_profile(self, profile_id: str) -> None:
+        """建立首个档案：一次写入元数据，再把档案目录建出来。
+
+        先写元数据再建目录：反过来一旦写元数据失败，就会留下「有档案目录但没有
+        指针」的现场，下次读取只能停在 `metadata_pointer_invalid` 恢复态。
+        """
+        with self._lock:
+            metadata = self.read_launcher_metadata()
+            metadata["schema_version"] = LAUNCHER_SCHEMA_VERSION
+            metadata["active_profile"] = profile_id
+            metadata["active_epoch"] = _catalog_counter(metadata.get("active_epoch")) + 1
+            metadata["catalog_revision"] = (
+                _catalog_counter(metadata.get("catalog_revision")) + 1
+            )
+            self._write_document(paths.launcher_json_path(self._root), metadata)
+        paths.profile_dir(self._root, profile_id).mkdir(parents=True, exist_ok=True)
+
     def profile(self) -> Path:
+        """当前档案目录；绑定实例直接由 `profile_id` 求目录，不读 `launcher.json`。
+
+        未绑定实例在「首次初始化」时经 `ensure_first_profile()` 建立；查询路径
+        必须用 `profile_or_none()`，不得调用本方法（要求 2、4）。
+        """
         return paths.profile_dir(self._root, self.require_profile())
+
+    def profile_or_none(self) -> Path | None:
+        """查询路径用的档案目录；没有档案返回 None，绝不建立首个档案（要求 2）。
+
+        绑定实例直接由 `profile_id` 求目录，完全不读 `launcher.json`。
+        """
+        profile_id = self._resolve_pointer()
+        if profile_id is None:
+            return None
+        return paths.profile_dir(self._root, profile_id)
 
     def set_active_profile(self, profile_id: str) -> None:
         """原子切换活动档案指针（§13.3：切换前必须确认旧 Worker 已退出，由调用方保证）。
 
         先读后写：读失败（损坏/不可读/版本不支持）必须直接失败，绝不把覆盖当成
-        「修复」，损坏现场保持字节不变（F2）。
+        「修复」，损坏现场保持字节不变（F2）。**只有文件不存在的新根目录**才写
+        `LAUNCHER_SCHEMA_VERSION`；文件已存在时原样保留它已有的 `schema_version`
+        —— 包括「没有这个字段」的旧文件（`read_launcher_metadata()` 按正常旧文件
+        读取）：一次指针写入不会**隐式升级**，升级是迁移的职责，只经
+        `update_catalog()` 的显式入口。
         """
         paths.validate_profile_id(profile_id)
+        metadata_path = paths.launcher_json_path(self._root)
         with self._lock:
             metadata = self.read_launcher_metadata()
-            metadata["schema_version"] = SCHEMA_VERSION
+            if not metadata_path.exists():
+                metadata["schema_version"] = LAUNCHER_SCHEMA_VERSION
             metadata["active_profile"] = profile_id
+            self._write_document(metadata_path, metadata)
+
+    def update_catalog(self, changes: Mapping[str, Any]) -> dict[str, Any]:
+        """目录字段的窄写入口：写锁内「读—改—原子写 `launcher.json`」（要求 5）。
+
+        先读后写：读取失败（含四种元数据故障）直接抛出，绝不覆盖现场（F2）。
+        只接受 `active_profile`、`active_epoch`、`catalog_revision` 与
+        `schema_version`，其余键抛 `invalid_catalog_change`；`schema_version` 只
+        允许**升到** `LAUNCHER_SCHEMA_VERSION`（当前值必须更小），降级与同级同样
+        拒绝 —— 版本迁移只从这个显式入口发生，不会藏在别的写路径里。
+        返回写入后的完整元数据映射。
+
+        调用前提：`launcher.json` 已存在，或本次 `changes` 显式带上
+        `active_profile`。文件不存在时调用会写出**没有指针**的元数据，此后所有读取
+        都按 `metadata_pointer_invalid` 停在恢复态 —— 迁移的 catalog 步与 N2 的
+        删除流程必须自己保证指针在场（本入口只写它被要求写的字段）。
+        """
+        with self._lock:
+            metadata = self.read_launcher_metadata()
+            for key, value in changes.items():
+                if key not in _CATALOG_FIELDS:
+                    raise ConfigServiceError("invalid_catalog_change")
+                if key == "active_profile":
+                    if not isinstance(value, str):
+                        raise ConfigServiceError("invalid_catalog_change")
+                    try:
+                        paths.validate_profile_id(value)
+                    except ValueError as exc:
+                        raise ConfigServiceError("invalid_catalog_change") from exc
+                elif key in ("active_epoch", "catalog_revision"):
+                    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                        raise ConfigServiceError("invalid_catalog_change")
+                else:  # schema_version
+                    if (
+                        value != LAUNCHER_SCHEMA_VERSION
+                        or _catalog_counter(metadata.get("schema_version"))
+                        >= LAUNCHER_SCHEMA_VERSION
+                    ):
+                        raise ConfigServiceError("invalid_catalog_change")
+                metadata[key] = value
             self._write_document(paths.launcher_json_path(self._root), metadata)
+            return metadata
 
     def start_bot_on_launch(self) -> bool:
         """档案里的**旧**启动偏好（只读口径）；桌面偏好的唯一来源是 `desktop.json`。
@@ -497,7 +631,7 @@ class ConfigService:
         """读正式配置；不存在返回 None（`needs_setup`）。
 
         读是查询路径：不建立首个档案，也不写指针（F2）。首个档案只在写路径上由
-        `require_profile()` 建立。
+        `ensure_first_profile()` 建立。
         """
         document = self._read_formal()
         if document is None:
@@ -505,7 +639,7 @@ class ConfigService:
         return self._to_saved(document)
 
     def load_draft(self) -> DraftConfig | None:
-        profile = self._profile_for_read()
+        profile = self.profile_or_none()
         if profile is None:
             return None
         data = self._read_document(
@@ -524,7 +658,7 @@ class ConfigService:
         """配置就绪状态（§9.1）。凭据库可能阻塞，调用方应在工作线程里调用。
 
         元数据故障落进稳定恢复状态，而不是 `needs_setup`；查询只报告，不修复、
-        不创建、不覆盖，也不抛异常（F2）。
+        不创建、不覆盖，也不抛异常（F2）。在绑定实例上只报告该档案自身的状态。
         """
         try:
             saved = self.load_saved()
@@ -534,6 +668,10 @@ class ConfigService:
                 return ConfigStatus(state=STATE_RECOVERY, error=code)
             return ConfigStatus(state=STATE_INVALID, error=code)
         if saved is None:
+            return ConfigStatus(state=STATE_NEEDS_SETUP)
+        profile = self.profile_or_none()
+        if profile is None:
+            # 有正式配置就一定解析得出档案目录；真出现矛盾也不在这里创建档案。
             return ConfigStatus(state=STATE_NEEDS_SETUP)
         if not saved.credentials_ref:
             return ConfigStatus(
@@ -559,11 +697,11 @@ class ConfigService:
             )
         try:
             core_config.parse_config(
-                saved.mapping, config_dir=str(self.profile()), secrets=credentials
+                saved.mapping, config_dir=str(profile), secrets=credentials
             )
             # 手工编辑过的配置也要过能力策略与路径包含检查（§9.1 的 invalid
             # 涵盖「Light 能力策略不符合要求」）。
-            self._validate_policy(saved.mapping, self.profile())
+            self._validate_policy(saved.mapping, profile)
         except ConfigError as exc:
             return ConfigStatus(
                 state=STATE_INVALID,
@@ -603,12 +741,17 @@ class ConfigService:
             if current is not None:
                 base = _deep_merge(base, self._without_launcher_owned(current.mapping))
             merged = _merge_editable(base, values)
-            self._validate(merged, credentials=None, allow_missing_required=True)
+            self._validate(
+                merged,
+                credentials=None,
+                allow_missing_required=True,
+                profile=profile,
+            )
             self._validate_policy(merged, profile)
             revision = current_revision + 1
             document = {
                 LAUNCHER_SECTION: {
-                    "schema_version": SCHEMA_VERSION,
+                    "schema_version": CONFIG_SCHEMA_VERSION,
                     "revision": revision,
                 },
                 **merged,
@@ -619,17 +762,24 @@ class ConfigService:
     def validate_values(self, values: Mapping[str, Any]) -> None:
         """静态校验：只走公共字段规则与 Light 能力策略，不写盘、不碰凭据（§11）。
 
-        与草稿同一口径：允许「还没填」，但**已填写项**必须合法。
+        与草稿同一口径：允许「还没填」，但**已填写项**必须合法。无档案时以
+        `light_base_mapping(None)` 为基线（不含档案内路径字段，`_validate_policy`
+        对缺失的路径字段跳过包含检查），校验全程只读、不建目录、不写指针。
         """
         with self._lock:
-            profile = self.profile()
+            profile = self.profile_or_none()
             base = light_base_mapping(profile)
             current = self._read_formal()
             if current is not None:
                 saved = self._to_saved(current)
                 base = _deep_merge(base, self._without_launcher_owned(saved.mapping))
             merged = _merge_editable(base, values)
-            self._validate(merged, credentials=None, allow_missing_required=True)
+            self._validate(
+                merged,
+                credentials=None,
+                allow_missing_required=True,
+                profile=profile,
+            )
             self._validate_policy(merged, profile)
 
     # --- 正式提交（§6.4） --------------------------------------------------
@@ -691,7 +841,12 @@ class ConfigService:
 
             # 3) 校验：字段与跨字段规则、Light 能力策略、必要凭据齐备。
             #    校验在写任何东西之前完成，因此失败不会留下半份新配置。
-            self._validate(merged, credentials=new_secrets, allow_missing_required=False)
+            self._validate(
+                merged,
+                credentials=new_secrets,
+                allow_missing_required=False,
+                profile=profile,
+            )
             self._validate_policy(merged, profile)
 
             # 4) 凭据：先登记脱敏（内存），再写库并回读确认；旧引用此时仍然有效。
@@ -712,7 +867,7 @@ class ConfigService:
             revision = current_revision + 1
             document = {
                 LAUNCHER_SECTION: {
-                    "schema_version": SCHEMA_VERSION,
+                    "schema_version": CONFIG_SCHEMA_VERSION,
                     "revision": revision,
                     "credentials_ref": credentials_ref,
                     "account": new_account,
@@ -806,20 +961,13 @@ class ConfigService:
             raise ConfigServiceError(broken_code)
         return data
 
-    def _profile_for_read(self) -> Path | None:
-        """查询路径用的档案目录；没有档案时返回 None，绝不建立首个档案（F2）。"""
-        profile_id = self._resolve_pointer()
-        if profile_id is None:
-            return None
-        return paths.profile_dir(self._root, profile_id)
-
     def _read_formal(self) -> dict[str, Any] | None:
         """读正式配置的原始文档；不存在返回 None，损坏则报稳定错误。
 
         查询路径不得建立首个档案：没有指针就没有正式配置，交给 `status()` 报
         `needs_setup`（F2 的「查询不创建」）。
         """
-        profile = self._profile_for_read()
+        profile = self.profile_or_none()
         if profile is None:
             return None
         return self._read_document(paths.config_path(profile), broken_code="config_unreadable")
@@ -828,7 +976,7 @@ class ConfigService:
         launcher = document.get(LAUNCHER_SECTION)
         launcher = launcher if isinstance(launcher, dict) else {}
         schema_version = launcher.get("schema_version")
-        if schema_version != SCHEMA_VERSION:
+        if schema_version != CONFIG_SCHEMA_VERSION:
             # 版本不认识就不猜：宁可报告无效，也不按新格式解释旧文件（§6.5）。
             raise ConfigServiceError("unsupported_schema")
         reference = launcher.get("credentials_ref")
@@ -839,7 +987,7 @@ class ConfigService:
             credentials_ref=reference if isinstance(reference, str) and reference else None,
             account=account if isinstance(account, str) and account else None,
             start_bot_on_launch=bool(launcher.get("start_bot_on_launch", False)),
-            schema_version=SCHEMA_VERSION,
+            schema_version=CONFIG_SCHEMA_VERSION,
         )
 
     def _resolve_credentials(self, saved: SavedConfig | None) -> Secrets | None:
@@ -870,6 +1018,7 @@ class ConfigService:
         *,
         credentials: Secrets | None,
         allow_missing_required: bool,
+        profile: Path | None,
     ) -> None:
         """统一走 `parse_config()`：GUI 与 CLI 因此只有一份字段规则（§6.1）。
 
@@ -878,6 +1027,9 @@ class ConfigService:
         合法占位值补齐尚未填写的必填项后整体校验：剩下的任何错误都只可能来自
         已填写的字段（类型、范围、跨字段、URL 安全策略），一律拒绝（§6.2）。
         正式提交还要求凭据齐备 —— 缺凭据不是字段没填，而是不能启动（§7）。
+
+        `profile` 是相对路径的基准目录；无档案的查询路径传 None，此时用数据根，
+        并由调用方保证映射里不含档案内路径字段（那样不会误判包含关系）。
         """
         if not allow_missing_required:
             if credentials is None or not (
@@ -895,13 +1047,19 @@ class ConfigService:
             document = _deep_merge(_PROBE_VALUES, _without_blanks(mapping))
         try:
             core_config.parse_config(
-                document, config_dir=str(self.profile()), secrets=probe
+                document,
+                config_dir=str(profile if profile is not None else self._root),
+                secrets=probe,
             )
         except ConfigError as exc:
             raise ConfigInvalid.from_config_error(exc) from exc
 
-    def _validate_policy(self, mapping: Mapping[str, Any], profile: Path) -> None:
-        """Light 能力策略（§4.2、§9.5）：不能靠「界面没提供开关」来保证。"""
+    def _validate_policy(self, mapping: Mapping[str, Any], profile: Path | None) -> None:
+        """Light 能力策略（§4.2、§9.5）：不能靠「界面没提供开关」来保证。
+
+        无档案时（`profile is None`）路径字段一定缺失（基线省略、提交也拒绝这些
+        键），缺失即跳过包含检查；一旦出现路径字段又无档案锚点，仍然拒绝。
+        """
         for key in ("mcp.enabled", "blog.enabled"):
             if _get_path(mapping, key):
                 raise ConfigInvalid(
@@ -913,7 +1071,11 @@ class ConfigService:
             value = _get_path(mapping, key)
             if value is None:
                 continue
-            if not isinstance(value, str) or not paths.is_within(profile, value):
+            if (
+                profile is None
+                or not isinstance(value, str)
+                or not paths.is_within(profile, value)
+            ):
                 raise ConfigInvalid(
                     f"配置 {key} 必须位于当前档案目录内",
                     code="path_outside_profile",

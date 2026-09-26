@@ -46,6 +46,7 @@ from .credential_store import CredentialStore, SessionMemoryStore, SystemKeyring
 from .desktop_settings import DesktopSettings, DesktopSettingsError, DesktopSettingsService
 from .events import EventService
 from .lifecycle_gate import LifecycleGate
+from .migration import MigrationResult, MigrationService
 from .platform import (
     InstanceGuard,
     LauncherPlatform,
@@ -62,6 +63,7 @@ from .process_manager import (
     WorkerSpec,
     default_worker_spec,
 )
+from .profile_service import ProfileService
 from .session import SessionManager
 from .startup_service import StartupService
 from .status_service import StatusService
@@ -170,6 +172,17 @@ class Controller:
         # 注册表适配器在这里惰性取得，测试用替身注入 `LocalApi`，不碰真实注册表。
         self._desktop_settings = DesktopSettingsService(self._data_root)
         self._startup_service = self._build_startup_service()
+        # 档案级入口：控制面按档案取绑定服务（一次请求只解析一次档案上下文），
+        # 状态聚合也经它读活动档案与代次（§4.1、D-135）。
+        self._profiles = ProfileService(
+            self._data_root, base_config_service=self._config
+        )
+        # v1 迁移（§10）：服务在装配期构造，真正的迁移在 `start()` 的第一步跑；
+        # 结果留在这里供 `_auto_start()` 判断（迁移未完成不自动运行机器人）。
+        self._migration = MigrationService(
+            self._data_root, config_service=self._config
+        )
+        self._migration_result: MigrationResult | None = None
         # 事件时间要与管理页显示的墙钟一致（同一处时钟时基缺陷，复审指出）。
         self._events = EventService(instance_id=self._instance_id, clock=time.time)
         self._sessions = SessionManager(instance_id=self._instance_id, clock=time.monotonic)
@@ -186,6 +199,7 @@ class Controller:
             instance_id=self._instance_id,
             config_service=self._config,
             manager=self._manager,
+            profile_service=self._profiles,
         )
         # 站点测试与启停共用的生命周期门：进程内单实例，随控制器一起装配
         # （§59、D-132）。互斥范围就是这个对象，所以只能有一个。
@@ -252,6 +266,8 @@ class Controller:
 
     def start(self) -> None:
         """绑定回环端口、启动 API 与激活管道、发布运行元数据。"""
+        # 第一步是 v1 迁移：它在任何对外接口起来之前把数据根接管完（§10.6）。
+        self._run_migration()
         self._start_api()
         self._listener = self._platform.create_activation_listener()
         self._listener.start(self._handle_activation)
@@ -361,6 +377,36 @@ class Controller:
         if tray is not None:
             tray.request_close()
 
+    def _run_migration(self) -> None:
+        """v1 无损接管（§10）：迁移是启动的第一步，失败/阻塞只记日志、继续启动 UI。
+
+        迁移完全离线：不登录站点、不启动 Worker、不请求数据档案锁；单实例互斥体
+        已由 `main.py` 在构造 Controller 之前取得（§10.1「停稳 Worker」）。结果
+        如实留在 `self._migration_result` 里：`_auto_start()` 按它阻止自动运行，
+        恢复态由 `status()` 报出（四类元数据故障 → `recovery`）。
+        """
+        try:
+            result = self._migration.migrate()
+        except Exception as exc:
+            # 未归类的失败不阻断启动：管理页仍要能打开，日志只记异常类名。
+            self._migration_result = None
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "launcher.migration",
+                status="failed",
+                error=type(exc).__name__,
+            )
+            return
+        self._migration_result = result
+        log_event(
+            self._logger,
+            logging.INFO if result.ok else logging.WARNING,
+            "launcher.migration",
+            status=result.stage,
+            error=result.metadata_fault or result.error,
+        )
+
     def _auto_start(self) -> None:
         """首次进入：按桌面偏好解析自动运行并决定是否启动（§5.2、§8、D-150）。
 
@@ -377,6 +423,12 @@ class Controller:
         仍走 `LifecycleGate` 与 `WorkerManager` 的同一条路（§8.1）。任何一步读不
         出来都不猜：不启动、不改写现场，只给一次可见提示。
         """
+        # v1 迁移门（§10.6）：迁移失败、被阻塞或抛错时不把半迁移的根目录当作
+        # 干净安装，不启动机器人，只打开管理页让用户看到恢复入口。
+        result = self._migration_result
+        if result is None or not result.ok:
+            self._open_url(self.entry_url())
+            return
         try:
             settings = self._desktop_settings.read()
         except DesktopSettingsError as exc:
@@ -414,7 +466,7 @@ class Controller:
             if status is None or status.state != STATE_CONFIGURED:
                 self._open_entry_or_tray()
                 return
-            self._start_bot(status.revision)
+            self._start_bot(status.revision, self._profiles.active_profile_id())
             return
         try:
             target_removed = not self._profile_exists(target)
@@ -459,10 +511,14 @@ class Controller:
             )
             self._open_entry_or_tray()
             return
-        self._start_bot(status.revision)
+        self._start_bot(status.revision, target)
 
-    def _start_bot(self, revision: int | None) -> None:
-        """取生命周期租约后派发一次启动，并挂上静默失败监视（§9.2、D-132）。"""
+    def _start_bot(self, revision: int | None, profile_id: str | None = None) -> None:
+        """取生命周期租约后派发一次启动，并挂上静默失败监视（§9.2、D-132）。
+
+        `profile_id` 在派发前固定一次（§5.2 的输入固定）：启动线程与规格工厂都不再
+        从可变的活动指针推导目录，页面显示的档案与后台运行的档案因此不会分叉。
+        """
         ticket = self._lifecycle.begin_operation("start")
         if ticket is None:
             # 门被站点测试占着：不绕过并发门，也不排队（§5.1 第 3 条）。
@@ -475,7 +531,7 @@ class Controller:
             self._open_entry_or_tray()
             return
         try:
-            operation = self._manager.start(revision=revision)
+            operation = self._manager.start(revision=revision, profile_id=profile_id)
         finally:
             # 租约只覆盖派发本身，长等待不留在门内（与 §59 的启停入口同一口径）。
             self._lifecycle.end(ticket)
@@ -621,6 +677,7 @@ class Controller:
             instance_id=self._instance_id,
             data_root=self._data_root,
             config_service=self._config,
+            profile_service=self._profiles,
             manager=self._manager,
             status_service=self._status,
             events=self._events,
@@ -826,19 +883,39 @@ class Controller:
 
     # --- Worker -----------------------------------------------------------
 
-    def _build_spec(self, revision: int | None, run_id: str) -> WorkerSpec:
-        """构造一次启动的完整输入：运行快照与凭据在配置锁内一次取得（§6.5）。"""
-        saved = self._config.load_saved()
+    def _build_spec(
+        self, revision: int | None, run_id: str, profile_id: str | None
+    ) -> WorkerSpec:
+        """构造一次启动的完整输入：运行快照与凭据在配置锁内一次取得（§6.5）。
+
+        `profile_id` 是派发时固定下来的档案（§5.2 的输入固定）：用它的绑定实例
+        取快照、凭据与目录，**不再**在启动线程里重新解析可变的活动指针 —— 否则
+        切换档案的瞬间会起出一个「配置属于 A、目录已经指向 B」的 Worker。
+        身份校验的期望值同样在这里固定：取该档案已绑定的稳定 ID 注入 Worker 环境；
+        未验证身份的档案（v1 迁移来的）取到 `None`，不注入也不校验（§10.4）。
+        """
+        service = (
+            self._config
+            if profile_id is None
+            else self._profiles.config_service(profile_id)
+        )
+        saved = service.load_saved()
         if saved is None:
             raise ConfigServiceError("no_active_config")
         target = saved.revision if revision is None else revision
-        launch = self._config.build_run_launch(target)
+        launch = service.build_run_launch(target)
+        expected = (
+            None
+            if profile_id is None
+            else self._profiles.expected_site_user_id(profile_id)
+        )
         return default_worker_spec(
             run_config=str(launch.config_path),
-            config_dir=str(self._config.profile()),
+            config_dir=str(service.profile()),
             credentials=launch.credentials,
             instance_id=self._instance_id,
             run_id=run_id,
+            expected_site_user_id=expected,
         )
 
     def _on_worker_event(self, name: str, fields: dict, level: str = "info") -> None:

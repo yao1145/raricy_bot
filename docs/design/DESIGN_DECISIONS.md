@@ -20,7 +20,11 @@ D-131 凭据删除先摘入口（N2 再交付完整清除），D-132 Light 控�
 下一代 Light（[LIGHT_NEXT_GENERATION.md](LIGHT_NEXT_GENERATION.md) §11）从 D-133 起按阶段连续编号，
 **编号区已一次性划定，不预占、不跳号**：N0 占 D-130–D-132，N1（档案基础）占 D-133–D-137，
 N3（Windows 托盘）占 D-138–D-141，N2（账号与凭据操作）占 D-143–D-147，N4（登录启动）从
-D-142 起（D-142 已被 N4 Task 2 占用，N2 分配后 N4 续用 D-148 及以后）；已落地：D-138 托盘
+D-142 起（D-142 已被 N4 Task 2 占用，N2 分配后 N4 续用 D-148 及以后）；已落地：D-133 固定档案的
+ConfigService（查询不创建、显式创建入口与分离的 launcher schema）、D-134 档案记录的降级读取、
+账号名归属与由调用方停机的低层激活、D-135 控制面的档案身份（只读路径不创建、状态 DTO 身份键与
+启动固定档案）、D-136 身份校验接缝（登录之后、账号锁与消费者装配之前阻断）、D-137 v1 迁移
+（先备份后写、可重入、schema 2 让旧读取器主动拒绝）、D-138 托盘
 图标资源与冻结闭包（N3 Task 1）、D-139 托盘视图模型（N3 Task 2）、D-140 托盘协调器与命令
 边界（N3 Task 3）、D-141 托盘窗口层与系统事件（N3 Task 4）、D-142 桌面偏好独立成文件
 （N4 Task 2）、D-148 登录启动项的五项分离事实、`unknown` 优先与「待应用只诊断不重放」（N4 Task 3）、
@@ -1454,6 +1458,196 @@ N2 = D-143–147，N4 = D-142 与 D-148 起；D-148 已由启动项事实条目�
 
 编号说明：本条按最终分配用 D-150（N0 = D-130–132，N1 = D-133–137，N3 = D-138–141，
 N2 = D-143–147，N4 = D-142 与 D-148 起；D-148、D-149 已占用）；本条不占用其他阶段的号。
+
+<a id="d-133"></a>
+
+## D-133 固定档案的 ConfigService：查询不创建、显式创建入口与分离的 launcher schema
+
+N1 的落地口径（[下一代设计](LIGHT_NEXT_GENERATION.md) §4.1、§5.1、§11）。修复前
+`ConfigService` 虽然支持 `profile_id=` 绑定，但查询路径仍会落回可变活动指针：
+`_config_view`（`GET /api/config`）为了取 System Prompt 默认值、`validate_values()` 与
+`GET /api/kb/status` 都会经 `profile()` → `require_profile()` 在真正空的根目录上建立首个
+档案并写指针。结果是一次纯查询留下了 `launcher.json` 与 `profiles/`，与 §4.1 末句
+「API 查询不得再隐式调用『创建首个档案』」直接冲突。
+
+- **为什么把创建改成显式入口**：读与写在磁盘上必须可区分 —— 查询（`load_saved()`、
+  `load_draft()`、`validate_values()`、`status()`）一律走只读解析 `profile_or_none()`
+  （无档案返回 `None`），只有 `ensure_first_profile()` 会建立首个档案；`require_profile()`
+  保留并委托给它，既有写路径调用方行为不变。创建条件仍是 D-130 的那一条（元数据文件
+  不存在且 `profiles/` 下没有任何既有档案目录），四类元数据故障的稳定码与语义不改；
+  指针、`active_epoch`、`catalog_revision` 在同一次写入里落盘，避免「指针有了但目录
+  字段没写」的中间态。把「没有档案」当错误会让首次启动失败，把查询当写路径则会让
+  只读访问改变现场，两种偏差都不允许。
+- **为什么绑定实例共享写锁**：`for_profile(profile_id)` 让一次请求只解析一次档案上下文，
+  后续读写都用同一实例（§4.1），因此实例数目随请求增长。若每个实例各建一把
+  `RLock`，「同一数据根只有一把进程内写锁」这条既有前提就不成立：两个请求可以同时
+  改同一份 `launcher.json` / `config.yaml`，原子替换保得住单文件完整，却保不住读—改—写
+  的串行性。锁因此作为构造参数 `lock=` 可注入，工厂把父实例的锁传给绑定实例；绑定
+  实例的读路径由 `profile_id` 直接求目录、完全不读 `launcher.json`，`status()` 只报该
+  档案自身的状态，同号 revision 不跨档案。
+- **为什么 launcher schema 与档案内 schema 分开**：两个文档的生命周期不同。档案内
+  `config.yaml` / `draft.yaml` 的 `_launcher.schema_version` 是 Core 解析契约的一部分
+  （`_to_saved()` 要求等于 `CONFIG_SCHEMA_VERSION = 1`），不能因为目录结构多了一个字段
+  就要求所有档案重写配置；`launcher.json` 则承载活动指针、`active_epoch`、
+  `catalog_revision` 与迁移状态，N1 起写入 `LAUNCHER_SCHEMA_VERSION = 2`，读取侧接受
+  1 与 2（缺字段按旧文件）。共用一个数字会让「升级目录元数据」与「升级档案内配置」
+  被迫同时发生，而没有这种依赖。**不得隐式升级**：`set_active_profile()` 写指针时原样
+  保留已有版本，v1 根目录不会因为一次指针写入变成 v2；版本变化只经 `update_catalog()`
+  这个窄写入口（四个键、先读后写、只升不降），迁移流程才能在受控的时点做出显式动作。
+- **边界**：`light_base_mapping(profile=None)` 只是在「还没有档案」时省略四个档案内路径
+  字段（`storage.db_path`、`knowledge_base.root_dir`、`memory.root_dir`、
+  `logging.archive.directory`），供查询与向导临时校验使用；正式提交路径始终传真实档案
+  目录，取值逐字节不变。`update_catalog()` 先读后写在读失败时直接抛出，绝不覆盖损坏
+  现场 —— 与 D-130 的「查询不修复」是同一条原则的写入口版本。
+
+<a id="d-134"></a>
+
+## D-134 档案记录：缺 `profile.json` 按降级默认读、账号名不进记录、激活是低层 API
+
+N1 Task 2 的落地口径（[下一代设计](LIGHT_NEXT_GENERATION.md) §4.1、§4.2、§5.1）。
+`profiles/<id>/profile.json` 承载稳定身份、生命周期状态与 `profile_revision`，
+由 `profile_service.ProfileService` 维护（字段表与三种读故障码见 §58）。
+
+- **为什么缺 `profile.json` 按降级默认处理而不是报错**：现存安装只有档案目录与
+  `config.yaml`，没有记录文件；把「文件不存在」当成故障会让升级后的每一次读取都停在
+  恢复态，v1 无损接管（§10）也就无从谈起。因此缺失读作「未验证、没有身份、revision 0」
+  的默认记录，并且**不**顺手补写 —— 查询路径一旦会写盘，只读的列表与状态就会改变现场。
+  真正读不出来时反过来绝不当成「没有」：非 UTF-8、非法 JSON、顶层不是对象或版本字段
+  类型不对报 `profile_corrupt`，`OSError` 报 `profile_unreadable`，版本更大报
+  `profile_unsupported_version`，三者都不覆盖现场 —— 这是 D-130 同一条原则在档案记录上
+  的版本。补写只发生在写路径：`ensure_first_profile()` 建立或补全记录，`bind_identity()`
+  与 `create_profile()` 写自己的新版本。
+- **为什么账号名不进 `profile.json`**：登录账号名已经以 `config.yaml` 的
+  `_launcher.account` 为唯一来源（§13.3 规定档案内不可变），复制进记录会让同一个事实
+  出现两个副本：改名（N2 的 `display_name` 改名或重设账号）时两者可能不一致，而按记录
+  里的名字显示、按配置里的名字登录正是最难发现的那类偏差。`display_name` 是可改的本地
+  标签，与登录身份无关；稳定身份只由 `site_user_id` 表达。
+- **为什么激活是低层 API 且由调用方负责停机**：`activate()` 只做「读目录、比代次、
+  一次写入指针与代次」，它不碰 Worker，也不该碰：迁移/切换的事务（验证目标、停旧 Worker、
+  确认退出、提交指针、按需启动）属于 N2 的 `LifecycleService`，N1 只固定输入（§5.2）。
+  文档化的前置条件是**调用方先停稳 Worker 并确认进程退出**（§5.1 第 2 条），因为指针一改，
+  旧 Worker 的写入就归属到新档案，而同号 revision 不串档案靠的正是代次比较。N1 不把它
+  暴露成 HTTP 路由；带 `expected_epoch` 的冲突返回 `revision_conflict`，且在任何写入之前失败。
+- **边界**：`catalog()` 是只读视图，指针缺失或不是合法档案 ID 时如实给出 `None`；
+  「文件存在但没有可用指针」属于元数据故障，由 `ConfigService.profile_or_none()` 一侧
+  报 `metadata_pointer_invalid`（D-130），本模块不修它。`create_profile()` 在
+  `launcher.json` 尚不存在的全新根目录上把 `catalog_revision` 与 `active_profile`、
+  `active_epoch`、schema 写进**同一次**写入：只写计数会留下一个没有指针的文件，
+  此后所有读都判 `metadata_pointer_invalid`，而 `ensure_first_profile()` 按 F2 拒绝修复它。
+  文件存在时本模块只改 `catalog_revision`，绝不改指针。
+
+## D-135 控制面的档案身份：只读路径不创建、状态 DTO 身份键与启动固定档案
+
+N1 Task 3 的落地口径（[下一代设计](LIGHT_NEXT_GENERATION.md) §4.1、§5.1 第 6 条、§5.2、§9）。
+`LocalApi` 注入 `ProfileService`，每个请求只解析一次档案上下文（`_profile_id` 解析、
+`_bound` 取绑定实例，另有一个只读上下文的私有助手 `_read_service`）；
+`WorkerManager` 的启动/重启与
+`Operation` 携带 `profile_id`；`StatusService` 的 DTO 暴露五个档案字段。契约见 §59。
+
+- **为什么身份键是 `(profile_id, config_revision, profile_epoch)` 而不是只比数字
+  revision**：`running_revision` 与 `saved_revision` 同为 1 并不说明它们属于同一个档案
+  —— A、B 各自从 rev 1 开始时，只比数字会把 A 的测试结果、待重启判断和操作结果当成 B
+  的当前事实。`profile_id` 区分档案，`config_revision` 区分同一档案内的版本变化，
+  `active_epoch` 区分活动指针的代次（同一档案被重新选中、指针被手工改动）。三者合起来
+  才能回答「这份结果属于现在这一刻的哪个档案的哪一版」。
+- **为什么 `profile_epoch` 只在记录方给出时才参与测试结果的过期判定**：活动指针每切换
+  一次 `active_epoch` 就 +1，**切回原档案也一样**（`activate()` 的语义就是推进代次）。
+  把「当前代次」当作测试结果的严格相等键，会让同一档案的旧结果在任意一次切换往返后
+  永久过期 —— 那是误报，不是串档案。因此 API 记录测试结果时带 `profile_id` 与
+  `revision`（同号 revision 不串档案靠前者），`record_test` 与 `TestResult` 保留
+  `profile_epoch` 供需要更严格判定的调用方使用；代次进 DTO 的主要用途是 N2 的写入冲突
+  判定（`expected_profile_epoch`）。
+- **为什么元数据故障在 `snapshot()` 里降级为 `None` 而不是抛**：`/api/status` 是管理页
+  定位问题时的第一个请求，它自己 500 会把「元数据损坏」这个已经诊断清楚的事实变成一个
+  空白页。`config.state == "recovery"` 与它的稳定码（D-130）已经承载原因，档案字段如实
+  报「读不出来就是 None」即可；不猜、也不触发任何修复动作。
+- **为什么查询路径彻底不创建**：N0 路由过来的缺陷是「读一次配置就顺手把首个档案建出来」，
+  于是页面刷新、知识库状态查询甚至一次纯校验都会在真正空的根目录上留下 `launcher.json`
+  与 `profiles/`，把「还没设置」变成「设置了一半」。现在只有 `PUT /api/config` 与
+  `PUT /api/config/draft` 经 `ProfileService.ensure_first_profile()` 建首个档案；
+  `GET /api/config`、`GET /api/kb/status`、`POST /api/config/validate`、向导临时测试
+  （`/api/test/site`、`/api/test/model` 带显式输入的分支）都用只读上下文，`no_active_profile`
+  只在需要已有档案的 `GET /api/kb/status`、`POST /api/kb/import` 出现，启动/重启无档案
+  仍是既有的 `config_not_ready`。
+- **为什么启动档案要在派发前固定**：启动线程里重新解析活动指针会造出「配置属于 A、目录
+  已经指向 B」的 Worker，而这类错配只能在消费消息之后才被发现。`_bot_start` / `_bot_restart`
+  与 `_auto_start` 因此都在派发前解析一次并显式传 `profile_id`；`_build_spec` 用该档案的
+  绑定实例取快照与凭据，`Operation.profile_id` 让异步结果也能归位（N1 只做「固定」，
+  切换事务在 N2）。
+- **`startup_profile_id` 的过渡口径与 N4 的替换点**：N1 还没有 `desktop.json` 的启动目标
+  （N4 交付），因此暂以「活动档案 + 档案内 `start_bot_on_launch` 为真」表示启动目标；
+  N4 换成桌面设置里的 `startup_profile_id` 时，这里的判据与来源一起改，前端不再读档案内
+  偏好（D-142 已记录该字段只保留在历史快照与迁移的只读口径里）。
+- **为什么事件归属打标留给 N2**：N1 没有任何切换或删除入口（`activate()` 是低层 API，
+  不暴露成路由），事件只可能属于当前活动档案；唯一会出现「旧归属」的情形是有人手工编辑
+  `launcher.json` 的指针，此时任何打标都建立在一个不可信的输入上。N2 引入账号页与
+  `LifecycleService` 后，切换事务才有明确的「旧上下文」需要标记与清理（§9 的事件归属）。
+
+## D-136 身份校验接缝：登录之后、账号锁与消费者装配之前阻断
+
+N1 Task 4 的落地口径（[下一代设计](LIGHT_NEXT_GENERATION.md) §4.2 末段、§10.4）。
+Core 侧是 `BotApp(..., expect_site_user_id=)` 这个**可选**关键字（默认 `None` 不校验），
+异常类型 `SiteIdentityMismatch` 放在 `assembly.py`；Light 侧由 Controller 从
+`ProfileService.expected_site_user_id(profile_id)` 取值，经
+`default_worker_spec` 写环境变量 `RARICY_LIGHT_EXPECTED_SITE_USER_ID`，Worker 转交 Core，
+不符时上报 `worker.identity_mismatch` 并以 `EXIT_RUNTIME` 结束。契约见 INTERFACES
+§16、§59。
+
+- **为什么接缝放在 `BotApp` 而不是 Light 侧包一层**：登录由 `start()` 内部发起，返回的
+  `Author` 不经过任何注入点 —— 在 Light 侧「包一层」只能靠轮询 `client.self_user` 或
+  另起一次探活，前者是竞态（消费可能先发生），后者多一次往返且仍不保证次序。把校验放进
+  `start()` 用的是同一个 `user` 对象、同一条装配路径，Light 只提供期望值；异常类型放在
+  只依赖标准库的既有接缝模块 `assembly.py`，Light 闭包因此不必新增依赖。
+- **为什么必须放在 `_start_after_login` 之前**：那条调用一旦开始就会装配 Router、SSE、
+  记忆与评论，并立刻开始消费消息与写库；校验放在它之后或放在 `ready` 上报之后，用户看到
+  的第一件事就是「机器人用错账号回了一条消息」。次序因此是硬要求：登录 → 校验 →
+  `acquire_account_lock` → `_start_after_login`。校验失败时关闭 `SiteClient` 与 `Store`
+  后抛出，Worker 随即退出进程 —— **绝不让校验失败后的 Worker 继续跑**。
+- **为什么退出码不变、稳定码走事件**：退出码是控制面的**粗粒度**契约（0/1/2/4 已被
+  既有路径占满，父端按码分类操作结果），再开一个 5 只会让既有父端的分类出现未覆盖分支；
+  而「为什么失败」是需要展示给人看的**定义域更细**的事实。既有 `log` 帧已经承载稳定码
+  （`worker.data_locked` 等），因此新增 `worker.identity_mismatch` 事件、`fields.reason`
+  固定为 `account_identity_mismatch`，退出码沿用 `EXIT_RUNTIME`。异常正文不进帧（§12 红线）。
+- **为什么期望值只能来自 `ProfileService.bind_identity()`**：向导里的站点测试返回的
+  `account_id` 来自**一次性输入**（用户当下填的账号密码），把它由前端回传后就当身份绑定，
+  等于让「谁在浏览器里说自己是这个账号」变成持久事实；前端可被替换、回传可被伪造，而档案
+  记录一旦写错就会在每次启动时拿着错误的期望值去拦截正确的账号。绑定身份因此只有一个入口
+  `bind_identity()`（N2 由一次性验证票据消费时调用，票据在内存中绑定会话、候选档案与
+  服务器取得的稳定 ID），`/api/test/site` 的 `account_id` 仍**不落盘**（D-135）。
+- **为什么未验证档案不校验**：v1 迁移来的档案在首次受控登录验证前没有可信的稳定 ID
+  （§10.4 标记 `identity_unverified`），此时注入任何期望值都只能靠猜；`expected_site_user_id()`
+  在没有 `identity_state="verified"` 时就返回 `None`，`worker_env` 因此不写该环境变量，
+  Worker 与完整版同形 —— 「不知道」就是不校验，而不是拿账号名当身份。
+
+## D-137 v1 迁移：先备份后写、可重入、schema 2 让旧读取器主动拒绝、不接管孤立目录
+
+N1 Task 5 的落地口径（[下一代设计](LIGHT_NEXT_GENERATION.md) §10）。`migration.py` 的
+`MigrationService` 把「单档案 + `launcher.json`（schema 1）+ `profiles/<id>/config.yaml`」
+的既有安装接管到 schema 2，在 `Controller.start()` 的第一步运行（契约见 §58、§60）。
+
+- **为什么迁移必须可重入且先备份**：迁移要改的是用户唯一一份生产数据，而它会在启动路径上
+  跑 —— 断电、磁盘满、杀进程、权限被安全软件挡住都可能发生在任意一步。因此每次写入之前先
+  把要改的文件复制到 `migration/backup-<时间戳>/`，`manifest.json` 最后写；每步的
+  `prepared` / `done` 落进 `operations/migration-v1-to-v2.json`。半份备份（有文件没清单）与
+  半迁移根目录（记录停在 `in_progress`）因此都可识别，下次运行只补没做完的步骤，已完成的
+  步骤不重做、备份目录原样复用。反过来，把「迁移」做成一次性的整体动作，任何一次中断都会
+  留下既不是 v1 也不是 v2、且没人知道做到了哪一步的根目录。
+- **为什么用 schema 2 让旧读取器主动拒绝**：旧程序对根元数据的校验很弱（§10.7），只加一个
+  `min_version` 字段不能保证它不误写。`LAUNCHER_SCHEMA_VERSION` 升到 2 之后，旧程序读
+  `launcher.json` 会得到 `metadata_unsupported_version` 并停在恢复态，既不进向导、也不改
+  指针 —— 拒绝是**读侧就发生**的，不依赖旧程序是否理解新字段。代价是回退必须用升级前的
+  停机备份恢复整份数据目录（使用手册 §7），这一条已写进用户文档。
+- **为什么不自动接管孤立目录**：没有可用指针时（多个档案目录、指针损坏或根本没有指针），
+  任何「自动选一个」的规则都是猜：按修改时间选会把最近用过的目录当成活动档案，合并同名
+  目录会把两个账号的数据混在一起，而这两件事都不可撤销。恢复候选因此只报告、不写任何
+  东西（§10.5），由用户在有完整停机备份的前提下决定；迁移也只接管指针明确指向的那一个
+  档案，其余目录原样保留。
+- **为什么迁移不写 `identity_state="verified"`**：稳定站点 ID 只能由站点在受控登录时给出，
+  v1 数据里没有可信来源；把 `config.yaml` 的账号名、记忆管理员名单或任何本地字段当作身份
+  都会让「谁是这个机器人」变成猜出来的事实，而错误的期望值会在每次启动时拦住正确的账号
+  （D-136）。迁移因此只写 `unverified` + `site_user_id=null`，`display_name` 取账号名只是
+  本地标签；解除未验证状态只经 `bind_identity()`（N2 由一次性验证票据消费时调用）——
+  迁移本身完全离线、绝不自动登录。
 
 ## 实施期编号兼容
 
