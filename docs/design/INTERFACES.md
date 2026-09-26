@@ -927,6 +927,10 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   2. 目标档案**已被移除**（档案目录不存在）：经 `DesktopSettingsService.update()` 清空
      `startup_profile_id` 并把 `start_bot_on_launch` 置 false，**保留** `launch_at_sign_in`
      与其注册项，本次不启动；revision 冲突时不重试、不覆盖，只保证本次不启动。
+     「已移除」只认 `FileNotFoundError` / `NotADirectoryError`：档案目录**读不到**（权限、
+     被占用、数据根暂时不可用）**不等于**已移除 —— 读不到时保留目标与偏好、不启动
+     （可区分状态 `target_unreadable`，且不做任何清理），下一次启动重新判定。判定不复用
+     `Path.is_dir()`，正是因为它会把 `OSError` 吞成 `False`，把「读不到」说成「不存在」。
   3. 目标**暂时不完整**（`needs_credentials` / `invalid` / `recovery` / 读不出来）：保留目标与
      偏好，不启动、不自动清除（凭据可以再填、配置可以再修）。
   4. 目标可用：先把选中指针设为该目标（§5.2 切换事务的退化形态：本次没有运行中的 Worker，

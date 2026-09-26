@@ -330,8 +330,23 @@ class Controller:
                 return
             self._start_bot(status.revision)
             return
-        if not self._profile_exists(target):
-            # 目标已被移除（不存在/已删除）：清空目标并关掉机器人自动启动偏好。
+        try:
+            target_removed = not self._profile_exists(target)
+        except (OSError, ValueError) as exc:
+            # 档案目录**读不到**（权限、被占用、数据根暂时不可用、布局损坏）：
+            # 这不是「已移除」，不能触发清空目标与偏好的破坏性清理；保留现场，
+            # 本次不启动，下一次启动重新判定（与 D-130 同口径）。
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "launcher.auto_start_skipped",
+                status="target_unreadable",
+                error=type(exc).__name__,
+            )
+            self._open_entry_or_tray()
+            return
+        if target_removed:
+            # 目标**真的**已被移除（不存在/已删除）：清空目标并关掉机器人自动启动偏好。
             self._clear_startup_target(settings)
             self._open_entry_or_tray()
             return
@@ -432,11 +447,19 @@ class Controller:
         return False
 
     def _profile_exists(self, profile_id: str) -> bool:
-        """目标档案目录是否还在（查询路径：不建目录、不写指针）。"""
+        """目标档案目录是否真的**不存在**（查询路径：不建目录、不写指针）。
+
+        只有 `FileNotFoundError` / `NotADirectoryError` 才算「已移除」；其余
+        `OSError`（权限、被占用、暂时不可用的数据根）一律向上抛，由调用方按
+        「读不到」处理并**保留**目标。不用 `Path.is_dir()`：它会把 `OSError` 吞成
+        `False`，于是「读不到」会被当成「不存在」，触发清空目标与偏好的破坏性清理
+        （与 D-130「读不到、读到了但不能用、不存在」三者严格分开同口径）。
+        """
         try:
-            return paths.profile_dir(self._data_root, profile_id).is_dir()
-        except (OSError, ValueError):
+            paths.profile_dir(self._data_root, profile_id).stat()
+        except (FileNotFoundError, NotADirectoryError):
             return False
+        return True
 
     def _profile_status(self, profile_id: str | None) -> ConfigStatus | None:
         """按档案读配置就绪状态；读不出来返回 None（查询路径，不建立档案）。
