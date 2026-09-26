@@ -894,7 +894,7 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   `field` 是该凭据名，响应另带 `message`（`texts.py` 的固定文案）说明暂不可用与手工撤销
   步骤。删除入口也不在页面上。不得把该动作继续转成 `CredentialUpdate.delete()` 后让提交
   撞上必填校验 —— 那样用户看到的 `credentials_required` 把「功能未交付」说成了「凭据没填」。
-  配置页与服务层仍保留 delete 动作本身（`ACTION_DELETE`、`CredentialUpdate.delete()`、
+  delete 动作本身只保留在服务层（`ACTION_DELETE`、`CredentialUpdate.delete()`、
   `commit()` 的置空分支），完整清除在 N2 交付（D-131）。
 - **服务层错误边界**（§11）：`ConfigServiceError` 及其子类由**应用级处理器**兜底，任何
   路由（包括在 `except ApiError` 之外调用服务层的启动/重启与知识库导入）都回同一套 JSON
