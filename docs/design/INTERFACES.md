@@ -1015,6 +1015,57 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   （`schema_version` 大于本程序）、`desktop_settings_write_failed`（写盘失败）。`str(exc)`
   就是码，不含路径、命令或异常原文。
 
+- **凭据引用归属索引**（N2、D-144）：`credentials-index.json` 与 `launcher.json` 同级
+  （`paths.CREDENTIALS_INDEX_FILE` / `credentials_index_path()`），UTF-8 JSON，写入用
+  同目录临时文件 + flush + fsync + `os.replace`。形状固定：顶层
+  `{"schema_version": 1, "index_revision": 4, "entries": [...]}`，条目为
+  `{"ref": "…", "profile_id": "p-…", "kinds": ["password", "llm_api_key"], "state": "owned",
+  "revision": 7, "created_at": "…", "updated_at": "…", "last_error": null}`。
+  `index_revision` 每次写入 +1；`kinds` 只取 `password` / `llm_api_key`（账号名不在其中）；
+  `revision` 是引用它的配置 revision，未被引用时为 `null`；`last_error` 是稳定类别码。
+  文档**不含**任何秘密取值（密码、模型 Key、账号名都不写）。五种 `state`：`pending`
+  （已登记、凭据库写入未确认，或写入成功但还没有 revision 引用）、`owned`（已被某个
+  revision 引用）、`revoked`（已从凭据库删除）、`pending_removal`（申请删除但后端失败，
+  可重试）、`orphan`（创建失败且回滚删除也失败）。读取分级与 D-130 同口径：文件不存在 →
+  空索引；`OSError` → `credentials_index_unreadable`；JSON 或结构非法 →
+  `credentials_index_corrupt`（含超体积、顶层不是对象、版本类型不对、条目字段形状不对）；
+  `schema_version` 大于本程序 → `credentials_index_unsupported_version`。三种故障都
+  **不覆盖现场**，并让破坏性操作（`clear()` 与 Task 3 的移除）在写任何东西之前失败。
+- **先登记后写库**（§6.3、D-144）：`CredentialLifecycle.reserve(profile_id=…, kinds=…)`
+  先把 `pending` 条目落盘并返回新引用，调用方才写凭据库；提交成功后 `confirm(ref,
+  profile_id=…, revision=…)` 标成 `owned`，提交失败则 `abandon(ref)` 尽力删除（删不掉
+  留 `orphan` + `last_error`）。回读不一致仍抛 `credential_readback_mismatch`，且**不删除**
+  不确定的引用（D-127），只把条目留在 `pending` 并记 `last_error`。`ConfigService.commit()`
+  的凭据步骤因此是 reserve → put → 回读 → confirm/abandon；构造参数新增
+  `credential_lifecycle=None`（缺省保持旧路径，仅供不装配索引的孤立测试），`for_profile()`
+  的签名与共享语义不变，只把该对象一并传给绑定实例。
+- **历史引用并集**（§6.1、D-144）：`reconcile(profile_id)` 读该档案 `config.yaml` 与
+  `revisions/*.yaml` 里出现过的 `credentials_ref`，与索引并集：未见过的引用按 `owned`
+  登记（`revision` 取引用它的最大版本），已经是 `pending` 但配置里确实引用了它的条目
+  **认领回 `owned`**（确认前崩溃的恢复路径），并返回 `{"registered", "claimed"}` 计数。
+  `reconcile_all(profile_ids)` 在 `Controller.start()` 的 `recover()` 之后跑一次，只读
+  YAML + 写索引、**不碰凭据库**。`clear()` 撤销的是这个并集（当前版本与全部历史快照），
+  不是当前那一条；读不出来的历史快照跳过（不删除、不覆盖），不阻止用户清除凭据。
+  旧版本留下的、完全失去引用的 `RaricyBotLight` 条目**不枚举、不批量删除**（归属未知），
+  只在页面与使用手册里提示到 Windows 凭据管理器人工清理。
+- **清除范围与 `needs_credentials` 的新判据**（§6.1、D-144）：`clear(profile_id, kinds=…)`
+  的 `kinds` 是 `{password, llm_api_key}` 的非空子集，空集或未知类别 →
+  `credential_scope_required`。还有保留项时先把保留项复制到**新引用**（先登记后写库），
+  再逐个撤销该档案的受管旧引用；两类都清时不建新引用（`credentials_ref=None`）。单条
+  删除失败不中止其余：失败的条目标 `pending_removal` + `last_error` 并留在索引里，
+  `ClearResult.ok=False` 时调用方必须把档案留在不可启动态并显示
+  `credentials_cleanup_pending`（不谎报已清除）。`retry_pending(profile_id)` 重试
+  `pending_removal` / `orphan`；`pending_profiles()` 供卡片与预览查询（含 `pending`：
+  写过、还没有 revision 引用的条目也算清理待办）。
+  `ConfigService.commit_credentials_clear(expected_revision=…, credentials_ref=…, account=…)`
+  只改 `_launcher.credentials_ref`（`account` 非空时一并写账号名，其余键原样保留），写
+  `revisions/<n>.yaml` + 原子替换（沿用 `_write_document`），字段与策略校验用
+  `allow_missing_required=True`：清除后**配置结构仍然有效**，能否启动交给 `status()` ——
+  `store.get()` 成功后 `username` / `password` / `llm_api_key` 任一为空即
+  `needs_credentials`（`error=None`，与「没有引用」同形）。`_validate(allow_missing_required=
+  False)` 的必填语义不变；`PUT /api/config` 的 `{"action":"delete"}` 仍回 409
+  `credential_delete_unavailable`（D-131 不变，文案改成指向新的独立清除入口）。
+
 ## 59. Light 控制面（会话、API、进程与事件）
 
 入口：[桌面入口](../../src/raricy_launcher/main.py)、[会话](../../src/raricy_launcher/session.py)、
@@ -1249,6 +1300,18 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   profile_epoch=)` 可选；`_test_view()` 的过期判定改为：档案 id 不同即 `stale`（两边都是
   `None` 时退回按数字 revision 比较），代次只在两边都记录了它时参与比较，数字 revision
   仍参与 —— 身份键是 `(profile_id, config_revision, profile_epoch)`（§5.1 第 6 条）。
+
+- **凭据清除的稳定码**（N2、§6.1、D-144）：清除是一次独立的协调器操作
+  （`kind="credentials_clear"`），阶段固定 `stop` → `clear_credentials` → `commit_config`；
+  结果码 `cleared` / `cleared_partial` / `clear_failed`。停止未确认 → `clear_failed` /
+  `error="stop_unconfirmed"`，**什么都不清**（先停止机器人、清除凭据、移除账号是三件
+  不同的事）。`cleared_partial` 覆盖两种情形：凭据撤了但配置没写上（档案不可启动、
+  记录清理待办），配置写上了但 keyring 里有失败项。请求的 `kinds` 缺失或非法 → 422
+  `credential_scope_required`。归属索引的三种故障（`credentials_index_corrupt` /
+  `credentials_index_unreadable` / `credentials_index_unsupported_version`）→ 409，且
+  这些故障下不写任何东西；清理待办的显示码是 `credentials_cleanup_pending`，页面必须
+  如实展示并可重试，不谎报已清除。`PUT /api/config` 的 `{"action":"delete"}` 仍回 409
+  `credential_delete_unavailable`（`message` 指向新的独立清除入口）。
 
 ## 60. 管理页与发行（`frontend/`、`packaging/light/`）
 
