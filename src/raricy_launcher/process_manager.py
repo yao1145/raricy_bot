@@ -33,6 +33,9 @@ from .platform import LauncherPlatform, ReportPipe, SuspendedProcess, WorkerJob
 # 子进程环境里的实例身份：Worker 用它回填 IPC 信封（§10.1）。
 INSTANCE_ID_ENV: str = "RARICY_LIGHT_INSTANCE_ID"
 RUN_ID_ENV: str = "RARICY_LIGHT_RUN_ID"
+# 档案期望的站点稳定 ID：Worker 登录后据此校验身份（设计 §4.2、INTERFACES §59）。
+# 只在档案已绑定身份（`identity_state="verified"`）时注入；缺省即不校验。
+EXPECTED_USER_ID_ENV: str = "RARICY_LIGHT_EXPECTED_SITE_USER_ID"
 
 # 子进程环境的系统变量白名单（Windows）；凭据与 PYTHONPATH 走 extra。
 _SYSTEM_ENV_KEYS: tuple[str, ...] = (
@@ -105,15 +108,28 @@ def build_worker_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
-def worker_env(*, credentials: Secrets, instance_id: str, run_id: str) -> dict[str, str]:
-    """注入子进程的凭据与身份变量：Core 仍只经这些环境变量取凭据（§7）。"""
-    return {
+def worker_env(
+    *,
+    credentials: Secrets,
+    instance_id: str,
+    run_id: str,
+    expected_site_user_id: str | None = None,
+) -> dict[str, str]:
+    """注入子进程的凭据与身份变量：Core 仍只经这些环境变量取凭据（§7）。
+
+    `expected_site_user_id` 只在非空时注入：`None` 表示档案未绑定身份（v1 迁移来的
+    档案在首次受控登录验证前不假定身份），Worker 侧因此不校验（§10.4）。
+    """
+    env = {
         USERNAME_ENV: credentials.username,
         PASSWORD_ENV: credentials.password,
         LLM_API_KEY_ENV: credentials.llm_api_key,
         INSTANCE_ID_ENV: instance_id,
         RUN_ID_ENV: run_id,
     }
+    if expected_site_user_id:
+        env[EXPECTED_USER_ID_ENV] = expected_site_user_id
+    return env
 
 
 @dataclass(frozen=True)
@@ -134,13 +150,20 @@ def default_worker_spec(
     credentials: Secrets,
     instance_id: str,
     run_id: str,
+    expected_site_user_id: str | None = None,
 ) -> WorkerSpec:
     """当前运行形态下的 Worker 启动规格。
 
     冻结发行用同一程序的 ``--worker`` 入口（首版选择，§10.1）；开发模式
     用独立模块入口。两者都是参数数组、明确 cwd，不拼接 shell 命令。
+    `expected_site_user_id` 原样透传给 `worker_env`：非空才进环境。
     """
-    extra = worker_env(credentials=credentials, instance_id=instance_id, run_id=run_id)
+    extra = worker_env(
+        credentials=credentials,
+        instance_id=instance_id,
+        run_id=run_id,
+        expected_site_user_id=expected_site_user_id,
+    )
     if getattr(sys, "frozen", False):
         return WorkerSpec(
             argv=(sys.executable, "--worker"),

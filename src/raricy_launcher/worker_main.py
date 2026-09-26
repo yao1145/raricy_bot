@@ -10,6 +10,13 @@
    帧与父端 EOF 都转换成 `app.stop()`；
 6. 上报 `ready` / `status` / `log` 帧；原始 stdout/stderr 由父进程排空丢弃（§12）。
 
+身份校验（设计 §4.2、§10.4）：档案已绑定站点稳定 ID 时，Controller 经
+`RARICY_LIGHT_EXPECTED_SITE_USER_ID` 注入期望值；Worker 转交给 `BotApp`，由它在
+登录之后、消费者装配之前比较。不符则上报 `worker.identity_mismatch`（固定
+`reason="account_identity_mismatch"`）并以 `EXIT_RUNTIME` 结束 —— 稳定码由事件承载，
+不新增退出码。绑定身份的唯一入口是 `ProfileService.bind_identity()`，绝不信任前端
+自报的 `account_id`，也不把校验推迟到 `ready` 上报之后。
+
 退出码：0 正常，1 运行期致命，2 配置错误，4 数据目录不可用或被占用。
 """
 
@@ -25,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from raricy_bot.app import BotApp
+from raricy_bot.assembly import SiteIdentityMismatch
 from raricy_bot.config import (
     LLM_API_KEY_ENV,
     PASSWORD_ENV,
@@ -39,7 +47,7 @@ from raricy_bot.data_lock import DataLockError, acquire_data_lock, data_lock_dir
 from raricy_bot.logging_setup import event_payload, get_logger, log_event
 
 from . import ipc
-from .process_manager import INSTANCE_ID_ENV, RUN_ID_ENV
+from .process_manager import EXPECTED_USER_ID_ENV, INSTANCE_ID_ENV, RUN_ID_ENV
 
 EXIT_OK = 0
 EXIT_RUNTIME = 1
@@ -120,6 +128,17 @@ def _env_secret(name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"缺少环境变量 {name}", field=name, kind="missing")
     return value
+
+
+def _expected_site_user_id() -> str | None:
+    """档案期望的站点稳定 ID；缺省或空串（含只有空白）表示不校验（§4.2、§10.4）。
+
+    这是 Light 注入共享 Core 的可选接缝：没有这个变量时 `BotApp` 与完整版逐字节同形。
+    """
+    value = os.environ.get(EXPECTED_USER_ID_ENV)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
 
 
 def _load_run_config(path: str, *, config_dir: str | None) -> Config:
@@ -250,6 +269,19 @@ async def _serve(app: BotApp, reporter: _Reporter, control_fd: int) -> int:
 
     try:
         await app.start()
+    except SiteIdentityMismatch:
+        # 身份不符是**确定的拒绝**，不是启动故障：稳定码走独立事件（§4.2、§12）。
+        # 退出码不新增：父端据既有 EXIT_RUNTIME 收敛为失败操作，原因由这条事件承载。
+        # 事件字段用固定码而不是 `str(exc)`：异常正文一律不进上报帧。
+        reporter.report(
+            "log",
+            {
+                "event": "worker.identity_mismatch",
+                "level": "ERROR",
+                "fields": {"reason": "account_identity_mismatch"},
+            },
+        )
+        return EXIT_RUNTIME
     except Exception as exc:
         # 启动失败只报**类型**：异常正文可能带站点/模型响应（§12）。
         log_event(
@@ -273,8 +305,16 @@ async def _serve(app: BotApp, reporter: _Reporter, control_fd: int) -> int:
     return EXIT_OK
 
 
-def _run(config: Config, reporter: _Reporter, *, control_fd: int) -> int:
-    app = BotApp(config)  # Light 形态：无工厂 → 无工具实现（§56）
+def _run(
+    config: Config,
+    reporter: _Reporter,
+    *,
+    control_fd: int,
+    expected_site_user_id: str | None = None,
+) -> int:
+    # Light 形态：无工厂 → 无工具实现（§56）。期望 ID 交给 BotApp 的可选校验接缝；
+    # None 时与完整版同一形态（不校验）。
+    app = BotApp(config, expect_site_user_id=expected_site_user_id)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -343,7 +383,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         fd = _open_handle_fd(args.control_handle, os.O_RDONLY)
         try:
-            return _run(config, reporter, control_fd=fd)
+            return _run(
+                config,
+                reporter,
+                control_fd=fd,
+                expected_site_user_id=_expected_site_user_id(),
+            )
         finally:
             try:
                 os.close(fd)

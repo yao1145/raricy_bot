@@ -5,6 +5,10 @@
 - 启动顺序：`Store.open` → `SiteClient.start` + `login` → 构造 `SSEReceiver`
   → **用 `store.watermark()` 播种 `Last-Event-ID`（D-16）** → `WorkerPool.start`
   → `OpsServer.start` → `sse.run()` 作为后台 task；
+- 可选身份校验（设计 §4.2、§10.4）：`expect_site_user_id` 非 None 时，登录成功之后、
+  账号锁与 `_start_after_login(user)` **之前**比较真实 `user.id`，不符则关闭客户端与
+  Store 并抛 `SiteIdentityMismatch("account_identity_mismatch")`。默认 None 不校验；
+  Light Worker 从档案的 `expected_site_user_id()` 取值经环境变量注入（INTERFACES §59）；
 - 长期记忆的装配位置（§34.2）：在 Store 崩溃恢复与主模型构造**之后**、聊天 worker 与评论服务
   启动**之前**——`MemoryService.start` → 构造 `MemoryWriter` / `MemoryController` → 启动记忆
   worker → 构造 Router 时注入 access policy、memory queue 与 `private_enabled` 回调 →
@@ -50,6 +54,7 @@ from .assembly import (
     BlogServiceLike,
     McpManagerLike,
     NoToolMcpManager,
+    SiteIdentityMismatch,
 )
 from .capabilities import CAPABILITIES, Capability
 from .comments.quota import CommentQuotaGuard
@@ -212,9 +217,15 @@ class BotApp:
         memory_writer: MemoryWriter | None = None,
         memory_controller: MemoryController | None = None,
         archive: Any | None = None,
+        expect_site_user_id: str | None = None,
     ) -> None:
         self._config = config
         self._transport = transport
+        # 可选身份校验接缝（设计 §4.2、§10.4）：Light 传入档案期望的站点稳定 ID，
+        # 登录后比较真实 `user.id` 再决定是否继续。默认 `None` 表示不校验，完整版
+        # CLI 的行为逐字节不变。期望值只能来自 `ProfileService.expected_site_user_id()`
+        # （`identity_state="verified"` 的档案）；绝不接受前端自报的 `account_id`。
+        self._expect_site_user_id = expect_site_user_id
         # 永久归档由 `__main__` 装配（它要在 BotApp 之前决定"打不开就退出"），
         # 这里只保留一个只读引用供本地健康检查用。
         self._archive = archive
@@ -480,6 +491,17 @@ class BotApp:
             await self._client.aclose()
             await self._store.close()
             raise
+
+        # 可选身份校验（设计 §4.2、§10.4）：登录成功之后、账号锁与消费者装配之前。
+        # 次序是硬要求：放在 `_start_after_login` 之后等于「已经消费了消息才报错」；
+        # 放在登录之前则没有可信的 `user.id` 可比。失败路径与登录失败同款：
+        # 关闭客户端与 Store 之后以稳定码抛出，调用方（Light Worker）据此结束进程，
+        # 绝不让校验失败后的 Worker 继续跑。期望值缺失时不校验，这是完整版与
+        # 未验证身份档案（v1 迁移来的）的既有一致行为。
+        if self._expect_site_user_id is not None and str(user.id) != self._expect_site_user_id:
+            await self._client.aclose()
+            await self._store.close()
+            raise SiteIdentityMismatch("account_identity_mismatch")
 
         # 完整版 CLI 与 Light Worker 共用本锁。只在身份登录成功后取得，且早于
         # SSE、评论、记忆等账号消费路径；锁标识只使用站点地址与稳定 user.id。

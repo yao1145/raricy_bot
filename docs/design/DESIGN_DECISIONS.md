@@ -19,6 +19,7 @@ D-131 凭据删除先摘入口（N2 再交付完整清除），D-132 Light 控�
 D-133 固定档案的 ConfigService（查询不创建、显式创建入口与分离的 launcher schema），
 D-134 档案记录的降级读取、账号名归属与由调用方停机的低层激活，
 D-135 控制面的档案身份（只读路径不创建、状态 DTO 身份键与启动固定档案），
+D-136 身份校验接缝（登录之后、账号锁与消费者装配之前阻断，稳定码走事件不走退出码），
 D-142 桌面偏好独立成文件（`desktop.json`）与独立 settings revision（N4）。
 后续变更沿用编号注明替代关系，不叠加互相矛盾的补丁段落。
 
@@ -1322,6 +1323,42 @@ N1 Task 3 的落地口径（[下一代设计](LIGHT_NEXT_GENERATION.md) §4.1、
   不暴露成路由），事件只可能属于当前活动档案；唯一会出现「旧归属」的情形是有人手工编辑
   `launcher.json` 的指针，此时任何打标都建立在一个不可信的输入上。N2 引入账号页与
   `LifecycleService` 后，切换事务才有明确的「旧上下文」需要标记与清理（§9 的事件归属）。
+
+## D-136 身份校验接缝：登录之后、账号锁与消费者装配之前阻断
+
+N1 Task 4 的落地口径（[下一代设计](LIGHT_NEXT_GENERATION.md) §4.2 末段、§10.4）。
+Core 侧是 `BotApp(..., expect_site_user_id=)` 这个**可选**关键字（默认 `None` 不校验），
+异常类型 `SiteIdentityMismatch` 放在 `assembly.py`；Light 侧由 Controller 从
+`ProfileService.expected_site_user_id(profile_id)` 取值，经
+`default_worker_spec` 写环境变量 `RARICY_LIGHT_EXPECTED_SITE_USER_ID`，Worker 转交 Core，
+不符时上报 `worker.identity_mismatch` 并以 `EXIT_RUNTIME` 结束。契约见 INTERFACES
+§16、§59。
+
+- **为什么接缝放在 `BotApp` 而不是 Light 侧包一层**：登录由 `start()` 内部发起，返回的
+  `Author` 不经过任何注入点 —— 在 Light 侧「包一层」只能靠轮询 `client.self_user` 或
+  另起一次探活，前者是竞态（消费可能先发生），后者多一次往返且仍不保证次序。把校验放进
+  `start()` 用的是同一个 `user` 对象、同一条装配路径，Light 只提供期望值；异常类型放在
+  只依赖标准库的既有接缝模块 `assembly.py`，Light 闭包因此不必新增依赖。
+- **为什么必须放在 `_start_after_login` 之前**：那条调用一旦开始就会装配 Router、SSE、
+  记忆与评论，并立刻开始消费消息与写库；校验放在它之后或放在 `ready` 上报之后，用户看到
+  的第一件事就是「机器人用错账号回了一条消息」。次序因此是硬要求：登录 → 校验 →
+  `acquire_account_lock` → `_start_after_login`。校验失败时关闭 `SiteClient` 与 `Store`
+  后抛出，Worker 随即退出进程 —— **绝不让校验失败后的 Worker 继续跑**。
+- **为什么退出码不变、稳定码走事件**：退出码是控制面的**粗粒度**契约（0/1/2/4 已被
+  既有路径占满，父端按码分类操作结果），再开一个 5 只会让既有父端的分类出现未覆盖分支；
+  而「为什么失败」是需要展示给人看的**定义域更细**的事实。既有 `log` 帧已经承载稳定码
+  （`worker.data_locked` 等），因此新增 `worker.identity_mismatch` 事件、`fields.reason`
+  固定为 `account_identity_mismatch`，退出码沿用 `EXIT_RUNTIME`。异常正文不进帧（§12 红线）。
+- **为什么期望值只能来自 `ProfileService.bind_identity()`**：向导里的站点测试返回的
+  `account_id` 来自**一次性输入**（用户当下填的账号密码），把它由前端回传后就当身份绑定，
+  等于让「谁在浏览器里说自己是这个账号」变成持久事实；前端可被替换、回传可被伪造，而档案
+  记录一旦写错就会在每次启动时拿着错误的期望值去拦截正确的账号。绑定身份因此只有一个入口
+  `bind_identity()`（N2 由一次性验证票据消费时调用，票据在内存中绑定会话、候选档案与
+  服务器取得的稳定 ID），`/api/test/site` 的 `account_id` 仍**不落盘**（D-135）。
+- **为什么未验证档案不校验**：v1 迁移来的档案在首次受控登录验证前没有可信的稳定 ID
+  （§10.4 标记 `identity_unverified`），此时注入任何期望值都只能靠猜；`expected_site_user_id()`
+  在没有 `identity_state="verified"` 时就返回 `None`，`worker_env` 因此不写该环境变量，
+  Worker 与完整版同形 —— 「不知道」就是不校验，而不是拿账号名当身份。
 
 ## 实施期编号兼容
 

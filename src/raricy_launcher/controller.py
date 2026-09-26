@@ -377,6 +377,8 @@ class Controller:
         `profile_id` 是派发时固定下来的档案（§5.2 的输入固定）：用它的绑定实例
         取快照、凭据与目录，**不再**在启动线程里重新解析可变的活动指针 —— 否则
         切换档案的瞬间会起出一个「配置属于 A、目录已经指向 B」的 Worker。
+        身份校验的期望值同样在这里固定：取该档案已绑定的稳定 ID 注入 Worker 环境；
+        未验证身份的档案（v1 迁移来的）取到 `None`，不注入也不校验（§10.4）。
         """
         service = (
             self._config
@@ -388,12 +390,18 @@ class Controller:
             raise ConfigServiceError("no_active_config")
         target = saved.revision if revision is None else revision
         launch = service.build_run_launch(target)
+        expected = (
+            None
+            if profile_id is None
+            else self._profiles.expected_site_user_id(profile_id)
+        )
         return default_worker_spec(
             run_config=str(launch.config_path),
             config_dir=str(service.profile()),
             credentials=launch.credentials,
             instance_id=self._instance_id,
             run_id=run_id,
+            expected_site_user_id=expected,
         )
 
     def _on_worker_event(self, name: str, fields: dict, level: str = "info") -> None:

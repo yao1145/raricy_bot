@@ -263,6 +263,12 @@ resync 拉取按 message ID 去重，空 event ID 不抬水位。
 没有工厂而配置启用了对应子域则在**构造期**抛 `AssemblyError`（消息是稳定类别码），
 不进 `start()` 的软故障兜底。显式传入的 `mcp_manager` 实例优先于工厂。
 
+可选身份校验（设计 §4.2、§10.4）：`BotApp(..., expect_site_user_id=)` 默认 `None` 即
+**不校验**（完整版 CLI 行为不变）。非 `None` 时，校验发生在登录成功**之后**、账号锁与
+消费者装配（`acquire_account_lock`、`_start_after_login`）**之前**：真实 `user.id` 与
+期望值不符就关闭 `SiteClient` 与 `Store`、抛 `SiteIdentityMismatch("account_identity_mismatch")`
+（异常类型在 `assembly.py`，消息是稳定类别码）。此时 SSE、评论与记忆一条都还没起。
+
 ## 16.1 评论子系统
 
 入口：[发现器](../../src/raricy_bot/comments/discovery.py)、[路由](../../src/raricy_bot/comments/router.py)、
@@ -1037,6 +1043,17 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   `api._bot_start/_bot_restart` 都显式传它。`WorkerManager.status()` 新增
   `running_profile_id`：与 `running_revision` 同点设置（`state=running`）、同点清空
   （停止、失败、回收、`shutdown`）。
+- **身份校验的注入与上报**（N1、D-136）：Controller 在 `_build_spec` 里取该档案的
+  `expected_site_user_id()`（只有 `identity_state="verified"` 且 ID 非空的档案才有值），
+  经 `default_worker_spec(..., expected_site_user_id=)` → `worker_env(...)` 写进子进程
+  环境变量 **`RARICY_LIGHT_EXPECTED_SITE_USER_ID`**（`EXPECTED_USER_ID_ENV`）；未验证身份的
+  档案取到 `None` 时**不注入该键**，Worker 因此不校验（§10.4 的 v1 档案口径）。Worker 侧
+  `worker_main._expected_site_user_id()` 把缺省或空串读成 `None`，转交
+  `BotApp(config, expect_site_user_id=...)`。登录后不符时 `app.start()` 抛
+  `SiteIdentityMismatch`，Worker 上报**既有 `log` 帧**承载的事件
+  **`worker.identity_mismatch`**（`level="ERROR"`、`fields.reason` 固定为
+  **`account_identity_mismatch`**，异常正文不进帧），并以既有 `EXIT_RUNTIME = 1` 结束 ——
+  **不新增退出码**，稳定码由事件承载。
 - **生命周期门**（F3、D-132）：站点测试与启停共用一把进程内、非阻塞的租约门
   （`lifecycle_gate.py`；控制器装配一个实例，`LocalApi` 构造注入，互斥范围就是这个对象）。
   `POST /api/test/site` 在整段执行期间持有租约，`manager.state` 检查与派发都在租约覆盖内

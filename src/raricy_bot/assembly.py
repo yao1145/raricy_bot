@@ -23,6 +23,16 @@ class AssemblyError(Exception):
     """
 
 
+class SiteIdentityMismatch(Exception):
+    """登录账号与档案期望的站点稳定 ID 不符；消息是稳定类别码。
+
+    由 `BotApp.start()` 在登录成功之后、账号锁与消费者装配**之前**抛出（唯一 raiser），
+    此时 SSE、评论与记忆一条都还没起，客户端与 Store 已经关闭（设计 §4.2、§10.4）。
+    放在本模块是因为它是 App 与发行版之间的既有接缝：只依赖标准库，Light 闭包
+    因此不必新增依赖。绑定身份的唯一入口仍是 `ProfileService.bind_identity()`。
+    """
+
+
 class ToolRegistryLike(Protocol):
     """App 用到的 MCP 工具注册表视图。"""
 
