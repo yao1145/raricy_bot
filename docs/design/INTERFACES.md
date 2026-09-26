@@ -827,6 +827,7 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 ## 58. `raricy_launcher` 的配置与凭据（L2）
 
 入口：[档案布局](../../src/raricy_launcher/paths.py)、[配置事务](../../src/raricy_launcher/config_service.py)、
+[v1 迁移](../../src/raricy_launcher/migration.py)、
 [桌面设置](../../src/raricy_launcher/desktop_settings.py)、[凭据库](../../src/raricy_launcher/credential_store.py)、
 [数据档案锁](../../src/raricy_bot/data_lock.py)。
 
@@ -898,6 +899,41 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   （`storage.db_path`、`knowledge_base.root_dir`、`memory.root_dir`、
   `logging.archive.directory`），其余取值不变，仅供「还没有档案」的查询与向导临时校验；
   正式提交路径始终传真实档案目录。
+- **v1 迁移**（§10、D-137）：`migration.MigrationService` 把「单档案 + `launcher.json`
+  （schema 1 或缺 `schema_version`）+ `profiles/<id>/config.yaml`」的既有安装接管到 schema 2。
+  迁移在 `Controller.start()` 的**第一步**跑（§10.6），完全离线：不登录站点、不启动 Worker、
+  不请求数据档案锁（单实例互斥体已由 `main.py` 在构造 Controller 之前取得）；失败、阻塞或抛错
+  只记一条 `launcher.migration` 事件（字段 `status` 为阶段码、`error` 为稳定码或异常类名），
+  UI 照常启动、恢复态由 `status()` 如实报告，`_auto_start()` 在结果 `ok` 不为真时不启动机器人、
+  只打开管理页。
+  `inspect()` 只读，阶段码固定（缺省无写入、不建目录）：`nothing_to_migrate`（数据根不存在，
+  或既没有 `launcher.json` 也没有档案目录）、`already_migrated`（`schema_version == 2` 且迁移
+  记录已完成）、`blocked_metadata_fault`（N0 的四码之一，携带该码）、
+  `blocked_recovery_candidate`（没有可用指针：多个档案目录、指针损坏或根本没有指针；不选
+  「最新修改目录」、不合并同名目录、不自动接管）、`migratable`。
+  `migrate()` 先 `inspect()`，前四类直接返回（幂等、无写入）；`migratable` 时按固定顺序
+  执行四步，每步在 `<数据根>/operations/migration-v1-to-v2.json` 里落 `prepared` / `done`：
+  1. `backup`：复制 `launcher.json`、每个档案的 `config.yaml`、`draft.yaml` 与已有
+     `profile.json` 到 `migration/backup-<UTC 紧凑时间戳>/`（如 `backup-20260926T141530Z`），
+     保留相对目录结构；`manifest.json` **最后写**（`created_at`、`tool_version`、
+     `files[{path, sha256}]`、`schema_from: 1`、`schema_to: 2`），半份备份因此可识别；
+     同一时间戳已有完整清单则复用。
+  2. `profile_record`：补写 `profiles/<id>/profile.json`（`identity_state="unverified"`、
+     `site_user_id=null`、`state="active"`、`display_name` 取 `_launcher.account`，没有就空串；
+     **已存在不覆盖**）。
+  3. `catalog`：经 `update_catalog()` 写 `schema_version=2`、`catalog_revision=1`、
+     `active_epoch=1`；`active_profile` 不动，已有值不覆盖、同值不重写（同值 `schema_version`
+     会被该入口拒绝，见上一条）。
+  4. `record`：`operations/migration-v1-to-v2.json` 置 `stage="completed"` 并写
+     `completed_at`；失败保留已完成步骤码（`stage="in_progress"`），下次运行按阶段续跑，
+     已完成的步骤不重做（清单完整的备份目录原样复用）。
+  操作记录只保存 ID、revision、固定阶段码、受管相对路径与备份目录；备份与记录都只含非敏感
+  文件，**不含**密码、模型 Key、任何凭据取值、System Prompt、聊天/知识库/记忆正文或原始异常。
+  `identity_unverified` 的含义与解除路径：v1 档案没有可信的稳定站点 ID，身份校验因此不注入
+  期望值（§4.2、D-136），首次受控登录验证前不假定身份；迁移绝不写 `identity_state="verified"`，
+  解除只经 `bind_identity()`（N2 由一次性验证票据消费时调用）。旧程序读到 schema 2 会报
+  `metadata_unsupported_version` 并停在恢复态，因此不会误写；回退必须用升级前的停机备份恢复
+  整份数据目录（使用手册 §7）。
 - **档案记录与身份**（§4.1，D-134）：`profiles/<id>/profile.json` 是档案级记录
   （UTF-8 JSON、键固定、`profile_revision` 每次写入 +1）：
 
@@ -1118,6 +1154,10 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   任何新文件。首个档案只由写接口（`PUT /api/config`、`PUT /api/config/draft`）经
   `ProfileService.ensure_first_profile()` 建立（§5.1 第 1 步），向导因此仍可直接保存 ——
   把「没有档案」当错误会让首次启动失败，而把查询当写路径会让只读访问留下档案。
+- 升级路径（N1、D-137）：v1 安装首次启动时由迁移先接管数据根（§58），此后数据根新增
+  `profiles/<id>/profile.json`、`operations/` 与 `migration/backup-*/` 三处，都只含非敏感
+  内容（档案记录、固定恢复码与受管相对路径、配置类文件的副本与 sha256），不含密码、
+  模型 Key 或任何凭据取值。
 - 验收边界：`tools/smoke_light.py` 覆盖「启动 → 激活 → 会话 → 状态 → 页面与构建产物 →
   凭据后端可用 → 退出 → 元数据清理」，运行时本机不能再有另一个 Light 实例（激活通道与
   互斥体按当前用户命名）。**干净 Windows 清单（§17.2）与真实站点/模型验收仍未执行**，

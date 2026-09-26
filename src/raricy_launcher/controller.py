@@ -35,6 +35,7 @@ from .config_service import ConfigService, ConfigServiceError
 from .credential_store import CredentialStore, SessionMemoryStore, SystemKeyringStore
 from .events import EventService
 from .lifecycle_gate import LifecycleGate
+from .migration import MigrationResult, MigrationService
 from .platform import InstanceGuard, LauncherPlatform
 from .process_manager import (
     START_TIMEOUT_SECONDS,
@@ -110,6 +111,12 @@ class Controller:
         self._profiles = ProfileService(
             self._data_root, base_config_service=self._config
         )
+        # v1 迁移（§10）：服务在装配期构造，真正的迁移在 `start()` 的第一步跑；
+        # 结果留在这里供 `_auto_start()` 判断（迁移未完成不自动运行机器人）。
+        self._migration = MigrationService(
+            self._data_root, config_service=self._config
+        )
+        self._migration_result: MigrationResult | None = None
         # 事件时间要与管理页显示的墙钟一致（同一处时钟时基缺陷，复审指出）。
         self._events = EventService(instance_id=self._instance_id, clock=time.time)
         self._sessions = SessionManager(instance_id=self._instance_id, clock=time.monotonic)
@@ -169,6 +176,8 @@ class Controller:
 
     def start(self) -> None:
         """绑定回环端口、启动 API 与激活管道、发布运行元数据。"""
+        # 第一步是 v1 迁移：它在任何对外接口起来之前把数据根接管完（§10.6）。
+        self._run_migration()
         self._start_api()
         self._listener = self._platform.create_activation_listener()
         self._listener.start(self._handle_activation)
@@ -241,8 +250,44 @@ class Controller:
     def request_quit(self) -> None:
         self._quit.set()
 
+    def _run_migration(self) -> None:
+        """v1 无损接管（§10）：迁移是启动的第一步，失败/阻塞只记日志、继续启动 UI。
+
+        迁移完全离线：不登录站点、不启动 Worker、不请求数据档案锁；单实例互斥体
+        已由 `main.py` 在构造 Controller 之前取得（§10.1「停稳 Worker」）。结果
+        如实留在 `self._migration_result` 里：`_auto_start()` 按它阻止自动运行，
+        恢复态由 `status()` 报出（四类元数据故障 → `recovery`）。
+        """
+        try:
+            result = self._migration.migrate()
+        except Exception as exc:
+            # 未归类的失败不阻断启动：管理页仍要能打开，日志只记异常类名。
+            self._migration_result = None
+            log_event(
+                self._logger,
+                logging.WARNING,
+                "launcher.migration",
+                status="failed",
+                error=type(exc).__name__,
+            )
+            return
+        self._migration_result = result
+        log_event(
+            self._logger,
+            logging.INFO if result.ok else logging.WARNING,
+            "launcher.migration",
+            status=result.stage,
+            error=result.metadata_fault or result.error,
+        )
+
     def _auto_start(self) -> None:
         """首次进入：配置可用且偏好开启时静默启动；否则打开向导/修复页（§5.2）。"""
+        result = self._migration_result
+        if result is None or not result.ok:
+            # 迁移失败、被阻塞或抛错：不把半迁移的根目录当作干净安装（§10.6），
+            # 不启动机器人，只打开管理页让用户看到恢复入口。
+            self._open_url(self.entry_url())
+            return
         try:
             status = self._config.status()
         except ConfigServiceError:
