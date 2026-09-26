@@ -12,7 +12,10 @@
   N1 不把它暴露成 HTTP 路由；`commit_activation()` 是生命周期协调器在 A→B 事务的
   `commit_active_B` 阶段用的提交入口：与 `activate()` 同语义，另把 `catalog_revision`
   一起 +1（§58），使旧页面持有的目录 revision 自然过期；
-- `bind_identity()` 是绑定站点稳定 ID 的唯一入口：一个稳定 ID 只属于一个可用档案。
+- `bind_identity()` 是绑定站点稳定 ID 的唯一入口：一个稳定 ID 只属于一个可用档案；
+- `set_state()` 是生命周期状态的唯一写入口（`active` / `detached` / `deleting`），
+  `clear_activation()` 是删除活动档案时的清空指针入口；`list_profiles()` **跳过**
+  带墓碑（`removed.json`）的已删除档案，目录本身与墓碑留给后续维护（§6.2、D-145）。
 
 本模块不复制账号名：登录账号仍以 `config.yaml` 的 `_launcher.account` 为唯一来源，
 把同一个事实写进 `profile.json` 只会制造第二份副本。
@@ -48,7 +51,13 @@ IDENTITY_VERIFIED: str = "verified"
 # 生命周期状态：N1 只写 `active`；`detached` / `deleting` 由 N2 引入，
 # 读到未知值原样保留、不报错，只有查重时 `detached` 不占用稳定 ID。
 PROFILE_STATE_ACTIVE: str = "active"
+# `detached`：保留本地数据的移除（凭据已清除、不再参与活动指针；查重时不算占用）。
 PROFILE_STATE_DETACHED: str = "detached"
+# `deleting`：删除事务已经落记录（拒绝启动与配置/草稿写入），可重试续做。
+PROFILE_STATE_DELETING: str = "deleting"
+PROFILE_STATES: frozenset[str] = frozenset(
+    {PROFILE_STATE_ACTIVE, PROFILE_STATE_DETACHED, PROFILE_STATE_DELETING}
+)
 
 # 档案记录的读故障（稳定码，直接进 API 与状态）。
 PROFILE_CORRUPT: str = "profile_corrupt"
@@ -273,9 +282,18 @@ class ProfileService:
         )
 
     def _write_active_pointer(
-        self, profile_id: str, *, expected_epoch: int | None, bump_catalog_revision: bool
+        self,
+        profile_id: str | None,
+        *,
+        expected_epoch: int | None,
+        bump_catalog_revision: bool,
     ) -> int:
-        """两个激活入口共用的「读—校验代次—一次写入」；差异只有目录 revision。"""
+        """激活入口共用的「读—校验代次—一次写入」；差异只有目录 revision。
+
+        `profile_id=None` 是**清空**指针（删除活动档案，§6.2）：写出的
+        `active_profile` 键仍在、值为 null，`config_service` 一侧据此报
+        `no_selection` 而不是元数据故障（D-145）。
+        """
         with self._lock:
             catalog = self.catalog()
             if expected_epoch is not None and catalog.active_epoch != expected_epoch:
@@ -289,6 +307,54 @@ class ProfileService:
                 changes["catalog_revision"] = catalog.catalog_revision + 1
             self._base.update_catalog(changes)
             return epoch
+
+    def clear_activation(self, *, expected_epoch: int | None = None) -> int:
+        """清空活动指针：`active_profile=None`、`active_epoch` 与 `catalog_revision` 各 +1。
+
+        删除活动档案时由移除流程调用（§6.2 第 3 步），**在 N1 基础上新增**：
+        一次写入三个目录字段，绝不顺手选中别的档案（那是用户的决定，不是删除的
+        副作用）。返回新代次；`expected_epoch` 不符抛 `revision_conflict`。
+        """
+        return self._write_active_pointer(
+            None, expected_epoch=expected_epoch, bump_catalog_revision=True
+        )
+
+    # --- 生命周期状态（N2） -----------------------------------------------
+
+    def set_state(
+        self,
+        profile_id: str,
+        *,
+        state: str,
+        expected_profile_revision: int | None = None,
+    ) -> ProfileRecord:
+        """写档案的生命周期状态并把 `profile_revision` +1，返回写入后的记录。
+
+        `state` 只允许 `active` / `detached` / `deleting`，其余值抛
+        `invalid_profile_state`（同一套取值集合，不额外发明状态）。`deleting` 是
+        删除事务的「已登记」标记：此后该档案不得启动、不得写配置与草稿（§6.2 第 1 步）。
+        `expected_profile_revision` 给定时与当前记录不符抛 `revision_conflict`，
+        且不写任何东西（页面并发编辑因此不会互相覆盖）。
+
+        记录缺失（v1 档案目录）时按默认记录起写，与 `bind_identity()` 同口径；
+        本方法不创建档案目录。
+        """
+        if state not in PROFILE_STATES:
+            raise ProfileError("invalid_profile_state")
+        with self._lock:
+            profile = paths.profile_dir(self._root, profile_id)
+            if not profile.is_dir():
+                raise ProfileError(PROFILE_UNREADABLE)
+            document = self._read_document(profile)
+            if document is None:
+                document = self._new_document(profile_id)
+            revision = self._revision(document)
+            if expected_profile_revision is not None and expected_profile_revision != revision:
+                raise ProfileError("revision_conflict")
+            document["state"] = state
+            document["profile_revision"] = revision + 1
+            self._write_document(profile, document)
+            return self._to_record(profile_id, document)
 
     # --- 身份 -------------------------------------------------------------
 
@@ -366,6 +432,10 @@ class ProfileService:
         目录名非法或不是目录的条目跳过（不报错、不删除）；记录读不出来时如实抛
         `profile_corrupt` / `profile_unreadable` / `profile_unsupported_version`，
         绝不把「读不出来」当成「没有」。
+
+        **已删除的档案不出现在这里**：目录里有墓碑（`removed.json`）即跳过（§6.2、
+        D-145）。目录本身与墓碑保留给后续维护，本方法不报错、不删除、也不影响
+        `catalog()`；`catalog` 里的活动指针是另一回事，由清空指针的写入者负责。
         """
         try:
             entries = list(paths.profiles_root(self._root).iterdir())
@@ -380,6 +450,8 @@ class ProfileService:
             except ValueError:
                 continue
             if not entry.is_dir():
+                continue
+            if paths.removed_json_path(entry).exists():
                 continue
             records.append(self._to_record(entry.name, self._read_document(entry)))
         records.sort(key=lambda record: record.profile_id)

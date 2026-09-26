@@ -22,6 +22,9 @@ from urllib.parse import urlsplit, urlunsplit
 # 锁文件名：与数据档案内的其他文件区分开，`bot.db -wal/-shm` 之外单列。
 DATA_LOCK_FILE: str = ".raricy-data.lock"
 ACCOUNT_LOCK_EXTENSION: str = ".lock"
+# 彻底删除后的墓碑（§6.2、D-145）；名字与 `raricy_launcher.paths.REMOVED_FILE` 逐字
+# 相同 —— 核心包不能依赖 Launcher 包，两边各有一份定义，共享入口按同一文件名判定。
+REMOVED_MARKER_FILE: str = "removed.json"
 
 
 class DataLockError(Exception):
@@ -214,3 +217,26 @@ def acquire_data_lock(data_dir: str | Path) -> DataLock:
         raise DataLockError("data_in_use") from exc
     _write_owner(fd)
     return DataLock(fd, lock_path)
+
+
+def refuse_removed_profile(
+    profile_root: str | Path, *, marker: str = REMOVED_MARKER_FILE
+) -> None:
+    """档案已被彻底删除（存在墓碑）时拒绝继续：抛 `DataLockError("profile_removed")`。
+
+    共享入口（完整版 CLI 与 Light Worker）在**取得数据锁之后、打开归档与 Store
+    之前**调用一次：墓碑说明这份数据已经按用户要求删除，旧版本程序不认识它，只有
+    本程序自己的入口能据此拒绝（§6.2、D-145 的已知边界）。
+
+    判定只看墓碑文件本身，不看目录内容：空目录不是「已删除」。目录不存在时无操作
+    （首次运行本来就还没有档案目录）；墓碑在那里但读不到（权限、占用）按
+    `data_dir_unavailable` 拒绝 —— 读不到不等于没有，宁可拒绝也不放行（D-130 同口径）。
+    """
+    path = Path(profile_root) / marker
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise DataLockError("data_dir_unavailable") from exc
+    raise DataLockError("profile_removed")

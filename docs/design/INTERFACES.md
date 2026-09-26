@@ -1107,6 +1107,31 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   `needs_credentials`（`error=None`，与「没有引用」同形）。`_validate(allow_missing_required=
   False)` 的必填语义不变；`PUT /api/config` 的 `{"action":"delete"}` 仍回 409
   `credential_delete_unavailable`（D-131 不变，文案改成指向新的独立清除入口）。
+- **档案状态与删除墓碑**（N2 Task 3、§6.2、D-145）：`profile.json` 的 `state` 取
+  `active`（可用档案）/ `detached`（保留数据的移除：凭据已撤销、不再参与启动与查重，
+  可以重新绑定同一账号）/ `deleting`（删除事务已登记：拒绝启动、拒绝配置与草稿写入，
+  → `profile_state_conflict`，判定落在激活校验与账号页路由上）。
+  `ProfileService.set_state(profile_id, state=…, expected_profile_revision=None)` 是状态
+  的唯一写入口（非法值 → `invalid_profile_state`，期望值不符 → `revision_conflict`，
+  写成功 `profile_revision` +1）；`clear_activation()` 是删除活动档案时的清空指针入口
+  （一次写入 `active_profile=None`、`active_epoch` +1 与 `catalog_revision` +1，**不**
+  自动选中别的档案）。**活动指针的显式 null 是合法状态**：`active_profile` 键存在且值
+  为 `null` 表示「当前没有选中档案」，`_resolve_pointer()` 返回 `None` 而不抛错，
+  `status()` 因此返回新增状态 **`no_selection`**（既不是 `needs_setup` 也不是
+  `recovery`）；键缺失或取值非法仍是 `metadata_pointer_invalid`（F2、D-130 不变）。
+  写路径（`ensure_first_profile()` / `require_profile()`）在没有选中档案时抛
+  `no_active_profile`，**不**自动建立并选中一个新档案。`update_catalog()` 的
+  `active_profile` 接受 `None`（清空），其余取值仍走 `validate_profile_id`。
+  **墓碑**：彻底删除后在 `profiles/<id>/removed.json` 留一份最小记录
+  `{"schema_version": 1, "profile_id": "p-…", "state": "deleted", "removed_at": "…",
+  "scope": "purge_data", "catalog_revision": n}`（`catalog_revision` 是预览时确认过的
+  目录 revision）—— 不含正文、账号或任何秘密；`data/`
+  目录与锁文件一起保留。`list_profiles()` **跳过**含墓碑的目录（不报错、不删除、不影响
+  `catalog`）；`raricy_bot.data_lock.refuse_removed_profile(profile_root)` 在共享入口
+  **取得数据锁之后、打开 Store/归档之前**拒绝已删除档案（`DataLockError("profile_removed")`），
+  两边的文件名常量 `paths.REMOVED_FILE` / `REMOVED_MARKER_FILE` 必须逐字一致。
+  边界（D-145）：旧版本程序不认识墓碑，且手工把 `storage.db_path` 改到档案内更深层时
+  `raricy_bot/__main__.py` 的检查会漏 —— 不宣称对任意旧 CLI 的保护。
 
 ## 59. Light 控制面（会话、API、进程与事件）
 
@@ -1443,6 +1468,49 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   这些故障下不写任何东西；清理待办的显示码是 `credentials_cleanup_pending`，页面必须
   如实展示并可重试，不谎报已清除。`PUT /api/config` 的 `{"action":"delete"}` 仍回 409
   `credential_delete_unavailable`（`message` 指向新的独立清除入口）。
+- **移除服务与确认令牌**（N2 Task 3、§6.2、D-145）：`profile_removal.RemovalService`
+  只接受**档案 ID**（内部一律 `paths.profile_dir()` 解析，绝不接受调用方给的路径），
+  并把删除分成两种范围：`keep_data`（移除账号、保留本地数据 → 档案转 `detached`）与
+  `purge_data`（彻底删除 → 删业务数据、留墓碑）。`detached` 档案只允许 `purge_data`，
+  `deleting` 档案允许继续预览（重试）。
+  - **预览**（`preview(profile_id, scope=…, session_id=…)`，只读）：返回类别与大小
+    （`config` / `revisions` / `runtime` / `database` / `memory` / `knowledge` / `logs` /
+    `credentials`，有界扫描最多 20000 个条目，超出时 `size_complete=false`）、
+    `credentials` 归属摘要（`managed` / `cleanup_pending` / `unknown_ownership`，后者为真
+    表示有读不出来的历史快照，归属不完整）、`is_active` / `running` / `is_startup_target`
+    与两个 revision，并在内存里签发 `confirmation_token`（`expires_in = 300`）。
+    预览**不改任何文件、不删凭据、不写记录**；未知或已删除（墓碑）档案 →
+    `not_found`，范围非法 → `removal_scope_invalid`，路径有链接/重解析点 →
+    `removal_unsafe_path`。
+  - **令牌**：绑定 `session_id + profile_id + scope + profile_revision +
+    catalog_revision`，只存内存、一次性、不落盘不写日志；同一会话对同一档案重新预览
+    使旧令牌失效。未知/过期/已用/会话或档案不符 → `removal_token_invalid`；scope 或两个
+    revision 与预览时不同 → `removal_preview_stale`。校验在**预留记录之前**同步完成，
+    幂等命中（同键同摘要）不重跑校验，因此重复提交不会第二次消耗令牌。
+  - **执行体**（协调器命令 `LifecycleService.remove(profile_id, scope=…,
+    confirmation_token=…, session_id=…, idempotency_key=…)`，202）：阶段固定
+    `preview`（落 `deleting`、写受管路径）→ `stop`（停运行中的该档案并确认退出、**非
+    阻塞**取数据排他锁、清启动目标与活动指针）→ `clear_credentials`（先落引用与归属，
+    再撤销全部受管引用）→ `detach` / `purge_data` → `finalize`。结果码
+    `removed_detached` / `removed_purged` / `removed_partial` / `remove_failed`；
+    错误码 `data_in_use`（数据被占用，停在 `stop`）/ `stop_unconfirmed` /
+    `credential_backend_unavailable`（停在 `clear_credentials`，**不进入数据清理**）/
+    `removal_unsafe_path`（删除被拒绝：重解析点、跨卷、身份不一致、解析失败或墓碑写不
+    进去）。三种错误都表示「已清理的部分不回滚、档案留在 `deleting`、重新预览后可
+    重试」；请求范围全部完成才算成功，部分完成要如实显示已清理/未完成类别。
+  - **删除器**：逐层 `os.lstat`（绝不跟随），链接/重解析点、非普通文件、跨卷（`st_dev`
+    不同）与身份变化（`(st_dev, st_ino)` 不符）一律停止推进；`OSError` 同样拒绝，**不
+    退回字符串路径**。删除顺序是叶子文件 → 目录；`data/` 里只留 `.raricy-data.lock`，
+  档案目录里只留 `removed.json` 与 `data/`。墓碑**先于** `profile.json` 落盘，崩溃后不
+  会留下「没有记录也没有墓碑」的僵尸档案；`operations/<id>.json` 记录不随档案删除。
+  两种模式都**不提供撤销**。
+  - **记录里的受管路径**：开始阶段写本次范围（`purge_data` 的类别路径，`keep_data` 为
+  空），收尾阶段改写为**仍未完成**的路径；`credentials` 数组在动 keyring 之前先写归属
+  （`owned`），清完之后按结果写 `revoked` / `pending_removal`。
+  - **共享入口拒绝**：`raricy_bot.data_lock.refuse_removed_profile()` 在 `worker_main`
+  与完整版 CLI 取得数据锁之后、打开 Store/归档之前调用；失败沿用既有事件
+  `worker.data_locked`（`reason="profile_removed"`）与退出码 `EXIT_DATA_LOCKED = 4`，
+  不新增退出码。
 
 ## 60. 管理页与发行（`frontend/`、`packaging/light/`）
 

@@ -130,6 +130,10 @@ STATE_CONFIGURED: str = "configured"
 STATE_INVALID: str = "invalid"
 # 元数据故障的稳定恢复状态（F2）：坏元数据不是「首次运行」，不进入向导。
 STATE_RECOVERY: str = "recovery"
+# 「有档案但一个都没选中」（N2、D-145）：`launcher.json` 的 `active_profile` 键存在且
+# 值为 null 时的合法状态。它**不是** `needs_setup`（那会打开空的首次设置向导），
+# 也**不是** `recovery`（没有故障需要修复）：界面据此进入账号页。
+STATE_NO_SELECTION: str = "no_selection"
 
 # 元数据故障码（`ConfigStatus.error`）：四种互相可区分，恢复面板按码给文案。
 METADATA_CORRUPT: str = "metadata_corrupt"
@@ -145,6 +149,10 @@ _METADATA_FAULT_CODES: frozenset[str] = frozenset(
         METADATA_POINTER_INVALID,
     }
 )
+
+# 「键不在」的哨兵：把「`active_profile` 键缺失」与「键存在且值为 null」分开
+# （N2、D-145）—— 前者是元数据故障，后者是合法的「没有选中档案」。
+_MISSING = object()
 
 # `update_catalog()` 的窄写白名单：目录字段只有这四个，其余一律拒绝。
 _CATALOG_FIELDS: frozenset[str] = frozenset(
@@ -503,16 +511,36 @@ class ConfigService:
             return True
         return any(entry.is_dir() for entry in entries)
 
+    def pointer_is_empty(self) -> bool:
+        """`active_profile` 键**存在且值为 null**：合法的「当前没有选中档案」（N2）。
+
+        与「键缺失或取值非法」分开：后两者仍是元数据故障，由 `_resolve_pointer()`
+        报 `metadata_pointer_invalid`。读元数据失败按 False 处理（故障自会由其它
+        路径如实报告，这里不把读不出来误报成「没有选中」）。
+        """
+        try:
+            metadata = self.read_launcher_metadata()
+        except ConfigServiceError:
+            return False
+        return metadata.get("active_profile", _MISSING) is None
+
     def _resolve_pointer(self) -> str | None:
         """解析当前档案指针；**不建立**任何档案（查询路径专用，F2）。
 
-        没有可用指针且「元数据文件存在」或「已有档案目录」时，这属于元数据故障：
-        抛 `metadata_pointer_invalid`，不能退化成首次运行 —— 首次初始化只允许在
-        「元数据文件不存在且 `profiles/` 下没有任何既有档案目录」时发生（要求 2）。
+        三种「没有指针」严格分开（N2、D-145）：
+
+        - **键不存在**（含整个文件不存在）：元数据文件存在或 `profiles/` 下已有档案
+          目录时抛 `metadata_pointer_invalid`，不能退化成首次运行 —— 首次初始化只
+          允许在「元数据文件不存在且 `profiles/` 下没有任何既有档案目录」时发生；
+        - **键存在且值为 null**：合法的「当前没有选中档案」（删除活动档案后的状态），
+          返回 `None` 且不抛错；
+        - 键存在但取值不是合法档案 ID：仍是 `metadata_pointer_invalid`。
         """
         profile_id = self.profile_id()
         if profile_id is not None:
             return profile_id
+        if self.pointer_is_empty():
+            return None
         if paths.launcher_json_path(self._root).exists() or self._has_existing_profiles():
             raise ConfigServiceError(METADATA_POINTER_INVALID)
         return None
@@ -537,13 +565,22 @@ class ConfigService:
         只会认最后一个，先建立的那些档案里的写入就再也看不见了（复审 N-2）。
         指针、`active_epoch` 与 `catalog_revision` 在同一次写入里落盘，不产生
         「指针有了但目录字段没写」的中间态。
+
+        `active_profile` 键存在且为 null（「当前没有选中档案」）时**不建立**新档案，
+        抛 `no_active_profile`：写路径必须先有一个被选中的档案，自动建一个并选中
+        它等于替用户选了账号（§6.2「不得自动选中其他账号」），而且刚删掉档案的
+        数据根上再冒出一个空档案正是用户要避免的。
         """
         profile_id = self._resolve_pointer()
         if profile_id is not None:
             return profile_id
+        if self.pointer_is_empty():
+            raise ConfigServiceError("no_active_profile")
         with self._bootstrap_lock:
             profile_id = self._resolve_pointer()
             if profile_id is None:
+                if self.pointer_is_empty():
+                    raise ConfigServiceError("no_active_profile")
                 profile_id = paths.new_profile_id()
                 self._create_first_profile(profile_id)
         return profile_id
@@ -610,7 +647,9 @@ class ConfigService:
         `schema_version`，其余键抛 `invalid_catalog_change`；`schema_version` 只
         允许**升到** `LAUNCHER_SCHEMA_VERSION`（当前值必须更小），降级与同级同样
         拒绝 —— 版本迁移只从这个显式入口发生，不会藏在别的写路径里。
-        返回写入后的完整元数据映射。
+        `active_profile` 接受 `None`，表示**清空指针**（「当前没有选中档案」，
+        §6.2 的删除活动档案；键仍然写出来，值为 null），其余取值仍走
+        `validate_profile_id`。返回写入后的完整元数据映射。
 
         调用前提：`launcher.json` 已存在，或本次 `changes` 显式带上
         `active_profile`。文件不存在时调用会写出**没有指针**的元数据，此后所有读取
@@ -623,12 +662,14 @@ class ConfigService:
                 if key not in _CATALOG_FIELDS:
                     raise ConfigServiceError("invalid_catalog_change")
                 if key == "active_profile":
-                    if not isinstance(value, str):
-                        raise ConfigServiceError("invalid_catalog_change")
-                    try:
-                        paths.validate_profile_id(value)
-                    except ValueError as exc:
-                        raise ConfigServiceError("invalid_catalog_change") from exc
+                    # `None` 是显式清空（删除活动档案）：键写出来、值为 null。
+                    if value is not None:
+                        if not isinstance(value, str):
+                            raise ConfigServiceError("invalid_catalog_change")
+                        try:
+                            paths.validate_profile_id(value)
+                        except ValueError as exc:
+                            raise ConfigServiceError("invalid_catalog_change") from exc
                 elif key in ("active_epoch", "catalog_revision"):
                     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                         raise ConfigServiceError("invalid_catalog_change")
@@ -686,6 +727,9 @@ class ConfigService:
 
         元数据故障落进稳定恢复状态，而不是 `needs_setup`；查询只报告，不修复、
         不创建、不覆盖，也不抛异常（F2）。在绑定实例上只报告该档案自身的状态。
+
+        `active_profile` 为显式 null 时是 `no_selection`：有档案但一个都没选中
+        （删掉活动档案后的正常状态），既不是首次设置，也不是需要修复（N2、D-145）。
         """
         try:
             saved = self.load_saved()
@@ -695,6 +739,8 @@ class ConfigService:
                 return ConfigStatus(state=STATE_RECOVERY, error=code)
             return ConfigStatus(state=STATE_INVALID, error=code)
         if saved is None:
+            if self._profile_id is None and self.pointer_is_empty():
+                return ConfigStatus(state=STATE_NO_SELECTION)
             return ConfigStatus(state=STATE_NEEDS_SETUP)
         profile = self.profile_or_none()
         if profile is None:

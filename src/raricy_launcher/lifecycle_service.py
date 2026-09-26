@@ -107,12 +107,23 @@ RESULT_SELECTED_ONLY: str = "selected_only"
 RESULT_CANCELLED_BY_STOP: str = "cancelled_by_stop"
 RESULT_START_FAILED: str = "start_failed"
 
+# remove 的结果码（Task 3 使用，同一处定义）。
+RESULT_REMOVED_DETACHED: str = "removed_detached"
+RESULT_REMOVED_PURGED: str = "removed_purged"
+RESULT_REMOVED_PARTIAL: str = "removed_partial"
+RESULT_REMOVE_FAILED: str = "remove_failed"
+
 # 记录里的错误码（三类操作共有 `record_write_failed` 与 `lifecycle_busy`）。
 ERROR_STOP_UNCONFIRMED: str = "stop_unconfirmed"
 ERROR_CATALOG_WRITE_FAILED: str = "catalog_write_failed"
 ERROR_RESOLVE_FAILED: str = "resolve_failed"
 ERROR_RECORD_WRITE_FAILED: str = "record_write_failed"
 ERROR_LIFECYCLE_BUSY: str = "lifecycle_busy"
+# remove 的错误码（Task 3 使用）：三者都表示「已清理的部分不回滚、档案留在
+# `deleting` 可重试」（§6.2、D-145）。
+ERROR_DATA_IN_USE: str = "data_in_use"
+ERROR_REMOVAL_UNSAFE_PATH: str = "removal_unsafe_path"
+ERROR_CREDENTIAL_BACKEND_UNAVAILABLE: str = "credential_backend_unavailable"
 # 崩溃恢复给未完成记录的固定错误码。
 ERROR_CONTROLLER_RESTART: str = "controller_restart"
 
@@ -348,6 +359,25 @@ class OperationContext:
         """派发一次停止（在生命周期门租约内），并把这次代次变化计入自己的基线。"""
         return self._service.dispatch_stop(self.operation_id)
 
+    def await_exit(self, stop_operation: Any) -> bool:
+        """确认这次停止已回收进程（判据同 A→B 事务的 `confirm_A_exited`，§5.1 第 2 条）。"""
+        return self._service.await_worker_exit(stop_operation)
+
+    def running_profile_id(self) -> str | None:
+        """当前运行中的档案 id（没有 Worker 或管理器尚未上报时 None，只读）。"""
+        return self._service.running_profile_id()
+
+    def record_details(
+        self,
+        *,
+        credentials: tuple[CredentialRef, ...] | None = None,
+        managed_paths: tuple[str, ...] | None = None,
+    ) -> None:
+        """把凭据引用与受管路径写进记录（**关键副作用之前**落盘，§6.2 第 4 步）。"""
+        self._service.set_operation_details(
+            self.operation_id, credentials=credentials, managed_paths=managed_paths
+        )
+
     def cancelled(self) -> bool:
         """预留之后是否收到过外部的 `stop` / `quit`（自己的停止不算）。"""
         return self._service.operation_cancelled(self.operation_id)
@@ -363,9 +393,11 @@ class LifecycleService:
     """一个数据根上的生命周期协调器；所有公开方法线程安全。
 
     依赖都是注入的：`profiles`（`ProfileService` 兼容对象，除 N1 的只读查询外还要有
-    `commit_activation()`）、`manager`（`WorkerManager` 兼容对象）、`gate`
-    （进程内唯一的 `LifecycleGate`）。`clock` 是单调时钟（有界等待用），`wall_clock`
-    是记录时间戳用的墙钟；`sleep` 可注入，测试因此不做真实等待。
+    `commit_activation()` 与 `set_state()`）、`manager`（`WorkerManager` 兼容对象）、
+    `gate`（进程内唯一的 `LifecycleGate`）、`removal`（`RemovalService` 兼容对象，
+    `remove` 命令用；缺省时该命令回 `config_not_ready`，仅供不装配移除的测试）。
+    `clock` 是单调时钟（有界等待用），`wall_clock` 是记录时间戳用的墙钟；`sleep`
+    可注入，测试因此不做真实等待。
     """
 
     def __init__(
@@ -383,6 +415,7 @@ class LifecycleService:
         exit_confirm_timeout: float = EXIT_CONFIRM_TIMEOUT_SECONDS,
         gate_wait_seconds: float = OPERATION_GATE_WAIT_SECONDS,
         stage_hook: Callable[[str, str], None] | None = None,
+        removal: Any = None,
     ) -> None:
         self._root = Path(data_root)
         self._profiles = profiles
@@ -396,6 +429,7 @@ class LifecycleService:
         self._exit_confirm_timeout = exit_confirm_timeout
         self._gate_wait_seconds = gate_wait_seconds
         self._stage_hook = stage_hook
+        self._removal = removal
 
         self._lock = threading.RLock()
         self._records: dict[str, OperationRecord] = {}
@@ -553,6 +587,71 @@ class LifecycleService:
             target_revision=target_revision,
             target_epoch=expected_epoch,
         )
+
+    # --- 移除账号（Task 3 的删除事务） -------------------------------------
+
+    def remove(
+        self,
+        profile_id: str,
+        *,
+        scope: str,
+        confirmation_token: str,
+        session_id: str,
+        idempotency_key: str,
+    ) -> str:
+        """按确认令牌发起一次删除，返回 `operation_id`（异步，202）。
+
+        令牌在**预留之前同步**校验并消耗：未知/过期/已用/会话或档案不符 →
+        `removal_token_invalid`，scope 或两个 revision 与预览时不同 →
+        `removal_preview_stale`。校验失败不留记录、没有任何副作用；校验通过后由
+        `RemovalService.remove()` 在自己的线程里按 §6.2 的六步执行。重试要重新
+        预览（新令牌）并换新的幂等键；幂等命中时不重跑校验，因此响应丢失后的
+        重复提交不会产生第二次副作用。
+        """
+        removal = self._require_removal()
+        digest = (
+            hashlib.sha256(confirmation_token.encode("utf-8")).hexdigest()
+            if isinstance(confirmation_token, str)
+            else ""
+        )
+        request = {
+            "profile_id": profile_id,
+            "scope": scope,
+            "session_id": session_id,
+            # 令牌本身不进摘要输入：摘要在内存里参与幂等比较，不落盘。
+            "token_digest": digest,
+        }
+        # 令牌校验 consume 之后才填：body 只在预留成功、validate 已经跑过时才执行。
+        binding_box: dict[str, Any] = {}
+
+        def validate() -> None:
+            binding_box["binding"] = removal.consume_token(
+                profile_id, scope=scope, token=confirmation_token, session_id=session_id
+            )
+
+        def body(context: OperationContext) -> None:
+            removal.remove(
+                context,
+                profile_id=profile_id,
+                scope=scope,
+                binding=binding_box["binding"],
+            )
+
+        return self.submit(
+            kind=KIND_REMOVE,
+            profile_id=profile_id,
+            idempotency_key=idempotency_key,
+            request=request,
+            body=body,
+            validate=validate,
+            to_profile_id=profile_id,
+        )
+
+    def _require_removal(self) -> Any:
+        """移除服务（`RemovalService` 兼容对象）；没装配时按「配置不可用」如实拒绝。"""
+        if self._removal is None:
+            raise ConfigServiceError(CODE_CONFIG_NOT_READY)
+        return self._removal
 
     # --- 串行化与幂等（Task 2/3 的命令复用这一条） --------------------------
 
@@ -734,6 +833,47 @@ class LifecycleService:
                 self._notify_stage(operation_id, stage)
 
         return _scope()
+
+    def set_operation_details(
+        self,
+        operation_id: str,
+        *,
+        credentials: tuple[CredentialRef, ...] | None = None,
+        managed_paths: tuple[str, ...] | None = None,
+    ) -> None:
+        """把凭据引用与受管路径写进记录（**关键副作用之前**落盘，§6.2 第 4 步）。
+
+        两个参数缺省表示「本次不改它」；记录里只出现不透明引用与受管相对路径，
+        没有秘密、没有绝对路径。写盘失败抛 `record_write_failed`：调用方据此在动
+        keyring 或删数据之前停下（记录写不进去就不能继续做副作用）。
+        """
+        with self._lock:
+            record = self._records.get(operation_id)
+            if record is None:
+                raise ConfigServiceError(ERROR_RECORD_WRITE_FAILED)
+            updated = replace(
+                record,
+                credentials=record.credentials if credentials is None else credentials,
+                managed_paths=record.managed_paths if managed_paths is None else managed_paths,
+                updated_at=self._timestamp(),
+            )
+            self._records[operation_id] = updated
+        self._write_record(updated)
+
+    def await_worker_exit(self, stop_operation: Any) -> bool:
+        """确认一次停止已经回收进程（判据同 A→B 事务的 `confirm_A_exited`）。"""
+        return self._await_exit(stop_operation)
+
+    def running_profile_id(self) -> str | None:
+        """当前运行中的档案 id：没有 Worker 或管理器尚未上报时为 None（只读）。
+
+        判据与状态聚合一致（`manager.status()["running_profile_id"]`），并额外要求
+        进程句柄在场 —— 句柄没了就是没有 Worker 在跑，旧的运行档案 id 不作数。
+        """
+        if self._manager.worker is None:
+            return None
+        value = self._manager.status().get("running_profile_id")
+        return value if isinstance(value, str) and value else None
 
     def dispatch_stop(self, operation_id: str) -> Any:
         """在门租约内派发一次停止，并把这次代次变化计入该操作的基线。
@@ -1015,11 +1155,22 @@ class LifecycleService:
             )
 
     def _stage_error(self, operation_id: str) -> str:
-        """按当时的阶段给出确定错误码：停机阶段未确认，其余按提交失败处理。"""
+        """按当时的阶段给出确定错误码（错误码集合不超出总表）。
+
+        - activate 的停机阶段未确认 → `stop_unconfirmed`；
+        - remove 的凭据阶段 → `credential_backend_unavailable`（停在那里、不进入数据
+          清理，重试要重新预览，§6.2 第 4 步）；
+        - remove 的数据阶段 → `removal_unsafe_path`（删除被拒绝，档案留在 `deleting`）；
+        - 其余（写记录、写指针、写墓碑之前的落盘）→ `catalog_write_failed`。
+        """
         record = self.operation(operation_id)
         stage = record.stage if record is not None else ""
         if stage in (STAGE_RESERVE_OPERATION, STAGE_STOP_A, STAGE_CONFIRM_A_EXITED):
             return ERROR_STOP_UNCONFIRMED
+        if stage == STAGE_CLEAR_CREDENTIALS:
+            return ERROR_CREDENTIAL_BACKEND_UNAVAILABLE
+        if stage in (STAGE_DETACH, STAGE_PURGE_DATA, STAGE_FINALIZE):
+            return ERROR_REMOVAL_UNSAFE_PATH
         return ERROR_CATALOG_WRITE_FAILED
 
     def _validate_idempotency_key(self, key: Any) -> str:
@@ -1294,5 +1445,8 @@ _KNOWN_ERROR_CODES: frozenset[str] = frozenset(
         ERROR_RESOLVE_FAILED,
         ERROR_RECORD_WRITE_FAILED,
         ERROR_LIFECYCLE_BUSY,
+        ERROR_DATA_IN_USE,
+        ERROR_REMOVAL_UNSAFE_PATH,
+        ERROR_CREDENTIAL_BACKEND_UNAVAILABLE,
     }
 )

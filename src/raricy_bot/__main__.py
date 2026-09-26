@@ -26,7 +26,12 @@ from .app import BotApp
 from .assembly import AssemblyError
 from .blog.assembly import build_blog_service
 from .config import Config, ConfigError, load_config
-from .data_lock import DataLockError, acquire_data_lock, data_lock_dir
+from .data_lock import (
+    DataLockError,
+    acquire_data_lock,
+    data_lock_dir,
+    refuse_removed_profile,
+)
 from .error_archive import ArchiveError, ArchiveHandler, ErrorArchive, iter_entries, verify_segments
 from .mcp.assembly import build_mcp_manager
 from .mcp.tool_client import ToolCallingModelClient
@@ -44,7 +49,7 @@ from .logging_setup import (
 _logger = get_logger("main")
 
 # 退出码：0 正常，1 运行期致命错误，2 配置错误，3 归档已启用却打不开，
-# 4 数据目录不可用或已有写者（§9.5 的公共数据锁）。
+# 4 数据目录不可用、已有写者或档案已删除（§9.5 的公共数据锁 + §6.2 的墓碑）。
 EXIT_OK = 0
 EXIT_RUNTIME = 1
 EXIT_CONFIG = 2
@@ -82,12 +87,19 @@ def main(argv: list[str] | None = None) -> int:
 
     # 公共数据锁（§9.5）：完整版 CLI 与 Light Worker 争用同一个数据档案标识。
     # 必须在打开归档与 Store **之前**取得 —— 第二个写者不允许动任何数据。
+    data_dir = data_lock_dir(config.storage.db_path)
     try:
-        lock = acquire_data_lock(data_lock_dir(config.storage.db_path))
+        lock = acquire_data_lock(data_dir)
     except DataLockError as exc:
-        print(f"数据目录不可用：{exc}", file=sys.stderr)
-        shutdown_logging()
-        return EXIT_DATA_LOCKED
+        return _data_locked(str(exc))
+
+    # 已删除的档案（墓碑）：**取得数据锁之后、打开归档与 Store 之前**拒绝（§6.2、
+    # D-145）。旧版本程序不认识墓碑，这道检查只保护本程序自己的入口。
+    try:
+        refuse_removed_profile(data_dir.parent)
+    except DataLockError as exc:
+        lock.release()
+        return _data_locked(str(exc))
 
     with lock:
         archive = _open_archive(config)
@@ -114,6 +126,13 @@ def main(argv: list[str] | None = None) -> int:
             _close_archive(archive)
             shutdown_logging()
     return EXIT_OK
+
+
+def _data_locked(reason: str) -> int:
+    """数据目录不可用/已被占用/已删除的统一退出路径：一行原因 + 退出码 4。"""
+    print(f"数据目录不可用：{reason}", file=sys.stderr)
+    shutdown_logging()
+    return EXIT_DATA_LOCKED
 
 
 def _fatal(exc: BaseException) -> None:

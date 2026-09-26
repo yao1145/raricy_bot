@@ -46,6 +46,10 @@ OPERATIONS_DIR: str = "operations"
 MIGRATION_DIR: str = "migration"
 PROFILES_DIR: str = "profiles"
 PROFILE_FILE: str = "profile.json"
+# 彻底删除后的墓碑（§6.2）：档案目录里只留它、`data/` 与锁文件。名字与
+# `raricy_bot.data_lock.REMOVED_MARKER_FILE` 必须逐字相同 —— 核心包不能依赖
+# Launcher 包，两边各有一份定义，共享入口按同一文件名判定（D-145）。
+REMOVED_FILE: str = "removed.json"
 CONFIG_FILE: str = "config.yaml"
 DRAFT_FILE: str = "draft.yaml"
 REVISIONS_DIR: str = "revisions"
@@ -165,6 +169,11 @@ def profile_dir(data_root: Path, profile_id: str) -> Path:
 def profile_json_path(profile: Path) -> Path:
     """档案记录（稳定身份、生命周期状态与 revision）的位置（只计算路径，不创建）。"""
     return Path(profile) / PROFILE_FILE
+
+
+def removed_json_path(profile: Path) -> Path:
+    """彻底删除后的墓碑位置（只计算路径、不创建；§6.2、D-145）。"""
+    return Path(profile) / REMOVED_FILE
 
 
 def config_path(profile: Path) -> Path:
