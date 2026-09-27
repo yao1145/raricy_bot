@@ -1669,15 +1669,16 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
 - 发行构建：`tools/build_light.py` 生成 staging（Light 闭包 + 静态资源 + 构建信息），
   `--pyinstaller` 用 `light.spec` 冻结为 onedir/windowed 应用，`--zip` 打出 ZIP 与 `.sha256`。
   `build-info.json` 记录版本、协议版本、Python 版本、依赖清单与整包校验和。
-- 托盘图标资源（N3）：`src/raricy_launcher/assets/` 下三个多尺寸 ICO —— `tray-normal.ico`
-  （实心圆）、`tray-stopped.ico`（空心圆环）、`tray-attention.ico`（实心三角），尺寸集合固定
-  `16/20/24/32/48/256`，背景透明，三个**形状本身**不同而不只靠颜色区分（无障碍要求）。
+- 托盘图标资源（N3，D-151 更新）：`src/raricy_launcher/assets/` 下三个多尺寸 ICO ——
+  `tray-normal.ico`（四形状彩色填充）、`tray-stopped.ico`（四形状灰色描边）、
+  `tray-attention.ico`（三形状灰色描边，黄色三角填充）。每态都保留 favicon 的大圆、小圆、
+  方块、三角；尺寸集合固定 `16/20/24/32/48/256`，背景透明，填充方式使状态不单靠颜色区分。
   资源由 `tools/make_tray_icons.py` 生成，该工具只用标准库、输出确定性（重复运行字节一致），
   并且**不进 staging、不进冻结包、运行时不导入**；不要手改 `.ico` 字节，改样式请改生成器再重跑。
   运行期按包目录下的 `assets/` 定位（与 `static/` 同法，PyInstaller 6.x onedir 下即
   `_internal/raricy_launcher/assets/`）；`packaging/light/light.spec` 的 `datas` 与
   `packaging/light/pyproject.toml` 的 `[tool.setuptools.package-data]` **必须同步**，
-  缺一处就会有一种安装形态少图标。取舍理由见 [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) D-138。
+  缺一处就会有一种安装形态少图标。取舍理由见 [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) D-138、D-151。
 - 首次启动路径（N1、D-133）：查询路径**不再创建**首个档案 —— 数据根还没有活动档案时，
   管理页读到 `needs_setup`、`GET /api/config` 只回默认 System Prompt 模板，根目录不出现
   任何新文件。首个档案只由写接口（`PUT /api/config`、`PUT /api/config/draft`）经
@@ -1781,18 +1782,12 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   `status_service.snapshot_freshness(snapshot, now=...)`，默认阈值复用
   `SNAPSHOT_STALE_SECONDS`（30 秒）；不得复制常量或另写判据。`StatusService.snapshot()`
   内部调用同一个函数，二者不产生第二个真相。
-- **菜单**（`menu_for()`，顺序固定）：打开管理页（`open_admin`，始终可用）｜账号行｜状态行｜
-  启动机器人（`start`）｜停止机器人（`stop`）｜重启机器人（`restart`）｜打开诊断目录
-  （`open_diagnostics`，始终可用）｜退出 Light（`quit`，始终可用）。账号行为
-  `TRAY_ACCOUNT_PREFIX + (account or TRAY_ACCOUNT_UNSET)`，状态行为 `TRAY_STATUS_PREFIX + 状态标签`；
-  两条展示行 `command` 是空串且 `enabled is False`。分隔符在这张表里**不占独立菜单项**，而是
-  挂在紧随其后的项上（`separator_before`）；窗口层渲染时要在**该项之前**补一条独立的
-  `MF_SEPARATOR` 项，而不是把这一项自己变成分隔线（§61.4）。整个菜单 12 行 = 8 项 + 4 个
-  分隔符。可用性：`start` = 配置 `configured` 且进程
+- **菜单**（`menu_for()`，顺序固定）：启动（`start`）｜重启（`restart`）｜停止（`stop`）｜
+  退出（`quit`）。只有这四个可点命令，无展示行或分隔符；左键单击仍通过 `open_admin` 打开
+  管理页，状态标签在 tooltip 中显示。可用性：`start` = 配置 `configured` 且进程
   `stopped` / `failed` 且非 `quitting`；`stop` = 进程 `running` / `starting` 且非 `quitting`；
   `restart` = 配置 `configured` 且进程 `running` / `stopped` / `failed` 且非 `quitting`。
-  禁用只是交互提示，服务端仍然自己判。N3 **不**放切换账号（等 N2 的页面）与登录启动设置
-  （N4），也不放任何「未实现」占位项。
+  `quit` 始终可用。禁用只是交互提示，服务端仍然自己判。取舍见 D-151。
 - **tooltip** 固定为 `TRAY_TOOLTIP_FORMAT.format(app=APP_NAME, status=状态标签)`，按
   `NOTIFYICONDATA.szTip` 上限截断到 127 字符，**不含**账号、pid、路径或原始错误。
 - **词表**：命令常量 `open_admin` / `start` / `stop` / `restart` / `open_diagnostics` /
@@ -1800,6 +1795,7 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   `session_end` 定义在 `tray_model.py`；配置与进程状态字面量（`configured`、`needs_setup`、
   `needs_credentials`、`no_selection`、`recovery`、`invalid`；`stopped`、`starting`、`running`、
   `stopping`、`failed`）与该模块的本地常量必须与 ConfigService / WorkerManager（§59）逐字一致。
+  `open_diagnostics` 保留在协调器命令词表中，但当前窗口层不从菜单投递它。
 
 ### 61.2 协调器与命令端口（`tray_service.py`）
 
@@ -1908,18 +1904,11 @@ import 本模块（`--no-tray` 与非 Windows 路径都不加载 `win32gui`）�
 - **右键菜单**：`LOWORD(lParam) == WM_CONTEXTMENU` 时 `SetForegroundWindow(hwnd)` 后用
   `TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY` 弹 `TrackPopupMenu`（坐标取 `wParam` 的
   `GET_X_LPARAM`/`GET_Y_LPARAM`，按有符号 16 位解释；多显示器在左侧时可能是负数）。菜单项
-  id 是 1..n，按 `enabled` 挂 `MF_GRAYED`（可点项是 `MF_STRING`，`MF_STRING` 的值就是 0）；
-  `TrayMenuItem.separator_before` 表示「**这一项前面**先补一条**独立**的分隔项」，不是「这一项
-  是分隔符」—— 必须另起一次 `AppendMenu(MF_SEPARATOR, 0, "")`，而**不是**把 `MF_SEPARATOR`
-  或到该项自己的标志位上。Win32 的 `MF_SEPARATOR` 语义是「画一条横线，`lpNewItem` 与
-  `uIDNewItem` 都被忽略」（实测：`MF_STRING | MF_SEPARATOR` 的行 `GetMenuState` 带
-  `MF_SEPARATOR` 位、文本被丢弃）：并到带命令的项上会让它变成一条不可选中的空线，菜单从
-  12 行塌成 8 行 —— 账号行文案消失，`start`/`open_diagnostics`/`quit` 三条命令从托盘不可达
-  （`TrackPopupMenu` 永远拿不到它们的 id）。**弹出前把视图拷成局部变量**，返回的 id 必须用
+  id 是 1..4，按 `enabled` 挂 `MF_GRAYED`（可点项是 `MF_STRING`，`MF_STRING` 的值就是 0），
+  不追加 `MF_SEPARATOR`。**弹出前把视图拷成局部变量**，返回的 id 必须用
   同一份快照映射回命令 ——
   `TrackPopupMenu` 阻塞期间 `present()` 可能已经换掉视图，用新视图解释旧菜单的返回值会映射
-  到错误命令。收尾 `PostMessage(hwnd, WM_NULL, 0, 0)`。空串（账号行/状态行）与 0（取消）
-  都不投递。
+  到错误命令。收尾 `PostMessage(hwnd, WM_NULL, 0, 0)`。0（取消）和未知 id 不投递。
 - **`TaskbarCreated` 重加**（Explorer 重建任务栏）：`NIM_DELETE` → `NIM_ADD` →
   `NIM_SETVERSION` —— 菜单每次弹出都现场构建，不需要重建；重加后投递 `taskbar_created`
   让协调器重画一次。重加失败只记 `launcher.tray_icon_readd_failed`（`error` 是稳定码），

@@ -123,17 +123,10 @@ CREDENTIALS_INDEX_BROKEN: str = (
 )
 
 # 托盘菜单（N3）：顺序与可用性由 tray_model 固定，文案只在这里维护。
-TRAY_MENU_OPEN_ADMIN: str = "打开管理页"
-TRAY_MENU_START: str = "启动机器人"
-TRAY_MENU_STOP: str = "停止机器人"
-TRAY_MENU_RESTART: str = "重启机器人"
-TRAY_MENU_OPEN_DIAGNOSTICS: str = "打开诊断目录"
-TRAY_MENU_QUIT: str = "退出 Light"
-
-# 托盘的账号行与状态行（展示行，不可点击）。
-TRAY_ACCOUNT_PREFIX: str = "账号："
-TRAY_ACCOUNT_UNSET: str = "未设置"
-TRAY_STATUS_PREFIX: str = "状态："
+TRAY_MENU_START: str = "启动"
+TRAY_MENU_STOP: str = "停止"
+TRAY_MENU_RESTART: str = "重启"
+TRAY_MENU_QUIT: str = "退出"
 
 # 托盘状态标签：同一时刻只显示一条，判定顺序见 tray_model.status_label()。
 TRAY_STATUS_NEEDS_SETUP: str = "未设置账号"

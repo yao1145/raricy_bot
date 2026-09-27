@@ -90,12 +90,11 @@ class TrayState:
 
 @dataclass(frozen=True)
 class TrayMenuItem:
-    """一条菜单项；`command` 为空串表示展示行，不是可点项。"""
+    """一条菜单项。"""
 
-    command: str  # 空串 = 不可点（状态行）
+    command: str
     label: str
     enabled: bool
-    separator_before: bool = False
 
 
 @dataclass(frozen=True)
@@ -163,10 +162,9 @@ def status_label(state: TrayState) -> str:
 
 
 def menu_for(state: TrayState) -> tuple[TrayMenuItem, ...]:
-    """菜单：顺序、分隔符与可用性固定（§61）。
+    """右键菜单只保留启动、重启、停止、退出（§61）。
 
     禁用只是交互提示，服务端仍然自己判：窗口层不因为菜单项禁用就跳过命令校验。
-    分隔符不占独立菜单项，而是挂在紧随其后的项上（`separator_before`）。
     """
     configured = state.config_state == CONFIG_STATE_CONFIGURED
     process = state.process_state
@@ -182,24 +180,10 @@ def menu_for(state: TrayState) -> tuple[TrayMenuItem, ...]:
         and not state.quitting
     )
     return (
-        TrayMenuItem(TRAY_COMMAND_OPEN_ADMIN, texts.TRAY_MENU_OPEN_ADMIN, True),
-        TrayMenuItem(
-            "",
-            texts.TRAY_ACCOUNT_PREFIX + (state.account or texts.TRAY_ACCOUNT_UNSET),
-            False,
-            separator_before=True,
-        ),
-        TrayMenuItem("", texts.TRAY_STATUS_PREFIX + status_label(state), False),
-        TrayMenuItem(TRAY_COMMAND_START, texts.TRAY_MENU_START, can_start, separator_before=True),
-        TrayMenuItem(TRAY_COMMAND_STOP, texts.TRAY_MENU_STOP, can_stop),
+        TrayMenuItem(TRAY_COMMAND_START, texts.TRAY_MENU_START, can_start),
         TrayMenuItem(TRAY_COMMAND_RESTART, texts.TRAY_MENU_RESTART, can_restart),
-        TrayMenuItem(
-            TRAY_COMMAND_OPEN_DIAGNOSTICS,
-            texts.TRAY_MENU_OPEN_DIAGNOSTICS,
-            True,
-            separator_before=True,
-        ),
-        TrayMenuItem(TRAY_COMMAND_QUIT, texts.TRAY_MENU_QUIT, True, separator_before=True),
+        TrayMenuItem(TRAY_COMMAND_STOP, texts.TRAY_MENU_STOP, can_stop),
+        TrayMenuItem(TRAY_COMMAND_QUIT, texts.TRAY_MENU_QUIT, True),
     )
 
 
