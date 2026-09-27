@@ -117,7 +117,8 @@
   const archive = $derived(snapshot("archive"));
 </script>
 
-<div class="panel">
+<div class="status-layout">
+<div class="panel account-panel">
   <h2>当前账号</h2>
   {#if profile}
     <dl class="kv">
@@ -152,8 +153,13 @@
   {/if}
 </div>
 
-<div class="panel">
+<div class="panel status-hero">
   <h2>机器人</h2>
+  <div class="process-display" class:running={processState === "running"} class:failed={processState === "failed"}>
+    <span class="process-light" aria-hidden="true"></span>
+    <div><strong>{PROCESS_LABEL[processState] ?? processState}</strong><span>当前进程状态</span></div>
+    {#if status.process.pid}<code>PID {status.process.pid}</code>{/if}
+  </div>
   <dl class="kv">
     <dt>进程</dt>
     <dd>
@@ -200,7 +206,7 @@
 </div>
 
 {#if status.worker.freshness === "fresh"}
-  <div class="panel">
+  <div class="panel systems-panel">
     <h2>子系统</h2>
     <dl class="kv">
       <dt>站点</dt>
@@ -244,3 +250,4 @@
     </dl>
   </div>
 {/if}
+</div>

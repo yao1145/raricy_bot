@@ -499,6 +499,11 @@
   <h2>
     {target ? `填写账号设置 · ${displayName || account || "未命名账号"}` : `首次设置 · 第 ${step} / ${STEPS} 步`}
   </h2>
+  <div class="wizard-progress" aria-label={`设置进度：第 ${step} 步，共 ${STEPS} 步`}>
+    <span class:current={step === 1} class:complete={step > 1}>站点身份</span>
+    <span class:current={step === 2} class:complete={step > 2}>模型连接</span>
+    <span class:current={step === 3}>可选能力</span>
+  </div>
   {#if loading}
     <p class="hint">正在读取配置…</p>
   {/if}

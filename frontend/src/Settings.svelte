@@ -243,10 +243,12 @@
     <h2>模型与提示词</h2>
     <div class="grid">
       {#each modelFields as item (item.key)}
-        <label>{item.label}
+        <label class:checkbox={item.kind === "bool"}>
           {#if item.kind === "bool"}
             <input type="checkbox" bind:checked={flags[item.key]} />
+            {item.label}
           {:else}
+            {item.label}
             <input bind:value={texts[item.key]} />
           {/if}
           {#if item.help}<span class="hint">{item.help}</span>{/if}
@@ -414,14 +416,15 @@
       </div>
     {/if}
     <p class="hint" style="margin-top:12px">
-      「打开 Light 时启动机器人」与「登录 Windows 时启动 Light」都已移到「桌面」页的桌面设置。
+      「打开 Light 时启动机器人」与「登录 Windows 时启动 Light」在上方「桌面与启动」分区设置。
     </p>
   </div>
 
   {#if message}<div class="notice">{message}</div>{/if}
   {#if failure}<div class="error">{failure}</div>{/if}
 
-  <div class="row">
-    <button class="action" disabled={busy} onclick={save}>保存</button>
+  <div class="row save-bar">
+    <span class="hint">检查修改后保存；机器人运行中时，部分设置需重启后生效。</span>
+    <button class="action" disabled={busy} onclick={save}>保存机器人配置</button>
   </div>
 {/if}

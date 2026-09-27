@@ -11,13 +11,15 @@
   import { ACCOUNT_NOTICES } from "./texts";
 
   type Phase = "boot" | "expired" | "ready";
-  type Tab = "status" | "settings" | "events" | "desktop" | "accounts";
+  type Tab = "status" | "accounts" | "settings" | "events";
+  type SettingsView = "config" | "desktop";
 
   let phase = $state<Phase>("boot");
   let status = $state<api.StatusSnapshot | null>(null);
   let profiles = $state<api.ProfileCard[] | null>(null);
   let catalog = $state<api.ProfileCatalog | null>(null);
   let tab = $state<Tab>("status");
+  let settingsView = $state<SettingsView>("config");
   // 用户主动点过页签之后，状态变化不再自动夺走视图。
   let tabTouched = $state(false);
   // 向导：首次设置（profileId 为 null）或绑定到某个账号（添加账号 / 没有配置的账号）。
@@ -27,8 +29,10 @@
   let wizardDismissed = $state(false);
   let notice = $state<string | null>(null);
   let error = $state<string | null>(null);
+  let intro = $state(true);
 
   let refreshTimer: ReturnType<typeof setInterval> | null = null;
+  let introTimer: ReturnType<typeof setTimeout> | null = null;
   let unsubscribe: (() => void) | null = null;
 
   async function refresh(): Promise<void> {
@@ -55,6 +59,11 @@
   }
 
   onMount(async () => {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      intro = false;
+    } else {
+      introTimer = setTimeout(() => (intro = false), 1900);
+    }
     const token = api.bootstrapToken();
     // 令牌只在 fragment 里出现一次：无论成功与否都先清掉地址栏（§8.1）。
     api.clearFragment();
@@ -82,6 +91,7 @@
 
   onDestroy(() => {
     if (refreshTimer) clearInterval(refreshTimer);
+    if (introTimer) clearTimeout(introTimer);
     unsubscribe?.();
   });
 
@@ -89,6 +99,13 @@
     tabTouched = true;
     tab = next;
   }
+
+  const pageCopy: Record<Tab, { title: string; detail: string }> = {
+    status: { title: "运行状态", detail: "查看当前账号、机器人进程和子系统的实时状态。" },
+    accounts: { title: "账号档案", detail: "管理账号身份、活动档案与凭据清理。" },
+    settings: { title: "配置中心", detail: "调整模型、能力和桌面启动方式。" },
+    events: { title: "近期事件", detail: "按时间查看当前账号与控制服务的事件。" },
+  };
 
   const configState = $derived(status?.config.state ?? "unknown");
   // 恢复状态不是向导入口：坏元数据只给只读提示，绝不把用户带进空向导（F2）。
@@ -140,10 +157,31 @@
   }
 </script>
 
-<div class="shell">
+{#if intro}
+  <div class="intro-screen" aria-hidden="true">
+    <div class="intro-emblem">
+      <span class="intro-shape intro-orbit"></span>
+      <span class="intro-shape intro-satellite"></span>
+      <span class="intro-shape intro-vector"></span>
+      <span class="intro-shape intro-signal"></span>
+    </div>
+  </div>
+{/if}
+
+<div class="shell" class:intro-active={intro} inert={intro}>
   <header class="brand">
-    <h1>Raricy Light</h1>
-    <span class="tag">本机管理页 · 仅回环可访问</span>
+    <div class="brand-identity">
+      <img src="/favicon.ico" width="42" height="42" alt="" />
+      <div>
+        <h1>Raricy <span>Light</span></h1>
+        <p>本机控制台</p>
+      </div>
+    </div>
+    <div class="brand-state">
+      <span class="connection-dot" class:online={status?.process.state === "running"}></span>
+      {status?.process.state === "running" ? "机器人运行中" : "本地控制服务"}
+      <span class="brand-local">仅限本机</span>
+    </div>
   </header>
 
   {#if phase === "boot"}
@@ -157,17 +195,38 @@
       </p>
     </div>
   {:else}
-    <nav>
-      <button class:active={tab === "status"} onclick={() => selectTab("status")}>状态</button>
-      <button class:active={tab === "settings"} onclick={() => selectTab("settings")}>设置</button>
-      <button class:active={tab === "events"} onclick={() => selectTab("events")}>近期事件</button>
-      <button class:active={tab === "desktop"} onclick={() => selectTab("desktop")}>桌面</button>
-      <button class:active={tab === "accounts"} onclick={() => selectTab("accounts")}>账号</button>
+    <nav class="module-nav" aria-label="主要页面">
+      <button class="module-link module-link--status" class:active={tab === "status"} aria-current={tab === "status" ? "page" : undefined} onclick={() => selectTab("status")}>
+        <span class="module-shape shape-orbit" aria-hidden="true"></span>
+        <span class="module-label">状态</span><span class="module-sub">运行与健康</span>
+      </button>
+      <button class="module-link module-link--accounts" class:active={tab === "accounts"} aria-current={tab === "accounts" ? "page" : undefined} onclick={() => selectTab("accounts")}>
+        <span class="module-shape shape-satellite" aria-hidden="true"></span>
+        <span class="module-label">账号</span><span class="module-sub">身份与档案</span>
+      </button>
+      <button class="module-link module-link--settings" class:active={tab === "settings"} aria-current={tab === "settings" ? "page" : undefined} onclick={() => selectTab("settings")}>
+        <span class="module-shape shape-vector" aria-hidden="true"></span>
+        <span class="module-label">设置</span><span class="module-sub">配置与桌面</span>
+      </button>
+      <button class="module-link module-link--events" class:active={tab === "events"} aria-current={tab === "events" ? "page" : undefined} onclick={() => selectTab("events")}>
+        <span class="module-shape shape-signal" aria-hidden="true"></span>
+        <span class="module-label">事件</span><span class="module-sub">最近记录</span>
+      </button>
     </nav>
 
     {#if error}<div class="error">{error}</div>{/if}
     {#if notice}<div class="notice">{notice}</div>{/if}
 
+    {#if !wizard}
+      <div class="page-heading" data-page={tab}>
+        <div><h2>{pageCopy[tab].title}</h2><p>{pageCopy[tab].detail}</p></div>
+        {#if status?.active_profile_id && activeCard}
+          <span class="active-profile">当前账号 <strong>{activeCard.display_name || activeCard.account || "未命名"}</strong></span>
+        {/if}
+      </div>
+    {/if}
+
+    <main id="main-content">
     {#if wizard}
       <Wizard profileId={wizard.profileId} ondone={finishWizard} oncancel={cancelWizard} />
     {:else if tab === "status"}
@@ -194,9 +253,17 @@
         {/if}
       {/if}
     {:else if tab === "settings"}
-      {#key status?.active_profile_id}
-        <Settings profile={activeCard} {epoch} onchanged={refresh} />
-      {/key}
+      <div class="subnav" aria-label="设置分区">
+        <button class:active={settingsView === "config"} aria-current={settingsView === "config" ? "page" : undefined} onclick={() => (settingsView = "config")}>机器人配置</button>
+        <button class:active={settingsView === "desktop"} aria-current={settingsView === "desktop" ? "page" : undefined} onclick={() => (settingsView = "desktop")}>桌面与启动</button>
+      </div>
+      {#if settingsView === "config"}
+        {#key status?.active_profile_id}
+          <Settings profile={activeCard} {epoch} onchanged={refresh} />
+        {/key}
+      {:else}
+        <DesktopSettings onchanged={refresh} />
+      {/if}
     {:else if tab === "accounts"}
       {#key status?.active_profile_id}
         <Accounts
@@ -204,14 +271,13 @@
           profiles={profiles ?? []}
           {catalog}
           onchanged={refresh}
-          onedit={() => selectTab("settings")}
+          onedit={() => { settingsView = "config"; selectTab("settings"); }}
           onwizard={(profileId) => (wizard = { profileId })}
         />
       {/key}
-    {:else if tab === "desktop"}
-      <DesktopSettings onchanged={refresh} />
     {:else}
       <Events profileId={status?.active_profile_id ?? null} />
     {/if}
+    </main>
   {/if}
 </div>
