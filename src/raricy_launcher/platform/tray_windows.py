@@ -38,9 +38,11 @@ pywin32 build 312 + Python 3.13）：
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import threading
 from collections.abc import Callable
+from ctypes import wintypes
 from pathlib import Path
 
 import pywintypes
@@ -53,6 +55,7 @@ from raricy_bot.logging_setup import get_logger, log_event
 from .. import texts, tray_model
 from ..tray_model import TrayView
 from . import TrayError
+from .tray_popup import TrayPopup
 
 # 窗口类名固定：同名类重复注册会失败，所以它同时保证「一个进程一份托盘窗口」。
 WINDOW_CLASS_NAME: str = "RaricyBotLight.TrayWindow"
@@ -110,6 +113,37 @@ def _stable_error_code(exc: BaseException) -> str:
     return "win32_error" if isinstance(exc, pywintypes.error) else type(exc).__name__
 
 
+class _NotifyIconIdentifier(ctypes.Structure):
+    """与 shellapi.h 的 NOTIFYICONIDENTIFIER 布局一致，按 hWnd/uID 查图标。"""
+
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("hWnd", wintypes.HWND),
+        ("uID", wintypes.UINT),
+        ("guidItem", ctypes.c_ubyte * 16),
+    ]
+
+
+def _icon_rect(hwnd: int) -> tuple[int, int, int, int] | None:
+    """读取真正的通知区域图标位置；Shell 暂不可用时由调用方退到鼠标坐标。"""
+    identifier = _NotifyIconIdentifier()
+    identifier.cbSize = ctypes.sizeof(identifier)
+    identifier.hWnd = hwnd
+    identifier.uID = NOTIFY_ID
+    rect = wintypes.RECT()
+    try:
+        get_rect = ctypes.windll.shell32.Shell_NotifyIconGetRect
+        get_rect.argtypes = (
+            ctypes.POINTER(_NotifyIconIdentifier), ctypes.POINTER(wintypes.RECT)
+        )
+        get_rect.restype = ctypes.c_long
+        if get_rect(ctypes.byref(identifier), ctypes.byref(rect)) != 0:
+            return None
+    except (AttributeError, OSError, ValueError, ctypes.ArgumentError):
+        return None
+    return (rect.left, rect.top, rect.right, rect.bottom)
+
+
 class WinTrayIcon:
     """通知区域图标的 Windows 实现（`platform.TrayIcon` 协议，契约见 §61.4）。
 
@@ -136,6 +170,7 @@ class WinTrayIcon:
         self._hinstance = 0
         self._icon_added = False
         self._taskbar_created = 0
+        self._popup: TrayPopup | None = None
 
         # 跨线程共享的状态：一律在 `self._lock` 下读写。
         self._lock = threading.Lock()
@@ -367,6 +402,12 @@ class WinTrayIcon:
 
     def _destroy_window(self, hwnd: int) -> None:
         """摘图标、清句柄、销毁窗口；每步幂等，绝不抛出。"""
+        popup, self._popup = self._popup, None
+        if popup is not None:
+            try:
+                popup.close()
+            except Exception as exc:
+                self._log_callback_failure(exc)
         self._remove_icon(hwnd)
         with self._lock:
             if self._hwnd == hwnd:
@@ -474,16 +515,25 @@ class WinTrayIcon:
         # 其余（含 NIN_BALLOON*）一律忽略：N3 不做气泡通知，也不认识别的字符串。
 
     def _show_menu(self, hwnd: int, wparam: int) -> None:
-        """右键菜单：现场按当前视图构建，选中项用**同一份**视图映射回命令。
-
-        `TrackPopupMenu` 会一直阻塞到菜单收起（或系统取消），期间协调器照常渲染，
-        `self._view` 可能已经换了一版 —— 所以先把视图拷成局部变量：菜单项 id 与命令的
-        对应关系必须来自弹出时那一份，不能用新视图去解释旧菜单的返回值。
-        """
+        """右键打开深色弹窗；绘制失败时降级到四项系统菜单。"""
         with self._lock:
             view = self._view
         if view is None:
             return
+        x, y = _get_x_lparam(wparam), _get_y_lparam(wparam)
+        try:
+            if self._popup is None:
+                self._popup = TrayPopup(
+                    on_command=self._submit, on_error=self._log_callback_failure
+                )
+            self._popup.show(hwnd, view, x, y, _icon_rect(hwnd))
+        except Exception as exc:
+            self._log_callback_failure(exc)
+            self._popup = None
+            self._show_native_menu(hwnd, view, x, y)
+
+    def _show_native_menu(self, hwnd: int, view: TrayView, x: int, y: int) -> None:
+        """自定义窗口不可用时的回退：沿用同一份视图与四项命令。"""
         commands: dict[int, str] = {}
         menu = win32gui.CreatePopupMenu()
         try:
@@ -500,12 +550,13 @@ class WinTrayIcon:
             except pywintypes.error:
                 pass
             selected = win32gui.TrackPopupMenu(
+                menu,
                 win32con.TPM_RETURNCMD | win32con.TPM_RIGHTBUTTON | win32con.TPM_NONOTIFY,
-                _get_x_lparam(wparam),
-                _get_y_lparam(wparam),
+                x,
+                y,
                 0,
                 hwnd,
-                menu,
+                None,
             )
         finally:
             try:

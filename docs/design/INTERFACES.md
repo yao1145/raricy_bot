@@ -1783,8 +1783,8 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   `SNAPSHOT_STALE_SECONDS`（30 秒）；不得复制常量或另写判据。`StatusService.snapshot()`
   内部调用同一个函数，二者不产生第二个真相。
 - **菜单**（`menu_for()`，顺序固定）：启动（`start`）｜重启（`restart`）｜停止（`stop`）｜
-  退出（`quit`）。只有这四个可点命令，无展示行或分隔符；左键单击仍通过 `open_admin` 打开
-  管理页，状态标签在 tooltip 中显示。可用性：`start` = 配置 `configured` 且进程
+  退出（`quit`）。只有这四个可点命令，无展示行或分隔符项；左键单击仍通过 `open_admin` 打开
+  管理页，状态标签在 tooltip 和弹窗标题区显示。可用性：`start` = 配置 `configured` 且进程
   `stopped` / `failed` 且非 `quitting`；`stop` = 进程 `running` / `starting` 且非 `quitting`；
   `restart` = 配置 `configured` 且进程 `running` / `stopped` / `failed` 且非 `quitting`。
   `quit` 始终可用。禁用只是交互提示，服务端仍然自己判。取舍见 D-151。
@@ -1901,16 +1901,19 @@ import 本模块（`--no-tray` 与非 Windows 路径都不加载 `win32gui`）�
   → `on_message("open_admin")`。v4 不再单独送 `WM_LBUTTONDBLCLK`：左键单击与双击合并成
   `NIN_SELECT`，与设计 §7.1「双击图标执行同一动作」等效 —— 打开管理页这个动作不需要区分
   单击还是双击。`NIN_BALLOON*` 一律忽略（N3 不做通知）。
-- **右键菜单**：`LOWORD(lParam) == WM_CONTEXTMENU` 时 `SetForegroundWindow(hwnd)` 后用
-  `TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY` 弹 `TrackPopupMenu`（坐标取 `wParam` 的
-  `GET_X_LPARAM`/`GET_Y_LPARAM`，按有符号 16 位解释；多显示器在左侧时可能是负数）。菜单项
-  id 是 1..4，按 `enabled` 挂 `MF_GRAYED`（可点项是 `MF_STRING`，`MF_STRING` 的值就是 0），
-  不追加 `MF_SEPARATOR`。**弹出前把视图拷成局部变量**，返回的 id 必须用
-  同一份快照映射回命令 ——
-  `TrackPopupMenu` 阻塞期间 `present()` 可能已经换掉视图，用新视图解释旧菜单的返回值会映射
-  到错误命令。收尾 `PostMessage(hwnd, WM_NULL, 0, 0)`。0（取消）和未知 id 不投递。
+- **右键弹窗**（D-152）：`LOWORD(lParam) == WM_CONTEXTMENU` 时，先按 `hWnd + NOTIFY_ID`
+  调用 `Shell_NotifyIconGetRect` 取得图标屏幕矩形；失败才从 `wParam` 取有符号点击坐标。
+  在同一托盘线程打开 `tray_popup.TrayPopup` 的紧凑深色圆角工具窗口，优先贴图标左/右侧，
+  空间不足时换边，并限制在该显示器工作区。弹窗保留弹出时的 `TrayView` 快照；标题区
+  显示应用名与状态标签，四行按 `enabled` 灰显。鼠标点选和键盘上下/回车只派发可用命令；
+  Escape、失去激活或再次右键时收起。销毁托盘窗口前释放弹窗与 GDI 字体。弹窗自身不调用
+  启停方法，也不启动新消息循环。
+  自定义窗口创建/显示失败时，记录稳定类别码并回退四项原生菜单：
+  `TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, x, y, 0, hwnd, None)`。
+  pywin32 要求菜单句柄为**第一个**实参、总计七个实参；返回 id 使用同一份视图映射，
+  0（取消）或未知 id 不投递，收尾补 `WM_NULL`。
 - **`TaskbarCreated` 重加**（Explorer 重建任务栏）：`NIM_DELETE` → `NIM_ADD` →
-  `NIM_SETVERSION` —— 菜单每次弹出都现场构建，不需要重建；重加后投递 `taskbar_created`
+  `NIM_SETVERSION` —— 弹窗窗口复用、每次打开时换视图，回退菜单现场构建；重加后投递 `taskbar_created`
   让协调器重画一次。重加失败只记 `launcher.tray_icon_readd_failed`（`error` 是稳定码），
   不崩、不重启 Controller/Worker。
 - **系统事件合同**（处理函数本身不做任何等待）：
