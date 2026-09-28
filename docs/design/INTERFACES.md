@@ -191,7 +191,7 @@ DM 按频道，公开链用 `lobby-thread:<root_id>`，重启保留归属但不�
 6. 入队成功才消费近期批次。queued 由 worker 终结，reply_now/busy 由 App 终结；
    memory_queued 交记忆 worker，不当作普通聊天任务。
 
-候选消息若时间缺失或不符合站方格式，仍只落候选事件元数据并立即标为 `skipped`，不回复；可解析但已过期的消息同样静默标 `skipped`。登记事件、解析大区链等异步等待后须复查截止时间，再执行命令副作用或入队；大区链解析在数据库写入前也复查，防止已过期的 `/reset` 留下新链。未过期任务把 `expires_at` 随 Request/RouteResult 传下去，覆盖命令和 `notice_local` 等本地应答。
+候选消息若时间缺失或不符合已确认的站点格式，仍只落候选事件元数据并立即标为 `skipped`，不回复；可解析但已过期的消息同样静默标 `skipped`。目前兼容文档中的东八区 `YYYY-MM-DD HH:MM:SS` 和线上观测到的东八区墙上时间 `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`（后者的 `Z` 与实际时区不符，依据见 D-153）。登记事件、解析大区链等异步等待后须复查截止时间，再执行命令副作用或入队；大区链解析在数据库写入前也复查，防止已过期的 `/reset` 留下新链。未过期任务把 `expires_at` 随 Request/RouteResult 传下去，覆盖命令和 `notice_local` 等本地应答。
 
 大区 reset 以命令 ID 建新链，不清旧链；DM reset 清历史并递增 generation（D-21）。
 
