@@ -138,9 +138,12 @@ handler 普通异常不拆流，取消必须传播。传输游标与 Store 安�
 入口：[Store、表结构与事务](../../src/raricy_bot/store.py)。
 
 - 单条 SQLite 连接；工作线程持 `threading.Lock` 串行使用，生命周期另用异步锁（D-90）。
-- 事件表以 message ID 去重，只记录候选消息。NULL event ID 不参与安全水位。
+- 事件表以 message ID 去重，只记录候选消息。`expires_at` 为可空绝对 epoch 秒，存储层不保存消息正文；NULL event ID 不参与安全水位。
 - 安全水位检查点单调；清理保留回滚锚点，不删非终态事件，不设数据库硬容量上限。
-- 启动将旧非终态标为 `recover`，重放时原子认领，再查已发记录，避免重复回复（D-17）。
+- `record_event(event_id, message_id, channel_id, *, expires_at=None)` 保持旧调用兼容；升级旧库时幂等添加 `events.expires_at REAL`，既有行保持 NULL。
+- 启动先 `mark_orphans_recoverable()`，再调用 `expire_orphaned_events(*, now, max_age_seconds)`。匹配 `(channel_id, reply_to)` 的 `sent_replies` 证据先把 recover 行改为 `done`。
+- 无已发送证据时，`expires_at <= now` 的 recover 行改为 `skipped`。旧库的 NULL 过期时间仅在 `received_at + max_age_seconds <= now` 时跳过；新鲜 recover 行仍可原子认领与重放（D-17、D-153）。
+- 同一过期扫描也在现有周期清理中重复执行，只处理 `recover`，不触碰当前进程的 `pending`。这样启动时尚未过期、后来又未被服务端补发的孤儿最终会终结；不删行，终态仍按 D-16 推进水位。
 - 回复链映射、配额与幂等状态可持久化；消息正文不可。过期映射清理须同步作废内存会话。
 - 发文另有独立状态表和事务占额，允许保存脱敏标题（§53 / D-107）。
 
@@ -179,13 +182,15 @@ DM 按频道，公开链用 `lobby-thread:<root_id>`，重启保留归属但不�
 入口：[Request、RouteResult、MessageRouter](../../src/raricy_bot/core/router.py)。
 只判定和入队，不调用模型、不发送回复。处理次序：
 
-1. 观察大区近期消息、登记 DM；过滤自身消息、删除消息和拍一拍。
-2. 大区必须精确 @；通过候选过滤后才记录事件、去重/认领恢复。
+1. 观察未过期的大区近期消息、登记 DM；过滤自身消息、删除消息和拍一拍。过期大区消息不进入近期消息缓冲。
+2. 大区必须精确 @；通过候选过滤后才记录事件、去重/认领恢复。记录前将站方 `created_at` 按 UTC+8 解析，为所有候选消息（含命令和会走本地提示的消息）计算绝对 `expires_at = created_at + behavior.message_max_age_seconds`；默认值为 10_800 秒。
 3. 构造直接引用、解析公开回复链；链归属依据消息 ID，不依据用户名或模型判断。
 4. 已装配时识别记忆命令；再解析最多一个能力前缀，冲突本地拒绝。
 5. 空正文先判博客、再判图片；随后处理 help/reset、超长与密钥探测。
 6. 入队成功才消费近期批次。queued 由 worker 终结，reply_now/busy 由 App 终结；
    memory_queued 交记忆 worker，不当作普通聊天任务。
+
+候选消息若时间缺失或不符合站方格式，仍只落候选事件元数据并立即标为 `skipped`，不回复；可解析但已过期的消息同样静默标 `skipped`。未过期任务把 `expires_at` 随 Request/RouteResult 传下去，覆盖命令和 `notice_local` 等本地应答。
 
 大区 reset 以命令 ID 建新链，不清旧链；DM reset 清历史并递增 generation（D-21）。
 
@@ -203,6 +208,8 @@ DM 按频道，公开链用 `lobby-thread:<root_id>`，重启保留归属但不�
 只有网络层 `SiteError.status == 0` 走聊天不确定对账：`after=reply_to, limit=100`，
 未找到时最多重发一次，不能保证严格 exactly-once。**该策略不适用于博客发文**（D-109）。
 所有取消和异常出口都须结清预留。
+
+聊天发送携带输入事件的 `expires_at`：配额预留前后、会话建立后及每次实际 POST/不确定结果重试前都复查；等待期间到期则不发，已预留额度释放。返回 `expired` 供 App 静默终结输入事件为 `skipped`；不因超时发送 busy、失败或额度提示。
 
 `_deliver` / `_on_error` / `_reconcile` 只做 POST 与对账、**不结算**，用
 `_Delivery(result, record, charge)` 回报是否已确认送达；`send` 是唯一结算点，确认送达后由
@@ -250,6 +257,8 @@ MCP、KB、记忆、发文为软故障扩展，不纳入健康就绪条件。Com
 resync 拉取按 message ID 去重，空 event ID 不抬水位。
 403 中 CSRF 为客户端错误，其余权限/禁言进入不可用并定时探测。
 仅在回复成功后提交历史；退出总预算 10 秒，先停止发文/记忆等消费者，再关闭共享模型与 MCP。
+
+启动先将旧 pending 标为 recover，再调用 Store 过期恢复，最后从安全水位启动 SSE；超过 `behavior.message_max_age_seconds` 的候选输入静默跳过，默认值为 10_800 秒。工作器领取后、模型返回后、发送本地提示前和实际发送前都复查截止时间；到期输入以 `skipped` 终态推进水位，不留下半轮历史。周期清理重复终结已过期 recover 行，覆盖启动时仍新鲜但之后未获服务端补发的孤儿；旧库 NULL `expires_at` 按 `received_at + behavior.message_max_age_seconds <= now` 兜底（D-153）。
 
 两条队列都是 `SessionScheduler`（§14），容量取 `behavior.queue_size` / `memory.queue_size`；
 记忆 worker 并发固定为 1。关闭顺序里，`_shutdown` 在 `Store` 关闭**之前**调用

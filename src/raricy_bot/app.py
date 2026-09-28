@@ -111,7 +111,7 @@ from .site.client import SiteClient, SiteError
 from .site.models import LOBBY, ChatMessage
 from .site.sse import SSEReceiver
 from .stickers import StickerTable
-from .store import Store
+from .store import STATUS_SKIPPED, Store
 from .text_utils import has_media, truncate_at_paragraph
 
 _logger = get_logger("app")
@@ -220,6 +220,8 @@ class BotApp:
         expect_site_user_id: str | None = None,
     ) -> None:
         self._config = config
+        self._now = time.time
+        self._delivered_message_ids: set[int] = set()
         self._transport = transport
         # 可选身份校验接缝（设计 §4.2、§10.4）：Light 传入档案期望的站点稳定 ID，
         # 登录后比较真实 `user.id` 再决定是否继续。默认 `None` 表示不校验，完整版
@@ -1415,6 +1417,8 @@ class BotApp:
           （`WorkerPool` 会兜住异常，但兜不住一个没有终态的事件）。
         """
         try:
+            if self._is_expired(getattr(request, "expires_at", None)):
+                return
             controller = self._memory_controller
             if controller is None:
                 # 软故障也要**可见**（D-60）：这条命令只能被就地放弃，终态照留在 finally 里，
@@ -1427,21 +1431,67 @@ class BotApp:
                     reason="controller_unavailable",
                 )
                 return
+            if self._is_expired(getattr(request, "expires_at", None)):
+                return
             result = await controller.execute_command(request)
+            if self._is_expired(getattr(request, "expires_at", None)):
+                return
             if self._unavailable or not result.text:
                 # D-4：不可用期间不发消息（与 `_send_local` 同一口径）；
                 # 命令本身已经执行完，终态照常在 finally 里落。
                 return
-            outcome = await self._sender.send(
+            await self._send_message(
                 request.channel_id,
                 result.text,
                 request.message_id,
                 kind="notice_local",
                 thread_root_id=None,
+                expires_at=getattr(request, "expires_at", None),
             )
-            self._note_forbidden(outcome)
         finally:
-            await self._store.mark_handled(request.message_id, "done")
+            await self._mark_handled_for_deadline(
+                request.message_id, getattr(request, "expires_at", None)
+            )
+
+    def _is_expired(self, expires_at: float | None) -> bool:
+        """统一判定输入消息的截止时间；`None` 保留旧直接调用行为。"""
+        return expires_at is not None and self._now() >= expires_at
+
+    async def _mark_handled_for_deadline(
+        self, message_id: int, expires_at: float | None
+    ) -> None:
+        """未送达且已过期时标记 skipped；确认送达优先保留 done。"""
+        expired = self._is_expired(expires_at)
+        delivered = message_id in self._delivered_message_ids
+        self._delivered_message_ids.discard(message_id)
+        status = STATUS_SKIPPED if expired and not delivered else "done"
+        await self._store.mark_handled(message_id, status)
+
+    async def _send_message(
+        self,
+        channel_id: str,
+        text: str,
+        reply_to: int | None,
+        *,
+        kind: str,
+        actor_id: str | None = None,
+        thread_root_id: int | None = None,
+        expires_at: float | None = None,
+    ) -> SendResult:
+        """发一条受原始消息 deadline 约束的回复并记录已确认送达状态。"""
+        outcome = await self._sender.send(
+            channel_id,
+            text,
+            reply_to,
+            kind=kind,
+            actor_id=actor_id,
+            thread_root_id=thread_root_id,
+            expires_at=expires_at,
+        )
+        if outcome.delivered and reply_to is not None:
+            self._delivered_message_ids.add(reply_to)
+        self._note_forbidden(outcome)
+        return outcome
 
     # --- SSE 事件分派 -------------------------------------------------------
 
@@ -1471,7 +1521,12 @@ class BotApp:
     async def _send_local(self, result: RouteResult) -> None:
         """应答明确用户动作的本地回复：kind=notice_local（D-1，不落通知冷却）。"""
         try:
-            if not self._unavailable and result.channel_id is not None:
+            expires_at = getattr(result, "expires_at", None)
+            if (
+                not self._is_expired(expires_at)
+                and not self._unavailable
+                and result.channel_id is not None
+            ):
                 await self._send_notice_text(
                     result,
                     result.text or "",
@@ -1481,11 +1536,16 @@ class BotApp:
                 )
         finally:
             if result.message_id is not None:
-                await self._store.mark_handled(result.message_id, "done")
+                await self._mark_handled_for_deadline(
+                    result.message_id, getattr(result, "expires_at", None)
+                )
 
     async def _send_busy(self, result: RouteResult) -> None:
         """队列满提示：kind=notice，按 (频道, 触发者) 冷却（D-3、D-18）。"""
         try:
+            expires_at = getattr(result, "expires_at", None)
+            if self._is_expired(expires_at):
+                return
             if result.channel_id is None:
                 return
             if await self._notice_cooling_down(result.channel_id, result.actor_id):
@@ -1501,41 +1561,43 @@ class BotApp:
             )
         finally:
             if result.message_id is not None:
-                await self._store.mark_handled(result.message_id, "done")
+                await self._mark_handled_for_deadline(
+                    result.message_id, getattr(result, "expires_at", None)
+                )
 
     async def _notify_failure(self, request: Request) -> None:
         """模型最终失败提示：kind=notice，按 (频道, 触发者) 冷却（D-3、D-18）。"""
-        if self._unavailable:
+        if self._unavailable or self._is_expired(getattr(request, "expires_at", None)):
             return
         actor_id = request.message.author.id
         if await self._notice_cooling_down(request.channel_id, actor_id):
             return
-        outcome = await self._sender.send(
+        await self._send_message(
             request.channel_id,
             texts.FAILURE_NOTICE_TEXT,
             request.message.id,
             kind="notice",
             actor_id=actor_id,
             thread_root_id=request.thread_root_id,
+            expires_at=getattr(request, "expires_at", None),
         )
-        self._note_forbidden(outcome)
 
     async def _notify_quota(self, request: Request) -> None:
         """额度用尽提示：尝试发一次 kind=notice 的本地通知（D-18 同冷却口径）。"""
-        if self._unavailable:
+        if self._unavailable or self._is_expired(getattr(request, "expires_at", None)):
             return
         actor_id = request.message.author.id
         if await self._notice_cooling_down(request.channel_id, actor_id):
             return
-        outcome = await self._sender.send(
+        await self._send_message(
             request.channel_id,
             texts.QUOTA_NOTICE_TEXT,
             request.message.id,
             kind="notice",
             actor_id=actor_id,
             thread_root_id=request.thread_root_id,
+            expires_at=getattr(request, "expires_at", None),
         )
-        self._note_forbidden(outcome)
 
     async def _notice_cooling_down(self, channel_id: str, actor_id: str | None) -> bool:
         """该 (频道, 触发者) 的通知冷却是否仍在生效。
@@ -1560,22 +1622,25 @@ class BotApp:
         """发送一条通知/本地回复；403 按 reason 分流（D-4）。"""
         if result.channel_id is None or not text:
             return None
-        outcome = await self._sender.send(
+        outcome = await self._send_message(
             result.channel_id,
             text,
             result.reply_to,
             kind=kind,
             actor_id=actor_id,
             thread_root_id=thread_root_id,
+            expires_at=getattr(result, "expires_at", None),
         )
-        self._note_forbidden(outcome)
         return outcome
 
     # --- worker 的请求处理 --------------------------------------------------
 
     async def _handle_request(self, request: Request) -> None:
-        """worker 的实际处理：上下文 → 模型 → 发送；无论成败都标记 done。"""
+        """worker 的实际处理：上下文 → 模型 → 发送；终态按 deadline 标记 done/skipped。"""
         try:
+            # WorkerPool 领取后立刻复查：积压期间过期的输入不再展开上下文或触达模型。
+            if self._is_expired(getattr(request, "expires_at", None)):
+                return
             if self._unavailable:
                 # D-4：不可用期间不发消息。这里刻意不逐条记日志，
                 # 否则一条活跃私聊会把「期间不刷日志」变成每消息一行。
@@ -1753,6 +1818,8 @@ class BotApp:
             for part in blog.image_parts:
                 attach_image(messages, part)
             model = self._model
+            if self._is_expired(getattr(request, "expires_at", None)):
+                return
             if model is None:
                 if capability is not None:
                     await self._send_capability_unavailable(
@@ -1823,6 +1890,10 @@ class BotApp:
                 )
                 return
 
+            # 模型调用可能跨过 deadline；到期后不再运行自动记忆或发送本地失败提示。
+            if self._is_expired(getattr(request, "expires_at", None)):
+                return
+
             # 表情归一必须排在自动提取**之前**（设计 §4.5）：短期历史提交的是模型原文，
             # 而披露绝不进历史，所以历史拿到的必须是「已归一、不含披露」的正文，否则会留下
             # 未修正的坏 token，下一轮模型模仿自己。这里传 `max_chars=None`：归一要做，
@@ -1842,6 +1913,9 @@ class BotApp:
                     await self._notify_failure(request)
                 return
 
+            if self._is_expired(getattr(request, "expires_at", None)):
+                return
+
             # 自动提取（§34.4）就在这一格：主模型已经给出回答、这条回答还没有发出。
             # 位置在代次检查之二**之后**：被 /reset 作废的那一轮连提取都不做（本方法自己
             # 还会再复查一次代次）。它换出来的是**要发出的文本**，历史提交用已归一的
@@ -1852,15 +1926,19 @@ class BotApp:
             # 发送器也是异步边界；/reset 在此期间到达时，旧请求不得再发送。
             # 自动提取本身也是一段异步边界，这个检查因此不只是形式：记忆已经落盘而回复不发的
             # 情况是允许的（见 `_auto_capture_answer` 的取舍说明）。
-            if self._ctx.generation(request.session_key) != request.generation:
+            if (
+                self._ctx.generation(request.session_key) != request.generation
+                or self._is_expired(getattr(request, "expires_at", None))
+            ):
                 return
 
-            outcome = await self._sender.send(
+            outcome = await self._send_message(
                 request.channel_id,
                 send_text,
                 request.message.id,
                 kind="reply",
                 thread_root_id=request.thread_root_id,
+                expires_at=getattr(request, "expires_at", None),
             )
             if outcome.delivered:
                 # 只有用户真的看见了这一轮，才把它写进历史（D-22）。
@@ -1883,11 +1961,11 @@ class BotApp:
                     )
             if outcome.reason == "quota":
                 await self._notify_quota(request)
-            else:
-                self._note_forbidden(outcome)
         finally:
-            # §16：无论成功失败都必须标记 done，否则水位永远推进不了。
-            await self._store.mark_handled(request.message.id, "done")
+            # §16：成功/失败落 done；未送达且已过 deadline 落 skipped，避免水位卡住。
+            await self._mark_handled_for_deadline(
+                request.message.id, getattr(request, "expires_at", None)
+            )
 
     async def _load_image(self, request: Request) -> tuple[dict[str, Any] | None, str]:
         """取回本轮图片并编码；关闭图片输入时**完全不碰图床**。"""
@@ -2064,6 +2142,8 @@ class BotApp:
 
     async def _send_kb_local(self, request: Request, reason: str, text: str) -> None:
         """`/kb` 的本地提示：kind=`notice_local`，不占主动通知冷却（D-1）。"""
+        if self._is_expired(getattr(request, "expires_at", None)):
+            return
         if self._ctx.generation(request.session_key) != request.generation:
             return
         log_event(
@@ -2076,20 +2156,22 @@ class BotApp:
         )
         if self._unavailable:
             return
-        outcome = await self._sender.send(
+        await self._send_message(
             request.channel_id,
             text,
             request.message.id,
             kind="notice_local",
             thread_root_id=request.thread_root_id,
+            expires_at=getattr(request, "expires_at", None),
         )
-        self._note_forbidden(outcome)
 
     async def _send_capability_unavailable(
         self, request: Request, capability: Capability, reason: str
     ) -> None:
         """显式授权了能力但它不可用时只发本地提示，并记下可判别的 feature 与 reason。"""
         # 只有本地能力没有这句文案，而它们在自己的代码路径上收口（如 `/kb`），不会到这里。
+        if self._is_expired(getattr(request, "expires_at", None)):
+            return
         text = capability.unavailable_text
         if text is None:
             return
@@ -2104,14 +2186,14 @@ class BotApp:
             channel_id=request.channel_id,
             channel_kind=request.channel_kind,
         )
-        outcome = await self._sender.send(
+        await self._send_message(
             request.channel_id,
             text,
             request.message.id,
             kind="notice_local",
             thread_root_id=request.thread_root_id,
+            expires_at=getattr(request, "expires_at", None),
         )
-        self._note_forbidden(outcome)
 
     async def _send_media_unavailable(self, request: Request, text: str) -> None:
         """整条消息就是引用但读不到：本地提示，不调模型。
@@ -2120,16 +2202,16 @@ class BotApp:
         都是应答明确用户动作的本地回复（D-1）。用 notice 会占掉该用户 24 小时的
         主动通知名额，把一次「没读到」变成「今天别再提醒他」（D-30）。
         """
-        if self._unavailable:
+        if self._unavailable or self._is_expired(getattr(request, "expires_at", None)):
             return
-        outcome = await self._sender.send(
+        await self._send_message(
             request.channel_id,
             text,
             request.message.id,
             kind="notice_local",
             thread_root_id=request.thread_root_id,
+            expires_at=getattr(request, "expires_at", None),
         )
-        self._note_forbidden(outcome)
 
     @staticmethod
     def _pending_turn(
@@ -2242,9 +2324,25 @@ class BotApp:
         过期链的内存上下文必须**同时失效**：否则一个在途请求会把正文写回
         已经过期的链，下一个人回复旧消息时又变成新链，上下文对不上。
         """
+        now = time.time()
+        try:
+            await self._store.expire_orphaned_events(
+                now=now,
+                max_age_seconds=getattr(
+                    self._config.behavior, "message_max_age_seconds", 10800
+                ),
+            )
+        except Exception as exc:
+            # 过期孤儿清理失败不得阻止清理其他运行状态；下一周期会重试。
+            log_event(
+                _logger,
+                logging.WARNING,
+                "app.expired_events_failed",
+                error=type(exc).__name__,
+            )
         try:
             result = await self._store.prune_runtime_state(
-                now=time.time(), cfg=self._config.storage
+                now=now, cfg=self._config.storage
             )
         except Exception as exc:
             log_event(_logger, logging.ERROR, "app.cleanup_failed", error=type(exc).__name__)

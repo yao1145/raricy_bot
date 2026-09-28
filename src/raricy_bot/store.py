@@ -337,7 +337,8 @@ _SCHEMA: tuple[str, ...] = (
         message_id INTEGER PRIMARY KEY,
         channel_id TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'pending',
-        received_at REAL NOT NULL
+        received_at REAL NOT NULL,
+        expires_at REAL
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_events_status ON events (status)",
@@ -745,6 +746,11 @@ class Store:
         conn.execute(f"PRAGMA journal_size_limit={int(self._wal_journal_limit_bytes)}")
         for statement in _SCHEMA:
             conn.execute(statement)
+        event_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(events)").fetchall()
+        }
+        if "expires_at" not in event_columns:
+            conn.execute("ALTER TABLE events ADD COLUMN expires_at REAL")
         conn.commit()
         return conn
 
@@ -774,18 +780,26 @@ class Store:
 
     # --- 事件与水位（去重主键是 message_id，不是 event_id）------------------
 
-    async def record_event(self, event_id: int | None, message_id: int, channel_id: str) -> bool:
+    async def record_event(
+        self,
+        event_id: int | None,
+        message_id: int,
+        channel_id: str,
+        *,
+        expires_at: float | None = None,
+    ) -> bool:
         """记录一条候选事件；返回 True 表示首次记录，False 表示该 message_id 已存在。
 
         `event_id` 为 None 表示消息来自 resync 拉取，没有 SSE 事件 id。
+        `expires_at` 是消息的绝对 epoch 秒过期时间；不传时保留 NULL，兼容旧调用和旧事件。
         """
 
         def operation(conn: sqlite3.Connection) -> bool:
             cursor = conn.execute(
                 "INSERT OR IGNORE INTO events"
-                " (event_id, message_id, channel_id, status, received_at)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (event_id, message_id, channel_id, STATUS_PENDING, time.time()),
+                " (event_id, message_id, channel_id, status, received_at, expires_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (event_id, message_id, channel_id, STATUS_PENDING, time.time(), expires_at),
             )
             conn.commit()
             return cursor.rowcount > 0
@@ -885,6 +899,47 @@ class Store:
                 "UPDATE events SET status = ? WHERE status = ?",
                 (STATUS_RECOVER, STATUS_PENDING),
             )
+            conn.commit()
+            return int(cursor.rowcount)
+
+        return await self._execute(operation)
+
+    async def expire_orphaned_events(self, *, now: float, max_age_seconds: int) -> int:
+        """将已发送或已过期的 recover 行终结，返回本次新标记为 skipped 的数量。
+
+        先按 `sent_replies` 的 `(channel_id, reply_to)` 证据修成 done，再把已到绝对
+        过期时间的行标成 skipped。升级前的行没有 `expires_at`，仅按 `received_at` 加
+        最大年龄判断。只处理 recover，因此可在启动与周期清理中重复调用而不碰本进程
+        的 pending 工作。
+        """
+        if max_age_seconds < 0:
+            raise ValueError("max_age_seconds 不能为负数")
+
+        def operation(conn: sqlite3.Connection) -> int:
+            try:
+                conn.execute(
+                    "UPDATE events SET status = ? WHERE status = ?"
+                    " AND EXISTS ("
+                    " SELECT 1 FROM sent_replies"
+                    " WHERE sent_replies.channel_id = events.channel_id"
+                    " AND sent_replies.reply_to = events.message_id"
+                    " )",
+                    (STATUS_DONE, STATUS_RECOVER),
+                )
+                cursor = conn.execute(
+                    "UPDATE events SET status = ? WHERE status = ?"
+                    " AND NOT EXISTS ("
+                    " SELECT 1 FROM sent_replies"
+                    " WHERE sent_replies.channel_id = events.channel_id"
+                    " AND sent_replies.reply_to = events.message_id"
+                    " )"
+                    " AND ((expires_at IS NOT NULL AND expires_at <= ?)"
+                    " OR (expires_at IS NULL AND received_at + ? <= ?))",
+                    (STATUS_SKIPPED, STATUS_RECOVER, now, max_age_seconds, now),
+                )
+            except BaseException:
+                conn.rollback()
+                raise
             conn.commit()
             return int(cursor.rowcount)
 

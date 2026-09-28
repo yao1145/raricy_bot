@@ -32,8 +32,10 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from .. import texts
+from ..chat_expiry import message_expiry
 from ..capabilities import CAPABILITY_BY_FEATURE
 from ..config import BehaviorConfig, StorageConfig
 from ..logging_setup import get_logger, log_event, new_trace_id
@@ -154,6 +156,8 @@ class Request:
     # 本地随机关联标识（计划 §4）：把同一条消息的路由判定、模型失败与发送结果串起来。
     # 它只由随机数生成，不编码 message_id / 用户 / 频道 —— 因此可以安全地进日志与归档。
     trace_id: str = ""
+    # 站点消息的处理截止时间；App 在执行耗时步骤和发送本地文案前再次检查。
+    expires_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -171,6 +175,7 @@ class RouteResult:
     reason: str
     actor_id: str | None = None  # 触发者；主动通知按它计冷却（D-18）
     thread_root_id: int | None = None  # 同 Request；DM 恒为 None
+    expires_at: float | None = None  # 当前消息的处理截止时间；流控/非消息结果为 None
 
 
 class MessageRouter:
@@ -274,13 +279,24 @@ class MessageRouter:
     ) -> RouteResult:
         """消息的判定顺序（§12）；`record_event` 在第 6 步才调用（D-15）。"""
         is_lobby = channel_id == LOBBY
+        expires_at, expired = message_expiry(
+            message.created_at,
+            now=self._now(),
+            max_age_seconds=self._cfg.message_max_age_seconds,
+        )
+
+        def emit_current_message(
+            action: str, reason: str, **kwargs: Any
+        ) -> RouteResult:
+            """给本条消息的所有路由结果带上同一处理截止时间。"""
+            return self._emit(action, reason, expires_at=expires_at, **kwargs)
 
         # 0. 大区近期消息观察（§38.2）。**必须排在所有过滤之前**：机器人自己的公开回复
         #    也要被看见，未 @ 的普通消息也要被看见，而 observe() 自己负责文本准入
         #    （图片、拍一拍、已删除、空正文）。它是同步纯内存操作，放在最前面不会产生
         #    「哪条消息绕过去了」的空档。私聊不观察：那是一对一的私有频道。
         trigger_sequence: int | None = None
-        if is_lobby:
+        if is_lobby and not expired:
             trigger_sequence = self._observe_lobby_message(message)
 
         # 1. 私聊频道登记（大区不登记）。
@@ -293,7 +309,7 @@ class MessageRouter:
             # 站点成功信封没带消息对象、或本地映射写入失败时，这是唯一的兜底。
             if is_lobby and message.reply is not None and not message.reply.is_deleted:
                 await self._attach_self_echo(message)
-            return self._emit(
+            return emit_current_message(
                 "ignored",
                 "self_message",
                 channel_id=channel_id,
@@ -302,7 +318,7 @@ class MessageRouter:
                 event_id=event_id,
             )
         if message.is_deleted:
-            return self._emit(
+            return emit_current_message(
                 "ignored",
                 "deleted",
                 channel_id=channel_id,
@@ -311,7 +327,7 @@ class MessageRouter:
                 event_id=event_id,
             )
         if message.pat is not None:
-            return self._emit(
+            return emit_current_message(
                 "ignored",
                 "pat",
                 channel_id=channel_id,
@@ -323,7 +339,7 @@ class MessageRouter:
         # 5. 频道判定与正文提取。
         if is_lobby:
             if not contains_bot_mention(message.content, self._bot_username):
-                return self._emit(
+                return emit_current_message(
                     "ignored",
                     "no_mention",
                     channel_id=channel_id,
@@ -343,7 +359,9 @@ class MessageRouter:
             channel_kind = "dm"
 
         # 6. 主去重键拦截：只有通过前面过滤的候选消息才落库（D-15）。
-        if not await self._store.record_event(event_id, message.id, channel_id):
+        if not await self._store.record_event(
+            event_id, message.id, channel_id, expires_at=expires_at
+        ):
             # 该 message_id 已有记录。两种可能：
             #   (a) 本进程已入队的重复投递 —— 应当忽略；
             #   (b) **上一进程崩溃时遗留的未完成事件**（启动时被
@@ -351,7 +369,7 @@ class MessageRouter:
             # 没有 (b) 这条分支的话，崩溃后靠水位补发回来的消息会被当成 duplicate
             # 丢掉：消息永远不处理、该行永远 pending、水位永远卡在它之前。
             if not await self._store.reclaim_orphan(message.id):
-                return self._emit(
+                return emit_current_message(
                     "ignored",
                     "duplicate",
                     channel_id=channel_id,
@@ -364,7 +382,7 @@ class MessageRouter:
             # 那就补一个完成标记即可，绝不能再回一遍。
             if await self._store.find_sent_for_reply(channel_id, message.id) is not None:
                 await self._store.mark_handled(message.id, "done")
-                return self._emit(
+                return emit_current_message(
                     "ignored",
                     "recovered_sent",
                     channel_id=channel_id,
@@ -373,6 +391,20 @@ class MessageRouter:
                     channel_kind=channel_kind,
                     event_id=event_id,
                 )
+
+        # 已通过候选过滤、去重认领和已发记录检查，现可将旧消息收为终态。
+        # 必须早于共享链解析、命令执行、近期消息消费与任何回复/入队路径。
+        if expired:
+            await self._store.mark_handled(message.id, "skipped")
+            return emit_current_message(
+                "ignored",
+                "expired",
+                channel_id=channel_id,
+                message_id=message.id,
+                reply_to=message.id,
+                channel_kind=channel_kind,
+                event_id=event_id,
+            )
 
         # 7. 引用上下文（已删除的引用视为无）。
         reply_context: str | None = None
@@ -387,7 +419,7 @@ class MessageRouter:
             )
             if thread_root_id is None:
                 # 解析失败已经记过日志：不调模型、不回话，事件保持非终态等补发。
-                return self._emit(
+                return emit_current_message(
                     "ignored",
                     "thread_resolve_failed",
                     channel_id=channel_id,
@@ -413,6 +445,7 @@ class MessageRouter:
                     session_key=session_key,
                     thread_root_id=thread_root_id,
                     event_id=event_id,
+                    expires_at=expires_at,
                 )
 
         # 9.1 解析单轮能力命令（D-39）。命令本身不是聊天正文，不进入模型；一条消息里
@@ -428,7 +461,7 @@ class MessageRouter:
             enabled_features = frozenset({capability})
             if not user_text:
                 spec = CAPABILITY_BY_FEATURE[capability]
-                return self._emit(
+                return emit_current_message(
                     "reply_now",
                     f"{capability}_usage",
                     channel_id=channel_id,
@@ -443,7 +476,7 @@ class MessageRouter:
                 leading_capability_command(user_text) is not None
                 or self._leads_with_memory_command(user_text)
             ):
-                return self._emit(
+                return emit_current_message(
                     "reply_now",
                     "capability_conflict",
                     channel_id=channel_id,
@@ -470,7 +503,7 @@ class MessageRouter:
                 queued_reason = "image_only"
             elif message.image is not None:
                 # 有图但读不到：图片输入未开启，或 image_missing。
-                return self._emit(
+                return emit_current_message(
                     "reply_now",
                     "media_only",
                     channel_id=channel_id,
@@ -483,7 +516,7 @@ class MessageRouter:
                 )
             elif message.blog is not None:
                 # 走到这里必然 blog_missing：站方已经告诉我们它没了。
-                return self._emit(
+                return emit_current_message(
                     "reply_now",
                     "media_only",
                     channel_id=channel_id,
@@ -495,7 +528,7 @@ class MessageRouter:
                     event_id=event_id,
                 )
             else:
-                return self._emit(
+                return emit_current_message(
                     "reply_now",
                     "empty",
                     channel_id=channel_id,
@@ -509,7 +542,7 @@ class MessageRouter:
 
         # 9.3 /help 本地应答，不触发模型。
         if is_help_command(user_text):
-            return self._emit(
+            return emit_current_message(
                 "reply_now",
                 "help",
                 channel_id=channel_id,
@@ -528,7 +561,7 @@ class MessageRouter:
         if is_reset_command(user_text):
             if not is_lobby:
                 self._ctx.reset(session_key)
-            return self._emit(
+            return emit_current_message(
                 "reply_now",
                 "reset",
                 channel_id=channel_id,
@@ -544,7 +577,7 @@ class MessageRouter:
 
         # 9.6 超长输入本地拦截。
         if len(user_text) > self._cfg.max_input_chars:
-            return self._emit(
+            return emit_current_message(
                 "reply_now",
                 "too_long",
                 channel_id=channel_id,
@@ -558,7 +591,7 @@ class MessageRouter:
 
         # 9.7 索取系统提示 / 密钥本地拒绝。
         if is_secret_probe(user_text):
-            return self._emit(
+            return emit_current_message(
                 "reply_now",
                 "secret_probe",
                 channel_id=channel_id,
@@ -593,13 +626,14 @@ class MessageRouter:
             # `message.author.id`，公开记忆路径拿到的只有这个不可逆的 key（R1）。
             public_memory_subject=self._public_memory_subject(message.author),
             lobby_recent=lobby_recent,
+            expires_at=expires_at,
         )
         try:
             self._queue.put_nowait(request)
         except asyncio.QueueFull:
             # 队列满 = 没有模型请求入队 = 这一批不算消费：一条都不删，
             # 留给下一次真正跑起来的唤起（设计 §13.2）。
-            return self._emit(
+            return emit_current_message(
                 "busy",
                 "queue_full",
                 channel_id=channel_id,
@@ -615,7 +649,7 @@ class MessageRouter:
         # 之后模型失败、额度拒绝、发送失败、代次失效或进程退出都不回滚（D-95 第 2 条）。
         if trigger_sequence is not None and self._lobby_recent is not None:
             self._lobby_recent.discard_through(trigger_sequence)
-        return self._emit(
+        return emit_current_message(
             "queued",
             queued_reason if queued_reason is not None else "queued",
             channel_id=channel_id,
@@ -772,6 +806,7 @@ class MessageRouter:
         session_key: str,
         thread_root_id: int | None,
         event_id: int | None,
+        expires_at: float | None,
     ) -> RouteResult:
         """记忆命令的授权与入队（§34.1）；不调模型、不读命令以外的任何状态。
 
@@ -790,6 +825,7 @@ class MessageRouter:
                 channel_kind=channel_kind,
                 thread_root_id=thread_root_id,
                 event_id=event_id,
+                expires_at=expires_at,
             )
         access = self._memory_access
         queue = self._memory_queue
@@ -814,6 +850,7 @@ class MessageRouter:
                 channel_kind=channel_kind,
                 thread_root_id=thread_root_id,
                 event_id=event_id,
+                expires_at=expires_at,
             )
         request = MemoryCommandRequest(
             event_id=event_id,
@@ -828,6 +865,7 @@ class MessageRouter:
             # 不在这里清洗、也不额外查询：`/memory public` 据此写 `owner_username`，
             # 合法性由 `publish_private`（R8）与 codec 的 `_check_public` 两道校验把关。
             username=message.author.username,
+            expires_at=expires_at,
         )
         try:
             queue.put_nowait(request)
@@ -844,6 +882,7 @@ class MessageRouter:
                 channel_kind=channel_kind,
                 thread_root_id=thread_root_id,
                 event_id=event_id,
+                expires_at=expires_at,
             )
         # 事件此刻已完成去重登记，**终态由记忆 worker 负责**（`mark_handled`，§34.3）：
         # 这里不标记完成，也不构造聊天 Request —— app 不把 `memory_queued` 当聊天请求。
@@ -856,6 +895,7 @@ class MessageRouter:
             channel_kind=channel_kind,
             thread_root_id=thread_root_id,
             event_id=event_id,
+            expires_at=expires_at,
         )
 
     # --- 大区共享链 ---------------------------------------------------------
@@ -940,6 +980,7 @@ class MessageRouter:
         channel_kind: str | None = None,
         event_id: int | None = None,
         thread_root_id: int | None = None,
+        expires_at: float | None = None,
     ) -> RouteResult:
         """构造 RouteResult 并按白名单字段记一条日志。"""
         result = RouteResult(
@@ -952,6 +993,7 @@ class MessageRouter:
             reason=reason,
             actor_id=actor_id,
             thread_root_id=thread_root_id,
+            expires_at=expires_at,
         )
         # 只输出 LOG_FIELDS 白名单内的稳定字段，且不打印空值。
         fields: dict[str, object] = {"reason": reason}

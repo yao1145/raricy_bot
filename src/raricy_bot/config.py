@@ -213,6 +213,8 @@ class BehaviorConfig:
     context_turns: int = 10
     context_input_tokens: int = 8000
     max_input_chars: int = 8000
+    # 站点创建时间为 UTC+8 墙上时间；超过此年龄的候选消息静默跳过。
+    message_max_age_seconds: int = 10800
     # 引用博客正文的长度上限。默认值与 comments.article_max_chars 相同，但**是两个键**：
     # 聊天模型与评论模型未必是同一个，两边各自可调。
     quoted_blog_max_chars: int = 1000
@@ -839,6 +841,9 @@ def _behavior(container: Mapping[str, Any]) -> BehaviorConfig:
     context_turns = _positive_int(container, "context_turns", "behavior", 10)
     context_input_tokens = _positive_int(container, "context_input_tokens", "behavior", 8000)
     max_input_chars = _positive_int(container, "max_input_chars", "behavior", 8000)
+    message_max_age_seconds = _positive_int(
+        container, "message_max_age_seconds", "behavior", 10800
+    )
     quoted_blog_max_chars = _positive_int(
         container, "quoted_blog_max_chars", "behavior", 1000
     )
@@ -860,6 +865,7 @@ def _behavior(container: Mapping[str, Any]) -> BehaviorConfig:
         context_turns=context_turns,
         context_input_tokens=context_input_tokens,
         max_input_chars=max_input_chars,
+        message_max_age_seconds=message_max_age_seconds,
         quoted_blog_max_chars=quoted_blog_max_chars,
         content_ref_max_chars=content_ref_max_chars,
         max_output_chars=max_output_chars,

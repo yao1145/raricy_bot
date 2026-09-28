@@ -100,6 +100,8 @@ class MemoryCommandRequest:
     # 缺省空串表示拿不到身份：`publish_private` 按 R8 回 `invalid_proposal`，Controller 映射到
     # `MEMORY_PUBLIC_IDENTITY_TEXT`。默认值让既有构造点（与测试）逐字不变。
     username: str = ""
+    # Router 计算的站点消息处理截止时间；记忆 worker 与本地发送器据此跳过过期工作。
+    expires_at: float | None = None
 
 
 @dataclass(frozen=True)

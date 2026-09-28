@@ -130,6 +130,7 @@ behavior:  # 聊天上下文、输入输出、并发与配额
   context_turns: 10  # 每个会话保留的完整对话轮数
   context_input_tokens: 8000  # 文字上下文的估算 token 预算；图片成本另行限制
   max_input_chars: 8000  # 剥离提及和命令后的输入字符上限
+  message_max_age_seconds: 10800  # 站点消息创建后允许处理的秒数；到期或时间无效时静默跳过
   quoted_blog_max_chars: 1000  # 引用博客正文的字符上限，超长时只提供标题和说明
   content_ref_max_chars: 2000  # 单条引用展开字符上限，同时约束消息和评论正文的展开总预算
   max_output_chars: 5000  # 出站字符上限，超出时按自然段截断并添加后缀
