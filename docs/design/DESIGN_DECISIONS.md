@@ -1515,7 +1515,7 @@ N2 = D-143–147，N4 = D-142 与 D-148 起；D-148、D-149 已占用）；本�
 所有聊天候选消息（包括命令和本地提示）在 `created_at` 可解析时保存绝对 `expires_at` epoch 秒；站方时间格式按 UTC+8 解释，时限取 `behavior.message_max_age_seconds`（默认 10_800 秒）。缺失或非法的时间直接把事件标为 `skipped`，不回复，过期列保持 NULL；事件表不保存正文。过期扫描在启动标记孤儿后及既有周期清理中执行，只处理 `recover`：
 
 - 匹配 `sent_replies(channel_id, reply_to)` 的事件先标 `done`，优先避免把已发送回复当成未处理事件。
-- 其余 `expires_at <= now` 的事件转成 `skipped`；新鲜 recover 行仍由水位补发并原子认领（D-17）。消息进入队列后，worker、模型返回后、发送前与发送重试前都复查同一截止时间；到期静默跳过并释放未结配额。
+- 其余 `expires_at <= now` 的事件转成 `skipped`；新鲜 recover 行仍由水位补发并原子认领（D-17）。Router 在候选事件登记与大区链解析的异步等待后、命令副作用和入队前复查；大区链在数据库写入前也检查，过期不建链。消息进入队列后，worker、模型返回后、发送前与发送重试前都复查同一截止时间。401 重登路径在重登前后复查，过期不重投；到期静默跳过并释放未结配额。
 - 迁移前的行 `expires_at` 为 NULL，仅在 `received_at + max_age_seconds <= now` 时跳过。周期重扫解决启动时还新鲜、随后超过配置时限但服务端没有再次补发的遗留 recover。
 
 `events.expires_at` 只保存时间元数据。旧库通过幂等 `ALTER TABLE` 增列，不重写接收时间，不删除事件，也不改变 message ID 去重、NULL event ID 不推进水位或 D-23 的安全清理锚点。

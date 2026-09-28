@@ -1919,15 +1919,17 @@ class Store:
         force_new: bool,
         now: float,
         retention_seconds: int,
-    ) -> int:
+        is_expired: Callable[[], bool] | None = None,
+    ) -> int | None:
         """命中活动链或新建链，登记 `message_id`，返回 `thread_root_id`。
 
         整体在**一个事务**内完成「查目标链是否活动 → 建链或命中 → 登记本条 → 刷新时间」，
         两个并发回复因此不会各自建出一条链（INTERFACES §9.3）。
         活动判据是开区间：`updated_at > now - retention_seconds`。
+        `is_expired` 由聊天路由注入，在写入前复查；过期则返回 None 且不建链。
         """
 
-        def operation(conn: sqlite3.Connection) -> int:
+        def operation(conn: sqlite3.Connection) -> int | None:
             root = message_id
             if not force_new and reply_to is not None:
                 row = conn.execute(
@@ -1943,6 +1945,9 @@ class Store:
                     ).fetchone()
                     if active is not None:
                         root = candidate
+
+            if is_expired is not None and is_expired():
+                return None
 
             conn.execute(
                 "INSERT OR IGNORE INTO lobby_threads(thread_root_id, created_at, updated_at)"

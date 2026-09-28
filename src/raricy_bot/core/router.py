@@ -291,6 +291,21 @@ class MessageRouter:
             """给本条消息的所有路由结果带上同一处理截止时间。"""
             return self._emit(action, reason, expires_at=expires_at, **kwargs)
 
+        async def skip_if_expired() -> RouteResult | None:
+            """每次候选消息跨过异步边界后，先终结过期事件。"""
+            if not expired and (expires_at is None or self._now() < expires_at):
+                return None
+            await self._store.mark_handled(message.id, "skipped")
+            return emit_current_message(
+                "ignored",
+                "expired",
+                channel_id=channel_id,
+                message_id=message.id,
+                reply_to=message.id,
+                channel_kind=channel_kind,
+                event_id=event_id,
+            )
+
         # 0. 大区近期消息观察（§38.2）。**必须排在所有过滤之前**：机器人自己的公开回复
         #    也要被看见，未 @ 的普通消息也要被看见，而 observe() 自己负责文本准入
         #    （图片、拍一拍、已删除、空正文）。它是同步纯内存操作，放在最前面不会产生
@@ -394,17 +409,9 @@ class MessageRouter:
 
         # 已通过候选过滤、去重认领和已发记录检查，现可将旧消息收为终态。
         # 必须早于共享链解析、命令执行、近期消息消费与任何回复/入队路径。
-        if expired:
-            await self._store.mark_handled(message.id, "skipped")
-            return emit_current_message(
-                "ignored",
-                "expired",
-                channel_id=channel_id,
-                message_id=message.id,
-                reply_to=message.id,
-                channel_kind=channel_kind,
-                event_id=event_id,
-            )
+        expired_result = await skip_if_expired()
+        if expired_result is not None:
+            return expired_result
 
         # 7. 引用上下文（已删除的引用视为无）。
         reply_context: str | None = None
@@ -415,8 +422,11 @@ class MessageRouter:
         thread_root_id: int | None = None
         if is_lobby:
             thread_root_id = await self._resolve_thread(
-                channel_id, message, user_text, event_id
+                channel_id, message, user_text, event_id, expires_at
             )
+            expired_result = await skip_if_expired()
+            if expired_result is not None:
+                return expired_result
             if thread_root_id is None:
                 # 解析失败已经记过日志：不调模型、不回话，事件保持非终态等补发。
                 return emit_current_message(
@@ -901,7 +911,12 @@ class MessageRouter:
     # --- 大区共享链 ---------------------------------------------------------
 
     async def _resolve_thread(
-        self, channel_id: str, message: ChatMessage, user_text: str, event_id: int | None
+        self,
+        channel_id: str,
+        message: ChatMessage,
+        user_text: str,
+        event_id: int | None,
+        expires_at: float | None,
     ) -> int | None:
         """解析这条大区消息属于哪条链，并登记它；失败返回 None 并记一条无正文错误。
 
@@ -923,6 +938,11 @@ class MessageRouter:
                 force_new=is_reset_command(self._inner_text(user_text)),
                 now=self._now(),
                 retention_seconds=self._storage.lobby_thread_retention_seconds,
+                is_expired=(
+                    (lambda: self._now() >= expires_at)
+                    if expires_at is not None
+                    else None
+                ),
             )
         except Exception as exc:  # 写不进去就不处理这条消息，绝不猜测归属
             log_event(

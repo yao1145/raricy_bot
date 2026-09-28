@@ -120,6 +120,7 @@ Key、会话 Cookie；用户名不是密钥。
 [聊天契约](../materials/chat-bot.md)、[评论契约](../materials/comment-bot.md) 优先。
 
 - 信封成功判据为 `code == 200`；发消息的 `message` 可为消息对象。spider 裸 JSON 读口单独解析。
+- 聊天发送遇 401 重登时，带截止时间的调用须在重登前后复查，过期则不进行第二次 POST（D-153）。
 - 不设置 `Origin` / `Referer`，登录并保存的 Cookie 不得出现在日志或错误正文。
 - `open_stream` 独立设置 300 秒读超时，不继承普通请求的 20 秒默认值。
 - 博客、评论等原匿名读口现须带会话 Cookie（D-104）；辅助读取的 401 不触发额外重登录。
@@ -190,7 +191,7 @@ DM 按频道，公开链用 `lobby-thread:<root_id>`，重启保留归属但不�
 6. 入队成功才消费近期批次。queued 由 worker 终结，reply_now/busy 由 App 终结；
    memory_queued 交记忆 worker，不当作普通聊天任务。
 
-候选消息若时间缺失或不符合站方格式，仍只落候选事件元数据并立即标为 `skipped`，不回复；可解析但已过期的消息同样静默标 `skipped`。未过期任务把 `expires_at` 随 Request/RouteResult 传下去，覆盖命令和 `notice_local` 等本地应答。
+候选消息若时间缺失或不符合站方格式，仍只落候选事件元数据并立即标为 `skipped`，不回复；可解析但已过期的消息同样静默标 `skipped`。登记事件、解析大区链等异步等待后须复查截止时间，再执行命令副作用或入队；大区链解析在数据库写入前也复查，防止已过期的 `/reset` 留下新链。未过期任务把 `expires_at` 随 Request/RouteResult 传下去，覆盖命令和 `notice_local` 等本地应答。
 
 大区 reset 以命令 ID 建新链，不清旧链；DM reset 清历史并递增 generation（D-21）。
 

@@ -350,7 +350,18 @@ class MessageSender:
         await self._client.ensure_session()
         if self._is_expired(expires_at):
             raise _DeadlineExpired
-        return await self._client.post_message(channel_id, content, reply_to=reply_to)
+
+        def check_retry_deadline() -> None:
+            """客户端 401 重登前后复查，防止其内部重发越过截止时间。"""
+            if self._is_expired(expires_at):
+                raise _DeadlineExpired
+
+        return await self._client.post_message(
+            channel_id,
+            content,
+            reply_to=reply_to,
+            before_retry=check_retry_deadline if expires_at is not None else None,
+        )
 
     async def _on_error(
         self,

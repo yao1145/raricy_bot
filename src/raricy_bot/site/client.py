@@ -17,7 +17,7 @@ import logging
 import math
 import re
 import urllib.parse
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -341,12 +341,20 @@ class SiteClient:
         return messages
 
     async def post_message(
-        self, channel_id: str, content: str, *, reply_to: int | None = None
+        self,
+        channel_id: str,
+        content: str,
+        *,
+        reply_to: int | None = None,
+        before_retry: Callable[[], None] | None = None,
     ) -> ChatMessage | None:
         """发消息；成功判据只看 `code == 200`，消息体不可用时返回 None。
 
         §7.2 的例外：本接口成功时的 `message` 是消息对象而非字符串，
         退化成字符串（或缺失）时返回 None，调用方必须容忍。
+
+        `before_retry` 供有截止时间的调用方在 401 重登前后复核；抛出的异常
+        原样传回调用方，避免认证等待后绕过发送限制。
         """
         path = _messages_path(channel_id)
         body: dict[str, Any] = {"content": content}
@@ -356,7 +364,11 @@ class SiteClient:
         response, payload = await self._request_envelope("POST", path, json_body=body)
         if payload["code"] == 401:
             # 会话失效：重新登录一次并重试一次。
+            if before_retry is not None:
+                before_retry()
             await self._relogin()
+            if before_retry is not None:
+                before_retry()
             response, payload = await self._request_envelope("POST", path, json_body=body)
         if payload["code"] != 200:
             raise self._error_from_payload(response, payload)
