@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from ..config import BehaviorConfig
@@ -47,8 +47,12 @@ _CSRF_MARKERS: tuple[str, ...] = ("跨源", "CSRF")
 _SETTLE_WAIT_TIMEOUT_SECONDS: float = 3.0
 
 
-class _DeadlineExpired(Exception):
-    """发送准备阶段越过消息截止时间时使用的内部短路信号。"""
+class _SendAborted(Exception):
+    """发送准备阶段截止时间或会话代次失效时的内部短路信号。"""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 def _forbidden_reason(message: str) -> str:
@@ -123,6 +127,7 @@ class MessageSender:
         actor_id: str | None = None,
         thread_root_id: int | None = None,
         expires_at: float | None = None,
+        generation_is_current: Callable[[], bool] | None = None,
     ) -> SendResult:
         """脱敏、表情归一与截断后发送；`kind` 与 `actor_id` 原样透传给 `quota`（三值见 §10）。
 
@@ -133,9 +138,12 @@ class MessageSender:
         让这条出站消息成为后续加入该链的锚点（D-20）。私聊恒为 None。
 
         `expires_at` 是这条输入消息的过期时刻。旧的直接调用不传时保留原行为。
+        `generation_is_current` 由调用方提供同步代次校验；每次 POST 前复核，
+        失效时只读对账仍可确认此前的发送，但绝不重投。
         """
-        if self._is_expired(expires_at):
-            result = SendResult(False, None, "expired")
+        abort_reason = self._abort_reason(expires_at, generation_is_current)
+        if abort_reason is not None:
+            result = SendResult(False, None, abort_reason)
             self._log(result, channel_id, kind)
             return result
 
@@ -167,23 +175,24 @@ class MessageSender:
 
         # 第 2 步：配额预留；三种拒绝都不写 send_attempts。
         reservation = await self._quota.reserve(channel_id, kind, actor_id=actor_id)
-        if self._is_expired(expires_at):
-            if reservation.allowed:
-                await self._run_settlement(
-                    self._release_reservation(channel_id, kind, actor_id)
-                )
-            result = SendResult(False, None, "expired")
-            self._log(result, channel_id, kind)
-            return result
         if not reservation.allowed:
-            result = SendResult(False, None, self._deny_reason(reservation.decision))
+            abort_reason = self._abort_reason(expires_at, generation_is_current)
+            result = SendResult(
+                False, None, abort_reason or self._deny_reason(reservation.decision)
+            )
             self._log(result, channel_id, kind)
             return result
 
         # 从这里开始持有预留：下面每一个出口都必须恰好 note_sent / release 一次。
         # `_deliver` 只做 POST 与对账，不结算；结算统一在本方法里做，保证唯一所有权。
         try:
-            delivery = await self._deliver(channel_id, content, reply_to, expires_at)
+            abort_reason = self._abort_reason(expires_at, generation_is_current)
+            if abort_reason is not None:
+                delivery = _Delivery(SendResult(False, None, abort_reason), None, False)
+            else:
+                delivery = await self._deliver(
+                    channel_id, content, reply_to, expires_at, generation_is_current
+                )
         except BaseException:
             # 未预期的异常（含取消）也不能让预留泄漏；release 同样受取消保护，
             # 否则取消恰好落在 quota 锁等待上时，这笔预留会永久占额。
@@ -236,6 +245,18 @@ class MessageSender:
     def _is_expired(self, expires_at: float | None) -> bool:
         """兼容无截止时间的旧调用，并用可替换时钟判定新请求。"""
         return expires_at is not None and self._now() >= expires_at
+
+    def _abort_reason(
+        self,
+        expires_at: float | None,
+        generation_is_current: Callable[[], bool] | None,
+    ) -> str | None:
+        """同步复核截止时间和代次；旧的无守卫调用保持原行为。"""
+        if self._is_expired(expires_at):
+            return "expired"
+        if generation_is_current is not None and not generation_is_current():
+            return "stale_generation"
+        return None
 
     async def _run_settlement(self, operation: Awaitable[None]) -> None:
         """把终结操作放进独立 task 执行，并在取消到来时**有界地**等它完成再传播。
@@ -322,14 +343,19 @@ class MessageSender:
         content: str,
         reply_to: int | None,
         expires_at: float | None,
+        generation_is_current: Callable[[], bool] | None,
     ) -> _Delivery:
         """执行一次 POST 并处理结果；不做结算，只回报是否已确认送达。"""
         try:
-            message = await self._post_once(channel_id, content, reply_to, expires_at)
-        except _DeadlineExpired:
-            return _Delivery(SendResult(False, None, "expired"), None, False)
+            message = await self._post_once(
+                channel_id, content, reply_to, expires_at, generation_is_current
+            )
+        except _SendAborted as exc:
+            return _Delivery(SendResult(False, None, exc.reason), None, False)
         except SiteError as exc:
-            return await self._on_error(channel_id, content, reply_to, exc, expires_at)
+            return await self._on_error(
+                channel_id, content, reply_to, exc, expires_at, generation_is_current
+            )
 
         return _Delivery(
             SendResult(True, message.id if message is not None else None, "delivered"),
@@ -343,24 +369,28 @@ class MessageSender:
         content: str,
         reply_to: int | None,
         expires_at: float | None,
+        generation_is_current: Callable[[], bool] | None,
     ) -> ChatMessage | None:
         """确保会话有效后发一次消息；失败抛 `SiteError`。"""
-        if self._is_expired(expires_at):
-            raise _DeadlineExpired
-        await self._client.ensure_session()
-        if self._is_expired(expires_at):
-            raise _DeadlineExpired
+        def check_authorization() -> None:
+            """探活与客户端 401 重登前后复核，失效时中止内部重发。"""
+            reason = self._abort_reason(expires_at, generation_is_current)
+            if reason is not None:
+                raise _SendAborted(reason)
 
-        def check_retry_deadline() -> None:
-            """客户端 401 重登前后复查，防止其内部重发越过截止时间。"""
-            if self._is_expired(expires_at):
-                raise _DeadlineExpired
+        check_authorization()
+        await self._client.ensure_session()
+        check_authorization()
 
         return await self._client.post_message(
             channel_id,
             content,
             reply_to=reply_to,
-            before_retry=check_retry_deadline if expires_at is not None else None,
+            before_retry=(
+                check_authorization
+                if expires_at is not None or generation_is_current is not None
+                else None
+            ),
         )
 
     async def _on_error(
@@ -370,6 +400,7 @@ class MessageSender:
         reply_to: int | None,
         exc: SiteError,
         expires_at: float | None,
+        generation_is_current: Callable[[], bool] | None,
     ) -> _Delivery:
         """把确定性的站点错误映射为发送结果；status == 0 才进入对账。"""
         self._note_site_error(exc)
@@ -381,7 +412,9 @@ class MessageSender:
         if exc.status == 400 and reply_to is not None:
             return _Delivery(SendResult(False, None, "reply_target_gone"), None, False)
         if exc.status == 0:
-            return await self._reconcile(channel_id, content, reply_to, expires_at)
+            return await self._reconcile(
+                channel_id, content, reply_to, expires_at, generation_is_current
+            )
         return _Delivery(SendResult(False, None, "failed"), None, False)
 
     def _note_site_error(self, exc: SiteError) -> None:
@@ -401,6 +434,7 @@ class MessageSender:
         content: str,
         reply_to: int | None,
         expires_at: float | None,
+        generation_is_current: Callable[[], bool] | None,
     ) -> _Delivery:
         """结果不确定时的对账：先查本地记录，再拉 `after=reply_to` 的最新一页。
 
@@ -438,9 +472,11 @@ class MessageSender:
         # 仍未命中：允许一次重发，仅一次。重发必须完整走第 5 步的错误副作用，
         # 尤其是 429 时的退避，否则会把站点的每分钟硬限撞穿。
         try:
-            resent = await self._post_once(channel_id, content, reply_to, expires_at)
-        except _DeadlineExpired:
-            return _Delivery(SendResult(False, None, "expired"), None, False)
+            resent = await self._post_once(
+                channel_id, content, reply_to, expires_at, generation_is_current
+            )
+        except _SendAborted as exc:
+            return _Delivery(SendResult(False, None, exc.reason), None, False)
         except SiteError as exc:
             self._note_site_error(exc)
             return _Delivery(SendResult(False, None, "failed"), None, False)

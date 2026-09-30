@@ -1477,8 +1477,9 @@ class BotApp:
         actor_id: str | None = None,
         thread_root_id: int | None = None,
         expires_at: float | None = None,
+        generation_is_current: Callable[[], bool] | None = None,
     ) -> SendResult:
-        """发一条受原始消息 deadline 约束的回复并记录已确认送达状态。"""
+        """传递原始消息的截止时间和代次守卫，并记录已确认送达状态。"""
         outcome = await self._sender.send(
             channel_id,
             text,
@@ -1487,6 +1488,7 @@ class BotApp:
             actor_id=actor_id,
             thread_root_id=thread_root_id,
             expires_at=expires_at,
+            generation_is_current=generation_is_current,
         )
         if outcome.delivered and reply_to is not None:
             self._delivered_message_ids.add(reply_to)
@@ -1580,6 +1582,9 @@ class BotApp:
             actor_id=actor_id,
             thread_root_id=request.thread_root_id,
             expires_at=getattr(request, "expires_at", None),
+            generation_is_current=lambda: (
+                self._ctx.generation(request.session_key) == request.generation
+            ),
         )
 
     async def _notify_quota(self, request: Request) -> None:
@@ -1597,6 +1602,9 @@ class BotApp:
             actor_id=actor_id,
             thread_root_id=request.thread_root_id,
             expires_at=getattr(request, "expires_at", None),
+            generation_is_current=lambda: (
+                self._ctx.generation(request.session_key) == request.generation
+            ),
         )
 
     async def _notice_cooling_down(self, channel_id: str, actor_id: str | None) -> bool:
@@ -1939,6 +1947,9 @@ class BotApp:
                 kind="reply",
                 thread_root_id=request.thread_root_id,
                 expires_at=getattr(request, "expires_at", None),
+                generation_is_current=lambda: (
+                    self._ctx.generation(request.session_key) == request.generation
+                ),
             )
             if outcome.delivered:
                 # 只有用户真的看见了这一轮，才把它写进历史（D-22）。
@@ -2163,6 +2174,9 @@ class BotApp:
             kind="notice_local",
             thread_root_id=request.thread_root_id,
             expires_at=getattr(request, "expires_at", None),
+            generation_is_current=lambda: (
+                self._ctx.generation(request.session_key) == request.generation
+            ),
         )
 
     async def _send_capability_unavailable(
@@ -2193,6 +2207,9 @@ class BotApp:
             kind="notice_local",
             thread_root_id=request.thread_root_id,
             expires_at=getattr(request, "expires_at", None),
+            generation_is_current=lambda: (
+                self._ctx.generation(request.session_key) == request.generation
+            ),
         )
 
     async def _send_media_unavailable(self, request: Request, text: str) -> None:
@@ -2211,6 +2228,9 @@ class BotApp:
             kind="notice_local",
             thread_root_id=request.thread_root_id,
             expires_at=getattr(request, "expires_at", None),
+            generation_is_current=lambda: (
+                self._ctx.generation(request.session_key) == request.generation
+            ),
         )
 
     @staticmethod

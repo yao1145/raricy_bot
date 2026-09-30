@@ -1147,8 +1147,8 @@ class LocalApi:
         字段过期。首次设置（还没有任何档案）时正确的取值是 `profile_id: null`、
         `expected_profile_epoch: 0`。
 
-        返回值不是装饰：写路径必须带着它落到**同一个**档案上（见 `_commit_config()`），
-        否则门只是把竞态窗口挪了个位置。
+        返回值不是装饰：写路径必须带着它落到**同一个**档案上（见 `_commit_config()`、
+        `_write_kb_file()`），否则门只是把竞态窗口挪了个位置。
 
         元数据故障（N0 的四个码）在**判上下文之前**如实抛出：恢复态下「页面该刷新
         配置」比「页面该升级」更接近事实，且四个码是既有契约。
@@ -2434,13 +2434,14 @@ class LocalApi:
         return self._json(200, {"ok": True, "files": files, "worker": kb})
 
     async def _kb_import(self, request: Request):
-        """导入一份 Markdown 到受管目录：先写临时文件再替换（§13.2）。"""
+        """导入一份 Markdown 到核验过的档案：先写临时文件再替换（§13.2、D-146）。"""
         try:
             session = self._require_session(request)
             self._require_write(request, session)
             # 导入走更宽的传输上限（JSON 包装另留余量）：单文件上限才是真正生效的
             # 那道门，而不是被通用请求体上限抢先拒绝（审查 M9）。
             body = await self._json_body(request, limit=MAX_IMPORT_BYTES + 16 * 1024)
+            target_profile_id, expected_epoch = self._transition_gate(body)
         except ApiError as exc:
             return self._json(exc.status, exc.payload())
         name = body.get("name")
@@ -2448,14 +2449,26 @@ class LocalApi:
         if not isinstance(name, str) or not isinstance(content, str):
             return self._json(400, {"ok": False, "code": "bad_request"})
         try:
-            target = await asyncio.to_thread(self._write_kb_file, name, content)
+            target = await asyncio.to_thread(
+                self._write_kb_file,
+                name,
+                content,
+                target_profile_id,
+                expected_epoch,
+            )
         except ApiError as exc:
             return self._json(exc.status, exc.payload())
         except OSError:
             return self._json(500, {"ok": False, "code": "write_failed"})
         return self._json(200, {"ok": True, "name": target.name})
 
-    def _write_kb_file(self, name: str, content: str) -> Path:
+    def _write_kb_file(
+        self,
+        name: str,
+        content: str,
+        target_profile_id: str | None,
+        expected_epoch: int,
+    ) -> Path:
         if len(name) > MAX_IMPORT_NAME_CHARS or not name.lower().endswith(".md"):
             raise ApiError(422, "invalid_file_name", field="name")
         # 只取纯文件名：不解释路径、不允许目录穿越（§13.2）。
@@ -2465,15 +2478,25 @@ class LocalApi:
         payload = content.encode("utf-8")
         if len(payload) > MAX_IMPORT_BYTES:
             raise ApiError(413, "file_too_large")
-        # 导入是写路径，但目标档案必须是**已有**的：没有档案时回 409
-        # `no_active_profile`，不在这里顺手建一个（D-135）。删除中的档案同样拒绝：
-        # 往正在删除的账号里写知识库文件违反 §6.2 第 1 步。指针在场但档案记录
-        # 还没建（N1 的首次写入语义）仍照旧放行 —— 那不是「删除中」。
-        profile_id = self._profile_id()
-        record = self._record_or_none(profile_id)
+        # 工作线程只使用门核过的档案 ID，绝不跟随可能已经切换的活动指针。
+        # 再核一次当前指针与代次：通常在指针切换后立即拒绝；最后核验与写盘之间
+        # 仍有窄窗口，但目标已固定，因此即使返回成功也只会写入原档案。
+        catalog = self._profiles.catalog()
+        if catalog.active_epoch != expected_epoch:
+            raise ApiError(
+                409, "revision_conflict", field="expected_profile_epoch"
+            )
+        if catalog.active_profile_id != target_profile_id:
+            raise ApiError(409, "revision_conflict", field="profile_id")
+        if target_profile_id is None:
+            # 空根目录的 KB 导入不建立首个档案（D-135）。
+            raise ApiError(409, "no_active_profile")
+        # 删除中的档案同样拒绝：往正在删除的账号里写知识库文件违反 §6.2 第 1 步。
+        # 指针在场但档案记录还没建（N1 的首次写入语义）仍照旧放行。
+        record = self._record_or_none(target_profile_id)
         if record is not None:
             self._reject_deleting(record)
-        profile = self._bound(profile_id).profile()
+        profile = self._bound(target_profile_id).profile()
         directory = paths.knowledge_dir(profile)
         if not paths.is_within(profile, directory):
             raise ApiError(500, "path_outside_profile")

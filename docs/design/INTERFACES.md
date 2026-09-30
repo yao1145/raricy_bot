@@ -117,21 +117,23 @@ Key、会话 Cookie；用户名不是密钥。
 ## 7. `site/client.py`
 
 入口：[SiteClient](../../src/raricy_bot/site/client.py)；上游
-[聊天契约](../materials/chat-bot.md)、[评论契约](../materials/comment-bot.md) 优先。
+[聊天契约](../materials/chat-bot.md)、[评论契约](../materials/comment-bot.md)、
+[博客契约](../materials/blog-bot.md) 优先。
 
 - 信封成功判据为 `code == 200`；发消息的 `message` 可为消息对象。spider 裸 JSON 读口单独解析。
-- 聊天发送遇 401 重登时，带截止时间的调用须在重登前后复查，过期则不进行第二次 POST（D-153）。
+- 聊天发送遇 401 重登时，`before_retry` 同步守卫在重登前后复查截止时间及会话代次，失效则不进行第二次 POST（D-153、D-154）。
 - 不设置 `Origin` / `Referer`，登录并保存的 Cookie 不得出现在日志或错误正文。
 - `open_stream` 独立设置 300 秒读超时，不继承普通请求的 20 秒默认值。
 - 博客、评论等原匿名读口现须带会话 Cookie（D-104）；辅助读取的 401 不触发额外重登录。
 - 图片取回须同源、禁止跨源重定向带出 Cookie；流式字节上限、格式白名单见 §20。
-- 上游补充接口仅限已有记录：内容引用 D-50、发文 D-106。新增端点先记录依据和边界。
+- 上游补充接口仅限已有记录：内容引用 D-50、发文 D-106；博客契约同步见 D-157。新增端点先记录依据和边界。
 
 ## 8. `site/sse.py`
 
 入口：[SSEReceiver](../../src/raricy_bot/site/sse.py)。
 单连接，空行分帧、多行 data 拼接；只有带 ID 的 message 帧推进传输游标。
 成功解析帧重置退避；延迟为封顶后的指数退避乘 `1 + random()*0.2`，尊重服务端 retry。
+计算指数前须先限制数值，长期连续失败也不得溢出并终止重连任务（D-156）。
 handler 普通异常不拆流，取消必须传播。传输游标与 Store 安全水位分开（D-16）。
 
 ## 9. `store.py`
@@ -212,6 +214,12 @@ DM 按频道，公开链用 `lobby-thread:<root_id>`，重启保留归属但不�
 
 聊天发送携带输入事件的 `expires_at`：配额预留前后、会话建立后及每次实际 POST/不确定结果重试前都复查；等待期间到期则不发，已预留额度释放。返回 `expired` 供 App 静默终结输入事件为 `skipped`；不因超时发送 busy、失败或额度提示。
 
+模型回答及其本地/失败/额度提示另携带同步 `generation_is_current` 守卫：同样在配额预留前后、
+会话探活前后、每次 POST 与 401 重登前后复核。失效返回 `stale_generation`，不重投，
+预留恰好释放；守卫抛异常也须结清预留。不确定结果仍可只读对账确认此前已发送的证据，
+确认送达后照常记录、转正，不能因代次后来失效释放已发送的额度。无守卫调用保持原行为；
+不承诺撤回已经开始的 POST（D-154）。
+
 `_deliver` / `_on_error` / `_reconcile` 只做 POST 与对账、**不结算**，用
 `_Delivery(result, record, charge)` 回报是否已确认送达；`send` 是唯一结算点，确认送达后由
 `_commit_delivery` 把 `store.record_sent` 与 `quota.note_sent` 收敛成一次受取消保护的终结操作
@@ -260,6 +268,10 @@ resync 拉取按 message ID 去重，空 event ID 不抬水位。
 仅在回复成功后提交历史；退出总预算 10 秒，先停止发文/记忆等消费者，再关闭共享模型与 MCP。
 
 启动先将旧 pending 标为 recover，再调用 Store 过期恢复，最后从安全水位启动 SSE；超过 `behavior.message_max_age_seconds` 的候选输入静默跳过，默认值为 10_800 秒。工作器领取后、模型返回后、发送本地提示前和实际发送前都复查截止时间；到期输入以 `skipped` 终态推进水位，不留下半轮历史。周期清理重复终结已过期 recover 行，覆盖启动时仍新鲜但之后未获服务端补发的孤儿；旧库 NULL `expires_at` 按 `received_at + behavior.message_max_age_seconds <= now` 兜底（D-153）。
+
+Request 的会话代次守卫须贯通 `_send_message` 到发送器，覆盖模型回答及其失败、额度、KB、
+能力和媒体提示。DM `/reset` 或链失效发生在发送器的异步等待期间，也不得再开始旧请求的
+POST；已送达的消息仍结算，但代次失效后不写回短期历史（D-154）。
 
 两条队列都是 `SessionScheduler`（§14），容量取 `behavior.queue_size` / `memory.queue_size`；
 记忆 worker 并发固定为 1。关闭顺序里，`_shutdown` 在 `Store` 关闭**之前**调用
@@ -617,7 +629,7 @@ memory off 只关私有读取与自动提取，公开副本不变；自动更新
 
 已实现、默认关闭，**真实站点验收尚未完成**；启用、人工核实和验收见
 [USAGE.md §2.4](../usage/USAGE.md)。设计与实施计划已归档，见 [归档索引](../ARCHIVE.md)。
-使用普通用户 `POST /api/blogs`，属于显式例外（D-106），不使用编辑文章接口。
+使用普通用户 `POST /api/blogs`，依据 [blog-bot.md](../materials/blog-bot.md)（D-106、D-157），不使用编辑文章接口。
 
 ### 53.1 基础类型
 
@@ -645,6 +657,10 @@ CHECK 一起维护，变更须处理旧行。
 ### 53.5 站点发布与搜索
 
 [site/blog_models.py](../../src/raricy_bot/site/blog_models.py)、[SiteClient](../../src/raricy_bot/site/client.py)。
+文章详情使用 `GET /api/blogs/:id`，要求成功信封及 `blog` 对象，再提取本轮标题与正文；
+与搜索共用有界读取，带会话 Cookie，读取失败不自动重登。发布请求只发送文档允许的
+title、description、content、category_id、visibility 五个键；SiteClient 默认 `internal`，
+可显式传入 `link` / `public`，非法可见性在网络前拒绝。当前定时任务沿用 `internal`，没有可见性配置或持久字段。
 只有合法业务信封可判明确拒绝；HTTP 状态本身不能证明未发布。
 成功需合法 blog_id。标题搜索有界且可能隐藏栏目，空结果不能证明未发布。
 
@@ -1309,6 +1325,11 @@ pyproject 一致）加平台层绑定 `pywin32`，**不含 `mcp`**。清单与�
   （先缓冲再检查等于没有上限）；知识库导入另有一个更宽的传输上限，让「单文件 1 MiB」
   成为真正生效的那道门。响应一律 `Cache-Control: no-store`，HTML 带 CSP 与
   `X-Content-Type-Options`；静态路径拒绝穿越。
+- **知识库导入的档案绑定**（D-155）：`POST /api/kb/import` 的 `name` / `content` 之外，
+  必须携带加载配置视图中的 `profile_id` 与 `expected_profile_epoch`。已有档案下缺字段回
+  409 `client_upgrade_required`，与当前档案或代次不符回 409 `revision_conflict`；没有活动
+  档案仍回 409 `no_active_profile`。先在事件循环核验，写线程复核代次、拒绝 `deleting`，
+  并始终对核验后的固定档案写入，不能在线程内重新读取活动指针。
 - **配置面**（§11）：`GET/PUT /api/config`、`POST /api/config/validate`、草稿读写。
   读接口显式构造响应：只含可编辑字段、revision、账号与「凭据已配置/后端可用」三态，
   不返回凭据取值，也不返回可用于读取凭据的引用。校验失败回 422（`field` + 稳定码），

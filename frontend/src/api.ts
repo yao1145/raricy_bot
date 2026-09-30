@@ -455,8 +455,17 @@ export function kbStatus(): Promise<{ ok: true; files: number; worker: unknown }
   return apiGet("/api/kb/status");
 }
 
-export function kbImport(name: string, content: string): Promise<{ name: string }> {
-  return apiWrite("/api/kb/import", { name, content }, "POST");
+export function kbImport(
+  name: string,
+  content: string,
+  profileId: string | null,
+  expectedProfileEpoch: number,
+): Promise<{ name: string }> {
+  return apiWrite(
+    "/api/kb/import",
+    { name, content, profile_id: profileId, expected_profile_epoch: expectedProfileEpoch },
+    "POST",
+  );
 }
 
 export function quit(): Promise<{ message: string }> {

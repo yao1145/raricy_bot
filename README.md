@@ -346,7 +346,7 @@ docker compose logs -f bot
 | Exa 多 Key 池与本地知识库怎么配、怎么看日志、怎么排障 | [`docs/usage/EXA_POOL_AND_KB.md`](docs/usage/EXA_POOL_AND_KB.md) |
 | 模块边界、判定顺序与代码入口 | [`docs/design/INTERFACES.md`](docs/design/INTERFACES.md) |
 | 某处行为为什么是这样 | [`docs/design/DESIGN_DECISIONS.md`](docs/design/DESIGN_DECISIONS.md) |
-| 上游站点 API 的原始契约 | [`docs/materials/chat-bot.md`](docs/materials/chat-bot.md) |
+| 上游站点 API 的原始契约 | [聊天](docs/materials/chat-bot.md)、[评论](docs/materials/comment-bot.md)、[博客](docs/materials/blog-bot.md) |
 | 推荐的系统提示词 | [`docs/design/SYSTEM_PROMPTS.md`](docs/design/SYSTEM_PROMPTS.md) |
 
 改代码前按 [INTERFACES.md](docs/design/INTERFACES.md) 定位相关模块与决策；

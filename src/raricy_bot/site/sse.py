@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random as random_module
 from collections.abc import Awaitable, Callable
 
@@ -24,6 +25,8 @@ from .models import StreamEvent
 
 # 抖动上限：退避时长最多上浮 20%。
 _JITTER_RATIO: float = 0.2
+# 将任何有限非零浮点数乘以 2**该值都会溢出；仅用于非正配置的兜底缩放。
+_MAX_FLOAT_SCALE: int = 2098
 
 
 def _parse_int(value: str) -> int | None:
@@ -194,5 +197,36 @@ class SSEReceiver:
         base = self._base_delay
         if self._server_retry_ms is not None:
             base = max(base, self._server_retry_ms / 1000.0)
-        delay = min(self._max_delay, base * (2**self._attempt))
+
+        # 常规正数配置下先比较二进制指数与尾数，达到上限就不再计算幂，
+        # 避免长时间重连后 attempt 过大导致整数转浮点时溢出。
+        if (
+            base > 0.0
+            and self._max_delay > 0.0
+            and math.isfinite(base)
+            and math.isfinite(self._max_delay)
+        ):
+            if base >= self._max_delay:
+                delay = self._max_delay
+            else:
+                base_fraction, base_exponent = math.frexp(base)
+                max_fraction, max_exponent = math.frexp(self._max_delay)
+                scaled_exponent = base_exponent + self._attempt
+                reached_max = scaled_exponent > max_exponent or (
+                    scaled_exponent == max_exponent and base_fraction >= max_fraction
+                )
+                delay = (
+                    self._max_delay
+                    if reached_max
+                    else math.ldexp(base, self._attempt)
+                )
+        else:
+            # 配置校验外仍保持有界计算；有效的常规配置走上面的精确封顶路径。
+            scale = min(self._attempt, _MAX_FLOAT_SCALE)
+            try:
+                scaled = math.ldexp(base, scale)
+            except OverflowError:
+                scaled = math.copysign(math.inf, base)
+            delay = min(self._max_delay, scaled)
+
         return delay * (1.0 + self._random() * _JITTER_RATIO)

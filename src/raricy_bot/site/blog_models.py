@@ -3,17 +3,21 @@
 只含站点 DTO 与常量：不 import config、Store、Publisher，也**不** import `blog/` ——
 依赖方向是业务层读站点层的判断结果，站点层不反过来依赖业务层。因此这里的四个
 `OUTCOME_*` 是**站点层的分类**（这一次 HTTP 往返算哪一类），落库用的持久原因常量仍由
-`blog/models.py` 提供，两者的映射在 Publisher 里显式做一次。
+`blog_records.py` 提供，两者的映射在 Publisher 里显式做一次。
 
-`POST /api/blogs` 是 D-106 显式记录的接口例外：它是普通用户网页表单的同一个接口，
-不在站方机器人契约里。
+`POST /api/blogs` 遵循站方 `blog-bot.md` §7（D-106、D-157），只接受契约定义的五个字段。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-# 一次发布的分类结果。取值与 `blog/models.py` 的同名原因 token 相同，
+# 发文接口接受的站外可见性；不传时站点默认为仅站内可见。
+BLOG_VISIBILITY_VALUES: tuple[str, ...] = ("internal", "link", "public")
+DEFAULT_BLOG_VISIBILITY: str = "internal"
+
+
+# 一次发布的分类结果。取值与 `blog_records.py` 的同名原因 token 相同，
 # 但语义不同：这里只回答「这次往返属于哪一类」，不回答「这一行该落什么状态」。
 OUTCOME_PUBLISHED: str = "published"
 OUTCOME_REJECTED: str = "rejected"

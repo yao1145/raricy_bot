@@ -26,6 +26,8 @@ import httpx
 from ..logging_setup import get_logger, log_event, register_secret
 from ..redact import Redactor, SecretRegistry
 from .blog_models import (
+    BLOG_VISIBILITY_VALUES,
+    DEFAULT_BLOG_VISIBILITY,
     OUTCOME_PUBLISHED,
     OUTCOME_RATE_LIMITED,
     OUTCOME_REJECTED,
@@ -60,12 +62,11 @@ _ME_PATH: str = "/api/auth/me"
 _STREAM_PATH: str = "/api/chat/stream"
 _CHANNELS_PREFIX: str = "/api/chat/channels"
 _COMMENTS_PREFIX: str = "/api/blogs"
-# 发文（POST）与文章列表（GET）都挂在 `/api/blogs` 本身，评论是它的子路径。
+# 发文、文章列表/详情都挂在 `/api/blogs` 下，评论是它的子路径。
 # 与 `_COMMENTS_PREFIX` 同值是这个接口形状的事实，另起名字是为了让发文与对账
-# 不再借评论的常量名（`blog_write` 是显式记录的接口例外，D-106）。
+# 不再借评论的常量名（`blog_write` 依据站方博客契约，D-106、D-157）。
 _BLOGS_PATH: str = "/api/blogs"
 _SPIDER_COMMENTS_PATH: str = "/api/spider/comments"
-_SPIDER_BLOGS_PREFIX: str = "/api/spider/blogs"
 _NOTIFICATIONS_PATH: str = "/api/notifications"
 _CHAT_USERS_PATH: str = "/api/chat/users"
 _CLIPBOARD_PREFIX: str = "/api/clipboard"
@@ -353,7 +354,7 @@ class SiteClient:
         §7.2 的例外：本接口成功时的 `message` 是消息对象而非字符串，
         退化成字符串（或缺失）时返回 None，调用方必须容忍。
 
-        `before_retry` 供有截止时间的调用方在 401 重登前后复核；抛出的异常
+        `before_retry` 供调用方在 401 重登前后复核截止时间或会话代次；抛出的异常
         原样传回调用方，避免认证等待后绕过发送限制。
         """
         path = _messages_path(channel_id)
@@ -435,19 +436,24 @@ class SiteClient:
         return result
 
     async def fetch_blog_context(self, blog_id: str) -> BlogContext:
-        """读取本轮文章资料；spider 博客接口是裸对象，需 core+ 会话 Cookie。"""
+        """读取本轮文章资料；走带会话 Cookie 的正式文章详情信封接口。"""
         normalized = normalize_uuid(blog_id)
         if normalized is None:
             raise ValueError("文章 id 不是 UUID")
-        payload = await self._request_spider_json(f"{_SPIDER_BLOGS_PREFIX}/{normalized}")
-        if not isinstance(payload, Mapping):
+        response, payload = await self._request_comment_envelope(
+            "GET", f"{_BLOGS_PATH}/{normalized}"
+        )
+        if payload["code"] != 200:
+            raise self._error_from_payload(response, payload)
+        blog = payload.get("blog")
+        if not isinstance(blog, Mapping):
             raise self._error(200, "malformed blog response")
-        meta = payload.get("meta")
-        title = meta.get("title") if isinstance(meta, Mapping) else ""
+        title = blog.get("title")
+        content = blog.get("content")
         return BlogContext(
             id=normalized,
             title=title if isinstance(title, str) else "",
-            content=payload.get("content") if isinstance(payload.get("content"), str) else None,
+            content=content if isinstance(content, str) else None,
         )
 
     # --- 定时发文（INTERFACES §53.5）---------------------------------------
@@ -459,24 +465,34 @@ class SiteClient:
         description: str,
         content: str,
         category_id: int | None,
+        visibility: str | None = DEFAULT_BLOG_VISIBILITY,
     ) -> BlogPublishResult:
-        """发布一篇文章：普通用户网页表单的同一个接口（D-106；INTERFACES §53.5）。
+        """发布一篇文章：普通账号接口（D-106、D-157；INTERFACES §53.5）。
 
         **只发一次**：不做传输层自动重试，也**不模仿** `post_message` / `post_comment`
         的 401 自动重登重投 —— 站方没有幂等键，重复投递的代价高于「这次没发出去」。
         `Origin` / `Referer` 照旧两个都不设（`_cookie_headers()`）：站方 CSRF 对同时缺失
         这两头的写请求保守放行，带一个**错误**的值反而会 403。
 
-        分类只看**解析成功的业务信封**：`_decode()` 会把非法信封变成带 HTTP 状态的
-        `SiteError`，所以传输错误、超时、非法/超大响应、5xx 一律 `unconfirmed`，
+        分类只看**解析成功的业务信封**：有界信封请求会把非法响应转成 `SiteError`，
+        所以传输错误、超时、非法/超大响应、5xx 一律 `unconfirmed`，
         绝不冒充「确定没发出去」。`CancelledError` 不在这里捕获，继续向上传播。
+
+        `visibility` 只接受 `internal`、`link`、`public`；缺省、`None` 与空串归一为
+        `internal`。其他类型或档位在发送请求前拒绝。
         """
+        if visibility is None or visibility == "":
+            visibility = DEFAULT_BLOG_VISIBILITY
+        if not isinstance(visibility, str) or visibility not in BLOG_VISIBILITY_VALUES:
+            raise ValueError("visibility 必须是 internal、link 或 public")
+
         body = {
             "title": title,
             "description": description,
             "content": content,
             # 未分类就是 null：站方把可空当「未分类」，这里不替人猜一个默认栏目。
             "category_id": category_id,
+            "visibility": visibility,
         }
         try:
             _response, payload = await self._request_comment_envelope(

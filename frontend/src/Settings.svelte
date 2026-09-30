@@ -28,6 +28,8 @@
   } = $props();
 
   let view = $state<api.ConfigView | null>(null);
+  // 与表单视图一起固定的代次；不使用稍后刷新的 props epoch 配旧配置正文。
+  let viewProfileEpoch = $state(0);
   let texts = $state<Record<string, string>>({}); // 非布尔字段的输入框文本
   let flags = $state<Record<string, boolean>>({}); // 布尔字段
   let showAdvanced = $state(false);
@@ -52,9 +54,11 @@
   let clearBusy = $state(false);
 
   async function load(): Promise<void> {
+    const requestedEpoch = epoch ?? 0;
     try {
       const loaded = await api.getConfig();
       view = loaded;
+      viewProfileEpoch = requestedEpoch;
       const nextTexts: Record<string, string> = {};
       const nextFlags: Record<string, boolean> = {};
       for (const spec of FIELDS) {
@@ -155,10 +159,16 @@
   }
 
   async function importKb(): Promise<void> {
+    if (!view) return;
     busy = true;
     failure = null;
     try {
-      const result = await api.kbImport(kbFile, kbContent);
+      const result = await api.kbImport(
+        kbFile,
+        kbContent,
+        view.profile_id,
+        viewProfileEpoch,
+      );
       message = `已导入 ${result.name}；机器人在下一次刷新知识库时会加载它。`;
       kbContent = "";
       await load();

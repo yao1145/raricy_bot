@@ -53,6 +53,8 @@
 这两条要求**整条消息就是命令**（前后不要带别的字），大小写不敏感。评论区里写
 `@<机器人用户名> /help`，或直接回复我的评论写 `/help`、`/reset`，效果一样。
 `/reset` 只作废短对话的上下文，**不等于删除长期记忆**（见 3.3）。
+私聊重置还会作废旧轮次尚未发送的回答和相关提示；已经开始发送的站点请求可能完成，
+重置不会撤回已发送的消息。
 
 #### 3.2 五条能力命令
 
@@ -294,7 +296,7 @@
 | 知识库默认只对私聊白名单开放 | `config.knowledge_base`：`enabled=false`、`access_mode=allowlist`、`allowed_channel_kinds=["dm"]`（D-44） |
 | 知识库有刷新周期 | `knowledge_base.refresh_seconds`（默认 60）；构建成功后一次性替换快照（D-45） |
 | 定时发文默认关闭、没有 Web 界面 | `config.blog.enabled`（默认 `false`）与 `config.example.yaml` 的 `blog` 段；任务表在 YAML 里（INTERFACES §53.2） |
-| 发文走的是普通用户接口，不是站方机器人契约 | INTERFACES §53 与 D-106；上游依据是 `raricycms/raricy.com@5eace12` 的 `src/app/api/blogs/route.ts` |
+| 发文走普通用户接口，默认仅站内可见 | 站方 [blog-bot.md](../materials/blog-bot.md) §7；INTERFACES §53 与 D-106、D-157 |
 | 调度点、本地日预算都按 UTC+8 切 | `blog/planner.py` 的 `UTC8` / `utc8_day`；站方 `dayStart` 同口径（D-108） |
 | 停机期间不补发、只处理 5 分钟窗口内的点 | `blog/planner.py` 的 `SCAN_WINDOW_SECONDS`（300）与 `due_runs(startup=...)`；超过 5 分钟未开始的 `queued` 行由 `store.take_blog_run` 转 `skipped`/`misfire` |
 | 结果不确定的行持续占额、不自动重投 | `blog_records.py` 的 `POST_HOLDING_STATUSES` 与 `blog/publisher.py`；D-108、D-109 |
@@ -340,9 +342,10 @@
 它（`capabilities.blog_write` 的 `command` 是 `None`，`CAPABILITY_COMMANDS` 会把它过滤掉），
 所以第一部分没有对应条目。
 
-**这是唯一一处本仓库使用站方机器人契约之外的接口**：发文走普通用户网页表单同一个
-`POST /api/blogs`，它不在 `docs/materials/chat-bot.md` 里，站方也没有任何文档承诺它的稳定性
-（裁决 D-106）。它是 core+ 功能，账号掉出核心用户即整体失效。
+发文走普通用户网页表单同一个 `POST /api/blogs`，接口依据是站方
+[blog-bot.md](../materials/blog-bot.md)，现行边界见 D-106、D-157。
+它是 core+ 功能，账号掉出核心用户即整体失效。定时任务显式以 `internal` 发布，
+即仅站内可见；当前任务配置不提供 `link` / `public` 的切换。
 
 #### 启用
 
@@ -355,10 +358,9 @@
 **漏挂不报错**：目录不存在等同队列空，表现只是每次到点记一条 `blog.empty_queue`，
 日志看着正常而文章永远发不出去。
 
-站点没有公开的栏目列表接口，有子栏目的父栏目 id 会出现在公开的 `/blog` 页面 HTML 里，
-叶子栏目不会。因此 `category_id` 只能人工填，或留空发为「未分类」；机器人**不做**
-启动时抓页面解析栏目（栏目由维护者配置）—— 那条路只覆盖父栏目、站方改版即静默失效，
-而失效的表现是发错栏目。
+维护者可用 core+ 会话查询站方 `GET /api/categories`，从实际清单选数字 `id` 填入
+`category_id`，并检查有效的 `admin_only_posting`；不能把栏目名称、slug 或 path 当成 ID。
+留空发为「未分类」。机器人运行期不自动选择栏目，栏目由维护者配置。
 
 #### 调度行为
 
