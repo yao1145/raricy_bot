@@ -641,7 +641,7 @@ class Controller:
         self._start_bot(status.revision, target)
 
     def _start_bot(self, revision: int | None, profile_id: str | None = None) -> None:
-        """取生命周期租约后派发一次启动，并挂上静默失败监视（§9.2、D-132）。
+        """派发一次启动，手动入口打开管理页，登录入口挂上失败监视（§9.2、D-132）。
 
         `profile_id` 在派发前固定一次（§5.2 的输入固定）：启动线程与规格工厂都不再
         从可变的活动指针推导目录，页面显示的档案与后台运行的档案因此不会分叉。
@@ -669,6 +669,10 @@ class Controller:
             status="ok",
             trace_id=self._instance_id,
         )
+        # 手动双击是打开控制面板的明确意图，不随机器人自动启动偏好变成静默入口。
+        # 在监视线程启动前打开一次；后续失败由已有页面显示，不再弹第二个页面。
+        if not self._startup_launch:
+            self._open_entry_or_tray()
         watcher = threading.Thread(
             target=self._watch_auto_start,
             args=(operation.operation_id,),
@@ -813,7 +817,7 @@ class Controller:
             if operation is None:
                 return
             if operation.state == OP_FAILED:
-                if not self._quit.is_set():
+                if self._startup_launch and not self._quit.is_set():
                     self._open_entry_or_tray()
                 return
             if operation.finished_at is not None:
