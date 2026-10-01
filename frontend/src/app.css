@@ -1,42 +1,37 @@
 /* 图标的四色几何形状是控制台的视觉中心。 */
 :root {
   color-scheme: dark;
-  --bg: #07111f; --surface: #0d1a2a; --field: #081626;
+  --bg: #05060a; --surface: #0d1a2a; --field: #081626;
+  --grid-image: linear-gradient(rgba(255,255,255,.03) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.03) 1px, transparent 1px);
+  --grid-mask: radial-gradient(ellipse 70% 60% at 50% 50%, black 20%, transparent 80%);
   --line: #294057; --line-soft: #1b3045;
   --text: #eaf3fc; --muted: #a1b5c9;
   --blue: #63b8f6; --coral: #ff7882; --yellow: #ffd66b; --teal: #37cdbd;
   --accent: var(--blue); --accent-dim: #3685b8;
   --danger: #ff929c; --warn: var(--yellow); --ok: #55dcc2;
   --mono: "Cascadia Code", "Cascadia Mono", Consolas, monospace;
-  --sans: "Microsoft YaHei UI", "PingFang SC", "Noto Sans CJK SC", "Segoe UI", sans-serif;
+  --sans: "Segoe UI Variable Text", "Segoe UI", "DengXian", "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei UI", sans-serif;
 }
 *, *::before, *::after { box-sizing: border-box; }
 html { min-width: 320px; scroll-behavior: smooth; }
 body {
-  margin: 0; min-height: 100vh; color: var(--text); font: 14px/1.65 var(--sans);
-  background: radial-gradient(ellipse 74% 52% at 54% -20%, #19446a 0%, transparent 72%),
-    linear-gradient(90deg, transparent 0 31px, #5ba4d309 32px),
-    linear-gradient(transparent 0 31px, #5ba4d309 32px), var(--bg);
-  background-size: auto, 32px 32px, 32px 32px, auto;
+  margin: 0; min-height: 100vh; color: var(--text); font: 14px/1.7 var(--sans);
+  -webkit-font-smoothing: antialiased;
+  isolation: isolate;
+  background: var(--bg);
 }
+body::before, body::after { content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none; }
+body::before { background: radial-gradient(ellipse 80% 60% at 50% 45%, #0c1220 0%, var(--bg) 70%); }
+body::after { background-image: var(--grid-image); background-size: 64px 64px; mask-image: var(--grid-mask); animation: grid-drift 28s linear infinite; }
+@keyframes grid-drift { from { background-position: 0 0; } to { background-position: 64px 64px; } }
+body:has(.intro-screen) { overflow: hidden; }
 button, input, textarea, select { font: inherit; }
 button { -webkit-tap-highlight-color: transparent; }
 button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
 ::selection { background: #29648b; color: white; }
-.intro-screen { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; overflow: hidden; background: radial-gradient(circle at center, #132d47 0, #071321 45%, #030913 100%); animation: intro-curtain 1.9s ease-in both; }
-.intro-emblem { position: relative; width: 275px; height: 275px; filter: drop-shadow(0 10px 28px #0009); }
-.intro-shape { position: absolute; display: block; }
-.intro-orbit { left: 0; top: 0; width: 143px; height: 143px; border-radius: 50%; background: var(--blue); box-shadow: 0 0 45px #63b8f644; animation: intro-orbit-away 1.7s ease-in-out .12s both; }
-.intro-satellite { left: 182px; top: 7px; width: 69px; height: 69px; border-radius: 50%; background: var(--coral); box-shadow: 0 0 38px #ff788244; animation: intro-satellite-away 1.7s ease-in-out .12s both; }
-.intro-vector { left: 153px; top: 108px; width: 113px; height: 112px; background: var(--yellow); clip-path: polygon(50% 0, 100% 100%, 0 100%); filter: drop-shadow(0 0 24px #ffd66b55); animation: intro-vector-away 1.7s ease-in-out .12s both; }
-.intro-signal { left: 36px; top: 165px; width: 99px; height: 99px; border-radius: 6px; background: var(--teal); box-shadow: 0 0 38px #37cdbd44; animation: intro-signal-away 1.7s ease-in-out .12s both; }
-.shell.intro-active { animation: console-reveal .88s cubic-bezier(.18,.68,.2,1) 1.02s both; }
-@keyframes intro-curtain { 0%, 47% { opacity: 1; } 100% { opacity: 0; } }
+.shell.intro-active { opacity: 0; }
+.shell.intro-active.intro-leaving { animation: console-reveal .7s cubic-bezier(.18,.68,.2,1) .2s both; }
 @keyframes console-reveal { from { opacity: 0; transform: translateY(18px); } to { opacity: 1; transform: translateY(0); } }
-@keyframes intro-orbit-away { 0%, 25% { opacity: 1; transform: translate(0,0) scale(1); } 100% { opacity: 0; transform: translate(-43vw,-29vh) rotate(-28deg) scale(.58); } }
-@keyframes intro-satellite-away { 0%, 25% { opacity: 1; transform: translate(0,0) scale(1); } 100% { opacity: 0; transform: translate(38vw,-34vh) scale(.35); } }
-@keyframes intro-vector-away { 0%, 25% { opacity: 1; transform: translate(0,0) scale(1); } 100% { opacity: 0; transform: translate(42vw,34vh) rotate(42deg) scale(.52); } }
-@keyframes intro-signal-away { 0%, 25% { opacity: 1; transform: translate(0,0) scale(1); } 100% { opacity: 0; transform: translate(-39vw,33vh) rotate(-38deg) scale(.48); } }
 .shell { max-width: 1240px; margin: auto; padding: 25px clamp(18px, 3.3vw, 48px) 90px; }
 .brand { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding-bottom: 27px; }
 .brand-identity { display: flex; align-items: center; gap: 13px; }
@@ -201,7 +196,7 @@ code { font: .92em var(--mono); color: #b9d6ef; overflow-wrap: anywhere; }
 }
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
-  .intro-screen { display: none; }
-  .shell.intro-active { animation: none; opacity: 1; }
+  body::after { animation: none; }
+  .shell.intro-active.intro-leaving { animation: none; opacity: 1; }
   *, *::before, *::after { transition-duration: .01ms !important; animation-duration: .01ms !important; }
 }

@@ -1,11 +1,12 @@
 <script lang="ts">
-  import { onDestroy, onMount } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
   import * as api from "./api";
   import Accounts from "./Accounts.svelte";
   import DesktopSettings from "./DesktopSettings.svelte";
   import Events from "./Events.svelte";
   import Recovery from "./Recovery.svelte";
   import Settings from "./Settings.svelte";
+  import Intro from "./Intro.svelte";
   import Status from "./Status.svelte";
   import Wizard from "./Wizard.svelte";
   import { ACCOUNT_NOTICES } from "./texts";
@@ -30,9 +31,10 @@
   let notice = $state<string | null>(null);
   let error = $state<string | null>(null);
   let intro = $state(true);
+  let introLeaving = $state(false);
+  let shell: HTMLDivElement;
 
   let refreshTimer: ReturnType<typeof setInterval> | null = null;
-  let introTimer: ReturnType<typeof setTimeout> | null = null;
   let unsubscribe: (() => void) | null = null;
 
   async function refresh(): Promise<void> {
@@ -59,11 +61,6 @@
   }
 
   onMount(async () => {
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-      intro = false;
-    } else {
-      introTimer = setTimeout(() => (intro = false), 1900);
-    }
     const token = api.bootstrapToken();
     // 令牌只在 fragment 里出现一次：无论成功与否都先清掉地址栏（§8.1）。
     api.clearFragment();
@@ -91,13 +88,18 @@
 
   onDestroy(() => {
     if (refreshTimer) clearInterval(refreshTimer);
-    if (introTimer) clearTimeout(introTimer);
     unsubscribe?.();
   });
 
   function selectTab(next: Tab): void {
     tabTouched = true;
     tab = next;
+  }
+
+  async function finishIntro(): Promise<void> {
+    intro = false;
+    await tick();
+    shell.focus({ preventScroll: true });
   }
 
   const pageCopy: Record<Tab, { title: string; detail: string }> = {
@@ -158,17 +160,10 @@
 </script>
 
 {#if intro}
-  <div class="intro-screen" aria-hidden="true">
-    <div class="intro-emblem">
-      <span class="intro-shape intro-orbit"></span>
-      <span class="intro-shape intro-satellite"></span>
-      <span class="intro-shape intro-vector"></span>
-      <span class="intro-shape intro-signal"></span>
-    </div>
-  </div>
+  <Intro onenter={() => (introLeaving = true)} ondone={finishIntro} />
 {/if}
 
-<div class="shell" class:intro-active={intro} inert={intro}>
+<div class="shell" class:intro-active={intro} class:intro-leaving={introLeaving} inert={intro} bind:this={shell} tabindex="-1">
   <header class="brand">
     <div class="brand-identity">
       <img src="/favicon.ico" width="42" height="42" alt="" />
