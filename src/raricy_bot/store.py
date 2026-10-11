@@ -596,6 +596,17 @@ _SCHEMA: tuple[str, ...] = (
         watermark  REAL NOT NULL
     )
     """,
+    # 永久限制图像能力；只保存可信用户 ID 和稳定原因，不保存请求/上游正文。
+    """
+    CREATE TABLE IF NOT EXISTS image_blacklist (
+        scope TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        blocked_at REAL NOT NULL,
+        reason TEXT NOT NULL CHECK (reason IN ('manual', 'content_policy')),
+        trigger_message_id INTEGER,
+        PRIMARY KEY (scope, actor_id)
+    )
+    """,
 )
 
 # --- 定时发文的状态语义与行转换（INTERFACES §53.4）--------------------------
@@ -993,6 +1004,39 @@ class Store:
                 # 排队期间被 close() 了：连接要么已经关掉，要么正等着这条锁。
                 raise RuntimeError("Store 已关闭，无法执行操作")
             return operation(conn)
+
+    async def is_image_user_blocked(self, scope: str, actor_id: str | None) -> bool:
+        """图像门禁；缺少可信作者时拒绝调用上游。"""
+        if not actor_id:
+            return True
+        return await self._execute(lambda conn: conn.execute(
+            "SELECT 1 FROM image_blacklist WHERE scope=? AND actor_id=?", (scope, actor_id)
+        ).fetchone() is not None)
+
+    async def block_image_user(
+        self, scope: str, actor_id: str, *, reason: str, now: float,
+        trigger_message_id: int | None = None,
+    ) -> None:
+        """幂等加入黑名单，保留首次封禁元数据；没有到期或自动释放路径。"""
+        if not scope or not actor_id or reason not in ("manual", "content_policy"):
+            raise ValueError("invalid_image_blacklist_entry")
+        def operation(conn: sqlite3.Connection) -> None:
+            with conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO image_blacklist "
+                    "(scope,actor_id,blocked_at,reason,trigger_message_id) VALUES (?,?,?,?,?)",
+                    (scope, actor_id, now, reason, trigger_message_id),
+                )
+        await self._execute(operation)
+
+    async def unblock_image_user(self, scope: str, actor_id: str) -> bool:
+        """管理员持有数据锁后调用；返回是否实际移除封禁。"""
+        def operation(conn: sqlite3.Connection) -> bool:
+            with conn:
+                return conn.execute(
+                    "DELETE FROM image_blacklist WHERE scope=? AND actor_id=?", (scope, actor_id)
+                ).rowcount > 0
+        return await self._execute(operation)
 
     # --- 事件与水位（去重主键是 message_id，不是 event_id）------------------
 

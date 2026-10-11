@@ -2003,3 +2003,11 @@ SQLite 只存标识、时刻、大小及状态，不存描述或图片；重启�
 不重新 POST。文本调用不传新增空参数。图床维护和上传共用锁，仅删本功能登记图：
 30 天到期清理、空间不足时最旧优先删除到够用。关闭生成仍维护旧图片。
 Light 的配置与运行入口拒绝启用。App 先停图像 worker/维护，再关闭提供方和 Store。
+
+黑名单（D-160）：`image_blacklist` 主键为 `(scope, actor_id)`，无到期和自动解除。
+Router 用与 ImageService 相同的 `base_url.rstrip('/')|self_user_id` 作用域，在图片入队前查可信作者 ID；
+Service 在参考图读取和额度预留前、调用前再查，缺少作者时拒绝；仅限制生成/编辑。
+Provider 的 `content_policy` 只来自有界错误信封明确 code/type；普通 HTTP 错误不表示安全拒绝。
+Service 先永久加入黑名单，再按 `uncertain` 处理本次额度并发送固定禁用提示，不写原始错误体。
+Store 的 `block_image_user` 幂等保留首次封禁，`unblock_image_user` 仅供本地管理入口使用。
+本地管理 `images.admin list` 只读；`block/unblock` 必须持有公共数据锁，作用域不唯一时要求 `--scope`。

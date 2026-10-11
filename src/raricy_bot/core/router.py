@@ -235,6 +235,7 @@ class MessageRouter:
         self._image_queue = image_queue
         self._image_enabled = image_enabled and image_queue is not None
         self._site_base_url = site_base_url
+        self._image_scope = f"{site_base_url.rstrip('/')}|{self_user_id}"
         self._logger = _logger
 
     # --- 事件分派 -----------------------------------------------------------
@@ -465,6 +466,8 @@ class MessageRouter:
                 channel_id,
             ) is None:
                 return emit_current_message("reply_now", "image_channel", text=texts.IMAGE_CHANNEL_TEXT, **local)
+            if await self._store.is_image_user_blocked(self._image_scope, message.author.id):
+                return emit_current_message("reply_now", "image_blacklisted", text=texts.IMAGE_BLACKLIST_TEXT, **local)
             prompt = image_command.prompt
             if leading_capability_command(prompt) or leading_execution_command(prompt) or parse_memory_command(prompt):
                 return emit_current_message("reply_now", "capability_conflict", text=texts.CAPABILITY_CONFLICT_TEXT, **local)

@@ -34,6 +34,7 @@ REASON_NOT_CONFIGURED: str = "not_configured"
 REASON_INVALID_REFERENCE: str = "invalid_reference"
 REASON_RATE_LIMITED: str = "rate_limited"
 REASON_REJECTED: str = "rejected"
+REASON_CONTENT_POLICY: str = "content_policy"
 # 结果不确定（保守占额）。
 REASON_NETWORK: str = "network"
 REASON_TIMEOUT: str = "timeout"
@@ -49,6 +50,23 @@ MAX_PROMPT_CHARS: int = 32000
 
 # 响应体硬上限：一张 10 MiB 的图 Base64 后约 13.4 MiB，再加 JSON 外壳与余量。
 MAX_RESPONSE_BYTES: int = MAX_OUTPUT_BYTES * 4 // 3 + 1024 * 1024
+MAX_ERROR_BYTES: int = 64 * 1024
+_SAFETY_CODES = frozenset({"content_policy_violation", "image_content_policy_violation", "moderation_blocked"})
+
+
+def _is_safety_error(raw: bytes) -> bool:
+    """只认错误信封中的明确 code/type；不匹配可能回显描述的 message。"""
+    if len(raw) > MAX_ERROR_BYTES:
+        return False
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, RecursionError):
+        return False
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    return isinstance(error, dict) and any(
+        isinstance(error.get(key), str) and error[key] in _SAFETY_CODES
+        for key in ("code", "type")
+    )
 
 # 只有这两种格式支持 output_compression；png 传入该字段会被上游拒绝。
 _COMPRESSIBLE_FORMATS: tuple[str, ...] = ("webp", "jpeg")
@@ -211,6 +229,12 @@ class ImageProvider:
                 "POST", url, headers=headers, **kwargs
             ) as response:
                 status = response.status_code
+                if status in (400, 403, 422) or status >= 500:
+                    # 小错误体只在内存中分类；超限、断流或非法 JSON 保留原状态分类。
+                    if await self._read_safety_error(response):
+                        raise ImageProviderError(
+                            REASON_CONTENT_POLICY, uncertain=status >= 500, http_status=status
+                        )
                 if status >= 500:
                     # 5xx 可能已经处理到一半，无法证明这次没有产出。
                     raise ImageProviderError(REASON_SERVER_ERROR, uncertain=True, http_status=status)
@@ -220,7 +244,11 @@ class ImageProvider:
                 if status < 200 or status >= 300:
                     # 其余 3xx/4xx 都是明确的业务拒绝；重定向已关闭，不会重复外发密钥。
                     raise ImageProviderError(REASON_REJECTED, http_status=status)
-                return await self._read_bounded(response)
+                raw = await self._read_bounded(response)
+                if _is_safety_error(raw):
+                    # 第三方把错误包在 2xx 时仍保守占额，不重复发出付费请求。
+                    raise ImageProviderError(REASON_CONTENT_POLICY, uncertain=True, http_status=status)
+                return raw
         except ImageProviderError:
             raise
         except httpx.TimeoutException:
@@ -230,6 +258,20 @@ class ImageProvider:
             raise
         except httpx.HTTPError:
             raise ImageProviderError(REASON_NETWORK, uncertain=True) from None
+
+    async def _read_safety_error(self, response: httpx.Response) -> bool:
+        """有界读取错误信封；失败时不推断安全拦截，也不保留原始错误正文。"""
+        chunks: list[bytes] = []
+        total = 0
+        try:
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > MAX_ERROR_BYTES:
+                    return False
+                chunks.append(chunk)
+        except httpx.HTTPError:
+            return False
+        return _is_safety_error(b"".join(chunks))
 
     async def _read_bounded(self, response: httpx.Response) -> bytes:
         """流式累加响应体，超过硬上限立即放弃（不读完、不拼接成无界内存）。"""

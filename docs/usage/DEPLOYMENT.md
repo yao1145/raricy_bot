@@ -1,9 +1,39 @@
 # 远程 Linux 服务器部署指南
 
+## 图像黑名单管理
+
+2026-10-12 已部署至 `ssh rocky:/opt/raricy_bot`，当前镜像为
+`raricy-bot:image-blacklist-20261011-181129`（标签时间为 UTC）。管理员指定的初始用户已加入持久
+黑名单，后续明确安全拦截自动加入；定向离线检查通过，20 个运行模块哈希一致，存活、就绪均为
+200，容器 healthy。模型配置、凭据和原数据卷保留；源码、Compose 及一致性 SQLite 备份位于
+`/opt/raricy_bot/.deploy-backups/image-blacklist-20261011-181129`。
+
+明确安全拦截自动永久加入该用户，不影响文本。支持的稳定错误码及判断边界见 D-160；
+机构只返回普通 400 时不会推测封禁，可用本地 `block` 手动添加。没有聊天解除命令。
+
+在 `/opt/raricy_bot` 查看（可在线）：
+
+```bash
+docker compose exec -T bot python -m raricy_bot.images.admin list --db /app/data/bot.db
+```
+
+手动解除（把 `<用户ID>` 换成列表中的站点用户 ID）：
+
+```bash
+docker compose stop bot
+docker compose run --rm --no-deps bot python -m raricy_bot.images.admin unblock --db /app/data/bot.db --user-id '<用户ID>'
+docker compose up -d bot
+```
+
+手动添加把 `unblock` 换成 `block`。修改需停机器人以取得公共数据锁；操作失败也要执行最后的
+`up -d bot` 恢复服务。默认选择唯一的图像作用域；多作用域时按列表显式提供
+`--scope '<站点base_url>|<机器人用户ID>'`。路径必须指向现有数据库，输入错路径不会创建空库。
+重启、`/reset`、图片 30 天清理均不解除；保留数据卷。旧镜像不执行黑名单，回滚会失去限制。
+
 ## 图像接口配置
 
-2026-10-12 已部署至 `ssh rocky:/opt/raricy_bot`，当前镜像
-`raricy-bot:image-b64-20261011-172151`（标签时间为 UTC）。本次适配第三方 Base64 响应格式并
+2026-10-12 的前一次部署镜像为
+`raricy-bot:image-b64-20261011-172151`（标签时间为 UTC）。该次适配第三方 Base64 响应格式并
 补充图像失败日志，提供方与服务定向测试共 57 项通过；包含此前 UUID 私聊路由修复。
 切换后存活与就绪均为 200，容器 healthy，运行中的 19 个变更模块哈希与验收源码一致，
 图像开关已启用；用户的模型、密钥配置与数据卷保留。

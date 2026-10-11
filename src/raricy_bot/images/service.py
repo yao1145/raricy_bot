@@ -38,6 +38,7 @@ from ..store import (
     ImageJob,
 )
 from ..texts import (
+    IMAGE_BLACKLIST_TEXT,
     IMAGE_FAILURE_TEXT,
     IMAGE_QUOTA_TEXT,
     IMAGE_REFERENCE_TEXT,
@@ -50,7 +51,7 @@ from .models import (
     ImageOutput,
     ImageRequest,
 )
-from .provider import ImageProvider, ImageProviderError
+from .provider import ImageProvider, ImageProviderError, REASON_CONTENT_POLICY
 
 if TYPE_CHECKING:  # 只用于类型标注，避免运行期引入发送器依赖
     from ..core.sender import MessageSender
@@ -201,6 +202,10 @@ class ImageService:
         if self._expired(request):
             return False
 
+        if await self._store.is_image_user_blocked(self._scope, request.actor_id):
+            await self._notice(request, IMAGE_BLACKLIST_TEXT)
+            return False
+
         # 编辑入口：预留前完成参考图取回与格式校验，缺图/超限/取图失败一律不占额度。
         reference: ImageOutput | None = None
         if request.mode == MODE_EDIT:
@@ -229,8 +234,11 @@ class ImageService:
             return False
 
         # 预留后、调用前再复核一次：失效则释放预留，不产生任何付费副作用。
-        if not self._alive(request):
+        blocked = await self._store.is_image_user_blocked(self._scope, request.actor_id)
+        if blocked or not self._alive(request):
             await self._store.release_image_job(job_id, self._now())
+            if blocked:
+                await self._notice(request, IMAGE_BLACKLIST_TEXT)
             return False
         if not await self._store.begin_image_generation(job_id, self._now()):
             return False
@@ -240,6 +248,11 @@ class ImageService:
             output = await self._provider.generate(prompt, reference=reference)
         except ImageProviderError as exc:
             current = self._now()
+            if exc.reason == REASON_CONTENT_POLICY:
+                await self._store.block_image_user(
+                    self._scope, request.actor_id, reason="content_policy",
+                    now=current, trigger_message_id=request.message_id,
+                )
             log_event(
                 logger, logging.WARNING, "image.generate_failed",
                 reason=exc.reason, status="unknown" if exc.uncertain else "rejected",
@@ -251,7 +264,7 @@ class ImageService:
             else:
                 # 明确未生成：释放本次预留。
                 await self._store.fail_image_generation(job_id, exc.reason, current)
-            await self._notice(request, IMAGE_FAILURE_TEXT)
+            await self._notice(request, IMAGE_BLACKLIST_TEXT if exc.reason == REASON_CONTENT_POLICY else IMAGE_FAILURE_TEXT)
             return False
         except BaseException:
             # 未预期异常或取消：请求可能已发出，保守按不确定占额后原样抛出。
@@ -263,6 +276,9 @@ class ImageService:
 
         # 生成已确认：无论输出是否合格、上传/发送是否成功，这一张都已计费。
         await self._store.confirm_image_generated(job_id, self._now())
+        if await self._store.is_image_user_blocked(self._scope, request.actor_id):
+            await self._notice(request, IMAGE_BLACKLIST_TEXT)
+            return False
         return await self._upload_and_send(request, job_id, output)
 
     async def _load_reference(self, request: ImageRequest) -> ImageOutput:

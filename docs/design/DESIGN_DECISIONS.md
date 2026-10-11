@@ -2111,6 +2111,29 @@ Store 原子预留避免并发越额，重启不重投付费请求。单副本�
 站点缓存会延迟实际失效，不承诺严格到秒删除。容量淘汰只删除本功能最旧图，保留其他用途图片
 与参考图；不足时拒绝上传。关闭生成仍维护旧图，回滚旧镜像须另行安排清理以免租期失管。
 
+## D-160 明确图像安全拦截永久禁用该用户，管理员本地手动解除
+
+按用户要求，图像上游明确安全拒绝时自动加入黑名单。以可信消息作者 ID 为标识，
+作用域与图像账本一致（站点 base_url + 机器人账号），跨私聊和大区同时生效；只禁用生成和编辑，
+保留文本能力。Store 新增 `image_blacklist` 表，仅保存作用域、用户 ID、首次封禁时间、稳定原因
+与触发消息 ID，不保存描述、图片或上游错误正文。没有 TTL；重启、图片清理与 `/reset` 不解除。
+
+提供方只匹配 JSON `error.code` / `error.type` 中的 `content_policy_violation`、
+`image_content_policy_violation`、`moderation_blocked`，适用于 HTTP 400/403/422、5xx 及错误信封 2xx。
+错误体最多读取 64 KiB，不解析错误 message 或自由文本关键词。401、429、普通 400、网络错误不封禁。
+5xx/2xx 错误信封仍保守占额，明确 4xx 安全拒绝释放本次额度，不自动重试。
+依据：[OpenAI 图像指南](https://developers.openai.com/api/docs/guides/image-generation/)
+中的 `moderation_blocked`、[官方 SDK 错误类型](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_error.py)
+及 [Azure OpenAI 图像错误码](https://github.com/MicrosoftDocs/azure-ai-docs/blob/main/articles/foundry/openai/includes/dall-e-rest.md)。
+机构若只返回普通 400 或自由文本，不能据此自动封禁，需管理员手动加入或依据明确契约进一步适配。
+
+路由入队和执行者调用前均复核；封禁后排队请求不取参考图、不调用上游、不新增额度。
+已外发的并发请求无法撤回，返回成功后再查黑名单，已禁用户不继续上传新结果。
+管理入口 `python -m raricy_bot.images.admin` 只在服务器本地使用，没有聊天解除命令或公开写接口。
+列表使用 SQLite 只读连接；增删必须取得与机器人相同的数据目录锁，先停机器人再操作。
+历史日志只有普通 HTTP 400，不能据此追溯自动封禁；初始用户按管理员指定手动加入。
+回滚旧镜像会失去门禁，应保留数据库并仅回滚到同样执行黑名单的版本。
+
 ## 实施期编号兼容
 
 源码中的“裁决 A–G”与长期记忆 R8–R16：A/G→D-61，B→D-62，C→D-61/§33，
