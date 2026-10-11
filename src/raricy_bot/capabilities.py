@@ -24,6 +24,9 @@ from . import texts
 SOURCE_MCP = "mcp"
 SOURCE_LOCAL = "local"
 
+# 图像是独立执行命令，不注册为 MCP 或文本模型工具。
+IMAGE_COMMAND = "/image"
+
 # result_shape 取值：list = 本轮是多条条目；single = 本轮是整条答案，result_count 必须为 1。
 SHAPE_LIST = "list"
 SHAPE_SINGLE = "single"

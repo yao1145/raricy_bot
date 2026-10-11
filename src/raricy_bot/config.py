@@ -46,6 +46,21 @@ WORST_CASE_MEMORY_ID: str = "UM-999999999"
 USERNAME_ENV: str = "RARICY_USERNAME"
 PASSWORD_ENV: str = "RARICY_PASSWORD"
 LLM_API_KEY_ENV: str = "LLM_API_KEY"
+# 图像生成的独立密钥环境变量名（默认值；可由 image_generation.api_key_env 覆盖）。
+# 刻意**不回退**到 LLM_API_KEY：两套凭据属于不同供应商与账单，串用会让
+# 「图像功能总开关」变成「把文本密钥顺手发出去」的开关。
+IMAGE_API_KEY_ENV: str = "IMAGE_API_KEY"
+
+# 独立图像服务的默认地址（设计 §3）；兼容网关地址必须由部署配置显式覆盖。
+DEFAULT_IMAGE_BASE_URL: str = "https://api.openai.com/v1"
+
+# 输出位图格式与质量的取值：上游按模型支持范围校验，这里只钉住已核对的枚举，
+# 写错一个词应该在启动期失败，而不是等某次生成才以 400 收场。
+IMAGE_OUTPUT_FORMATS: tuple[str, ...] = ("png", "jpeg", "webp")
+IMAGE_QUALITIES: tuple[str, ...] = ("low", "medium", "high", "auto")
+
+# `size` 形如 `1024x1024`；宽松解析会让 "1024*1024" 这类写法留到上游才报错。
+_IMAGE_SIZE_RE = re.compile(r"^[1-9][0-9]{1,4}x[1-9][0-9]{1,4}$")
 
 
 # ConfigError 的机器可读分类：`KIND_MISSING` 只表示**还没填**（草稿可以接受、
@@ -379,17 +394,46 @@ class StickerConfig:
 
 
 @dataclass(frozen=True)
+class ImageGenerationConfig:
+    """独立图像生成/编辑配置（设计 §3）；默认关闭。
+
+    与文本模型完全独立：自己的地址、密钥、超时与并发额度。`api_key_env` 只保存
+    **环境变量名**，永远不保存密钥值；真实值只在构造
+    `images.provider.ImageProvider` 时从宿主环境读取，因此 repr、日志与异常文案里
+    都不可能带出密钥。
+    """
+
+    enabled: bool = False
+    base_url: str = DEFAULT_IMAGE_BASE_URL
+    # 启用前必须填写账号实际可用的 GPT Image 模型；关闭时允许为空。
+    model: str = ""
+    api_key_env: str = IMAGE_API_KEY_ENV
+    timeout_seconds: float = 180.0
+    size: str = "1024x1024"
+    quality: str = "medium"
+    output_format: str = "webp"
+    output_compression: int = 80
+    # 单张编辑参考图上限，与文本视觉配置独立；不得超过站点图床的单文件上限。
+    max_reference_bytes: int = 5242880
+    concurrency: int = 2
+    queue_size: int = 10
+
+
+@dataclass(frozen=True)
 class Secrets:
     """密钥集合；repr 必须脱敏。"""
 
     username: str
     password: str
     llm_api_key: str
+    # 图像生成独立密钥（可为空）。加在末位并带默认值：所有既有构造与相等比较
+    # 保持逐字节兼容，未配置图像功能的部署不需要改动任何调用点。
+    image_api_key: str = ""
 
     def __repr__(self) -> str:
         return (
             f"Secrets(username={self.username!r}, password='[redacted]', "
-            f"llm_api_key='[redacted]')"
+            f"llm_api_key='[redacted]', image_api_key='[redacted]')"
         )
 
 
@@ -444,6 +488,7 @@ class Config:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     blog: BlogConfig = field(default_factory=BlogConfig)
     stickers: StickerConfig = field(default_factory=StickerConfig)
+    image_generation: ImageGenerationConfig = field(default_factory=ImageGenerationConfig)
     log_archive: ArchiveConfig = field(default_factory=ArchiveConfig)
 
     @property
@@ -477,6 +522,9 @@ def load_config(path: str | None = None, env: Mapping[str, str] | None = None) -
             username=_secret(source, USERNAME_ENV),
             password=_secret(source, PASSWORD_ENV),
             llm_api_key=_secret(source, LLM_API_KEY_ENV),
+            # 图像密钥只在功能启用时才必需（由 parse_config 的 enabled 分支判定），
+            # 因此这里读到什么就是什么，缺省为空串，不额外要求宿主提供。
+            image_api_key=_optional_secret(source, _image_api_key_env(raw)),
         ),
     )
 
@@ -529,6 +577,7 @@ def parse_config(
     # Launcher 传档案目录），不随进程的工作目录漂移。
     blog = _blog(_section(raw, "blog"), config_dir)
     stickers_cfg = _stickers(_section(raw, "stickers"))
+    image_generation = _image_generation(_section(raw, "image_generation"), secrets)
     # 归档目录同样以配置文件所在目录为基准，并在这里就检查它与知识库、记忆、
     # 稿库互不重叠（计划 §5.2）：写错一个路径不该等到运行期才发现。
     log_archive = _archive(
@@ -566,6 +615,7 @@ def parse_config(
         memory=memory,
         blog=blog,
         stickers=stickers_cfg,
+        image_generation=image_generation,
         log_archive=log_archive,
     )
 
@@ -1730,6 +1780,111 @@ def _stickers(container: Mapping[str, Any]) -> StickerConfig:
     return StickerConfig(enabled=True, collection=collection, entries=tuple(entries))
 
 
+def _image_generation(
+    container: Mapping[str, Any], secrets: Secrets
+) -> ImageGenerationConfig:
+    """构造独立图像配置（设计 §3）。
+
+    **关闭时不介入**：`enabled: false` 只校验总开关与密钥环境变量名，地址、模型、
+    尺寸、质量等都是此刻未使用的字段，不要求合法（与 `stickers` 同一口径）。这既
+    保证旧配置继续可加载，也允许「先写好地址、拿到密钥再打开」的部署顺序。
+
+    启用时才要求地址、模型、格式与密钥齐备。密钥只从环境变量读，且**不回退**到
+    `LLM_API_KEY`；缺密钥按「还没填」分类（KIND_MISSING），让 Launcher 的草稿
+    校验与正式启动得到不同的结果。
+    """
+    where = "image_generation"
+    enabled = _bool_flag(container, "enabled", where, False)
+    raw_env = container.get("api_key_env", IMAGE_API_KEY_ENV)
+    if not isinstance(raw_env, str) or not _ENV_NAME_RE.fullmatch(raw_env.strip()):
+        raise ConfigError(
+            f"配置 {where}.api_key_env 必须是合法的环境变量名",
+            field=f"{where}.api_key_env",
+        )
+    api_key_env = raw_env.strip()
+
+    if not enabled:
+        return ImageGenerationConfig(enabled=False, api_key_env=api_key_env)
+
+    base_url = _optional_base_url(container, where)
+    model = _required_text(container, "model", f"{where}.model")
+    output_format = container.get("output_format", "webp")
+    if output_format not in IMAGE_OUTPUT_FORMATS:
+        raise ConfigError(
+            f"配置 {where}.output_format 只能是 {'/'.join(IMAGE_OUTPUT_FORMATS)}",
+            field=f"{where}.output_format",
+        )
+    quality = container.get("quality", "medium")
+    if quality not in IMAGE_QUALITIES:
+        raise ConfigError(
+            f"配置 {where}.quality 只能是 {'/'.join(IMAGE_QUALITIES)}",
+            field=f"{where}.quality",
+        )
+    size = container.get("size", "1024x1024")
+    if not isinstance(size, str) or not _IMAGE_SIZE_RE.match(size.strip()):
+        raise ConfigError(
+            f"配置 {where}.size 必须是 宽x高（如 1024x1024）", field=f"{where}.size"
+        )
+    if not secrets.image_api_key:
+        raise ConfigError(
+            f"缺少环境变量 {api_key_env}", field=api_key_env, kind=KIND_MISSING
+        )
+
+    return ImageGenerationConfig(
+        enabled=True,
+        base_url=base_url,
+        model=model,
+        api_key_env=api_key_env,
+        timeout_seconds=_positive_number(container, "timeout_seconds", where, 180.0),
+        size=size.strip(),
+        quality=quality,
+        output_format=output_format,
+        output_compression=_int_in_range(
+            container, "output_compression", where, 80, 0, 100
+        ),
+        max_reference_bytes=_max_reference_bytes(container),
+        concurrency=_positive_int(container, "concurrency", where, 2),
+        queue_size=_positive_int(container, "queue_size", where, 10),
+    )
+
+
+def _optional_base_url(container: Mapping[str, Any], where: str) -> str:
+    """取可选的 base_url；缺省用官方地址，给了就必须过传输安全校验。"""
+    if container.get("base_url") is None:
+        return DEFAULT_IMAGE_BASE_URL
+    return _base_url(container, where)
+
+
+def _int_in_range(
+    container: Mapping[str, Any],
+    key: str,
+    where: str,
+    default: int,
+    low: int,
+    high: int,
+) -> int:
+    """取闭区间内的整数配置；布尔不算整数。"""
+    value = container.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"配置 {where}.{key} 必须是整数", field=f"{where}.{key}")
+    if not low <= value <= high:
+        raise ConfigError(
+            f"配置 {where}.{key} 必须在 {low} 到 {high} 之间", field=f"{where}.{key}"
+        )
+    return value
+
+
+def _max_reference_bytes(container: Mapping[str, Any]) -> int:
+    """单张编辑参考图上限：正整数且不超过站点图床的 10 MiB 硬上限。"""
+    value = _positive_int(container, "max_reference_bytes", "image_generation", 5242880)
+    if value > MAX_IMAGE_BYTES:
+        raise ConfigError(
+            f"配置 image_generation.max_reference_bytes 不得超过 {MAX_IMAGE_BYTES}",
+            field="image_generation.max_reference_bytes",
+        )
+    return value
+
+
 def _mcp_args(value: Any, server: str) -> tuple[str, ...]:
     """校验 stdio 命令参数。"""
     if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
@@ -1903,3 +2058,30 @@ def _secret(env: Mapping[str, str], name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"缺少环境变量 {name}", field=name, kind=KIND_MISSING)
     return value
+
+
+def _optional_secret(env: Mapping[str, str], name: str) -> str:
+    """读可选密钥；缺失或全为空白返回空串，不报错（不打印取值）。
+
+    图像密钥只在 `image_generation.enabled` 为真时才必需，而这里还没有解析配置
+    语义；是否要求非空由 `parse_config` 在启用分支判定，避免关闭功能时也强制
+    宿主提供 `IMAGE_API_KEY`。
+    """
+    value = env.get(name)
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    return value
+
+
+def _image_api_key_env(raw: Mapping[str, Any]) -> str:
+    """从原始映射里预读图像密钥的环境变量名（供 load_config 取值用）。
+
+    取值非法时回落到默认名：真正的报错由 `parse_config` 在字段上给出，这里只负责
+    在还没校验语义时挑一个可以安全查表的名字。
+    """
+    section = raw.get("image_generation")
+    if isinstance(section, dict):
+        value = section.get("api_key_env", IMAGE_API_KEY_ENV)
+        if isinstance(value, str) and _ENV_NAME_RE.fullmatch(value.strip()):
+            return value.strip()
+    return IMAGE_API_KEY_ENV

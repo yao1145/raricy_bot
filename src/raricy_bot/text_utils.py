@@ -9,7 +9,7 @@ import math
 import string
 from typing import Any
 
-from .capabilities import CAPABILITY_COMMANDS
+from .capabilities import CAPABILITY_COMMANDS, IMAGE_COMMAND
 from .texts import TRUNCATION_SUFFIX
 
 # 用户名合法字符：字母、数字、下划线与连字符（对应 chat-bot.md §2.1）。
@@ -201,6 +201,11 @@ def parse_capability_command(text: str) -> tuple[str, str] | None:
 def parse_search_command(text: str) -> str | None:
     """解析开头的独立 /search，返回去掉命令后的正文。"""
     return _match_capability_command(text, "/search")
+
+
+def leading_execution_command(text: str) -> str | None:
+    """识别独立执行命令，只用于禁止能力前缀叠加。"""
+    return IMAGE_COMMAND if _match_capability_command(text, IMAGE_COMMAND) is not None else None
 
 
 def parse_kb_command(text: str) -> str | None:

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -38,6 +39,8 @@ from .. import texts
 from ..chat_expiry import message_expiry
 from ..capabilities import CAPABILITY_BY_FEATURE
 from ..config import BehaviorConfig, StorageConfig
+from ..images.commands import ImageCommandError, parse_image_command, reference_for_edit
+from ..images.models import ImageRequest
 from ..logging_setup import get_logger, log_event, new_trace_id
 from ..memory.access import MemoryAccessPolicy
 from ..memory.commands import (
@@ -54,6 +57,7 @@ from ..text_utils import (
     has_media,
     is_help_command,
     leading_capability_command,
+    leading_execution_command,
     parse_capability_command,
     is_reset_command,
     is_secret_probe,
@@ -104,6 +108,7 @@ _ACTIONABLE_REASONS: frozenset[str] = frozenset(
         "memory_dm_only",
         "memory_beta_denied",
         "memory_queue_full",
+        "image_queued",
     }
 )
 
@@ -199,6 +204,9 @@ class MessageRouter:
         private_enabled: Callable[[str | None], bool] | None = None,
         capabilities: frozenset[str] = frozenset(),
         lobby_recent: LobbyRecentContextBuffer | None = None,
+        image_queue: EnqueueQueue[ImageRequest] | None = None,
+        image_enabled: bool = False,
+        site_base_url: str = "",
     ) -> None:
         self._self_user_id = self_user_id
         self._bot_username = bot_username
@@ -224,6 +232,9 @@ class MessageRouter:
         # 大区近期消息缓冲（§38）：注入与否就是这条路径的总开关，与记忆同款。
         # 它是**外部持有**的实例（app 装配），不是模块全局 —— 测试之间不共享状态。
         self._lobby_recent = lobby_recent
+        self._image_queue = image_queue
+        self._image_enabled = image_enabled and image_queue is not None
+        self._site_base_url = site_base_url
         self._logger = _logger
 
     # --- 事件分派 -----------------------------------------------------------
@@ -440,6 +451,45 @@ class MessageRouter:
                 )
             session_key = lobby_thread_session_key(thread_root_id)
 
+        # 图像属于独立执行命令；确认明确唤起后只进入图片队列。
+        image_command = parse_image_command(user_text)
+        if image_command is not None:
+            local = dict(channel_id=channel_id, message_id=message.id, reply_to=message.id,
+                actor_id=message.author.id, channel_kind=channel_kind,
+                thread_root_id=thread_root_id, event_id=event_id)
+            if not self._image_enabled:
+                return emit_current_message("reply_now", "image_unavailable", text=texts.IMAGE_UNAVAILABLE_TEXT, **local)
+            # 真实私聊由站点生成 UUID；d_ 只保留契约示例的兼容形式。
+            if not is_lobby and re.fullmatch(
+                r"(?:d_[A-Za-z0-9_-]+|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})",
+                channel_id,
+            ) is None:
+                return emit_current_message("reply_now", "image_channel", text=texts.IMAGE_CHANNEL_TEXT, **local)
+            prompt = image_command.prompt
+            if leading_capability_command(prompt) or leading_execution_command(prompt) or parse_memory_command(prompt):
+                return emit_current_message("reply_now", "capability_conflict", text=texts.CAPABILITY_CONFLICT_TEXT, **local)
+            if not prompt:
+                return emit_current_message("reply_now", "image_usage", text=texts.IMAGE_USAGE_TEXT, **local)
+            if len(prompt) > self._cfg.max_input_chars:
+                return emit_current_message("reply_now", "too_long", text=texts.TOO_LONG_TEXT, **local)
+            if is_secret_probe(prompt):
+                return emit_current_message("reply_now", "secret_probe", text=texts.SECRET_REFUSAL_TEXT, **local)
+            try:
+                reference_id = reference_for_edit(image_command, message, site_base_url=self._site_base_url)
+            except ImageCommandError:
+                return emit_current_message("reply_now", "image_reference", text=texts.IMAGE_REFERENCE_TEXT, **local)
+            image_request = ImageRequest(event_id=event_id, channel_id=channel_id,
+                channel_kind=channel_kind, session_key=session_key,
+                generation=self._ctx.generation(session_key), message_id=message.id,
+                actor_id=message.author.id, prompt=prompt, mode=image_command.mode,
+                reference_image_id=reference_id, thread_root_id=thread_root_id,
+                trace_id=new_trace_id(), expires_at=expires_at)
+            try:
+                self._image_queue.put_nowait(image_request)
+            except asyncio.QueueFull:
+                return emit_current_message("busy", "image_queue_full", text=texts.IMAGE_BUSY_TEXT, **local)
+            return emit_current_message("image_queued", "image_queued", **local)
+
         # 9.0 记忆命令（§34.1、规划 §7.3）：**先于能力命令解析**识别，否则
         # `/search /remember x` 会在剥掉 `/search` 之后被当成记忆命令执行，绕过
         # 「一条消息最多一个能力」（D-39）。记忆未注入时整段不存在：那时 `/remember`
@@ -484,6 +534,7 @@ class MessageRouter:
                 )
             if (
                 leading_capability_command(user_text) is not None
+                or leading_execution_command(user_text) is not None
                 or self._leads_with_memory_command(user_text)
             ):
                 return emit_current_message(
@@ -753,6 +804,7 @@ class MessageRouter:
             private_enabled=self._private_enabled_for(user_id),
             blog_max_chars=self._cfg.quoted_blog_max_chars,
             capabilities=self._capabilities,
+            image_enabled=self._image_enabled,
         )
 
     # --- 记忆命令（§34.1） ---------------------------------------------------

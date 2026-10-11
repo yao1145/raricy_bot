@@ -1973,3 +1973,33 @@ import 本模块（`--no-tray` 与非 Windows 路径都不加载 `win32gui`）�
   `TrayError`：`Controller._start_tray()` 只捕获 `(PlatformError, TrayError, OSError)`，而
   `pywintypes.error` **不是** `OSError` 的子类，逸出的原始异常会直接结束进程，让「托盘建不
   起来仍继续运行、管理页仍是入口」的降级路径落空（§61.3）。
+
+## 62. 图像生成与编辑
+
+入口是 `images.commands` 与 `core.router.MessageRouter`，只接受私聊 UUID（兼容 `d_` 示例形式）
+与大区精确 @。站点 `chat-service.ts::startDirectChannel` 用 `crypto.randomUUID()` 创建私聊 ID；
+不能把上游文档中的 `d_xxx` 示例当作实际前缀约束。
+[`ImageRequest`](../../src/raricy_bot/images/models.py) 只携带当前描述、显式单张参考图 ID、
+触发者及会话代次等元数据，不进入文本 `Request`、MCP 白名单或短期历史。
+`ImageScheduler` 使用独立队列和并发，同一会话最多一个在途图像任务。
+
+`ImageProvider` 使用独立配置、环境密钥、httpx 客户端与超时。生成 JSON 请求
+`/images/generations`，显式编辑 multipart 请求 `/images/edits`，固定 `n=1`，
+只接收有界 Base64 位图。不跟随重定向、不自动重试，取消由服务保守记账后传播。
+配置和默认值以 [`config.py`](../../src/raricy_bot/config.py) 为准，密钥不回退到文本接口。
+按模型名最后一段区分 GPT Image 家族（`gpt-image-*`、`chatgpt-image-*`）：维持默认 Base64，
+不传其不支持的 `response_format`；其他兼容模型在生成 JSON 和编辑表单中显式请求
+`response_format=b64_json`。第三方返回的实际 PNG/JPEG/WebP MIME 仍按字节判断，不由配置强制。
+失败事件 `image.generate_failed` 仅记录稳定 reason、unknown/rejected、已知 HTTP 数字状态、
+阶段与随机 trace_id，不记录请求、响应或 URL，不自动重试。
+
+`ImageService` 由 App 图像 worker 调用，负责事件终态及 Store 生成、上传、发送状态。
+全站单副本以站点地址和机器人账号 ID 固定账本作用域，共享滚动 24 小时 50 张额度：
+确定未生成时释放，未知结果保守占额，成功以确认输出时刻起算。图片删除或上传、发送失败不退额度。
+SQLite 只存标识、时刻、大小及状态，不存描述或图片；重启只恢复和对账，不生成或补发旧结果。
+
+站点图床依据 [`image-bot.md`](../materials/image-bot.md)，附件通过 `post_message(image_id=...)`
+与 `MessageSender.send(image_id=...)` 贯通；发送未知时只读对账作者、引用目标、正文、精确图片 ID，
+不重新 POST。文本调用不传新增空参数。图床维护和上传共用锁，仅删本功能登记图：
+30 天到期清理、空间不足时最旧优先删除到够用。关闭生成仍维护旧图片。
+Light 的配置与运行入口拒绝启用。App 先停图像 worker/维护，再关闭提供方和 Store。

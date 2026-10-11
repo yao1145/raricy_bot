@@ -1,6 +1,9 @@
 # 构建上下文排除项：减小镜像并防止把本地密钥、数据与测试带进去。
 .git
 .gitignore
+.deploy-backups
+.deploy-image
+.tmp
 .github
 __pycache__
 *.pyc

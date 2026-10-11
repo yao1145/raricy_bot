@@ -13,9 +13,10 @@
 | Light 下一代（N0–N4 已实施，N5 发行验收未做）：账号更换/删除、托盘与 Windows 登录启动 | [LIGHT_NEXT_GENERATION.md](design/LIGHT_NEXT_GENERATION.md)：现有代码审查、复现证据、档案事务、桌面集成、迁移与验收 |
 | 跨模块行为与代码入口 | [INTERFACES.md](design/INTERFACES.md) |
 | 本次代码审查四项修复的问题、理由与替代关系 | [DESIGN_DECISIONS.md](design/DESIGN_DECISIONS.md) 的 D-115–D-118；已实施，一次性计划见[归档索引](ARCHIVE.md) |
-| 行为的理由、例外与取舍 | [DESIGN_DECISIONS.md](design/DESIGN_DECISIONS.md)（D-1–D-158；D-154–D-156 为发送代次、知识库档案绑定与 SSE 退避修复，D-157 为博客接口契约同步，D-158 为手动双击打开管理页） |
+| 行为的理由、例外与取舍 | [DESIGN_DECISIONS.md](design/DESIGN_DECISIONS.md)（D-1–D-159；图像设计见 D-159） |
 | 系统提示词规范 | [SYSTEM_PROMPTS.md](design/SYSTEM_PROMPTS.md)；文档不参与运行，配置提示词须同步到部署配置，静态附加说明须同步 `texts.py`；第三类静态来源（表情包，由已校验的部署配置渲染）见 §1.10、D-119 |
 | 用户命令、隐私说明、定时发文操作与待验收项 | [USAGE.md](usage/USAGE.md) |
+| 图像生成与编辑（完整版） | [使用方式](usage/USAGE.md#34-image-与-image-edit)、[部署配置](usage/DEPLOYMENT.md#图像接口配置)、[跨模块契约](design/INTERFACES.md#62-图像生成与编辑) |
 | Light 桌面版安装、升级、排障与未验收项 | [LIGHT.md](usage/LIGHT.md) |
 | 部署、升级、恢复、排障 | [DEPLOYMENT.md](usage/DEPLOYMENT.md) |
 | Exa 多 Key 池与本地知识库 | [EXA_POOL_AND_KB.md](usage/EXA_POOL_AND_KB.md) |
@@ -32,6 +33,7 @@
 | [chat-bot.md](materials/chat-bot.md) | 聊天 API 契约，上游 `5eace12`（2026-09-18） |
 | [comment-bot.md](materials/comment-bot.md) | 评论、通知与限频契约，同上 |
 | [blog-bot.md](materials/blog-bot.md) | 博客读写契约，用户于 2026-09-30 提供的原文；未附上游提交号，SHA-256：`1496554cd5d7d563a82e935c7e52051235bb34f7fa8fbc6b848fb338fc7415bd` |
+| [image-bot.md](materials/image-bot.md) | 整份同步网站图床契约，上游 `6f7245fa`（2026-10-09）；SHA-256：`c2c1495bbfae843df811ba6822d208ad7b89a9035cb08d4019f02c3069fcaa9a` |
 | [SITE_DOCS_SOURCE.md](materials/SITE_DOCS_SOURCE.md) | 知识库的许可、锁定版本、逐篇来源与更新复核步骤；改 `knowledge/` 前阅读 |
 | [推文-Logos-发布稿.md](materials/推文-Logos-发布稿.md) | 机器人形象发布文案 |
 | [推文-长期记忆-发布稿.md](materials/推文-长期记忆-发布稿.md) | 长期记忆 Beta 的对外发布文案 |

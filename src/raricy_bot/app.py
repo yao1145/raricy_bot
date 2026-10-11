@@ -90,6 +90,10 @@ from .core.worker import (
 from .data_lock import DataLock, acquire_account_lock
 from .diag import describe_error
 from .kb.service import KnowledgeService
+from .images.models import ImageRequest
+from .images.provider import ImageProvider
+from .images.queue import ImageScheduler
+from .images.service import ImageService
 from .logging_setup import (
     get_logger,
     log_event,
@@ -244,6 +248,7 @@ class BotApp:
         self._registry.attach(self._redactor)
         self._registry.register(config.secrets.password)
         self._registry.register(config.secrets.llm_api_key)
+        self._registry.register(config.secrets.image_api_key)
 
         self._store = Store(
             config.storage.db_path,
@@ -344,6 +349,16 @@ class BotApp:
             redactor=self._redactor,
             cfg=config.behavior,
             table=self._sticker_table,
+        )
+        # 图像具有独立队列、并发与模型客户端，不经过文本会话历史。
+        self._image_provider: ImageProvider | None = None
+        self._image_service: ImageService | None = None
+        self._image_armed = False
+        self._image_queue = ImageScheduler(maxsize=config.image_generation.queue_size)
+        self._image_workers = WorkerPool(
+            queue=self._image_queue,
+            handler=self._handle_image_request,
+            concurrency=config.image_generation.concurrency,
         )
 
         # 注入的假模型不归本对象关闭；内部构造的才需要 aclose。
@@ -524,6 +539,50 @@ class BotApp:
                 pass
             raise
 
+    def _image_request_current(self, request: ImageRequest) -> bool:
+        """异步边界复核会话代次、消息有效期与站点可用状态。"""
+        return (
+            not self._unavailable
+            and not self._is_expired(request.expires_at)
+            and self._ctx.generation(request.session_key) == request.generation
+        )
+
+    async def _handle_image_request(self, request: ImageRequest) -> None:
+        """图像终态与水位由独立服务统一结算。"""
+        service = self._image_service
+        if service is not None:
+            await service.handle(request)
+
+    async def _start_images(self, user) -> None:
+        """关闭新请求时仍维护已登记图片；装配失败只关闭图像入口。"""
+        cfg = self._config.image_generation
+        try:
+            if cfg.enabled:
+                self._image_provider = ImageProvider(
+                    cfg, self._config.secrets.image_api_key, transport=self._transport
+                )
+            self._image_service = ImageService(
+                cfg=cfg, store=self._store, site=self._client,
+                provider=self._image_provider, sender=self._sender,
+                scope=f"{self._config.site.base_url.rstrip('/')}|{user.id}",
+                generation_is_current=self._image_request_current,
+                redactor=self._redactor, now=self._now,
+            )
+            await self._image_service.start()
+            if cfg.enabled:
+                await self._image_workers.start()
+                self._image_armed = True
+        except Exception as exc:
+            self._image_armed = False
+            await self._image_workers.stop()
+            if self._image_service is not None:
+                await self._image_service.close()
+                self._image_service = None
+            if self._image_provider is not None:
+                await self._image_provider.close()
+                self._image_provider = None
+            log_event(_logger, logging.WARNING, "app.image_start_failed", error=type(exc).__name__)
+
     async def _start_after_login(self, user) -> None:
         """登录且取得公共账号锁之后装配账号级组件。"""
         # 主模型必须早于记忆撰写器构造：`MemoryWriter` 绑定的是这一个客户端（§34.2 第 2 步）。
@@ -539,6 +598,7 @@ class BotApp:
         # 记忆装配（§34.2 第 1-3 步）：必须在聊天 worker 与评论服务启动之前，
         # 且整段只在 `memory.enabled=true` 时执行（D-60）。整段成功跑完才会置 `_memory_armed`。
         await self._start_memory()
+        await self._start_images(user)
 
         # 记忆路径的三种参数要么都给，要么都不给：全都为 None 时 Router 的行为与
         # 升级前逐字节一致（§34.1）。判据是 `_memory_armed` 而不是配置里的 `enabled`：
@@ -559,6 +619,9 @@ class BotApp:
             memory_queue=self._memory_queue if memory_on else None,
             private_enabled=self._memory_private_enabled if memory_on else None,
             lobby_recent=self._lobby_recent,
+            image_queue=self._image_queue if self._image_armed else None,
+            image_enabled=self._image_armed,
+            site_base_url=self._config.site.base_url,
         )
         # MCP 是可选扩展：任何连接、发现或子进程错误只让对应 feature 不可用，
         # 不得阻止普通聊天、评论或健康端点启动。
@@ -1518,6 +1581,9 @@ class BotApp:
             # 唯一做事的角色是记忆 worker（`mark_handled` 也在它那边，§34.3），这里连
             # `mark_handled` 都不能调 —— 抢先把事件标成终态会让 worker 之外再没有终态写入点，
             # 命令失败时就永远卡住了。这个分支存在的意义只是「明确地什么都不做」。
+            return
+        elif result.action == "image_queued":
+            # 只有图像 worker 负责结算这一触发消息。
             return
 
     async def _send_local(self, result: RouteResult) -> None:
@@ -2556,6 +2622,12 @@ class BotApp:
         await self._workers.stop()
         # 记忆 worker 与主聊天 worker 同一阶段停下；此时没有新的记忆命令会被领取。
         await self._memory_workers.stop()
+        self._image_armed = False
+        await self._image_workers.stop()
+        if self._image_service is not None:
+            await self._image_service.close()
+        if self._image_provider is not None:
+            await self._image_provider.close()
         # 记忆刷新 task 在 worker 之后停（§34.2 第 3 步）：刷新的只是内存快照，
         # 但它要早于模型客户端与 Store，否则末次刷新会撞上已经关掉的东西。
         # 与启动同一条口径：关闭时连 stop() 都不必调（那时服务根本没被启动过，D-60）。

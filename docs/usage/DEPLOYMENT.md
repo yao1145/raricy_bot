@@ -1,5 +1,42 @@
 # 远程 Linux 服务器部署指南
 
+## 图像接口配置
+
+2026-10-12 已部署至 `ssh rocky:/opt/raricy_bot`，当前镜像
+`raricy-bot:image-b64-20261011-172151`（标签时间为 UTC）。本次适配第三方 Base64 响应格式并
+补充图像失败日志，提供方与服务定向测试共 57 项通过；包含此前 UUID 私聊路由修复。
+切换后存活与就绪均为 200，容器 healthy，运行中的 19 个变更模块哈希与验收源码一致，
+图像开关已启用；用户的模型、密钥配置与数据卷保留。
+本次源码与 Compose 备份在 `/opt/raricy_bot/.deploy-backups/image-b64-20261011-172151`。
+第三方生图接口已通过临时 SSH 通道验证，通道随后关闭。服务器直连恢复后，生产容器调用
+部署后的实际提供方生成成功：HTTP 200，6.99 秒，JPEG 234276 字节；当前无需代理。
+真实编辑、上传与站内附件显示仍待用户验收；取证边界见 [事件三](INCIDENTS.md)。
+
+首次部署时只读验证图床容量 50 MiB、图库为空，默认关闭图像功能。首次部署前的旧镜像、
+配置、源码和一致性 SQLite 备份保存在
+`/opt/raricy_bot/.deploy-backups/image-20261011-162543`；恢复旧镜像时保留当前数据卷，不直接覆盖回旧数据库。
+
+完整版支持独立 OpenAI Images 接口。部署默认 `image_generation.enabled: false`，
+后续在 `config.yaml` 的 `image_generation` 小节填写 `base_url`、`model`，再安全设置宿主
+`.env` 的 `IMAGE_API_KEY`。密钥不得写入 YAML 或粘贴到聊天；Compose 已单独透传该变量。
+自定义 `api_key_env` 时也须显式透传对应变量。不要使用文本模型 Key 的自动回退。
+填好后改 `enabled: true`，执行 `docker compose up -d --force-recreate bot`，以载入新的环境变量。
+字段默认值和中文说明见 [配置示例](../../config.example.yaml)。
+
+第三方 OpenAI Images 兼容模型（如 `mgr/grok-imagine-image`）会自动请求
+`response_format: b64_json`；GPT Image 家族维持其默认 Base64 协议。服务必须支持 Base64 输出，
+返回图片按实际 PNG/JPEG/WebP 字节上传，忽略输出格式参数的机构可能返回 JPEG。
+`event=image.generate_failed` 日志区分 `network`、`timeout`、`rejected`、`invalid_success` 等稳定码；
+已知 HTTP 错误附数字 `http_status`。只看 HTTP 200 不等于生成、解码、上传和发送均已成功。
+
+生成和编辑共享滚动 24 小时 50 张，账本在原数据卷 SQLite 新表中；保持单副本和同一机器人账号。
+关闭生成仍维护已登记图，到期每 10 分钟软删除；容量满时只淘汰本功能最旧图。
+SQLite 需一致性备份，不能只复制运行中的主文件；回滚保留数据卷和额度账本，旧版不维护图片，
+需另外安排租期清理。站点软删除和缓存无法保证严格到秒的失效。
+
+真实站点验收：私聊各一条 `/image` 与带参考图的 `/image edit`，确认两个端点、附件显示、
+期限和两张共享额度；大区精确 @ 的真实触发仍待操作者验证。离线测试不替代真实接口验收。
+
 面向第一次把这台机器人部署到远程 Linux 服务器的操作者。
 每一步都给出可直接执行的命令与**预期输出**，凡是容易踩坑的地方都单独标注了原因。
 

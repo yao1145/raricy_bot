@@ -293,6 +293,37 @@ class ChatUserSummary:
 
 
 @dataclass(frozen=True)
+class SiteImage:
+    """一张图床图片的元信息（图床契约 §3–§4）。
+
+    上传响应只回传 `filename` / `id` / `url`，`GET /api/images` 才带 `file_size` /
+    `mime_type` / `created_at`。上传路径因此把请求参数与字节数补进已知字段，
+    `created_at` 为 None；需要精确空间口径时以 `list_images` 的 `file_size` 求和为准。
+    """
+
+    id: str
+    filename: str
+    file_size: int
+    mime_type: str
+    created_at: str | None
+    url: str
+
+
+@dataclass(frozen=True)
+class ImageQuota:
+    """账号图床配额（图床契约 §5）；单位统一为字节。
+
+    上游只给两位小数的 MB 展示值（`Math.round(x * 100) / 100`），回算字节必然带
+    最多约 ±5 KiB 的舍入误差，因此只用于粗略预检；精确已用空间应累加
+    `list_images` 的 `file_size`。
+    """
+
+    used_bytes: int
+    limit_bytes: int
+    remaining_bytes: int
+
+
+@dataclass(frozen=True)
 class ChatMessage:
     """一条站内消息。"""
 

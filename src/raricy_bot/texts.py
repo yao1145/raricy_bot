@@ -251,6 +251,7 @@ def help_text(
     private_enabled: bool,
     blog_max_chars: int,
     capabilities: frozenset[str] = frozenset(),
+    image_enabled: bool = False,
 ) -> str:
     """/help 的文案：能力组合 × 媒体 × 记忆状态 × 频道（INTERFACES §36）。
 
@@ -269,6 +270,7 @@ def help_text(
         _HELP_HEAD
         + _HELP_SESSION_COMMANDS
         + _capability_commands(kb_enabled=kb_enabled, capabilities=capabilities)
+        + (IMAGE_HELP_TEXT if image_enabled else "")
         + _media_section(vision_enabled=vision_enabled, blog_max_chars=blog_max_chars)
         + _HELP_TAIL_ABOUT_LOBBY
     )
@@ -1096,3 +1098,24 @@ CURRENT_TIME_LABEL: str = "当前时间："
 # 星期名，**下标与 `datetime.weekday()` 对齐**：周一 = 0 … 周日 = 6。
 # 顺序一旦错位，跨日渲染出的星期就会整体偏移一天，因此不得重排（D-114）。
 WEEKDAYS: tuple[str, ...] = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+
+# 独立图像能力不进入文本模型，也不使用聊天历史或记忆。
+IMAGE_USAGE_TEXT = (
+    "用法：/image 图片描述；编辑请用 /image edit 修改描述，并附一张参考图、直接回复图片，"
+    "或写一个站内 [@图片ID]。生成与编辑共用滚动 24 小时 50 张额度。"
+    "描述和编辑参考图会发送给独立图像服务；生成结果上传公开图床，知道直链的人可以访问。"
+    "图片最多保留 30 天，空间不足可能提前删除。"
+)
+IMAGE_UNAVAILABLE_TEXT = "图像生成暂未开启。"
+IMAGE_CHANNEL_TEXT = "图像命令只支持私聊和聊天大群；大群中需要精确 @ 我。"
+IMAGE_REFERENCE_TEXT = "编辑需要一张可访问的 PNG、JPEG 或 WebP 参考图和修改描述；请检查图片是否已删除或超限。"
+IMAGE_FAILURE_TEXT = "这次图像请求未能完成；结果不确定时不会自动重新生成。"
+IMAGE_QUOTA_TEXT = "全站滚动 24 小时 50 张图像额度已用完；生成与编辑共用额度，请稍后再试。"
+IMAGE_SPACE_TEXT = "图床暂时没有足够空间，或旧图片清理未能确认完成，请稍后再试。"
+IMAGE_BUSY_TEXT = "图像任务正在处理或队列已满，请稍后再试。"
+IMAGE_RESULT_TEXT = "图像已生成。最长有效期至 {expires_at}（北京时间）；图床空间不足时可能提前删除。"
+IMAGE_HELP_TEXT = (
+    "\n- `/image 图片描述`：生成一张图。`/image edit 修改描述`：仅在提供一张参考图时编辑。"
+    "描述和编辑参考图发送给独立图像服务，结果存入公开图床；全站滚动 24 小时最多 50 张，"
+    "最多保留 30 天，空间不足淘汰本功能最旧图片。\n"
+)

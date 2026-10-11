@@ -4,6 +4,13 @@
 `docs/archive/` 按现有 `.gitignore` **不入库**；这里的链接指向本地副本，新克隆可能没有这些文件。
 不删除未入库的唯一副本；需要跨机器保存时另行备份。
 
+## 2026-10-12 图像功能实施计划
+
+用户批准后，由三个 Claude Code CLI 任务并行实施。一次性计划保存在
+[IMAGE_GENERATION_PLAN.md](archive/2026-10-12-IMAGE_GENERATION_PLAN.md)，原路径为
+`docs/design/IMAGE_GENERATION_PLAN.md`；它是尚未提交的本地唯一副本，归档不入库。
+现行行为见 INTERFACES §62、D-159；实际模型、密钥和真实接口验收留在使用与部署手册。
+
 ## 2026-09-27 登记：下一代 Light 设计暂不归档（在用）
 
 [LIGHT_NEXT_GENERATION.md](design/LIGHT_NEXT_GENERATION.md) 是 N0–N4 的设计来源，N0–N4 已实施

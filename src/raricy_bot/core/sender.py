@@ -25,6 +25,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
 
 from ..config import BehaviorConfig
 from ..logging_setup import get_logger, log_event
@@ -127,6 +128,7 @@ class MessageSender:
         actor_id: str | None = None,
         thread_root_id: int | None = None,
         expires_at: float | None = None,
+        image_id: str | None = None,
         generation_is_current: Callable[[], bool] | None = None,
     ) -> SendResult:
         """脱敏、表情归一与截断后发送；`kind` 与 `actor_id` 原样透传给 `quota`（三值见 §10）。
@@ -140,6 +142,10 @@ class MessageSender:
         `expires_at` 是这条输入消息的过期时刻。旧的直接调用不传时保留原行为。
         `generation_is_current` 由调用方提供同步代次校验；每次 POST 前复核，
         失效时只读对账仍可确认此前的发送，但绝不重投。
+
+        `image_id` 非空时把该图床图片作为附件发出，并启用**图片专属**的不确定处理：
+        网络、5xx 与非法成功形状都只做只读对账、绝不重投（计划 §6）。文本调用不传
+        该参数，请求体与既有重试行为逐字不变。
         """
         abort_reason = self._abort_reason(expires_at, generation_is_current)
         if abort_reason is not None:
@@ -191,7 +197,7 @@ class MessageSender:
                 delivery = _Delivery(SendResult(False, None, abort_reason), None, False)
             else:
                 delivery = await self._deliver(
-                    channel_id, content, reply_to, expires_at, generation_is_current
+                    channel_id, content, reply_to, image_id, expires_at, generation_is_current
                 )
         except BaseException:
             # 未预期的异常（含取消）也不能让预留泄漏；release 同样受取消保护，
@@ -342,19 +348,27 @@ class MessageSender:
         channel_id: str,
         content: str,
         reply_to: int | None,
+        image_id: str | None,
         expires_at: float | None,
         generation_is_current: Callable[[], bool] | None,
     ) -> _Delivery:
         """执行一次 POST 并处理结果；不做结算，只回报是否已确认送达。"""
         try:
             message = await self._post_once(
-                channel_id, content, reply_to, expires_at, generation_is_current
+                channel_id, content, reply_to, image_id, expires_at, generation_is_current
             )
         except _SendAborted as exc:
             return _Delivery(SendResult(False, None, exc.reason), None, False)
         except SiteError as exc:
             return await self._on_error(
-                channel_id, content, reply_to, exc, expires_at, generation_is_current
+                channel_id, content, reply_to, image_id, exc, expires_at, generation_is_current
+            )
+
+        if image_id is not None and not self._image_delivery_confirmed(message, image_id):
+            # 图片附件：`code == 200` 但消息体不可用或附件 ID 对不上，属于非法成功形状，
+            # 只能只读对账，绝不据此记成送达、更不重投（计划 §6）。
+            return await self._reconcile_image(
+                channel_id, content, reply_to, image_id, expires_at, generation_is_current
             )
 
         return _Delivery(
@@ -363,11 +377,17 @@ class MessageSender:
             True,
         )
 
+    @staticmethod
+    def _image_delivery_confirmed(message: ChatMessage | None, image_id: str) -> bool:
+        """POST 直接返回的消息能否确认本次图片附件已经送达。"""
+        return message is not None and message.image is not None and message.image.id == image_id
+
     async def _post_once(
         self,
         channel_id: str,
         content: str,
         reply_to: int | None,
+        image_id: str | None,
         expires_at: float | None,
         generation_is_current: Callable[[], bool] | None,
     ) -> ChatMessage | None:
@@ -382,6 +402,11 @@ class MessageSender:
         await self._client.ensure_session()
         check_authorization()
 
+        # 图片参数只在非空时才传给 client：旧替身的 post_message 不认识这个关键字，
+        # 文本调用必须保持逐字兼容（计划 §6）。
+        extra: dict[str, Any] = {}
+        if image_id is not None:
+            extra["image_id"] = image_id
         return await self._client.post_message(
             channel_id,
             content,
@@ -391,6 +416,7 @@ class MessageSender:
                 if expires_at is not None or generation_is_current is not None
                 else None
             ),
+            **extra,
         )
 
     async def _on_error(
@@ -398,12 +424,21 @@ class MessageSender:
         channel_id: str,
         content: str,
         reply_to: int | None,
+        image_id: str | None,
         exc: SiteError,
         expires_at: float | None,
         generation_is_current: Callable[[], bool] | None,
     ) -> _Delivery:
         """把确定性的站点错误映射为发送结果；status == 0 才进入对账。"""
         self._note_site_error(exc)
+        if image_id is not None and (
+            exc.status == 0 or exc.status >= 500 or 200 <= exc.status < 400
+        ):
+            # 图片附件：网络、5xx 与非法成功形状（含 HTTP 200 但信封坏掉）都是
+            # 「可能已发出」，只读对账、不重投（计划 §6）。
+            return await self._reconcile_image(
+                channel_id, content, reply_to, image_id, expires_at, generation_is_current
+            )
         if exc.status == 429:
             return _Delivery(SendResult(False, None, "backoff"), None, False)
         if exc.status == 403:
@@ -473,7 +508,7 @@ class MessageSender:
         # 尤其是 429 时的退避，否则会把站点的每分钟硬限撞穿。
         try:
             resent = await self._post_once(
-                channel_id, content, reply_to, expires_at, generation_is_current
+                channel_id, content, reply_to, None, expires_at, generation_is_current
             )
         except _SendAborted as exc:
             return _Delivery(SendResult(False, None, exc.reason), None, False)
@@ -485,6 +520,60 @@ class MessageSender:
             resent,
             True,
         )
+
+    async def _reconcile_image(
+        self,
+        channel_id: str,
+        content: str,
+        reply_to: int | None,
+        image_id: str,
+        expires_at: float | None,
+        generation_is_current: Callable[[], bool] | None,
+    ) -> _Delivery:
+        """图片附件结果不确定时的**只读**对账；未命中也不重投（计划 §6）。
+
+        与文本对账的关键差别：图片消息**绝不**在未命中时重发 —— 一次生成很贵，而且
+        文本那一次重发窗口本来就是为「快而短」的文本回复设计的。命中判据要求作者是
+        本机器人、`reply_to` 对上、正文逐字相同、且附件图的 ID 与本请求一致，避免把
+        错误的图当成成功。
+
+        对账查询失败或未命中都返回 `failed`（释放预留）；若此刻截止时间或会话代次已失效，
+        改报对应原因（`expired` / `stale_generation`），与文本对账的短路语义一致。
+        """
+        if reply_to is None:
+            return _Delivery(SendResult(False, None, "failed"), None, False)
+
+        existing = await self._store.find_sent_for_reply(channel_id, reply_to)
+        if existing is not None:
+            # 此前那次发送已经记过账，本次预留直接释放。
+            return _Delivery(SendResult(True, existing, "deduped"), None, False)
+
+        try:
+            messages = await self._client.fetch_messages(
+                channel_id, limit=100, after=reply_to
+            )
+        except SiteError:
+            # 对账查询本身失败：无法确认是否已发出，宁可不重发，避免双发。
+            return _Delivery(SendResult(False, None, "failed"), None, False)
+
+        self_user = self._client.self_user
+        self_id = self_user.id if self_user is not None else None
+        for message in messages:
+            if not self_id or message.author.id != self_id:
+                continue
+            if message.reply is None or message.reply.id != reply_to:
+                continue
+            if message.content != content:
+                continue
+            if message.image is None or message.image.id != image_id:
+                continue
+            # 命中的消息确实由本机器人发出、且带的正是这张图，只是此前没记账：补记并转正。
+            return _Delivery(SendResult(True, message.id, "deduped"), message, True)
+
+        abort_reason = self._abort_reason(expires_at, generation_is_current)
+        if abort_reason is not None:
+            return _Delivery(SendResult(False, None, abort_reason), None, False)
+        return _Delivery(SendResult(False, None, "failed"), None, False)
 
     async def _record_sent(
         self,

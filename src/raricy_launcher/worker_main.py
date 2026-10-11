@@ -150,6 +150,9 @@ def _expected_site_user_id() -> str | None:
 def _load_run_config(path: str, *, config_dir: str | None) -> Config:
     """按公共校验解析运行快照；凭据只来自环境变量（§7）。"""
     raw = read_config_yaml(path)
+    image_section = raw.get("image_generation", {})
+    if isinstance(image_section, dict) and image_section.get("enabled"):
+        raise ConfigError("Light 不支持该能力", field="image_generation.enabled")
     base = config_dir or str(Path(path).resolve().parent)
     config = parse_config(
         raw,

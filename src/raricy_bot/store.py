@@ -556,6 +556,46 @@ _SCHEMA: tuple[str, ...] = (
     """,
     "CREATE INDEX IF NOT EXISTS idx_blog_runs_pending"
     " ON blog_runs (site_base_url, self_user_id, status, scheduled_at, task_order)",
+    # 图像账本（设计 §4–§6）：只记元数据。描述、图片字节、Base64、参考图 URL
+    # 一律不落库。旧库打开后自动补建这两张表，旧数据不动。
+    """
+    CREATE TABLE IF NOT EXISTS image_jobs (
+        job_id                   TEXT PRIMARY KEY,
+        scope                    TEXT NOT NULL,
+        trigger_message_id       INTEGER NOT NULL,
+        channel_id               TEXT NOT NULL,
+        mode                     TEXT NOT NULL CHECK (mode IN ('generate', 'edit')),
+        status                   TEXT NOT NULL,
+        reserved_at              REAL NOT NULL,
+        generation_confirmed_at  REAL,
+        generation_expires_at    REAL,
+        phase_at                 REAL NOT NULL,
+        upload_filename          TEXT,
+        site_image_id            TEXT,
+        uploaded_at              REAL,
+        expires_at               REAL,
+        send_message_id          INTEGER,
+        delete_status            TEXT,
+        delete_reason            TEXT,
+        failure_code             TEXT,
+        created_at               REAL NOT NULL,
+        updated_at               REAL NOT NULL,
+        UNIQUE (scope, trigger_message_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_image_jobs_window"
+    " ON image_jobs (scope, generation_confirmed_at)",
+    "CREATE INDEX IF NOT EXISTS idx_image_jobs_status ON image_jobs (scope, status)",
+    "CREATE INDEX IF NOT EXISTS idx_image_jobs_evict"
+    " ON image_jobs (scope, uploaded_at, site_image_id)",
+    # 每个 scope（站点 base_url + 账号）最近观测的额度时钟水位：防止系统时钟回拨
+    # 让旧记录提前退出滚动窗口（设计 §5）。
+    """
+    CREATE TABLE IF NOT EXISTS image_quota_clock (
+        scope      TEXT PRIMARY KEY,
+        watermark  REAL NOT NULL
+    )
+    """,
 )
 
 # --- 定时发文的状态语义与行转换（INTERFACES §53.4）--------------------------
@@ -661,6 +701,182 @@ def _blog_refusal_reason(
         return None
     # rejected / abandoned（以及任何未知取值）：同指纹不自动再投，只保留诊断记录。
     return REASON_NOT_RETRYABLE
+
+
+# --- 图像生成账本（设计 §4–§6）-----------------------------------------------
+#
+# 状态沿调用链推进：`reserved → generating → generated → uploading → uploaded →
+# delivered`，另有 `rejected` / `interrupted` / `generation_unknown` /
+# `upload_unknown` / `delivery_unknown`。**只有明确未生成才释放预留**；进行中与结果
+# 未知不自动过期。生成与编辑共享同一 scope 的滚动 24h 硬额度，scope = 站点
+# base_url + 账号 ID，因此同一账号的全部 DM 与大群合计计量。
+
+# 首版代码边界，不接受用户或模型覆盖（设计 §5）。
+IMAGE_WINDOW_SECONDS: int = 86400
+IMAGE_LIMIT: int = 50
+
+# 预留结果原因（稳定 token，供调用方分支，不用于展示）。
+IMAGE_REASON_RESERVED: str = "reserved"
+IMAGE_REASON_QUOTA: str = "quota"
+IMAGE_REASON_DUPLICATE: str = "duplicate"
+
+# 任务状态。
+IMAGE_STATUS_RESERVED: str = "reserved"
+IMAGE_STATUS_GENERATING: str = "generating"
+IMAGE_STATUS_GENERATED: str = "generated"
+IMAGE_STATUS_UPLOADING: str = "uploading"
+IMAGE_STATUS_UPLOADED: str = "uploaded"
+IMAGE_STATUS_DELIVERED: str = "delivered"
+IMAGE_STATUS_REJECTED: str = "rejected"
+IMAGE_STATUS_INTERRUPTED: str = "interrupted"
+IMAGE_STATUS_GENERATION_UNKNOWN: str = "generation_unknown"
+IMAGE_STATUS_UPLOAD_UNKNOWN: str = "upload_unknown"
+IMAGE_STATUS_DELIVERY_UNKNOWN: str = "delivery_unknown"
+# 生成已确认、但明确没有上传成功（空间不足或确定性拒绝）：图不在站点，额度不退。
+IMAGE_STATUS_UPLOAD_REJECTED: str = "upload_rejected"
+
+# 图床租期删除：意图与结果都持久化，崩溃后可按图片 ID 对账（设计 §6）。
+IMAGE_DELETE_PENDING: str = "pending"
+IMAGE_DELETE_DONE: str = "done"
+IMAGE_DELETE_FAILED: str = "failed"
+IMAGE_DELETE_EXPIRED: str = "expired"
+IMAGE_DELETE_CAPACITY: str = "capacity"
+IMAGE_DELETE_REASONS: tuple[str, ...] = (IMAGE_DELETE_EXPIRED, IMAGE_DELETE_CAPACITY)
+IMAGE_DELETE_RESULTS: tuple[str, ...] = (IMAGE_DELETE_DONE, IMAGE_DELETE_FAILED)
+
+# 未确认生成、持续占额且永不自动过期的状态；未知状态重启后**不重新生成**。
+_IMAGE_HOLDING_STATUSES: tuple[str, ...] = (
+    IMAGE_STATUS_RESERVED,
+    IMAGE_STATUS_GENERATING,
+    IMAGE_STATUS_GENERATION_UNKNOWN,
+)
+# 已登记站点图片 ID、进入租期清理的状态；无论是否送达都要回收。
+_IMAGE_REGISTERED_STATUSES: tuple[str, ...] = (
+    IMAGE_STATUS_UPLOADED,
+    IMAGE_STATUS_DELIVERED,
+    IMAGE_STATUS_DELIVERY_UNKNOWN,
+)
+
+# SELECT 列顺序与 `ImageJob` 字段顺序逐字对应，行可直接解包。
+_IMAGE_JOB_COLUMNS: str = (
+    "job_id, scope, trigger_message_id, channel_id, mode, status, reserved_at,"
+    " generation_confirmed_at, generation_expires_at, phase_at, upload_filename,"
+    " site_image_id, uploaded_at, expires_at, send_message_id, delete_status,"
+    " delete_reason, failure_code, created_at, updated_at"
+)
+
+
+@dataclass(frozen=True)
+class ImageJob:
+    """一个图像任务的账本行；不含描述、参考图 URL 或任何图片字节。"""
+
+    job_id: str
+    scope: str
+    trigger_message_id: int
+    channel_id: str
+    mode: str
+    status: str
+    reserved_at: float
+    generation_confirmed_at: float | None
+    generation_expires_at: float | None
+    phase_at: float
+    upload_filename: str | None
+    site_image_id: str | None
+    uploaded_at: float | None
+    expires_at: float | None
+    send_message_id: int | None
+    delete_status: str | None
+    delete_reason: str | None
+    failure_code: str | None
+    created_at: float
+    updated_at: float
+
+
+@dataclass(frozen=True)
+class ImageReservation:
+    """一次额度预留结果；拒绝时 `job` 必为 None，不持有额度就不带出行快照。"""
+
+    allowed: bool
+    job: ImageJob | None
+    reason: str
+
+
+@dataclass(frozen=True)
+class ImageQuotaState:
+    """额度快照。
+
+    `earliest_exit_at` 是最早一条**已确认**记录退出滚动窗口的时刻；`blocked` 为真时
+    存在进行中/未知占额，届时**不承诺**一定有名额。
+    """
+
+    used: int
+    limit: int
+    earliest_exit_at: float | None
+    blocked: bool
+
+
+@dataclass(frozen=True)
+class ImageRecoverySummary:
+    """启动恢复计数；未知状态一律保留占额、绝不重新生成。"""
+
+    interrupted: int
+    generation_unknown: int
+    upload_unknown: int
+    delivery_unknown: int
+
+
+def _row_to_image_job(row: tuple[object, ...]) -> ImageJob:
+    return ImageJob(*row)
+
+
+def _image_clock(conn: sqlite3.Connection, scope: str, now: float) -> float:
+    """本 scope 的保守时钟：`max(now, 水位)`；回拨时不缩回窗口下界。"""
+    row = conn.execute(
+        "SELECT watermark FROM image_quota_clock WHERE scope = ?", (scope,)
+    ).fetchone()
+    watermark = float(row[0]) if row is not None else 0.0
+    return max(now, watermark)
+
+
+def _note_image_clock(conn: sqlite3.Connection, scope: str, clock: float) -> None:
+    """单调推进观测水位；只增不减。"""
+    conn.execute(
+        "INSERT INTO image_quota_clock (scope, watermark) VALUES (?, ?)"
+        " ON CONFLICT(scope) DO UPDATE SET watermark = MAX(watermark, excluded.watermark)",
+        (scope, clock),
+    )
+
+
+def _image_occupied(conn: sqlite3.Connection, scope: str, clock: float) -> int:
+    """窗口内已确认生成数 + 所有进行中/未知占额。
+
+    已确认记录的窗口是 `(clock - 86400, clock]`；**不设上界**：未来 confirmed_at
+    （时钟回拨后才可能出现）仍计费，保守优于漏计。进行中/未知不问时间。
+    """
+    placeholders = ", ".join("?" for _ in _IMAGE_HOLDING_STATUSES)
+    row = conn.execute(
+        "SELECT COUNT(*) FROM image_jobs WHERE scope = ? AND ("
+        " (generation_confirmed_at IS NOT NULL AND generation_confirmed_at > ?)"
+        f" OR (generation_confirmed_at IS NULL AND status IN ({placeholders}))"
+        ")",
+        (scope, clock - IMAGE_WINDOW_SECONDS, *_IMAGE_HOLDING_STATUSES),
+    ).fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+def _load_image_job(conn: sqlite3.Connection, job_id: str) -> ImageJob:
+    row = conn.execute(
+        f"SELECT {_IMAGE_JOB_COLUMNS} FROM image_jobs WHERE job_id = ?", (job_id,)
+    ).fetchone()
+    if row is None:
+        raise KeyError(f"image_job {job_id} 不存在")
+    return _row_to_image_job(row)
+
+
+def _require_image_status(job: ImageJob, allowed: tuple[str, ...]) -> None:
+    """状态不符即报错：把调用方的状态机错误暴露出来，而不是静默重复结清。"""
+    if job.status not in allowed:
+        raise ValueError(f"image_job {job.job_id}：{job.status} 不在 {allowed} 内")
 
 
 class Store:
@@ -2613,5 +2829,524 @@ class Store:
             if row is None:
                 raise RuntimeError("blog_posts 更新成功却读不回这一行")
             return _row_to_blog_post(row)
+
+        return await self._execute(operation)
+
+    # --- 图像账本（设计 §4–§6，B 所有）---------------------------------------
+
+    async def reserve_image_job(
+        self,
+        *,
+        scope: str,
+        job_id: str,
+        trigger_message_id: int,
+        channel_id: str,
+        mode: str,
+        now: float,
+    ) -> ImageReservation:
+        """在**一个事务里**复查滚动额度并预留一次生成/编辑。
+
+        拒绝顺序：同一个触发消息已有任务 → `duplicate`（`UNIQUE(scope,
+        trigger_message_id)` 是 SSE/resync/崩溃恢复之外的最后一道去重闸，绝不重复扣费）；
+        否则窗口内占用 >= 50 → `quota`。成功才插入 `reserved` 行。拒绝时也推进观测水位，
+        防止回拨把窗口下界缩回去。写库失败一律抛异常，不伪装成 `quota`。
+        """
+        if not job_id or not scope or not channel_id:
+            raise ValueError("job_id、scope、channel_id 必须非空")
+        if mode not in ("generate", "edit"):
+            raise ValueError(f"不是合法的图像模式：{mode}")
+
+        def operation(conn: sqlite3.Connection) -> ImageReservation:
+            existing = conn.execute(
+                f"SELECT {_IMAGE_JOB_COLUMNS} FROM image_jobs"
+                " WHERE scope = ? AND trigger_message_id = ?",
+                (scope, trigger_message_id),
+            ).fetchone()
+            if existing is not None:
+                return ImageReservation(
+                    allowed=False, job=None, reason=IMAGE_REASON_DUPLICATE
+                )
+            clock = _image_clock(conn, scope, now)
+            if _image_occupied(conn, scope, clock) >= IMAGE_LIMIT:
+                _note_image_clock(conn, scope, clock)
+                conn.commit()
+                return ImageReservation(
+                    allowed=False, job=None, reason=IMAGE_REASON_QUOTA
+                )
+            # 这里不捕 IntegrityError：触发消息已在上方查过，唯一键冲突只可能是
+            # job_id 主键碰撞，那是真错误，不能伪装成正常的去重命中（对照 claim_blog_run）。
+            conn.execute(
+                "INSERT INTO image_jobs (job_id, scope, trigger_message_id, channel_id,"
+                " mode, status, reserved_at, phase_at, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    scope,
+                    trigger_message_id,
+                    channel_id,
+                    mode,
+                    IMAGE_STATUS_RESERVED,
+                    now,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            _note_image_clock(conn, scope, clock)
+            reserved = conn.execute(
+                f"SELECT {_IMAGE_JOB_COLUMNS} FROM image_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            conn.commit()
+            if reserved is None:
+                raise RuntimeError("image_jobs 写入成功却读不回这一行")
+            return ImageReservation(
+                allowed=True,
+                job=_row_to_image_job(reserved),
+                reason=IMAGE_REASON_RESERVED,
+            )
+
+        return await self._execute(operation)
+
+    async def begin_image_generation(self, job_id: str, now: float) -> bool:
+        """`reserved → generating`；返回 False 表示任务已被取消（reset/关闭）。
+
+        只有返回 True 才允许调用图像服务：抢占失败就说明预留已在别处释放，
+        继续请求会绕开额度结算（设计 §5）。
+        """
+
+        def operation(conn: sqlite3.Connection) -> bool:
+            cursor = conn.execute(
+                "UPDATE image_jobs SET status = ?, phase_at = ?, updated_at = ?"
+                " WHERE job_id = ? AND status = ?",
+                (IMAGE_STATUS_GENERATING, now, now, job_id, IMAGE_STATUS_RESERVED),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+
+        return await self._execute(operation)
+
+    async def confirm_image_generated(self, job_id: str, now: float) -> ImageJob:
+        """`generating → generated`：把预留原子转成 `generation_confirmed_at` 起 24h 的占额。
+
+        无论输出字节是否合格、上传/发送是否成功，这一张都已计费（设计 §5）；调用方在
+        结果校验**之前**调用本方法。确认时推进观测水位。
+        """
+
+        def operation(conn: sqlite3.Connection) -> ImageJob:
+            job = _load_image_job(conn, job_id)
+            _require_image_status(job, (IMAGE_STATUS_GENERATING,))
+            clock = _image_clock(conn, job.scope, now)
+            cursor = conn.execute(
+                "UPDATE image_jobs SET status = ?, generation_confirmed_at = ?,"
+                " generation_expires_at = ?, phase_at = ?, updated_at = ?"
+                " WHERE job_id = ? AND status = ?",
+                (
+                    IMAGE_STATUS_GENERATED,
+                    now,
+                    now + IMAGE_WINDOW_SECONDS,
+                    now,
+                    now,
+                    job_id,
+                    IMAGE_STATUS_GENERATING,
+                ),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                raise RuntimeError(f"image_job {job_id} 的 generating 确认失败")
+            _note_image_clock(conn, job.scope, clock)
+            confirmed = conn.execute(
+                f"SELECT {_IMAGE_JOB_COLUMNS} FROM image_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            conn.commit()
+            if confirmed is None:
+                raise RuntimeError("image_jobs 更新成功却读不回这一行")
+            return _row_to_image_job(confirmed)
+
+        return await self._execute(operation)
+
+    async def fail_image_generation(
+        self, job_id: str, failure_code: str | None, now: float
+    ) -> ImageJob:
+        """`generating → rejected`：明确未生成（结构化拒绝/调用前取消），释放本次预留。
+
+        只有确定没有产生图片才走这里；超时、5xx、非法响应与调用中取消都按未知处理。
+        """
+
+        def operation(conn: sqlite3.Connection) -> ImageJob:
+            job = _load_image_job(conn, job_id)
+            _require_image_status(job, (IMAGE_STATUS_GENERATING,))
+            conn.execute(
+                "UPDATE image_jobs SET status = ?, failure_code = ?, phase_at = ?,"
+                " updated_at = ? WHERE job_id = ? AND status = ?",
+                (
+                    IMAGE_STATUS_REJECTED,
+                    failure_code,
+                    now,
+                    now,
+                    job_id,
+                    IMAGE_STATUS_GENERATING,
+                ),
+            )
+            rejected = _load_image_job(conn, job_id)
+            conn.commit()
+            return rejected
+
+        return await self._execute(operation)
+
+    async def mark_generation_unknown(self, job_id: str, now: float) -> ImageJob:
+        """`generating → generation_unknown`：结果不确定，保留占额、不自动释放。"""
+
+        return await self._image_transition(
+            job_id, (IMAGE_STATUS_GENERATING,), IMAGE_STATUS_GENERATION_UNKNOWN, now
+        )
+
+    async def release_image_job(self, job_id: str, now: float) -> bool:
+        """`reserved → interrupted`：调用前取消，释放预留。返回 False 表示已不是预留态。"""
+
+        def operation(conn: sqlite3.Connection) -> bool:
+            cursor = conn.execute(
+                "UPDATE image_jobs SET status = ?, phase_at = ?, updated_at = ?"
+                " WHERE job_id = ? AND status = ?",
+                (IMAGE_STATUS_INTERRUPTED, now, now, job_id, IMAGE_STATUS_RESERVED),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+
+        return await self._execute(operation)
+
+    async def mark_image_uploading(
+        self, job_id: str, upload_filename: str, now: float
+    ) -> ImageJob:
+        """`generated → uploading`：上传 POST **之前**持久化随机文件名。
+
+        文件名只用随机 job 标识，不带描述或用户信息；落库后即使本地崩溃，也能靠它
+        对账「这张图到底有没有上传成功」（设计 §6）。
+        """
+        if not upload_filename:
+            raise ValueError("upload_filename 必须非空")
+
+        return await self._image_transition(
+            job_id,
+            (IMAGE_STATUS_GENERATED,),
+            IMAGE_STATUS_UPLOADING,
+            now,
+            assignments=("upload_filename", "uploaded_at", "expires_at"),
+            values=(upload_filename, now, now + 30 * 86400),
+        )
+
+    async def confirm_image_upload(
+        self,
+        job_id: str,
+        image_id: str,
+        uploaded_at: float,
+        expires_at: float,
+        now: float,
+    ) -> ImageJob:
+        """`uploading`/`upload_unknown → uploaded`：登记站点图片 ID 与 30 天租期。
+
+        对账恢复走的是同一条路径。`uploaded_at` 由调用方给保守起点，避免未知阶段
+        把有效期拉长；`expires_at` 是 30 天上限。
+        """
+        if not image_id:
+            raise ValueError("image_id 必须非空")
+
+        return await self._image_transition(
+            job_id,
+            (IMAGE_STATUS_UPLOADING, IMAGE_STATUS_UPLOAD_UNKNOWN),
+            IMAGE_STATUS_UPLOADED,
+            now,
+            assignments=("site_image_id", "uploaded_at", "expires_at", "delete_status"),
+            values=(image_id, uploaded_at, expires_at, None),
+        )
+
+    async def mark_upload_unknown(self, job_id: str, now: float) -> ImageJob:
+        """`uploading → upload_unknown`：上传结果不确定，只读对账、不自动重传。"""
+
+        return await self._image_transition(
+            job_id, (IMAGE_STATUS_UPLOADING,), IMAGE_STATUS_UPLOAD_UNKNOWN, now
+        )
+
+    async def fail_image_upload(
+        self, job_id: str, failure_code: str | None, now: float
+    ) -> ImageJob:
+        """`generated`/`uploading → upload_rejected`：明确没有上传成功。
+
+        图床空间不足、确定性拒绝都走这里；**不删旧图**、**不退生成额度**（这一张
+        已经确认生成）。与 `upload_unknown` 的区别是「确定没传上去」，因此不做对账。
+        """
+
+        return await self._image_transition(
+            job_id,
+            (IMAGE_STATUS_GENERATED, IMAGE_STATUS_UPLOADING),
+            IMAGE_STATUS_UPLOAD_REJECTED,
+            now,
+            assignments=("failure_code",),
+            values=(failure_code,),
+        )
+
+    async def confirm_image_delivered(
+        self, job_id: str, send_message_id: int, now: float
+    ) -> ImageJob:
+        """`uploaded → delivered`：记录发送确认 ID。"""
+
+        return await self._image_transition(
+            job_id,
+            (IMAGE_STATUS_UPLOADED,),
+            IMAGE_STATUS_DELIVERED,
+            now,
+            assignments=("send_message_id",),
+            values=(send_message_id,),
+        )
+
+    async def mark_delivery_unknown(self, job_id: str, now: float) -> ImageJob:
+        """`uploaded → delivery_unknown`：发送结果不确定，保留待核实。"""
+
+        return await self._image_transition(
+            job_id, (IMAGE_STATUS_UPLOADED,), IMAGE_STATUS_DELIVERY_UNKNOWN, now
+        )
+
+    async def _image_transition(
+        self,
+        job_id: str,
+        allowed: tuple[str, ...],
+        status: str,
+        now: float,
+        *,
+        assignments: tuple[str, ...] = (),
+        values: tuple[object, ...] = (),
+    ) -> ImageJob:
+        """受状态条件保护的通用迁移，防止重复结清。"""
+
+        def operation(conn: sqlite3.Connection) -> ImageJob:
+            job = _load_image_job(conn, job_id)
+            _require_image_status(job, allowed)
+            set_sql = "".join(f", {column} = ?" for column in assignments)
+            cursor = conn.execute(
+                f"UPDATE image_jobs SET status = ?{set_sql}, phase_at = ?, updated_at = ?"
+                " WHERE job_id = ? AND status = ?",
+                (status, *values, now, now, job_id, job.status),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                raise RuntimeError(f"image_job {job_id} 的 {job.status} 迁移失败")
+            updated = _load_image_job(conn, job_id)
+            conn.commit()
+            return updated
+
+        return await self._execute(operation)
+
+    async def recover_image_jobs(self, now: float) -> ImageRecoverySummary:
+        """启动恢复：**只改状态、不重新生成任何图片**（设计 §5）。
+
+        - `reserved`（未发请求）→ `interrupted`，释放预留；
+        - `generating`（请求可能已发出）→ `generation_unknown`，保留占额；
+        - `uploading` → `upload_unknown`，靠已持久化的随机文件名只读对账；
+        - `uploaded` 且无发送确认 ID → `delivery_unknown`，不补发旧结果。
+
+        绝不把未知任务当作新请求重新生图；丢失的字节也不靠重新生成恢复。
+        """
+
+        def operation(conn: sqlite3.Connection) -> ImageRecoverySummary:
+            interrupted = conn.execute(
+                "UPDATE image_jobs SET status = ?, phase_at = ?, updated_at = ?"
+                " WHERE status = ?",
+                (IMAGE_STATUS_INTERRUPTED, now, now, IMAGE_STATUS_RESERVED),
+            ).rowcount
+            generation_unknown = conn.execute(
+                "UPDATE image_jobs SET status = ?, phase_at = ?, updated_at = ?"
+                " WHERE status = ?",
+                (IMAGE_STATUS_GENERATION_UNKNOWN, now, now, IMAGE_STATUS_GENERATING),
+            ).rowcount
+            upload_unknown = conn.execute(
+                "UPDATE image_jobs SET status = ?, phase_at = ?, updated_at = ?"
+                " WHERE status = ?",
+                (IMAGE_STATUS_UPLOAD_UNKNOWN, now, now, IMAGE_STATUS_UPLOADING),
+            ).rowcount
+            delivery_unknown = conn.execute(
+                "UPDATE image_jobs SET status = ?, phase_at = ?, updated_at = ?"
+                " WHERE status = ? AND send_message_id IS NULL",
+                (IMAGE_STATUS_DELIVERY_UNKNOWN, now, now, IMAGE_STATUS_UPLOADED),
+            ).rowcount
+            conn.commit()
+            return ImageRecoverySummary(
+                interrupted=int(interrupted),
+                generation_unknown=int(generation_unknown),
+                upload_unknown=int(upload_unknown),
+                delivery_unknown=int(delivery_unknown),
+            )
+
+        return await self._execute(operation)
+
+    async def image_quota_state(self, scope: str, now: float) -> ImageQuotaState:
+        """本 scope 的额度快照；读取也推进观测水位。"""
+
+        def operation(conn: sqlite3.Connection) -> ImageQuotaState:
+            clock = _image_clock(conn, scope, now)
+            used = _image_occupied(conn, scope, clock)
+            row = conn.execute(
+                "SELECT MIN(generation_confirmed_at) FROM image_jobs"
+                " WHERE scope = ? AND generation_confirmed_at IS NOT NULL"
+                " AND generation_confirmed_at > ?",
+                (scope, clock - IMAGE_WINDOW_SECONDS),
+            ).fetchone()
+            earliest = (
+                float(row[0]) + IMAGE_WINDOW_SECONDS
+                if row is not None and row[0] is not None
+                else None
+            )
+            placeholders = ", ".join("?" for _ in _IMAGE_HOLDING_STATUSES)
+            holding = conn.execute(
+                "SELECT COUNT(*) FROM image_jobs WHERE scope = ?"
+                f" AND generation_confirmed_at IS NULL AND status IN ({placeholders})",
+                (scope, *_IMAGE_HOLDING_STATUSES),
+            ).fetchone()
+            _note_image_clock(conn, scope, clock)
+            conn.commit()
+            return ImageQuotaState(
+                used=used,
+                limit=IMAGE_LIMIT,
+                earliest_exit_at=earliest,
+                blocked=bool(holding and int(holding[0]) > 0),
+            )
+
+        return await self._execute(operation)
+
+    async def find_image_job(self, job_id: str) -> ImageJob | None:
+        """按 job ID 查账本行；没有返回 None。"""
+
+        def operation(conn: sqlite3.Connection) -> ImageJob | None:
+            row = conn.execute(
+                f"SELECT {_IMAGE_JOB_COLUMNS} FROM image_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            return None if row is None else _row_to_image_job(row)
+
+        return await self._execute(operation)
+
+    async def find_image_job_by_message(
+        self, scope: str, trigger_message_id: int
+    ) -> ImageJob | None:
+        """按触发消息查任务；用于确认「这条消息是否已经占过额度」。"""
+
+        def operation(conn: sqlite3.Connection) -> ImageJob | None:
+            row = conn.execute(
+                f"SELECT {_IMAGE_JOB_COLUMNS} FROM image_jobs"
+                " WHERE scope = ? AND trigger_message_id = ?",
+                (scope, trigger_message_id),
+            ).fetchone()
+            return None if row is None else _row_to_image_job(row)
+
+        return await self._execute(operation)
+
+    async def list_image_upload_reconcile(self, scope: str) -> tuple[ImageJob, ...]:
+        """待只读对账的上传：结果未知且已持久化随机文件名的行。"""
+
+        def operation(conn: sqlite3.Connection) -> tuple[ImageJob, ...]:
+            rows = conn.execute(
+                f"SELECT {_IMAGE_JOB_COLUMNS} FROM image_jobs"
+                " WHERE scope = ? AND status = ? AND upload_filename IS NOT NULL"
+                " ORDER BY updated_at, job_id",
+                (scope, IMAGE_STATUS_UPLOAD_UNKNOWN),
+            ).fetchall()
+            return tuple(_row_to_image_job(row) for row in rows)
+
+        return await self._execute(operation)
+
+    async def list_image_delivery_reconcile(self, scope: str) -> tuple[ImageJob, ...]:
+        """待只读对账的发送：结果未知且已登记图片 ID 的行。"""
+
+        def operation(conn: sqlite3.Connection) -> tuple[ImageJob, ...]:
+            rows = conn.execute(
+                f"SELECT {_IMAGE_JOB_COLUMNS} FROM image_jobs"
+                " WHERE scope = ? AND status = ? ORDER BY updated_at, job_id",
+                (scope, IMAGE_STATUS_DELIVERY_UNKNOWN),
+            ).fetchall()
+            return tuple(_row_to_image_job(row) for row in rows)
+
+        return await self._execute(operation)
+
+    async def list_image_delete_reconcile(self, scope: str) -> tuple[ImageJob, ...]:
+        """删除意图已写、结果未确认的行；崩溃后按图片 ID 对账。"""
+
+        def operation(conn: sqlite3.Connection) -> tuple[ImageJob, ...]:
+            rows = conn.execute(
+                f"SELECT {_IMAGE_JOB_COLUMNS} FROM image_jobs"
+                " WHERE scope = ? AND delete_status = ? ORDER BY updated_at, job_id",
+                (scope, IMAGE_DELETE_PENDING),
+            ).fetchall()
+            return tuple(_row_to_image_job(row) for row in rows)
+
+        return await self._execute(operation)
+
+    async def list_image_eviction_candidates(
+        self, scope: str
+    ) -> tuple[ImageJob, ...]:
+        """本功能登记、尚未删除的图，按租期内最旧优先排序。
+
+        排序键 `uploaded_at, site_image_id` 同时覆盖「先清 30 天到期图、再按最旧淘汰
+        未到期图」：保留期统一，到期顺序即上传顺序，调用方按实际字节够用即停。
+        删除失败（`failed`）的行仍回到这里重试；`pending`/`done` 不在其列。
+        """
+
+        def operation(conn: sqlite3.Connection) -> tuple[ImageJob, ...]:
+            placeholders = ", ".join("?" for _ in _IMAGE_REGISTERED_STATUSES)
+            rows = conn.execute(
+                f"SELECT {_IMAGE_JOB_COLUMNS} FROM image_jobs"
+                " WHERE scope = ? AND site_image_id IS NOT NULL"
+                f" AND status IN ({placeholders})"
+                " AND (delete_status IS NULL OR delete_status = ?)"
+                " ORDER BY uploaded_at, site_image_id",
+                (scope, *_IMAGE_REGISTERED_STATUSES, IMAGE_DELETE_FAILED),
+            ).fetchall()
+            return tuple(_row_to_image_job(row) for row in rows)
+
+        return await self._execute(operation)
+
+    async def record_image_delete_intent(
+        self, job_id: str, reason: str, now: float
+    ) -> ImageJob:
+        """写删除意图（`pending` + 原因 `expired`/`capacity`），随后才执行删除。"""
+
+        if reason not in IMAGE_DELETE_REASONS:
+            raise ValueError(f"不是合法的删除原因：{reason}")
+
+        def operation(conn: sqlite3.Connection) -> ImageJob:
+            job = _load_image_job(conn, job_id)
+            _require_image_status(job, _IMAGE_REGISTERED_STATUSES)
+            if not job.site_image_id:
+                raise ValueError(f"image_job {job_id} 没有登记图片 ID，不能删除")
+            conn.execute(
+                "UPDATE image_jobs SET delete_status = ?, delete_reason = ?,"
+                " phase_at = ?, updated_at = ? WHERE job_id = ?",
+                (IMAGE_DELETE_PENDING, reason, now, now, job_id),
+            )
+            updated = _load_image_job(conn, job_id)
+            conn.commit()
+            return updated
+
+        return await self._execute(operation)
+
+    async def record_image_delete_result(
+        self, job_id: str, status: str, now: float
+    ) -> ImageJob:
+        """写删除结果；`done` 是终态，`failed` 保留为可重试候选。"""
+
+        if status not in IMAGE_DELETE_RESULTS:
+            raise ValueError(f"不是合法的删除结果：{status}")
+
+        def operation(conn: sqlite3.Connection) -> ImageJob:
+            job = _load_image_job(conn, job_id)
+            _require_image_status(job, _IMAGE_REGISTERED_STATUSES)
+            cursor = conn.execute(
+                "UPDATE image_jobs SET delete_status = ?, phase_at = ?, updated_at = ?"
+                " WHERE job_id = ? AND delete_status = ?",
+                (status, now, now, job_id, IMAGE_DELETE_PENDING),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                raise ValueError(f"image_job {job_id} 没有待确认的删除意图")
+            updated = _load_image_job(conn, job_id)
+            conn.commit()
+            return updated
 
         return await self._execute(operation)

@@ -34,6 +34,8 @@ services:
       RARICY_USERNAME: ${RARICY_USERNAME}
       RARICY_PASSWORD: ${RARICY_PASSWORD}
       LLM_API_KEY: ${LLM_API_KEY}
+      # 图像接口独立凭据；关闭图像功能时允许为空。
+      IMAGE_API_KEY: ${IMAGE_API_KEY:-}
       # 只透传给容器，由配置中的 env_from 再交给 Exa MCP 子进程；不写入 YAML。
       EXA_API_KEY: ${EXA_API_KEY}
       # 多 Key 池的逐个透传。Compose 不会自动带入宿主变量，必须显式列出；

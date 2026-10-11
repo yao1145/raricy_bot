@@ -46,7 +46,17 @@ from .comment_models import (
     normalize_uuid,
     strip_comment_content,
 )
-from .models import LOBBY, Author, ChatMessage, ChatUserSummary, Clipboard, Vote, _parse_author
+from .models import (
+    LOBBY,
+    Author,
+    ChatMessage,
+    ChatUserSummary,
+    Clipboard,
+    ImageQuota,
+    SiteImage,
+    Vote,
+    _parse_author,
+)
 
 # 会话 Cookie 名（chat-bot.md §3）。
 SESSION_COOKIE_NAME: str = "raricy_session"
@@ -163,6 +173,20 @@ def _parse_retry_after(response: httpx.Response) -> float | None:
     if not math.isfinite(seconds) or seconds < 0:
         return None
     return seconds
+
+
+def _mb_to_bytes(value: object) -> int | None:
+    """把上游的 MB 展示值回算为字节；非数字、负数或非有限值返回 None。
+
+    上游已经两次小数舍入（图床契约 §5），回算只可能近似；精确空间口径用
+    `list_images` 的 `file_size` 求和（图床契约 §4）。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    mb = float(value)
+    if not math.isfinite(mb) or mb < 0:
+        return None
+    return int(round(mb * 1024 * 1024))
 
 
 def _effective_port(parsed: urllib.parse.SplitResult) -> int | None:
@@ -347,12 +371,16 @@ class SiteClient:
         content: str,
         *,
         reply_to: int | None = None,
+        image_id: str | None = None,
         before_retry: Callable[[], None] | None = None,
     ) -> ChatMessage | None:
         """发消息；成功判据只看 `code == 200`，消息体不可用时返回 None。
 
         §7.2 的例外：本接口成功时的 `message` 是消息对象而非字符串，
         退化成字符串（或缺失）时返回 None，调用方必须容忍。
+
+        `image_id` 非空时把图床图片作为**附件**发出（图床契约 §6.3）；文本调用
+        不传该参数，请求体与旧行为逐字一致。
 
         `before_retry` 供调用方在 401 重登前后复核截止时间或会话代次；抛出的异常
         原样传回调用方，避免认证等待后绕过发送限制。
@@ -361,6 +389,8 @@ class SiteClient:
         body: dict[str, Any] = {"content": content}
         if reply_to is not None:
             body["reply_to"] = reply_to
+        if image_id is not None:
+            body["image_id"] = image_id
 
         response, payload = await self._request_envelope("POST", path, json_body=body)
         if payload["code"] == 401:
@@ -379,6 +409,203 @@ class SiteClient:
     async def probe_chat(self) -> None:
         """读一条大区消息，用于探测 403 禁言/权限是否恢复；异常时抛 SiteError。"""
         await self._call("GET", _messages_path(LOBBY), params={"limit": 1})
+
+    # --- 图床接口（图床契约 §3–§7）-----------------------------------------
+
+    async def upload_image(self, data: bytes, mime_type: str, filename: str) -> SiteImage:
+        """单文件 multipart 上传一张图，返回图床元信息。
+
+        只发**一个** `file` 字段，因此 `code == 200` 时必须同时满足 `items` 恰好一项、
+        `failed` 恰好为空，才算一次确定的成功；上游契约见图床契约 §3.2（`id`/`url`
+        只在「恰好一张且零失败」时出现）。解析不出合法 10 位 ID 的成功响应属于
+        **结果不确定**（`SiteError.status == 0`）：图片可能已经落盘，调用方应只读对账，
+        绝不自动重投（计划 §6）。网络错误、5xx 与不可解析响应同样按不确定处理。
+
+        401 是确定答复（认证先于保存），所以允许重登一次后重试一次；其余 4xx 原样抛出。
+        错误只带稳定码与 HTTP 状态，**不回显响应正文**。不设置 `Origin` / `Referer`。
+        """
+        if not isinstance(data, bytes):
+            raise ValueError("上传图片字节必须是 bytes")
+        files = {"file": (filename, data, mime_type)}
+        status, payload = await self._post_multipart(_IMAGES_PREFIX, files)
+        if self._payload_unauthorized(status, payload):
+            await self._relogin()
+            status, payload = await self._post_multipart(_IMAGES_PREFIX, files)
+        return self._parse_upload_result(status, payload, mime_type=mime_type, data=data)
+
+    async def list_images(self) -> list[SiteImage]:
+        """列出当前账号自己的图床图片（图床契约 §4）；需 core+ 登录。
+
+        逐条要求合法 10 位 ID 与整数 `file_size`，任何一条不合格都让整次列表失败 ——
+        调用方拿它做上传对账与空间核算，残缺列表不能冒充「没有那张图」。401 重登一次。
+        """
+        response, payload = await self._request_comment_envelope("GET", _IMAGES_PREFIX)
+        if payload["code"] == 401:
+            await self._relogin()
+            response, payload = await self._request_comment_envelope("GET", _IMAGES_PREFIX)
+        self._raise_for_image_envelope(response, payload)
+        raw = payload.get("images")
+        if not isinstance(raw, list):
+            raise self._error(200, "malformed image list")
+        return [self._parse_image_item(item) for item in raw]
+
+    async def image_quota(self) -> ImageQuota:
+        """读取当前账号的图床配额（图床契约 §5）；单位换算为字节，带展示舍入误差。"""
+        path = f"{_IMAGES_PREFIX}/quota"
+        response, payload = await self._request_comment_envelope("GET", path)
+        if payload["code"] == 401:
+            await self._relogin()
+            response, payload = await self._request_comment_envelope("GET", path)
+        self._raise_for_image_envelope(response, payload)
+        quota = payload.get("quota")
+        if not isinstance(quota, Mapping):
+            raise self._error(200, "malformed quota")
+        used = _mb_to_bytes(quota.get("used_mb"))
+        limit = _mb_to_bytes(quota.get("limit_mb"))
+        remaining = _mb_to_bytes(quota.get("remaining_mb"))
+        if used is None or limit is None or remaining is None:
+            raise self._error(200, "malformed quota")
+        return ImageQuota(used_bytes=used, limit_bytes=limit, remaining_bytes=remaining)
+
+    async def delete_image(self, image_id: str) -> None:
+        """软删除自己的一张图床图片（图床契约 §7）；ID 先过白名单再拼进路径。
+
+        `code == 200` 才算成功；已删除（400）、不存在（404）与无权（403）都抛 SiteError，
+        由调用方的删除状态机把终态与重试分开处理。
+        """
+        normalized = _content_id(image_id, IMAGE_ID_LEN, kind="image")
+        path = f"{_IMAGES_PREFIX}/{normalized}"
+        response, payload = await self._request_comment_envelope("DELETE", path)
+        if payload["code"] == 401:
+            await self._relogin()
+            response, payload = await self._request_comment_envelope("DELETE", path)
+        self._raise_for_image_envelope(response, payload)
+
+    async def _post_multipart(
+        self, path: str, files: Mapping[str, tuple[str, bytes, str]]
+    ) -> tuple[int, Mapping[str, Any] | None]:
+        """发一次带 Cookie 的 multipart 请求，返回 (HTTP 状态, 信封或 None)。
+
+        响应按有界流读取；JSON 非法、顶层不是对象或 `code` 不是整数时返回 `None`，
+        由调用方按「响应形状不可用」处理，绝不把正文原样带进异常。
+        """
+        headers = {"Accept": "application/json"}
+        headers.update(self._cookie_headers())
+        try:
+            async with self._require_client().stream(
+                "POST", path, headers=headers, files=dict(files)
+            ) as response:
+                status = int(response.status_code)
+                raw = await self._bounded_response_bytes(response)
+        except httpx.HTTPError as exc:
+            raise self._network_error(exc) from exc
+        try:
+            payload = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            return status, None
+        if not isinstance(payload, Mapping):
+            return status, None
+        code = payload.get("code")
+        if isinstance(code, bool) or not isinstance(code, int):
+            return status, None
+        return status, payload
+
+    @staticmethod
+    def _payload_unauthorized(status: int, payload: Mapping[str, Any] | None) -> bool:
+        """响应是否表示会话失效：信封 `code == 401`，或不可解析的 HTTP 401。"""
+        if payload is not None:
+            return payload["code"] == 401
+        return status == 401
+
+    def _parse_upload_result(
+        self,
+        status: int,
+        payload: Mapping[str, Any] | None,
+        *,
+        mime_type: str,
+        data: bytes,
+    ) -> SiteImage:
+        """按图床契约判定单文件上传结果；不确定形状一律映射为 `status == 0`。
+
+        - 不可解析响应：4xx 视为确定拒绝，其余（2xx/5xx/3xx）视为结果不确定；
+        - 信封 `code == 200`：必须恰好一项 `items`、零项 `failed`、ID 合法，否则不确定；
+        - `code >= 500`：结果不确定；其余码按确定错误抛出（只带稳定码与 HTTP 状态）。
+        """
+        if payload is None:
+            if 400 <= status < 500:
+                raise self._error(status, f"http={status}")
+            raise self._error(0, "unconfirmed upload")
+        code = payload["code"]
+        if code == 200:
+            return self._parse_single_upload(payload, mime_type=mime_type, data=data)
+        if code >= 500:
+            raise self._error(0, f"code={code}")
+        # 上传的 429 通常逐张进 `failed[]`（图床契约 §8），这里不额外解析 Retry-After。
+        raise self._error(code, f"code={code} http={status}")
+
+    def _parse_single_upload(
+        self, payload: Mapping[str, Any], *, mime_type: str, data: bytes
+    ) -> SiteImage:
+        """从 `code == 200` 的单文件上传信封构造 `SiteImage`；形状不符时 status 0。"""
+        items = payload.get("items")
+        failed = payload.get("failed")
+        if not isinstance(items, list) or not isinstance(failed, list):
+            raise self._error(0, "unconfirmed upload")
+        if len(items) != 1 or failed:
+            # 多文件、部分失败或全军覆没：单文件调用方拿不到唯一 ID，结果不确定。
+            raise self._error(0, "unconfirmed upload")
+        item = items[0]
+        if not isinstance(item, Mapping):
+            raise self._error(0, "unconfirmed upload")
+        try:
+            image_id = _content_id(item.get("id"), IMAGE_ID_LEN, kind="image")
+        except ValueError as exc:
+            raise self._error(0, "unconfirmed upload") from exc
+        filename = item.get("filename")
+        if not isinstance(filename, str) or not filename:
+            raise self._error(0, "unconfirmed upload")
+        url = item.get("url")
+        if not isinstance(url, str) or not url:
+            url = image_raw_path(image_id)
+        return SiteImage(
+            id=image_id,
+            filename=filename,
+            file_size=len(data),
+            mime_type=mime_type,
+            created_at=None,
+            url=url,
+        )
+
+    def _parse_image_item(self, item: object) -> SiteImage:
+        """解析 `GET /api/images` 的一项；ID 或 `file_size` 不合格即整次列表失败。"""
+        if not isinstance(item, Mapping):
+            raise self._error(200, "malformed image item")
+        try:
+            image_id = _content_id(item.get("id"), IMAGE_ID_LEN, kind="image")
+        except ValueError as exc:
+            raise self._error(200, "malformed image item") from exc
+        file_size = item.get("file_size")
+        if isinstance(file_size, bool) or not isinstance(file_size, int) or file_size < 0:
+            raise self._error(200, "malformed image item")
+        created_at = item.get("created_at")
+        return SiteImage(
+            id=image_id,
+            filename=item["filename"] if isinstance(item.get("filename"), str) else "",
+            file_size=file_size,
+            mime_type=item["mime_type"] if isinstance(item.get("mime_type"), str) else "",
+            created_at=created_at if isinstance(created_at, str) else None,
+            url=item["url"] if isinstance(item.get("url"), str) else "",
+        )
+
+    def _raise_for_image_envelope(
+        self, response: httpx.Response, payload: Mapping[str, Any]
+    ) -> None:
+        """图床读/删接口的非 200 统一抛稳定码错误，不回显响应正文（计划 §6）。"""
+        code = payload["code"]
+        if code == 200:
+            return
+        retry_after = _parse_retry_after(response) if code == 429 else None
+        raise self._error(code, f"code={code} http={int(response.status_code)}", retry_after)
 
     # --- 博客评论接口 ------------------------------------------------------
 

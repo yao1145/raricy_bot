@@ -13,6 +13,20 @@ model:  # 模型服务配置；API Key 从 LLM_API_KEY 环境变量读取
   vision_enabled: false  # 是否启用图片理解；模型须支持视觉，聊天和评论共用
   max_image_bytes: 5242880  # 单图下载字节上限，不得超过站点 10 MiB 限制
 
+image_generation:  # 完整版独立图像接口，Light 不开放
+  enabled: false  # 配好接口、模型及独立密钥后再开启
+  base_url: "https://api.openai.com/v1"  # OpenAI Images 兼容地址，与文本接口独立
+  model: ""  # 必须填写支持生成和编辑的图像模型名称
+  api_key_env: IMAGE_API_KEY  # 只填写环境变量名，不得填写密钥；无文本密钥回退
+  timeout_seconds: 180  # 单次请求超时秒数，无自动重试
+  size: "1024x1024"  # 输出尺寸，需模型支持
+  quality: medium  # 输出质量：low、medium、high 或 auto
+  output_format: webp  # 输出格式：webp、jpeg 或 png
+  output_compression: 80  # webp/jpeg 压缩质量，0–100；png 不传此参数
+  max_reference_bytes: 5242880  # 单张编辑参考图下载字节上限
+  concurrency: 2  # 独立图像任务并发数
+  queue_size: 10  # 待处理图像任务队列容量，同会话最多一个在途任务
+
 mcp:  # 外部工具总配置；查询可能发往对应上游，所有凭据只引用环境变量
   enabled: false  # 是否启用本模块；上级总开关也须开启
   connect_timeout_seconds: 10  # MCP 连接及工具发现超时秒数

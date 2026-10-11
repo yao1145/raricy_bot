@@ -112,6 +112,7 @@ LAUNCHER_OWNED_FIELDS: frozenset[str] = frozenset(
         "logging.archive.directory",
         "mcp.enabled",
         "blog.enabled",
+        "image_generation.enabled",
     }
 )
 
@@ -305,6 +306,7 @@ def light_base_mapping(profile: Path | None = None) -> dict[str, Any]:
         mapping["logging"] = {"archive": {"directory": str(paths.error_logs_dir(profile))}}
     mapping["mcp"] = {"enabled": False}
     mapping["blog"] = {"enabled": False}
+    mapping["image_generation"] = {"enabled": False}
     mapping["system_prompt"] = DEFAULT_SYSTEM_PROMPT
     return mapping
 
@@ -1241,7 +1243,7 @@ class ConfigService:
         无档案时（`profile is None`）路径字段一定缺失（基线省略、提交也拒绝这些
         键），缺失即跳过包含检查；一旦出现路径字段又无档案锚点，仍然拒绝。
         """
-        for key in ("mcp.enabled", "blog.enabled"):
+        for key in ("mcp.enabled", "blog.enabled", "image_generation.enabled"):
             if _get_path(mapping, key):
                 raise ConfigInvalid(
                     f"Light 不支持该能力：{key}",
