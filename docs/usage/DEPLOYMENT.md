@@ -8,6 +8,11 @@
 200，容器 healthy。模型配置、凭据和原数据卷保留；源码、Compose 及一致性 SQLite 备份位于
 `/opt/raricy_bot/.deploy-backups/image-blacklist-20261011-181129`。
 
+服务器的生产镜像标签保存在本地 `docker-compose.override.yml`，由 `.git/info/exclude` 忽略；
+两端 Git 中的 `docker-compose.yml` 保持相同公共模板。后续部署应更新覆盖文件中的 `image`，
+Compose 会优先采用该标签。Git 同步前的源码快照保存在
+`/opt/raricy_bot/.deploy-backups/git-sync-20261011-182331`，有效部署配置在同步前后保持一致。
+
 明确安全拦截自动永久加入该用户，不影响文本。支持的稳定错误码及判断边界见 D-160；
 机构只返回普通 400 时不会推测封禁，可用本地 `block` 手动添加。没有聊天解除命令。
 
