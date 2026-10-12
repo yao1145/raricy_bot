@@ -410,7 +410,7 @@ class ImageGenerationConfig:
     api_key_env: str = IMAGE_API_KEY_ENV
     timeout_seconds: float = 180.0
     size: str = "1024x1024"
-    quality: str = "medium"
+    quality: str = "low"
     output_format: str = "webp"
     output_compression: int = 80
     # 单张编辑参考图上限，与文本视觉配置独立；不得超过站点图床的单文件上限。
@@ -1814,7 +1814,7 @@ def _image_generation(
             f"配置 {where}.output_format 只能是 {'/'.join(IMAGE_OUTPUT_FORMATS)}",
             field=f"{where}.output_format",
         )
-    quality = container.get("quality", "medium")
+    quality = container.get("quality", "low")
     if quality not in IMAGE_QUALITIES:
         raise ConfigError(
             f"配置 {where}.quality 只能是 {'/'.join(IMAGE_QUALITIES)}",

@@ -412,7 +412,9 @@ class SiteClient:
 
     # --- 图床接口（图床契约 §3–§7）-----------------------------------------
 
-    async def upload_image(self, data: bytes, mime_type: str, filename: str) -> SiteImage:
+    async def upload_image(
+        self, data: bytes, mime_type: str, filename: str, *, compress: bool = True
+    ) -> SiteImage:
         """单文件 multipart 上传一张图，返回图床元信息。
 
         只发**一个** `file` 字段，因此 `code == 200` 时必须同时满足 `items` 恰好一项、
@@ -421,16 +423,18 @@ class SiteClient:
         **结果不确定**（`SiteError.status == 0`）：图片可能已经落盘，调用方应只读对账，
         绝不自动重投（计划 §6）。网络错误、5xx 与不可解析响应同样按不确定处理。
 
+        `compress=False` 发送站方契约的 `compress=0`，用于已经本地压缩的生成结果。
         401 是确定答复（认证先于保存），所以允许重登一次后重试一次；其余 4xx 原样抛出。
         错误只带稳定码与 HTTP 状态，**不回显响应正文**。不设置 `Origin` / `Referer`。
         """
         if not isinstance(data, bytes):
             raise ValueError("上传图片字节必须是 bytes")
         files = {"file": (filename, data, mime_type)}
-        status, payload = await self._post_multipart(_IMAGES_PREFIX, files)
+        fields = None if compress else {"compress": "0"}
+        status, payload = await self._post_multipart(_IMAGES_PREFIX, files, data=fields)
         if self._payload_unauthorized(status, payload):
             await self._relogin()
-            status, payload = await self._post_multipart(_IMAGES_PREFIX, files)
+            status, payload = await self._post_multipart(_IMAGES_PREFIX, files, data=fields)
         return self._parse_upload_result(status, payload, mime_type=mime_type, data=data)
 
     async def list_images(self) -> list[SiteImage]:
@@ -482,7 +486,8 @@ class SiteClient:
         self._raise_for_image_envelope(response, payload)
 
     async def _post_multipart(
-        self, path: str, files: Mapping[str, tuple[str, bytes, str]]
+        self, path: str, files: Mapping[str, tuple[str, bytes, str]],
+        *, data: Mapping[str, str] | None = None,
     ) -> tuple[int, Mapping[str, Any] | None]:
         """发一次带 Cookie 的 multipart 请求，返回 (HTTP 状态, 信封或 None)。
 
@@ -493,7 +498,7 @@ class SiteClient:
         headers.update(self._cookie_headers())
         try:
             async with self._require_client().stream(
-                "POST", path, headers=headers, files=dict(files)
+                "POST", path, headers=headers, files=dict(files), data=dict(data) if data is not None else None
             ) as response:
                 status = int(response.status_code)
                 raw = await self._bounded_response_bytes(response)

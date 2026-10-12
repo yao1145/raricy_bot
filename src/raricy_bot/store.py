@@ -60,6 +60,7 @@ from .blog_records import (
     utc8_next_day,
 )
 from .config import StorageConfig
+from .images.models import RETENTION_SECONDS as IMAGE_RETENTION_SECONDS
 
 _T = TypeVar("_T")
 
@@ -3076,7 +3077,7 @@ class Store:
             IMAGE_STATUS_UPLOADING,
             now,
             assignments=("upload_filename", "uploaded_at", "expires_at"),
-            values=(upload_filename, now, now + 30 * 86400),
+            values=(upload_filename, now, now + IMAGE_RETENTION_SECONDS),
         )
 
     async def confirm_image_upload(
@@ -3087,10 +3088,10 @@ class Store:
         expires_at: float,
         now: float,
     ) -> ImageJob:
-        """`uploading`/`upload_unknown → uploaded`：登记站点图片 ID 与 30 天租期。
+        """`uploading`/`upload_unknown → uploaded`：登记站点图片 ID 与 14 天租期。
 
         对账恢复走的是同一条路径。`uploaded_at` 由调用方给保守起点，避免未知阶段
-        把有效期拉长；`expires_at` 是 30 天上限。
+        把有效期拉长；`expires_at` 最长为首次上传后 14 天。
         """
         if not image_id:
             raise ValueError("image_id 必须非空")
@@ -3101,7 +3102,7 @@ class Store:
             IMAGE_STATUS_UPLOADED,
             now,
             assignments=("site_image_id", "uploaded_at", "expires_at", "delete_status"),
-            values=(image_id, uploaded_at, expires_at, None),
+            values=(image_id, uploaded_at, min(expires_at, uploaded_at + IMAGE_RETENTION_SECONDS), None),
         )
 
     async def mark_upload_unknown(self, job_id: str, now: float) -> ImageJob:
@@ -3178,6 +3179,20 @@ class Store:
             conn.commit()
             return updated
 
+        return await self._execute(operation)
+
+    async def update_image_retention(self, scope: str, now: float) -> int:
+        """限租期为 14 天，并延长尚有效且未开始删除的旧 7 天租期（D-162）。"""
+        def operation(conn: sqlite3.Connection) -> int:
+            with conn:
+                return conn.execute(
+                    "UPDATE image_jobs SET expires_at=uploaded_at+?, updated_at=?"
+                    " WHERE scope=? AND uploaded_at IS NOT NULL AND (expires_at>uploaded_at+?"
+                    " OR (expires_at=uploaded_at+? AND expires_at>?"
+                    " AND COALESCE(delete_status,'') NOT IN (?,?)))",
+                    (IMAGE_RETENTION_SECONDS, now, scope, IMAGE_RETENTION_SECONDS,
+                     7 * 86400, now, IMAGE_DELETE_PENDING, IMAGE_DELETE_DONE),
+                ).rowcount
         return await self._execute(operation)
 
     async def recover_image_jobs(self, now: float) -> ImageRecoverySummary:
@@ -3327,7 +3342,7 @@ class Store:
     ) -> tuple[ImageJob, ...]:
         """本功能登记、尚未删除的图，按租期内最旧优先排序。
 
-        排序键 `uploaded_at, site_image_id` 同时覆盖「先清 30 天到期图、再按最旧淘汰
+        排序键 `uploaded_at, site_image_id` 同时覆盖「先清 14 天到期图、再按最旧淘汰
         未到期图」：保留期统一，到期顺序即上传顺序，调用方按实际字节够用即停。
         删除失败（`failed`）的行仍回到这里重试；`pending`/`done` 不在其列。
         """

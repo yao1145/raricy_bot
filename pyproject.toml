@@ -13,6 +13,7 @@ dependencies = [
     "PyYAML>=6.0",
     "aiohttp>=3.9",
     "mcp>=2.2,<3",
+    "Pillow>=12.2.0,<13",  # 完整版图像上传前有界解码、缩放和 WebP 编码
 ]
 
 [project.optional-dependencies]

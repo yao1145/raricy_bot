@@ -5,7 +5,7 @@
 - `handle()` 消费一条 `ImageRequest`：编辑先取并校验参考图，**预留前完成**；再在滚动
   24h 硬额度内预留、调用独立图像提供方、上传图床、用现有发送器回一条带附件的消息，
   最后无论成败都终结触发事件。生成与编辑共用同一账本。
-- `cleanup_once()` 只维护本功能账本的图：先删 30 天到期图，再按实际字节最旧优先淘汰。
+- `cleanup_once()` 只维护本功能账本的图：先删 14 天到期图，再按实际字节最旧优先淘汰。
   生成开关关闭时仍运行，避免旧图永久残留。
 - 上传结果不确定时只按**精确随机文件名**只读对账，查不到不是失败证明；重启只读对账、
   绝不重新生成，丢失的字节也不靠重新生成恢复。
@@ -38,6 +38,7 @@ from ..store import (
     ImageJob,
 )
 from ..texts import (
+    IMAGE_COMPRESSION_TEXT,
     IMAGE_BLACKLIST_TEXT,
     IMAGE_FAILURE_TEXT,
     IMAGE_QUOTA_TEXT,
@@ -52,6 +53,7 @@ from .models import (
     ImageRequest,
 )
 from .provider import ImageProvider, ImageProviderError, REASON_CONTENT_POLICY
+from .compression import ImageCompressionError, compress_output
 
 if TYPE_CHECKING:  # 只用于类型标注，避免运行期引入发送器依赖
     from ..core.sender import MessageSender
@@ -139,6 +141,7 @@ class ImageService:
         """
         try:
             await self._store.recover_image_jobs(self._now())
+            await self._store.update_image_retention(self._scope, self._now())
         except Exception:
             log_event(logger, logging.WARNING, "image.recover", reason="failed")
         try:
@@ -279,6 +282,13 @@ class ImageService:
         if await self._store.is_image_user_blocked(self._scope, request.actor_id):
             await self._notice(request, IMAGE_BLACKLIST_TEXT)
             return False
+        try:
+            output = await asyncio.to_thread(compress_output, output)
+        except ImageCompressionError:
+            await self._store.fail_image_upload(job_id, "compression_failed", self._now())
+            log_event(logger, logging.WARNING, "image.compress_failed", reason="compression_failed", trace_id=request.trace_id)
+            await self._notice(request, IMAGE_COMPRESSION_TEXT)
+            return False
         return await self._upload_and_send(request, job_id, output)
 
     async def _load_reference(self, request: ImageRequest) -> ImageOutput:
@@ -348,7 +358,7 @@ class ImageService:
             return None
         try:
             uploaded = await self._site.upload_image(
-                output.data, output.mime_type, filename
+                output.data, output.mime_type, filename, compress=False
             )
         except SiteError as exc:
             if exc.status == 0:
@@ -420,7 +430,7 @@ class ImageService:
     # --- 图床维护与容量淘汰 -------------------------------------------------
 
     async def cleanup_once(self) -> None:
-        """一次租期维护：结清待对账的删除、删除 30 天到期图。可注入时钟测试。"""
+        """一次租期维护：结清待对账的删除、删除 14 天到期图。可注入时钟测试。"""
         async with self._maintenance:
             await self._cleanup_locked(self._now())
 

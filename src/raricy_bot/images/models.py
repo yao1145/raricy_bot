@@ -14,11 +14,14 @@ from dataclasses import dataclass, field
 WINDOW_SECONDS: int = 86400
 IMAGE_LIMIT: int = 50
 
-# 方案 A 的最长租期：从图床上传确认时间起 30 天（设计 §1）。
-RETENTION_SECONDS: int = 30 * 86400
+# 从首次图床上传时间起最多保留 14 天（D-162）。
+RETENTION_SECONDS: int = 14 * 86400
 
 # 输出图硬上限：与站点图床单文件上限一致（10 MiB）。
 MAX_OUTPUT_BYTES: int = 10 * 1024 * 1024
+
+# 上传前压缩结果必须严格小于 200 KB（十进制字节）。
+MAX_UPLOAD_BYTES: int = 200_000
 
 # 模式字面量。`edit` 是唯一会读取参考图的入口；普通 `generate` 即使用户附图也不取图。
 MODE_GENERATE: str = "generate"

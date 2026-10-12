@@ -20,7 +20,7 @@ image_generation:  # 完整版独立图像接口，Light 不开放
   api_key_env: IMAGE_API_KEY  # 只填写环境变量名，不得填写密钥；无文本密钥回退
   timeout_seconds: 180  # 单次请求超时秒数，无自动重试
   size: "1024x1024"  # 输出尺寸，需模型支持
-  quality: medium  # 输出质量：low、medium、high 或 auto
+  quality: low  # 输出生成质量：low、medium、high 或 auto；上传前另压缩到 200 KB 以下
   output_format: webp  # 输出格式：webp、jpeg 或 png
   output_compression: 80  # webp/jpeg 压缩质量，0–100；png 不传此参数
   max_reference_bytes: 5242880  # 单张编辑参考图下载字节上限
