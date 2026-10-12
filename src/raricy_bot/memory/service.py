@@ -37,15 +37,19 @@
 
 from __future__ import annotations
 
+from .. import texts
+
 import asyncio
+import copy
 import hashlib
+import json
 import logging
 import os
 import re
 import tempfile
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import IO, Any, TypeVar
@@ -99,6 +103,52 @@ from .models import (
 __all__ = ["MemoryService", "PrivateSettings"]
 
 _logger = get_logger("memory")
+
+# 画像的模型与 codec：**惰性加载**（首次用到时导入一次，之后走缓存）。
+#
+# 为什么不能写成本模块顶部的 `from ..persona import ...`：`raricy_bot.memory` 这个包在导入
+# `memory.service` 之前会先导入 `memory.controller`，而 `persona.codec` 需要 `memory.codec`
+# （导入它又会先执行 `memory/__init__`）。任一侧先被导入时，另一侧都会读到「还没执行完的包」，
+# 于是出现「名字尚未绑定」的导入期错误 —— 与运行时无关，纯粹是导入顺序的偶然性。
+# 把这条边推迟到调用时刻，两个方向就都成立：先导入 persona 或先导入 memory 都能正常工作。
+_PERSONA_LAYER: tuple[Any, Any] | None = None
+
+
+def _persona_layer() -> tuple[Any, Any]:
+    """返回（`persona.models`, `persona.codec`）；首次调用时导入并缓存。"""
+    global _PERSONA_LAYER
+    if _PERSONA_LAYER is None:
+        from ..persona import codec as persona_codec
+        from ..persona import models as persona_models
+
+        _PERSONA_LAYER = (persona_models, persona_codec)
+    return _PERSONA_LAYER
+
+
+class _LazyPersonaModule:
+    """惰性模块代理：第一次取属性时才真正导入画像的模型 / codec 模块。
+
+    模块级 `__getattr__`（PEP 562）只覆盖 `module.attr` 形式的访问，**管不到函数体里的全局
+    名字查找**，所以这里放一个导入期就存在的代理对象：`persona_models.validate_persona(...)`
+    在第一次执行到那一行时才触发导入（见 `_persona_layer` 的说明），之后直接转发给真模块。
+    """
+
+    __slots__ = ("_name", "_module")
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._module: Any = None
+
+    def __getattr__(self, name: str) -> Any:
+        if self._module is None:
+            persona_models, persona_codec = _persona_layer()
+            self._module = persona_models if self._name == "models" else persona_codec
+        return getattr(self._module, name)
+
+
+# 画像相关方法体里直接使用的两个名字；导入期不加载任何 persona 代码。
+persona_models = _LazyPersonaModule("models")
+persona_codec = _LazyPersonaModule("codec")
 
 # 频道类型（§30.2）：只有 dm 会碰用户私有文件，lobby 与 comment 连读都不读。
 _DM: str = "dm"
@@ -158,8 +208,8 @@ _REASON_IO: str = "io"
 # 不记文件名、路径或数量之外的任何东西。
 _REASON_TOO_MANY_FILES: str = "too_many_files"
 
-# 三类文件的解析结果。
-_MemoryDocument = CommonDocument | PrivateDocument | PublicMemoryDocument
+# 三类文件的解析结果。画像的三类文档是纯 dict（契约要求接口返回 dict），因此并入同一个别名。
+_MemoryDocument = CommonDocument | PrivateDocument | PublicMemoryDocument | dict[str, Any]
 
 # 纯函数形式的操作：给定基线文档，返回（新文档, 稳定状态, 对象 ID）；状态非 ok 时新文档为 None。
 _ApplyFn = Callable[[Any], "tuple[Any | None, str, str | None]"]
@@ -173,6 +223,47 @@ _EntryLike = TypeVar("_EntryLike", MemoryEntry, PublicMemoryEntry)
 # owner key 的形状：`user_storage_key` 的输出，64 位小写十六进制（§10.1）。
 _OWNER_KEY_LENGTH: int = 64
 _OWNER_KEY_CHARS = frozenset("0123456789abcdef")
+
+# --- 用户画像（设计 §8）的常量 ---
+
+# 工作流默认有效期（24 小时）：与 `PersonaConfig.workflow_ttl_seconds` 的默认值一致，
+# 显式传参时以传参为准。
+_PERSONA_DEFAULT_TTL: float = 86400.0
+
+# 画像快照 LRU 的容量：与用户快照同款，淘汰只释放内存。
+_PERSONA_CACHE_SIZE: int = 64
+
+# 画像目录的单次扫描上界（与 `MAX_PUBLIC_FILES` 同一套理由：一个被塞了几万个文件的目录
+# 不能拖垮启动或一次读取）。超出的文件这一轮不处理、只记一个稳定 reason。
+MAX_PERSONA_FILES: int = 4096
+
+# 启动恢复与关闭撤回共用的幂等键：它们不是用户操作，但同样要在目标文件里留下「做过」的记录，
+# 这样一次重试不会把同一步重复算成两次新操作。
+_PERSONA_RECOVER_OPERATION: str = "persona-recovery"
+
+# 画像公开条目在补充资料里的组间基数（`_PUBLIC_PRIORITY_BASE` 之后的一档）：公开画像整体
+# 晚于既有三组与旧公开个人记忆，DM 里根本不出现。
+_PERSONA_PUBLIC_PRIORITY_BASE: int = 3
+
+# 被隔离（suppressed）的 owner 上界：隔离是**进程内**的状态，只影响公开投影的可见性。
+# 上界防止一次被滥用的控制路径把内存塞满；淘汰最旧的条目即可 —— 隔离本身会在下一次
+# `/persona off`、启动恢复或撤回成功时重新建立（设计 §7 的待撤回语义）。
+_PERSONA_SUPPRESSED_MAX: int = 4096
+
+# 人工流程的基线指纹在 JSON 序列化时的两个固定项：`sort_keys` 保证同一份内容只有一种写法。
+_FINGERPRINT_SEPARATORS: tuple[str, str] = (",", ":")
+
+# 画像日志的 scope 取值（白名单 token）：三类文件各一个。
+_SCOPE_PERSONA: str = "persona_user"
+_SCOPE_PERSONA_FLOW: str = "persona_workflow"
+_SCOPE_PERSONA_PUBLIC: str = "persona_public"
+
+# `last_change` 的固定短语：`/persona` 用它显示「最近一次变更」。
+
+# `persona_commit_update` 允许由控制器提供的记账字段白名单：越界的键一律整条拒绝。
+_PERSONA_METADATA_FIELDS: frozenset[str] = frozenset(
+    ("update_day", "update_count", "last_update_at", "last_message_id", "observations", "last_change")
+)
 
 
 @dataclass(frozen=True)
@@ -208,20 +299,32 @@ class _Snapshot:
 
     @property
     def revision(self) -> int:
-        """当前快照的修订号；没有可用快照时为 0。"""
-        if self.document is None:
+        """当前快照的修订号；没有可用快照时为 0。
+
+        记忆文档是 dataclass（`document.revision`），画像文档是纯 dict（`document["revision"]`）；
+        两者的修订号语义相同，因此在这里统一读出。
+        """
+        document = self.document
+        if document is None:
             return 0
-        return int(self.document.revision)
+        if isinstance(document, dict):
+            return int(document.get("revision", 0))
+        return int(document.revision)
 
 
 @dataclass(frozen=True)
 class _DocumentView:
-    """把「共同文件」与「用户文件」的差异收在一处，供刷新与原子写复用。"""
+    """把「共同文件」与「用户文件」的差异收在一处，供刷新与原子写复用。
+
+    `render` 只在画像的三类文档上用得到：那三类是纯 dict，`self._render` 的 `isinstance`
+    分派认不出它们属于哪一类，因此由各自的 view 自带渲染器；记忆三类文档继续走 `_render`。
+    """
 
     path: str
     parser: Callable[[bytes, MemoryConfig], Any]
     fresh: Callable[[], Any]
     scope: str
+    render: Callable[[Any], bytes] | None = None
 
 
 class MemoryService:
@@ -240,6 +343,9 @@ class MemoryService:
         replace: Callable[[str, str], None] = os.replace,
         redactor: Redactor | None = None,
     ) -> None:
+        # 构造签名与 INTERFACES §30.1 逐字一致（`test_memory_service.py` 有一条契约测试钉住它），
+        # 因此画像的配置**不**从这里进：待办流程的有效期由 `start_persona(workflow_ttl_seconds=…)`
+        # 注入，装配层已经这么调（见 `app.py::_start_persona`）。
         self._config = config
         self._now = now
         self._replace = replace
@@ -275,6 +381,31 @@ class MemoryService:
         # 最近一次扫描记下的稳定 reason（超上限 / 目录不可读）：只在取值变化时记一条日志（§42.3）。
         self._public_scan_reason: str | None = None
         self._refresh_task: asyncio.Task[None] | None = None
+
+        # --- 用户画像（设计 §8）---
+        # 画像的三份文件与记忆共用这一把写锁、这一套原子写与这一套快照机制，但**开关与缓存
+        # 各自独立**：画像可以在 `memory.enabled=false` 的部署里单独启用（设计 §12），
+        # 因此它有自己的 `_persona_enabled`、自己的纪元与代次、自己的三份快照缓存。
+        self._persona_root: str = os.path.join(self._root, "personas")
+        self._persona_users_dir: str = os.path.join(self._persona_root, "users")
+        self._persona_flows_dir: str = os.path.join(self._persona_root, "workflows")
+        self._persona_public_dir: str = os.path.join(self._persona_root, "public")
+        self._persona_enabled: bool = False
+        self._persona_started: bool = False
+        # 工作流有效期：`start_persona(workflow_ttl_seconds=…)` 可覆盖，缺省 24 小时
+        # （与 `PersonaConfig.workflow_ttl_seconds` 的默认值一致）。
+        self._persona_ttl: float = _PERSONA_DEFAULT_TTL
+        self._persona_epoch: int = 0
+        self._persona_generation: dict[str, int] = {}
+        self._persona_users: "OrderedDict[str, _Snapshot]" = OrderedDict()
+        self._persona_flows: "OrderedDict[str, _Snapshot]" = OrderedDict()
+        self._persona_public: "OrderedDict[str, _Snapshot]" = OrderedDict()
+        # username → owner key(s)：与记忆公开索引同款的一次引用替换（§42.2）。
+        self._persona_index: Mapping[str, tuple[str, ...]] = {}
+        self._persona_scan_reason: str | None = None
+        # 被隔离的 owner（只存不可逆 owner key）：`/persona off` 或 `private` 一受理就立刻生效，
+        # 公开投影（画像的**与**旧的）在撤回真正落盘之前不再引用这些 owner。见 `persona_quarantine`。
+        self._persona_suppressed: "OrderedDict[str, None]" = OrderedDict()
 
     # --- 生命周期 ---------------------------------------------------------
 
@@ -409,6 +540,10 @@ class MemoryService:
         index: dict[str, list[str]] = {}
         total = 0
         for owner_key in keys:
+            if self._persona_suppressed_owner(owner_key):
+                # 画像侧的「待撤回」在完成之前同样挡住**旧**公开投影：一次 `/persona off`
+                # 承诺的是不再引用这个人的公开资料，旧公开副本不能成为例外（设计 §7、§11）。
+                continue
             state = self._public_state(owner_key, force=True)
             document = state.document
             if state.reason is not None or not isinstance(document, PublicMemoryDocument):
@@ -421,15 +556,18 @@ class MemoryService:
         self._publish_index(index)
         return total
 
-    def _public_file_keys(self) -> tuple[str, ...] | None:
+    def _public_file_keys(self, directory: str | None = None) -> tuple[str, ...] | None:
         """`public/` 下的 owner key 列表（按文件名排序）；目录不可读返回 None。
+
+        `directory` 默认是公开投影目录；画像的三类目录同样按 owner key 命名，因此共用这一个
+        扫描助手（画像只借它的「过滤非法文件名 + 数量上界」这两条规则）。
 
         非法的文件名（不是 `.md`、或 `.md` 的主干不是 64 位小写十六进制的 owner key 形状）直接跳过：
         那不是任何 owner 的公开文件，也就没有可归属的「坏文件」要记。文件数超过 `MAX_PUBLIC_FILES`
         时按排序截断，只记一个稳定 reason（R14）。
         """
         try:
-            with os.scandir(self._public_dir) as scan:
+            with os.scandir(directory or self._public_dir) as scan:
                 names = [entry.name for entry in scan]
         except FileNotFoundError:
             # 目录不存在（还没启用过、或被人删掉）：没有任何公开投影，不是失败。
@@ -468,8 +606,14 @@ class MemoryService:
         self._public_scan_reason = reason
 
     def _reindex_owner(self, owner_key: str, document: _MemoryDocument | None) -> None:
-        """一次 mutation 之后把该 owner 的索引项换成文档的当前事实（§42.4 第 10 步、§42.5）。"""
+        """一次 mutation 之后把该 owner 的索引项换成文档的当前事实（§42.4 第 10 步、§42.5）。
+
+        隔离中的 owner 一律按「没有公开投影」处理：隔离跟着画像的待撤回走，比某一次旧公开
+        写入更权威（`_refresh_public` 会在下一次整份重扫时给出同样的结论）。
+        """
         current = document if isinstance(document, PublicMemoryDocument) else None
+        if self._persona_suppressed_owner(owner_key):
+            current = None
         self._public_index = _reindex(self._public_index, owner_key, current)
 
     # --- 读路径 -----------------------------------------------------------
@@ -503,8 +647,14 @@ class MemoryService:
                     items.extend(self._scope_items(state.document, channel_kind))
                 else:
                     self._log_omitted("common", state.reason)
-            if channel_kind == _DM and user_id and access.permits_private(user_id, channel_kind):
+            if (
+                channel_kind == _DM
+                and user_id
+                and access.permits_private(user_id, channel_kind)
+                and not self._legacy_private_blocked(user_id)
+            ):
                 # 私有记忆只在 DM 且门禁通过时读取；其它频道连文件都不读（§30.2 的表）。
+                # 已迁移用户也不读：旧个人条目不得与新画像重复参与推断（设计 §11.5）。
                 state = self._user_state(user_id)
                 if state.available and isinstance(state.document, PrivateDocument):
                     # 快照照常载入并报修订号（开关就存在这份文件里，必须先读才知道），
@@ -559,8 +709,11 @@ class MemoryService:
         ]
 
     async def private_settings(self, user_id: str) -> PrivateSettings:
-        """该用户的私有设置；文件不存在或不可用都按「未开启」返回，不创建任何文件。"""
-        if not self._enabled or not user_id:
+        """该用户的私有设置；文件不存在或不可用都按「未开启」返回，不创建任何文件。
+
+        已迁移用户同样按「未开启」返回：旧个人记忆对该用户已经退役（设计 §11.5）。
+        """
+        if not self._enabled or not user_id or self._legacy_private_blocked(user_id):
             return PrivateSettings(private_enabled=False, auto_capture=False)
         state = self._user_state(user_id)
         if not isinstance(state.document, PrivateDocument):
@@ -574,9 +727,15 @@ class MemoryService:
         """只读内存快照、不做任何 I/O（D-67）：快照没加载或用户未知时返回 None。
 
         这是 §34.1 的 `private_enabled` 回调的唯一数据源：`/help` 是本地命令，不能为一句措辞去读文件。
+        **已迁移**这一点在这里只能靠内存里的画像快照判断（`_persona_cached_migrated`）：这是提示，
+        不是判据 —— 权威判据是异步的 `persona_is_migrated`（它会真的加载私有状态），命令路由
+        用后者。缓存被淘汰时这里返回文件里的原值，绝不会因此放行旧写入：写入路径有
+        `_mutate_private` 的迁移检查兜底。
         """
         if not user_id:
             return None
+        if self._persona_cached_migrated(user_id):
+            return PrivateSettings(private_enabled=False, auto_capture=False)
         state = self._users.get(user_id)
         if state is None or not isinstance(state.document, PrivateDocument):
             return None
@@ -633,8 +792,8 @@ class MemoryService:
         return tuple(state.document.entries)
 
     async def private_entries(self, user_id: str) -> tuple[MemoryEntry, ...]:
-        """该用户已生效的私有条目；不可用时返回空元组。"""
-        if not self._enabled or not user_id:
+        """该用户已生效的私有条目；不可用或已迁移时返回空元组。"""
+        if not self._enabled or not user_id or self._legacy_private_blocked(user_id):
             return ()
         state = self._user_state(user_id)
         if not isinstance(state.document, PrivateDocument):
@@ -741,6 +900,11 @@ class MemoryService:
             if not _valid_subject(subject) or subject.owner_key in seen:
                 continue
             seen.add(subject.owner_key)
+            if self._persona_suppressed_owner(subject.owner_key):
+                # 画像侧已受理但未完成的撤回同样挡住旧公开条目：这是**内存集合**的判定，
+                # 公开路由因此永远不会去读私有文件（设计 §7、Global Constraints 第 7 条）。
+                self._log_omitted("public", "suppressed")
+                continue
             state = self._public_state(subject.owner_key)
             if not state.available or not isinstance(state.document, PublicMemoryDocument):
                 # 冷启动就没有有效快照：这个 owner 本轮省略（§42.8）。
@@ -759,14 +923,14 @@ class MemoryService:
             for rank, (username, entry) in enumerate(ordered)
         ]
 
-    def _public_dir_readable(self) -> bool:
+    def _public_dir_readable(self, directory: str | None = None) -> bool:
         """`public/` 目录本身能不能列：不能就是「本轮无公开个人记忆」（§42.8）。
 
         目录**不存在**是正常路径而不是失败：那时一个公开文件也没有，逐 owner 读到的同样是空文档，
         结果一样是空的（也不记日志）。只有「存在但读不动」才降级成本轮无结果。
         """
         try:
-            with os.scandir(self._public_dir):
+            with os.scandir(directory or self._public_dir):
                 return True
         except FileNotFoundError:
             return True
@@ -859,11 +1023,14 @@ class MemoryService:
     async def begin_auto_capture(self, user_id: str) -> AutoCaptureToken | None:
         """开始一次自动提取：在同一把写锁内一并取授权、条目快照与该用户的提取代次。
 
-        返回 None 表示当时不满足授权（服务关闭、用户 ID 不可用、私有快照不可用，或用户没有
-        开启自动提取）—— 调用方据此静默跳过，不调用撰写器。取得令牌之后，模型调用发生在写锁
-        **之外**，因此隐私命令无需等待模型返回（修复计划 §2.3 第 2 条）。
+        返回 None 表示当时不满足授权（服务关闭、用户 ID 不可用、私有快照不可用、用户已迁移到
+        画像，或用户没有开启自动提取）—— 调用方据此静默跳过，不调用撰写器。取得令牌之后，模型
+        调用发生在写锁**之外**，因此隐私命令无需等待模型返回（修复计划 §2.3 第 2 条）。
         """
         if not self._enabled or not user_id or _storage_key(user_id) is None:
+            return None
+        if self._legacy_private_blocked(user_id):
+            # 已迁移用户不再跑旧自动提取：证据只从画像路径来（设计 §11.5）。
             return None
         async with self._write_lock:
             state = self._user_state(user_id)
@@ -933,6 +1100,11 @@ class MemoryService:
             return OperationResult(STATUS_FORBIDDEN, None, 0)
         owner_key = _storage_key(user_id)
         if owner_key is None:
+            return OperationResult(STATUS_FORBIDDEN, None, 0)
+        if self._legacy_private_blocked(user_id):
+            # 已迁移用户不再发布**旧**个人条目：公开一律走画像的独立快照（设计 §11.7）。
+            # 撤回路径（`unpublish_private` / `unpublish_all`）不设这道门：迁移本身要把旧公开
+            # 副本撤下来，撤回永远是被允许的方向。
             return OperationResult(STATUS_FORBIDDEN, None, 0)
         if not _valid_username(username):
             # 第一层身份校验（R8）：codec 的 `_check_public` 是第二层，两层都不接受任意文本。
@@ -1010,6 +1182,11 @@ class MemoryService:
 
         与 `_mutate_private` 同款，只是把「用户文件」换成「公开文件」：同一个 `asyncio.Lock`
         （**不新建第二把锁**），同一套 `_write_document` 七步原子写与同一套快照替换。
+
+        `asyncio.Lock` 不可重入，因此真正的实现在 `_mutate_public_locked`：画像的
+        `persona_confirm` / `persona_off` 已经持有写锁，需要在这段临界区里顺带撤回旧公开记忆
+        （逐用户迁移与关闭的固定顺序），调用的是同一个锁**之内**的那份实现，而不是再进一次
+        锁 —— 那会立刻自锁。
         """
         if not self._enabled or not user_id:
             return OperationResult(STATUS_FORBIDDEN, None, 0)
@@ -1017,29 +1194,38 @@ class MemoryService:
         if owner_key is None:
             return OperationResult(STATUS_FORBIDDEN, None, 0)
         async with self._write_lock:
-            # R24：销毁路径强制读盘。撤回步的 `not_found` 是 R19 授权删除私人来源的前提，必须
-            # 意味着「读过公开文件，里面确实没有这条」；TTL 缓存会把它退化成「我没看见」，
-            # 于是 TTL 窗口内落到盘上的公开条目会被漏撤，变成「私人删掉、公开遗留」。
-            state = self._public_state(owner_key, force=True)
-            if not isinstance(state.document, PublicMemoryDocument):
-                return OperationResult(STATUS_UNAVAILABLE, None, state.revision)
-            hit = state.document.operations.get(operation_id)
-            if hit is not None:
-                return hit
-            status, object_id, written = self._write_document(
-                self._public_view(owner_key), state, apply_fn
+            return self._mutate_public_locked(owner_key, operation_id, apply_fn)
+
+    def _mutate_public_locked(
+        self,
+        owner_key: str,
+        operation_id: str,
+        apply_fn: _ApplyFn,
+    ) -> OperationResult:
+        """公开文件的 mutation 主体；**调用方必须已经持有写锁**（见 `_mutate_public`）。"""
+        # R24：销毁路径强制读盘。撤回步的 `not_found` 是 R19 授权删除私人来源的前提，必须
+        # 意味着「读过公开文件，里面确实没有这条」；TTL 缓存会把它退化成「我没看见」，
+        # 于是 TTL 窗口内落到盘上的公开条目会被漏撤，变成「私人删掉、公开遗留」。
+        state = self._public_state(owner_key, force=True)
+        if not isinstance(state.document, PublicMemoryDocument):
+            return OperationResult(STATUS_UNAVAILABLE, None, state.revision)
+        hit = state.document.operations.get(operation_id)
+        if hit is not None:
+            return hit
+        status, object_id, written = self._write_document(
+            self._public_view(owner_key), state, apply_fn
+        )
+        if written is not state:
+            self._store_public(owner_key, written)
+            self._reindex_owner(owner_key, written.document)
+        if status == STATUS_OK:
+            self._log_updated(
+                "memory.updated",
+                scope="public",
+                revision=written.revision,
+                memory_id=object_id,
             )
-            if written is not state:
-                self._store_public(owner_key, written)
-                self._reindex_owner(owner_key, written.document)
-            if status == STATUS_OK:
-                self._log_updated(
-                    "memory.updated",
-                    scope="public",
-                    revision=written.revision,
-                    memory_id=object_id,
-                )
-            return OperationResult(status=status, object_id=object_id, revision=written.revision)
+        return OperationResult(status=status, object_id=object_id, revision=written.revision)
 
     # --- mutation：共同（四个管理操作各自独立复查 admin，§32.3 / 裁决 R14） ------
 
@@ -1167,6 +1353,11 @@ class MemoryService:
             # user_id 为空或含孤立代理项（编码不出存储键）说明调用方给的压根不是站点 ID：
             # 同样按 forbidden 处理，绝不为此建目录或落文件。
             return OperationResult(status=STATUS_FORBIDDEN, object_id=None, revision=0)
+        if self._legacy_private_blocked(user_id):
+            # 已迁移用户：旧个人记忆的**全部**写入路径在这里统一关闭（设计 §11.2、§11.6）。
+            # 收在一个入口是纵深防御，不是重复检查：任何一条私有 mutation（含将来新增的）
+            # 都不可能绕过它，`forbidden` 也如实说明了「不是暂时不可用，而是这条路已经退役」。
+            return OperationResult(status=STATUS_FORBIDDEN, object_id=None, revision=0)
         async with self._write_lock:
             state = self._user_state(user_id)
             if not isinstance(state.document, PrivateDocument):
@@ -1258,9 +1449,12 @@ class MemoryService:
         self._capture_generation[user_id] = self._capture_generation.get(user_id, 0) + 1
 
     def _capture_token_valid(self, token: AutoCaptureToken, document: PrivateDocument) -> bool:
-        """令牌此刻是否仍可提交：服务纪元、授权开关与提取代次三者都要成立。"""
+        """令牌此刻是否仍可提交：服务纪元、授权开关、提取代次与迁移状态都要成立。"""
         if token.epoch != self._capture_epoch or not self._enabled:
             # 服务已停止（或本实例已被替换过）：停止前发出的令牌一律不再被接受。
+            return False
+        if self._legacy_private_blocked(token.user_id):
+            # 用户在模型调用期间完成了迁移：这次基于旧基线的提取结果作废（设计 §11.5）。
             return False
         if not bool(document.auto_capture):
             # 授权被关闭（或文件被外部改成关闭）：重新校验授权，而不是只信令牌。
@@ -1280,6 +1474,1494 @@ class MemoryService:
             if isinstance(text, str) and redactor.redact(text) != text:
                 return True
         return False
+
+    # --- 用户画像：生命周期（设计 §8、§12） --------------------------------
+
+    @property
+    def persona_available(self) -> bool:
+        """画像存储是否已完成装配。"""
+        return self._persona_enabled and self._persona_started
+
+    async def start_persona(self, *, workflow_ttl_seconds: float | None = None) -> None:
+        """启用画像存储：建目录、扫公开索引、清理过期与恢复中断的工作流；失败只降级，绝不抛出。
+
+        **不启用旧记忆配置**是有意的：画像与旧记忆是两个独立的软故障面，任一子系统启用都能
+        单独工作（设计 §12），因此这里只翻转画像自己的开关，不碰 `self._enabled`。旧个人记忆
+        的读写门禁仍由它自己的配置决定，迁移期的行为因此不受影响。
+
+        `workflow_ttl_seconds` 是可选的配置注入（装配层传 `persona.workflow_ttl_seconds`）；
+        不传时用 24 小时的默认值。清理与恢复都在写锁内完成，因此启动期间的读路径不会看到
+        半个恢复状态。
+        """
+        if self._persona_started:
+            return
+        try:
+            os.makedirs(self._persona_users_dir, exist_ok=True)
+            os.makedirs(self._persona_flows_dir, exist_ok=True)
+            os.makedirs(self._persona_public_dir, exist_ok=True)
+        except OSError as exc:
+            # 目录建不出来（路径被文件占着、权限不足）：画像整块不可用，聊天照常（D-60）。
+            log_event(
+                _logger,
+                logging.WARNING,
+                "persona.load_failed",
+                scope=_SCOPE_PERSONA,
+                error=type(exc).__name__,
+            )
+            return
+        if workflow_ttl_seconds is not None and float(workflow_ttl_seconds) > 0:
+            self._persona_ttl = float(workflow_ttl_seconds)
+        self._persona_enabled = True
+        self._persona_started = True
+        # 顺序是安全要求：恢复先跑，它会把「待撤回」的 owner 放进隔离集，之后才构建公开索引 ——
+        # 反过来（先建索引再恢复）会让一次崩溃留下的待撤回 owner 在索引里露一小段头（设计 §7）。
+        try:
+            await self._recover_persona()
+        except Exception as exc:  # 恢复失败只降级：下一次访问仍会各自清理自己的过期流程。
+            log_event(
+                _logger,
+                logging.WARNING,
+                "persona.load_failed",
+                scope=_SCOPE_PERSONA_FLOW,
+                error=type(exc).__name__,
+            )
+        try:
+            count = self._refresh_persona_public()
+            log_event(
+                _logger, logging.INFO, "persona.ready", scope=_SCOPE_PERSONA_PUBLIC, count=count
+            )
+        except Exception as exc:  # 扫描自身的兜底：索引构建不能把异常带出去。
+            log_event(
+                _logger,
+                logging.WARNING,
+                "persona.load_failed",
+                scope=_SCOPE_PERSONA_PUBLIC,
+                error=type(exc).__name__,
+            )
+
+    async def stop_persona(self) -> None:
+        """停用画像写入：推进纪元让在途令牌失效、清空全部缓存与索引；绝不抛出。
+
+        令牌与隔离集都只活在进程内，停止之后不该再接受停止之前发出的令牌（设计 §9）——与
+        `stop()` 里记忆那套 `_capture_epoch` 是同一个理由。下一次 `start_persona` 的恢复会按
+        盘上的「待撤回」标记把隔离集重新建起来（待撤回本来就是持久状态）。
+        """
+        self._persona_epoch += 1
+        self._persona_enabled = False
+        self._persona_started = False
+        self._persona_users.clear()
+        self._persona_flows.clear()
+        self._persona_public.clear()
+        self._persona_index = {}
+        self._persona_generation.clear()
+        self._persona_suppressed.clear()
+
+    async def _recover_persona(self) -> None:
+        """启动恢复：过期流程清理、提交标记收尾、待撤回重试（设计 §9 的崩溃恢复）。
+
+        三类中断都在这里收口，全部在写锁内完成：
+
+        - **已提交但没来得及收尾**：生效画像里带着 `committed_draft_id`，工作流却还在。
+          只终结流程，绝不重复写画像、也不重做开关变更（`persona_confirm` 的固定顺序）。
+        - **已停用但流程还在**：`off` 的中间态。待办正文（问题、回答、草稿）立即清空，
+          不让一次崩溃把它们留在盘上。
+        - **待撤回**：`pending_unpublish` 为真时重试撤回公开副本（画像与旧记忆各一次），
+          成功后才清标记 —— 这正是 `/persona off` 承诺的「重启后继续完成」。这些 owner 在
+          重试成功之前一律先放进**隔离集**：公开投影不能一边说着「已关闭」一边继续引用
+          崩溃前没撤掉的公开副本（画像的与旧的都算）。
+        """
+        async with self._write_lock:
+            for owner_key in self._persona_file_keys(self._persona_flows_dir):
+                state = self._persona_flow_state(owner_key, force=True)
+                flow = state.document
+                if not isinstance(flow, dict) or persona_models.workflow_is_empty(flow):
+                    continue
+                user_state = self._persona_user_state(owner_key, force=True)
+                document = user_state.document
+                if not isinstance(document, dict):
+                    continue
+                if bool(document.get("pending_unpublish")):
+                    # `off` 走到「已停用 + 待撤回」就崩了：待办正文当场清空（设计 §7）。
+                    # 判据是待撤回标记，**不是** `enabled`：关闭状态下照样可以开始一次建档或编辑
+                    # （设计 §6 允许查看与编辑已保存画像），拿开关当判据会把这种在途流程误杀。
+                    self._persona_suppress(owner_key)
+                    self._clear_flow_locked(owner_key, stage="cancelled")
+                    continue
+                committed = document.get("committed_draft_id")
+                if committed and committed == flow.get("draft_id"):
+                    # 生效文件已经提交了同一稿，只差终结流程（设计 §9 的两步顺序）。
+                    self._clear_flow_locked(owner_key, stage="committed")
+                    continue
+                self._expire_flow_locked(owner_key, state)
+            for owner_key in self._persona_file_keys(self._persona_users_dir):
+                state = self._persona_user_state(owner_key, force=True)
+                document = state.document
+                if not isinstance(document, dict) or not bool(document.get("pending_unpublish")):
+                    continue
+                self._persona_suppress(owner_key)
+                if not self._retry_pending_revoke(owner_key, state):
+                    log_event(
+                        _logger,
+                        logging.WARNING,
+                        "persona.revoke_pending",
+                        scope=_SCOPE_PERSONA_PUBLIC,
+                        status=STATUS_UNAVAILABLE,
+                    )
+
+    def _retry_pending_revoke(self, owner_key: str, state: _Snapshot) -> bool:
+        """重试一次待撤回：画像公开副本与旧公开记忆都到位才清标记（写锁内调用）。
+
+        两个副本都确认撤回之后才解除隔离：隔离跟着「待撤回」走，不跟着这次的写入结果走 ——
+        标记没落盘就重启，恢复会重新隔离。
+        """
+        document = state.document
+        if not isinstance(document, dict):
+            return False
+        public_status = self._revoke_persona_public_locked(owner_key, _PERSONA_RECOVER_OPERATION)
+        legacy_status = self._revoke_legacy_locked(owner_key, _PERSONA_RECOVER_OPERATION)
+        if public_status not in (STATUS_OK, STATUS_NOOP) or legacy_status not in (
+            STATUS_OK,
+            STATUS_NOOP,
+        ):
+            return False
+        built = dict(document)
+        built["pending_unpublish"] = False
+        built["revision"] = state.revision + 1
+        status, _ = self._commit_persona(
+            self._persona_users, owner_key, self._persona_user_view(owner_key), state, built
+        )
+        if status == STATUS_OK:
+            self._persona_release(owner_key)
+        return status == STATUS_OK
+
+    # --- 用户画像：读路径 ---------------------------------------------------
+
+    async def persona_get(self, user_id: str) -> dict[str, Any] | None:
+        """该用户的私有画像（深拷贝）；存储未启用或不可用时返回 None。
+
+        文件不存在时返回**默认画像**（`migrated=false`、`enabled=false`、空短文），而不是 None：
+        「这个用户还没有画像」与「拿不到这个用户的画像」是两件事，前者要用默认值表达
+        （设计 §11 的逐用户迁移就是靠 `migrated` 判定）。返回值是深拷贝，调用方改它不影响
+        任何快照或文件。
+        """
+        if not self._persona_enabled or not user_id:
+            return None
+        owner_key = _storage_key(user_id)
+        if owner_key is None:
+            return None
+        state = self._persona_user_state(owner_key)
+        document = state.document
+        if state.reason is not None or not isinstance(document, dict):
+            return None
+        return copy.deepcopy(document)
+
+    def persona_cached(self, user_id: str) -> dict[str, Any] | None:
+        """只读内存快照、不做任何 I/O：快照没加载或用户未知时返回 None。
+
+        与 `private_settings_cached` 同款（D-67）：命令路由需要「这个人有没有开启画像」时
+        不能为一句措辞去读文件。
+        """
+        if not self._persona_enabled or not user_id:
+            return None
+        owner_key = _storage_key(user_id)
+        if owner_key is None:
+            return None
+        state = self._persona_users.get(owner_key)
+        if state is None or not isinstance(state.document, dict):
+            return None
+        return copy.deepcopy(state.document)
+
+    async def persona_is_migrated(self, user_id: str) -> bool:
+        """该用户是否已经进入新画像路径（逐用户迁移的判据，设计 §11）。
+
+        **必须实际加载私有状态**，不能只看 `persona_cached`：那份缓存只有 64 格，被淘汰之后
+        「读不到」与「没迁移」会变成同一件事，于是已迁移用户又悄悄拿回旧个人记忆（设计
+        §11.6 明确禁止）。读不回来时**失败关闭**（当作已迁移）：宁可少给一次旧记忆，
+       也不能让一次黑盒 IO 失败把用户退回旧路径。
+
+        私有文件被删掉时看工作流：墓碑里留着成功提交的 `object_id`，那就是这个用户迁移过的
+        证据 —— 删除文件不能复活旧个人记忆。
+        """
+        try:
+            return self._persona_migrated(user_id)
+        except Exception:  # 兜底：任何异常都按「已迁移」处理（fail closed）。
+            return bool(self._persona_enabled and user_id)
+
+    async def persona_legacy_allowed(self, user_id: str) -> bool:
+        """该用户是否还能使用**旧个人记忆**（私有读写与旧自动提取）。
+
+        只有两种情形允许：画像功能整体未装配（旧记忆是唯一路径），或这个人确实有一份旧私有
+        文件且**尚未迁移**。已迁移用户一律 False（设计 §11.2/§11.6）；拿不准时同样 False。
+        """
+        if not self._persona_enabled:
+            return True
+        try:
+            if self._persona_migrated(user_id):
+                return False
+            return self._legacy_private_file_exists(user_id)
+        except Exception:
+            return False
+
+    def persona_quarantine(self, user_id: str) -> None:
+        """同步隔离：立刻失效在途令牌，并让该 owner 的**公开投影**立即不可见（无私有 IO）。
+
+        装配层在用户明确要求停止的那一刻（`/persona off`、`private`）调用它，因为命令本身要
+        排队：等命令跑到服务层再收手，中间那段时间里在途的自动更新仍可能提交、旧的公开副本
+        仍可能被大区引用（设计 §6「off … 立即使旧令牌失效」）。这里做的事只有两件：
+        推进该用户的代次（令牌作废），把这个不可逆 owner key 放进有界的隔离集。
+
+        它**不读私有文件、不改私有状态**：`/persona private` 也要调用它，但那只该影响公开
+        投影，私有使用照旧（私有开关由 `enabled` 决定，不受隔离集影响）。
+        """
+        if not user_id:
+            return
+        self.persona_invalidate(user_id)
+        owner_key = _storage_key(user_id)
+        if owner_key is not None:
+            self._persona_suppress(owner_key)
+
+    async def persona_workflow(self, user_id: str) -> dict[str, Any] | None:
+        """该用户**待办**的工作流（深拷贝）；没有待办流程时返回 None。
+
+        过期清理在写锁内完成：一次访问就把过期流程落成墓碑（正文清空、阶段 `expired`），
+        因此下一次访问不会再读到它。终态流程与空文件一样返回 None —— 对调用方而言，
+        「已经提交、取消或过期的流程」不再是可继续的流程（设计 §9）。
+        """
+        if not self._persona_enabled or not user_id:
+            return None
+        owner_key = _storage_key(user_id)
+        if owner_key is None:
+            return None
+        async with self._write_lock:
+            flow = self._expire_flow_locked(owner_key, self._persona_flow_state(owner_key))
+            if not isinstance(flow, dict) or persona_models.workflow_is_empty(flow):
+                return None
+            return copy.deepcopy(flow)
+
+    def persona_public_username_index(self) -> Mapping[str, tuple[str, ...]]:
+        """当前画像公开索引的一次引用快照：`username -> tuple[owner_key, ...]`（无 I/O）。
+
+        与 `public_username_index` 同款、**独立一份**：调用方（C）把两份索引合并成公开
+        subject 列表时自行处理重名，本方法不替它做冲突决策。调用方不得跨轮缓存返回值。
+        """
+        return self._persona_index
+
+    def persona_public_revision_cached(self, user_id: str) -> int | None:
+        """该用户**公开快照**的版本号；没发布过、已撤回或快照未加载时返回 None。
+
+        **同步、只读、无 I/O**（与 `persona_cached` / `private_settings_cached` 同款，D-67）：
+        `/persona` 要显示「私有 v8，公开 v5」时不能为一行字去读盘。这里读的是公开快照**自己的**
+        版本号，不是私有画像的修订号 —— 两者独立演进，公开副本只在用户确认发布时才前进。
+        快照没加载时返回 None，宁可少显示一个版本号，也不做一次意外读取（与 `persona_cached`
+        同一口径）。任何异常都收敛成 None：这是展示用的增强，绝不影响命令本身。
+        """
+        if not self._persona_enabled or not user_id:
+            return None
+        try:
+            owner_key = _storage_key(user_id)
+            if owner_key is None:
+                return None
+            if self._persona_suppressed_owner(owner_key):
+                # 隔离中的 owner 对外就是「没有公开副本」：索引里也查不到它。
+                return None
+            state = self._persona_public.get(owner_key)
+            document = state.document if state is not None else None
+            if not isinstance(document, dict) or not document.get("paragraph"):
+                # 空快照（撤回后的墓碑）不算「有公开副本」：只报当前真正公开着的那一份。
+                return None
+            return int(document.get("revision", 0))
+        except Exception:
+            return None
+
+    async def persona_public_context(
+        self,
+        *,
+        subjects: tuple[PublicMemorySubject, ...],
+        channel_kind: str,
+    ) -> tuple[SupplementalItem, ...]:
+        """按已选定的 subject 取公开画像短文（设计 §7）；任何失败都返回空元组，绝不抛出。
+
+        **只读 `personas/public/`**：本方法在任何分支下都不会调用 `_persona_user_state`，因此
+        「未公开的私有画像永不进入大区或评论」是结构性的，不是靠过滤。DM 与未知频道一律空结果：
+        DM 里的私有画像由调用方另行注入，这里只服务公开场景（设计 §7 的「DM 不读第三方公开画像」）。
+        """
+        if not self._persona_enabled or channel_kind not in _PUBLIC_CHANNELS or not subjects:
+            return ()
+        try:
+            items = self._persona_public_items(subjects)
+        except Exception as exc:  # 兜底：公开读取是可选增强，绝不能外溢给聊天（D-60）。
+            log_event(
+                _logger,
+                logging.INFO,
+                "persona.context_omitted",
+                scope=_SCOPE_PERSONA_PUBLIC,
+                reason="internal",
+                error=type(exc).__name__,
+            )
+            return ()
+        return tuple(items)
+
+    def persona_invalidate(self, user_id: str) -> None:
+        """推进该用户的画像代次，使此前取得的所有更新令牌失效（无 I/O、不抛异常）。
+
+        进入手动编辑、关闭、清空与取消都会调用它；即便当时没有在途令牌也照常推进 ——
+        「值没变就不推」会让一次迟到的提交恰好落在同一个代次上。
+        """
+        if not user_id:
+            return
+        self._persona_generation[user_id] = self._persona_generation.get(user_id, 0) + 1
+
+    # --- 用户画像：mutation -------------------------------------------------
+
+    async def persona_save(
+        self,
+        user_id: str,
+        value: dict[str, Any],
+        *,
+        expected_revision: int,
+        operation_id: str,
+    ) -> str:
+        """整份保存私有画像：严格校验 + 版本 CAS + 原子写（设计 §8）。
+
+        `value` 是调用方控制的字段集合：给全一份完整画像 dict 可以，只给要改的几个字段也可以
+        （缺的字段沿用**现值**，文件还不存在时用 `default_persona()`）。这条「A 补默认值」的
+        读法让宿主不必先读一遍再原样抄回来，也让「只打开开关」不会顺带覆盖短文。
+        多出来的未知字段一律 `invalid_proposal`，不做宽容解析。
+
+        修订号由这里内部推进（基线 + 1），`value` 里的 `revision` 与 `operations` 不参与写入 ——
+        它们是宿主记账，允许调用方原样回传自己读到的旧值。载荷与现值相同返回 `noop`
+        （不写文件、不涨修订号），因此重复保存不会制造无意义的版本。
+        """
+        if not self._persona_enabled or not user_id or not operation_id:
+            return STATUS_UNAVAILABLE
+        owner_key = _storage_key(user_id)
+        if owner_key is None:
+            return STATUS_UNAVAILABLE
+        if (
+            not isinstance(value, dict)
+            or isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+        ):
+            return STATUS_INVALID_PROPOSAL
+        proposed = copy.deepcopy(value)
+        async with self._write_lock:
+            state = self._persona_user_state(owner_key)
+            document = state.document
+            if not isinstance(document, dict):
+                return STATUS_UNAVAILABLE
+            hit = document["operations"].get(operation_id)
+            if hit is not None:
+                # 幂等命中：返回第一次的稳定结果，不重复写、也不重新调模型（设计 §9）。
+                return str(hit["status"])
+            if state.revision != expected_revision:
+                return STATUS_CONFLICT
+            merged = _merge_fields(document, proposed, persona_models.PERSONA_FIELDS)
+            if merged is None:
+                return STATUS_INVALID_PROPOSAL
+            if persona_models.payload_of(document) == persona_models.payload_of(merged):
+                return STATUS_NOOP
+            built = merged
+            # 内容确实变了才刷新 `updated_at`（noop 已经在上面返回）：更新时间表示「画像内容
+            # 最后一次变化」，而不是「最后一次调用存储」——否则 `/persona` 会一直显示刚刚。
+            built["updated_at"] = self._timestamp()
+            built["revision"] = state.revision + 1
+            built["operations"] = self._record_operation(
+                document["operations"], operation_id, STATUS_OK, None, built["revision"]
+            )
+            try:
+                persona_models.validate_persona(built)
+            except persona_models.PersonaValidationError:
+                return STATUS_INVALID_PROPOSAL
+            if self._contains_secret(_persona_texts(built)):
+                return STATUS_SECRET_DETECTED
+            status, written = self._commit_persona(
+                self._persona_users,
+                owner_key,
+                self._persona_user_view(owner_key),
+                state,
+                built,
+                screen=lambda _document: _persona_texts(built),
+            )
+            self._log_persona_write(_SCOPE_PERSONA, status, written.revision)
+            return status
+
+    async def persona_save_workflow(
+        self,
+        user_id: str,
+        value: dict[str, Any] | None,
+        *,
+        expected_revision: int,
+        operation_id: str,
+    ) -> str:
+        """保存或清空该用户的工作流（设计 §8、§9）。
+
+        `value` 非空时整份校验后写入并推进修订号；与 `persona_save` 同款，`value` 可以只给要改
+        的字段，缺的沿用现值（新文件用 `default_workflow()`）。`value=None` 表示**清空敏感
+        正文**：问题、回答、草稿、摘要、修改意见与草稿编号一并清掉，只留下标识、阶段、计数与
+        幂等表，因此一次取消或超时之后盘上不会残留待审内容。
+
+        `base_fingerprint` 由**这里**维护，调用方不设置它：开一条新流程时按当时的私有画像快照
+        现算（`_persona_fingerprint`），继续同一条流程时原样保留。确认时据此复核「用户看到的那
+        一稿，是不是还基于同一份生效画像」——跨越重启也成立，因为指纹随流程落盘。
+
+        `value=None` 时 `expected_revision` **不参与判定**：清空是一个没有歧义的销毁动作，
+        让它因为一次版本漂移而静默失败，会把「已经取消的访谈」留在盘上。
+        """
+        if not self._persona_enabled or not user_id or not operation_id:
+            return STATUS_UNAVAILABLE
+        owner_key = _storage_key(user_id)
+        if owner_key is None:
+            return STATUS_UNAVAILABLE
+        if value is None:
+            async with self._write_lock:
+                return self._clear_flow_locked(owner_key, stage=None, operation_id=operation_id)[1]
+        if not isinstance(value, dict) or isinstance(expected_revision, bool) or not isinstance(
+            expected_revision, int
+        ):
+            return STATUS_INVALID_PROPOSAL
+        proposed = copy.deepcopy(value)
+        async with self._write_lock:
+            state = self._persona_flow_state(owner_key)
+            document = state.document
+            if not isinstance(document, dict):
+                return STATUS_UNAVAILABLE
+            hit = document["operations"].get(operation_id)
+            if hit is not None:
+                return str(hit["status"])
+            if persona_models.workflow_is_empty(document):
+                # 终态墓碑（已提交 / 已取消 / 已过期）与空文件对 CAS 而言是同一件事：调用方
+                # **拿不到**墓碑的修订号（`persona_workflow` 只返回待办流程），因此必须允许
+                # 它从 0 重新开始建一条新流程。幂等表保留，同一条消息的重放照旧命中。
+                baseline: dict[str, Any] = persona_models.default_workflow()
+                baseline["operations"] = dict(document["operations"])
+                base_revision = 0
+                new_flow = True
+            else:
+                incoming = proposed.get("workflow_id")
+                if isinstance(incoming, str) and incoming and incoming != document.get("workflow_id"):
+                    # 已有待办流程：重开必须先取消，不静默覆盖（设计 §9）。
+                    return STATUS_CONFLICT
+                baseline = document
+                base_revision = state.revision
+                new_flow = False
+            if base_revision != expected_revision:
+                return STATUS_CONFLICT
+            if new_flow:
+                # 新流程的基线指纹取**当下**的私有画像：这是「用户接下来看到的草稿基于哪一份
+                # 画像」的凭证。读不回来就不开流程 —— 一条没有基线的流程无法在确认时复核。
+                private = self._persona_user_state(owner_key, force=True)
+                private_document = private.document
+                if not isinstance(private_document, dict):
+                    return STATUS_UNAVAILABLE
+            merged = _merge_fields(baseline, proposed, persona_models.WORKFLOW_FIELDS)
+            if merged is None:
+                return STATUS_INVALID_PROPOSAL
+            if persona_models.payload_of(document) == persona_models.payload_of(merged):
+                # 载荷没变：不写盘、不涨修订号，因此也不动指纹（它本来就不会变）。
+                return STATUS_NOOP
+            built = merged
+            built["base_fingerprint"] = (
+                _persona_fingerprint(private_document)
+                if new_flow
+                else str(document.get("base_fingerprint") or "")
+            )
+            built["revision"] = base_revision + 1
+            built["operations"] = self._record_operation(
+                document["operations"], operation_id, STATUS_OK, None, built["revision"]
+            )
+            try:
+                persona_models.validate_workflow(built)
+            except persona_models.PersonaValidationError:
+                return STATUS_INVALID_PROPOSAL
+            if self._contains_secret(_workflow_texts(built)):
+                return STATUS_SECRET_DETECTED
+            status, written = self._commit_persona(
+                self._persona_flows,
+                owner_key,
+                self._persona_flow_view(owner_key),
+                state,
+                built,
+                screen=lambda _document: _workflow_texts(built),
+            )
+            self._log_persona_write(_SCOPE_PERSONA_FLOW, status, written.revision)
+            return status
+
+    async def persona_confirm(self, user_id: str, draft_id: str, *, operation_id: str) -> str:
+        """确认并提交已展示的草稿（设计 §3、§9）。
+
+        固定顺序：在写锁内复核送达、期限、草稿编号、基础版本与开关，然后**先写生效文件**
+        （带 `committed_draft_id` 标记）**再终结工作流**。崩溃发生在两步之间时，重启恢复只做
+        收尾（生效画像里的 `committed_draft_id` 与草稿编号相同即为证据），不重复写画像、
+        也不重做开关变更。提交的正文永远是**用户看到的那一稿**（工作流里存的那份），
+        不接受调用方再传一次文本。
+        """
+        if not self._persona_enabled or not user_id or not operation_id or not draft_id:
+            return STATUS_UNAVAILABLE
+        owner_key = _storage_key(user_id)
+        if owner_key is None:
+            return STATUS_UNAVAILABLE
+        async with self._write_lock:
+            # 确认路径强制读盘：草稿编号、送达标记与基础版本是「能不能提交」的判据，TTL 缓存会把
+            # 「刚刚落到盘上的那一稿」变成看不见的东西（与公开投影销毁路径的 R24 同款理由）。
+            flow_state = self._persona_flow_state(owner_key, force=True)
+            flow = flow_state.document
+            if not isinstance(flow, dict) or not flow.get("workflow_id"):
+                return STATUS_NOT_FOUND
+            hit = flow["operations"].get(operation_id)
+            if hit is not None and hit.get("object_id") == draft_id:
+                # 幂等命中：同一条确认消息重放时返回第一次的结果（草稿编号必须一致）。
+                return str(hit["status"])
+            if persona_models.is_terminal_stage(flow.get("stage")):
+                return STATUS_NOT_FOUND
+            if self._flow_expired(flow):
+                self._expire_flow_locked(owner_key, flow_state)
+                return persona_models.STATUS_EXPIRED
+            if flow.get("draft_id") != draft_id:
+                # 旧草稿编号、被清空的草稿与「不是当前这一稿」都走这里：只接受已送达的当前稿。
+                return STATUS_NOT_FOUND
+            if not bool(flow.get("delivered")):
+                # 用户没看见过的内容不能提交（设计 §9：确认只接受已送达的当前 draft_id）。
+                return persona_models.STATUS_NOT_DELIVERED
+            persona_state = self._persona_user_state(owner_key, force=True)
+            document = persona_state.document
+            if not isinstance(document, dict):
+                return STATUS_UNAVAILABLE
+            if bool(document.get("pending_unpublish")):
+                return STATUS_UNAVAILABLE
+            kind = flow.get("kind")
+            if kind not in ("create", "edit", "public", "clear"):
+                return STATUS_INVALID_PROPOSAL
+            if kind in ("create", "edit", "clear") and document.get("committed_draft_id") == draft_id:
+                # 崩溃恢复：生效文件早已提交并带上了这一稿的标记，只差收尾（设计 §9）。
+                # 这条路径**跳过**下面的基线复核：它要做的只是收尾，不重复任何写入。
+                self._clear_flow_locked(
+                    owner_key, stage="committed", operation_id=operation_id, object_id=draft_id
+                )
+                return STATUS_OK
+            # 基线复核：草稿必须仍基于**同一份**生效画像（见 `_confirm_baseline_matches`）。
+            if not self._confirm_baseline_matches(kind, document, persona_state.revision, flow):
+                return STATUS_CONFLICT
+            if kind in ("create", "edit"):
+                if kind == "create" and not bool(document.get("migrated")):
+                    # 逐用户迁移：旧公开记忆必须先撤回，撤回失败就不提交切换（设计 §11）。
+                    if self._revoke_legacy_locked(owner_key, f"{operation_id}:legacy") not in (
+                        STATUS_OK,
+                        STATUS_NOOP,
+                    ):
+                        return STATUS_UNAVAILABLE
+                status = self._confirm_persona_locked(
+                    owner_key, persona_state, flow, draft_id, operation_id
+                )
+            elif kind == "public":
+                status = self._confirm_public_locked(owner_key, persona_state, flow, operation_id)
+            else:
+                status = self._confirm_clear_locked(owner_key, persona_state, flow, operation_id)
+            if status != STATUS_OK:
+                return status
+            self._clear_flow_locked(
+                owner_key, stage="committed", operation_id=operation_id, object_id=draft_id
+            )
+            # 提交会改画像/公开副本：在途的自动更新结果一律作废（设计 §6、§9）。
+            self.persona_invalidate(user_id)
+            return STATUS_OK
+
+    async def persona_off(self, user_id: str, *, operation_id: str) -> str:
+        """关闭画像：先落盘停用与待撤回，再撤回公开副本（设计 §7）。
+
+        两步顺序是这条承诺的全部：第一次写入把「已停用 + 待撤回」落到盘上，**之后**才做撤回。
+        撤回失败时返回 `unavailable` 并保留待撤回标记 —— 不报告「全部关闭成功」，也不让用户
+        误以为公开副本已经收回；重启与下一次访问都会重试（`start_persona` 的恢复路径）。
+        私有画像本身保留，便于重新开启。
+        """
+        if not self._persona_enabled or not user_id or not operation_id:
+            return STATUS_UNAVAILABLE
+        owner_key = _storage_key(user_id)
+        if owner_key is None:
+            return STATUS_UNAVAILABLE
+        async with self._write_lock:
+            state = self._persona_user_state(owner_key, force=True)
+            document = state.document
+            if not isinstance(document, dict):
+                return STATUS_UNAVAILABLE
+            hit = document["operations"].get(operation_id)
+            if hit is not None:
+                return str(hit["status"])
+            # 受理即隔离：公开投影从**这一行**起就不再引用该 owner，哪怕下面的写入或撤回失败。
+            # 用户的诉求是「立刻停止」，不能等到两步落盘之间那段窗口结束才生效（设计 §7）。
+            self._persona_suppress(owner_key)
+            if not bool(document.get("enabled")) and not bool(document.get("pending_unpublish")):
+                # 本来就是关闭、也没有待撤回：不再翻版本，只把遗留令牌与待办流程收干净。
+                # 状态已经确认干净，隔离随即解除（盘上没有任何待撤的公开副本）。
+                self.persona_invalidate(user_id)
+                self._clear_flow_locked(owner_key, stage="cancelled")
+                self._persona_release(owner_key)
+                return STATUS_NOOP
+            staged = dict(document)
+            staged["enabled"] = False
+            staged["pending_unpublish"] = True
+            staged["revision"] = state.revision + 1
+            staged["updated_at"] = self._timestamp()
+            staged["last_change"] = texts.PERSONA_CHANGE_DISABLED_TEXT
+            status, written = self._commit_persona(
+                self._persona_users, owner_key, self._persona_user_view(owner_key), state, staged
+            )
+            self._log_persona_write(_SCOPE_PERSONA, status, written.revision)
+            if status != STATUS_OK:
+                return STATUS_UNAVAILABLE
+            # 停用立即生效：在途令牌失效，待办流程的正文（问题、回答、草稿）当场清空。
+            self.persona_invalidate(user_id)
+            flow_ok = self._clear_flow_locked(owner_key, stage="cancelled")[0]
+            public_status = self._revoke_persona_public_locked(owner_key, f"{operation_id}:public")
+            legacy_status = self._revoke_legacy_locked(owner_key, f"{operation_id}:legacy")
+            if (
+                not flow_ok
+                or public_status not in (STATUS_OK, STATUS_NOOP)
+                or legacy_status not in (STATUS_OK, STATUS_NOOP)
+            ):
+                log_event(
+                    _logger,
+                    logging.WARNING,
+                    "persona.revoke_pending",
+                    scope=_SCOPE_PERSONA_PUBLIC,
+                    status=STATUS_UNAVAILABLE,
+                )
+                return STATUS_UNAVAILABLE
+            final_state = self._persona_user_state(owner_key, force=True)
+            final = final_state.document
+            if not isinstance(final, dict):
+                return STATUS_UNAVAILABLE
+            built = dict(final)
+            built["pending_unpublish"] = False
+            built["revision"] = final_state.revision + 1
+            built["operations"] = self._record_operation(
+                final["operations"], operation_id, STATUS_OK, None, built["revision"]
+            )
+            status, written = self._commit_persona(
+                self._persona_users, owner_key, self._persona_user_view(owner_key), final_state, built
+            )
+            self._log_persona_write(_SCOPE_PERSONA, status, written.revision)
+            if status != STATUS_OK:
+                # 公开副本已经撤回、待撤回标记却没能落盘：保持隔离，等恢复/下一次 off 收尾。
+                return STATUS_UNAVAILABLE
+            self._persona_release(owner_key)
+            return STATUS_OK
+
+    async def persona_unpublish(self, user_id: str, *, operation_id: str) -> str:
+        """撤回公开副本，继续私有使用（`/persona private`）：只改公开文件，不动开关。
+
+        同样**受理即隔离**：撤回写失败时旧副本仍然在盘上，隔离必须留着，否则大区还会继续引用
+        一个用户已经要求下架的副本。撤回成功（或本来就没有副本）才解除隔离 —— 私有使用全程
+        不受影响，隔离集只管公开投影。
+        """
+        if not self._persona_enabled or not user_id or not operation_id:
+            return STATUS_UNAVAILABLE
+        owner_key = _storage_key(user_id)
+        if owner_key is None:
+            return STATUS_UNAVAILABLE
+        async with self._write_lock:
+            self._persona_suppress(owner_key)
+            status = self._revoke_persona_public_locked(owner_key, operation_id)
+            if status in (STATUS_OK, STATUS_NOOP):
+                self._persona_release(owner_key)
+            return status
+
+    # --- 用户画像：自动更新的授权令牌（设计 §6） ----------------------------
+
+    async def persona_begin_update(self, user_id: str) -> persona_models.PersonaUpdateToken | None:
+        """开始一次自动更新：在同一把写锁内取齐代次、版本与文档快照。
+
+        返回 None 表示当时不满足授权：画像未启用、用户已关闭画像、有待撤回未完成、已经有一个
+        待办流程（编辑期间暂停自动提交），或存储不可用。取得令牌之后模型调用发生在写锁
+        **之外**，因此 `/persona off`、清空与手动编辑无需等待模型返回。
+        """
+        if not self._persona_enabled or not user_id:
+            return None
+        owner_key = _storage_key(user_id)
+        if owner_key is None:
+            return None
+        async with self._write_lock:
+            state = self._persona_user_state(owner_key)
+            document = state.document
+            if not isinstance(document, dict):
+                return None
+            if not bool(document.get("enabled")) or bool(document.get("pending_unpublish")):
+                return None
+            flow = self._expire_flow_locked(owner_key, self._persona_flow_state(owner_key))
+            if isinstance(flow, dict) and not persona_models.workflow_is_empty(flow):
+                return None
+            return persona_models.PersonaUpdateToken(
+                user_id=user_id,
+                epoch=self._persona_epoch,
+                generation=self._persona_generation.get(user_id, 0),
+                revision=state.revision,
+                state="enabled",
+                enabled=True,
+                locked_features=persona_models.locked_feature_keys(document["features"]),
+                document=copy.deepcopy(document),
+            )
+
+    async def persona_commit_update(
+        self,
+        token: persona_models.PersonaUpdateToken,
+        paragraph: str,
+        features: list[dict[str, Any]],
+        *,
+        operation_id: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        """提交一次自动更新；令牌失效或锁定特征被改时返回 `noop`（丢弃这次结果，不写文件）。
+
+        令牌复核与写入在同一把锁内，因此 `/persona off`、清空与手动编辑之间没有可观察的中间态
+        （设计 §6）。**强制读盘**并与令牌里的整份快照逐字段比对（不只是修订号）：外部编辑可以
+        同 revision 改内容，只比修订号会让一次迟到的自动更新把那次编辑盖掉。锁定维度在这里
+        **由宿主保守冻结**（见 `_merge_auto_features`）：模型不得覆盖、重新推入或换词恢复用户
+        已经否定的内容；它动过锁定维度时连短文一起保留上一版。
+
+        `metadata` 是可选的白名单键（`update_day` / `update_count` / `last_update_at` /
+        `last_message_id` / `observations` / `last_change`），由控制器传入自动更新的记账字段；
+        越界的键一律 `invalid_proposal`，不做部分应用。
+        """
+        if not self._persona_enabled or not operation_id:
+            return STATUS_NOOP
+        if not isinstance(token, persona_models.PersonaUpdateToken):
+            return STATUS_NOOP
+        user_id = token.user_id
+        owner_key = _storage_key(user_id)
+        if owner_key is None:
+            return STATUS_NOOP
+        if metadata is not None and (
+            not isinstance(metadata, dict) or not set(metadata) <= _PERSONA_METADATA_FIELDS
+        ):
+            return STATUS_INVALID_PROPOSAL
+        async with self._write_lock:
+            if token.epoch != self._persona_epoch or self._persona_generation.get(user_id, 0) != (
+                token.generation
+            ):
+                return STATUS_NOOP
+            flow = self._expire_flow_locked(owner_key, self._persona_flow_state(owner_key))
+            if isinstance(flow, dict) and not persona_models.workflow_is_empty(flow):
+                return STATUS_NOOP
+            # 强制读盘：模型调用发生在锁外，这期间磁盘可能被人工改过（含同 revision 的改动）。
+            state = self._persona_user_state(owner_key, force=True)
+            document = state.document
+            if not isinstance(document, dict):
+                return STATUS_NOOP
+            if not bool(document.get("enabled")) or bool(document.get("pending_unpublish")):
+                return STATUS_NOOP
+            if state.revision != token.revision or document != token.document:
+                # 版本 CAS：修订号与**整份内容**都要与发放令牌时一致。并发写入、人工编辑
+                # （哪怕没动 revision）、以及外部的删除重建都让这次结果作废（设计 §6）。
+                return STATUS_NOOP
+            if persona_models.locked_feature_keys(document["features"]) != token.locked_features:
+                # 用户刚刚改过锁定项：这次结果基于旧授权，丢弃。
+                return STATUS_NOOP
+            hit = document["operations"].get(operation_id)
+            if hit is not None:
+                return str(hit["status"])
+            merged_result = _merge_auto_features(
+                document["features"], features, now_stamp=self._timestamp()
+            )
+            if merged_result is None:
+                return STATUS_INVALID_PROPOSAL
+            merged, locked_touched = merged_result
+            built = dict(document)
+            built["revision"] = state.revision + 1
+            # 模型动过锁定维度：它的新句子很可能正是在描述那几条被丢弃的改动，而宿主没有
+            # 语义能力把句子改回去 —— 整段保留上一版短文（保守冻结）。
+            built["paragraph"] = document["paragraph"] if locked_touched else paragraph
+            built["features"] = merged
+            built["updated_at"] = self._timestamp()
+            built["last_change"] = texts.PERSONA_CHANGE_UPDATED_TEXT
+            if metadata:
+                for name, value in metadata.items():
+                    built[name] = copy.deepcopy(value)
+            built["operations"] = self._record_operation(
+                document["operations"], operation_id, STATUS_OK, None, built["revision"]
+            )
+            try:
+                persona_models.validate_persona(built)
+            except persona_models.PersonaValidationError:
+                return STATUS_INVALID_PROPOSAL
+            if self._contains_secret(_persona_texts(built)):
+                return STATUS_SECRET_DETECTED
+            status, written = self._commit_persona(
+                self._persona_users,
+                owner_key,
+                self._persona_user_view(owner_key),
+                state,
+                built,
+                screen=lambda _document: _persona_texts(built),
+            )
+            self._log_persona_write(_SCOPE_PERSONA, status, written.revision)
+            return status
+
+    # --- 用户画像：迁移判据与隔离（设计 §11、§7） ---------------------------
+
+    def _persona_migrated(self, user_id: str) -> bool:
+        """`persona_is_migrated` 的实现：读私有状态（TTL 缓存），必要时回看工作流墓碑。"""
+        if not self._persona_enabled or not user_id:
+            return False
+        owner_key = _storage_key(user_id)
+        if owner_key is None:
+            # 编不出存储键说明调用方给的压根不是站点 ID：没有可归属的私有文件。
+            return False
+        state = self._persona_user_state(owner_key)
+        document = state.document
+        if not isinstance(document, dict):
+            # 文件存在但读不回来，而且没有一份可用的旧快照：拿不准 → 按已迁移处理。
+            return True
+        if bool(document.get("migrated")):
+            return True
+        if state.digest is None:
+            # 私有文件不在了：只有工作流墓碑能证明这个人迁移过。
+            return self._workflow_shows_commit(owner_key)
+        return False
+
+    def _workflow_shows_commit(self, owner_key: str) -> bool:
+        """工作流里有没有「成功提交过画像」的记录（幂等表里的 ok + 非空 object_id）。
+
+        `persona_save_workflow` 记的 `object_id` 永远是 None，因此这条判据不会被一次普通的
+        流程保存误命中；只有 `persona_confirm` 的四类提交会写下草稿编号。读不回来时按
+        「有提交」处理（fail closed）。
+        """
+        try:
+            # 强制读盘：这条判据只在私有画像文件**不在**的时候跑（罕见），而它决定的是一件
+            # 不可逆的事 —— 用户会不会重新拿回旧个人记忆。TTL 缓存里的一份旧流程文件足以
+            # 让它答错，这里不值得省那一次读取。
+            state = self._persona_flow_state(owner_key, force=True)
+        except Exception:
+            return True
+        flow = state.document
+        if not isinstance(flow, dict):
+            return True
+        for result in (flow.get("operations") or {}).values():
+            if (
+                isinstance(result, Mapping)
+                and result.get("status") == STATUS_OK
+                and result.get("object_id")
+            ):
+                return True
+        return False
+
+    def _legacy_private_file_exists(self, user_id: str) -> bool:
+        """旧私有记忆文件在不在盘上：只看「有没有这个文件」，不解析、不读正文。"""
+        try:
+            return _read_bytes(self.private_path(user_id), 1) is not None
+        except OSError:
+            return False
+
+    def _legacy_private_blocked(self, user_id: str | None) -> bool:
+        """旧个人记忆的私有路径是否已被画像迁移关上（纵深防御，见 D-56 同款理由）。
+
+        画像未装配时恒为 False：没有新路径就谈不上迁移，旧记忆照旧工作。读不回来时按
+        「已迁移」处理，与 `persona_is_migrated` 同一套失败方向。
+        """
+        if not self._persona_enabled or not user_id:
+            return False
+        try:
+            return self._persona_migrated(user_id)
+        except Exception:
+            return True
+
+    def _persona_cached_migrated(self, user_id: str) -> bool:
+        """只读内存快照判断「已迁移」（无 I/O）：给同步回调用的保守提示，不是权威判据。"""
+        if not self._persona_enabled or not user_id:
+            return False
+        owner_key = _storage_key(user_id)
+        if owner_key is None:
+            return False
+        state = self._persona_users.get(owner_key)
+        if state is None or not isinstance(state.document, dict):
+            return False
+        return bool(state.document.get("migrated"))
+
+    def _persona_suppress(self, owner_key: str) -> None:
+        """把一个 owner 放进隔离集（有界 FIFO）：两份公开索引立刻都不再列出它。
+
+        索引也要当场改：读取路径的过滤只在有人来取资料时生效，而 `public_username_index()` /
+        `persona_public_username_index()` 返回的是**索引快照**，调用方（装配层）拿它去组
+        subject 列表 —— 不改索引就等于「已下架」的 owner 还会被反复组进候选。
+        """
+        if not _valid_owner_key(owner_key):
+            return
+        self._persona_suppressed[owner_key] = None
+        self._persona_suppressed.move_to_end(owner_key)
+        while len(self._persona_suppressed) > _PERSONA_SUPPRESSED_MAX:
+            self._persona_suppressed.popitem(last=False)
+        self._public_index = _reindex(self._public_index, owner_key, None)
+        self._persona_index = _reindex_persona(self._persona_index, owner_key, None)
+
+    def _persona_release(self, owner_key: str) -> None:
+        """解除隔离：撤回/发布**确认落盘**之后才调用（隔离跟着待撤回走）。"""
+        self._persona_suppressed.pop(owner_key, None)
+
+    def _persona_suppressed_owner(self, owner_key: str) -> bool:
+        """该 owner 是否正被隔离；隔离集只装不可逆 owner key，写锁外读也是安全的。"""
+        return owner_key in self._persona_suppressed
+
+    # --- 用户画像：路径、视图与快照（与记忆同款，独立一份缓存） --------------
+
+    def _persona_user_path(self, owner_key: str) -> str:
+        """私有画像的路径（`personas/users/<owner_key>.md`；目录不存在时**不创建**）。"""
+        return os.path.join(self._persona_users_dir, f"{_persona_key(owner_key)}{_MD_SUFFIX}")
+
+    def _persona_flow_path(self, owner_key: str) -> str:
+        """工作流的路径（`personas/workflows/<owner_key>.md`）。"""
+        return os.path.join(self._persona_flows_dir, f"{_persona_key(owner_key)}{_MD_SUFFIX}")
+
+    def _persona_public_path(self, owner_key: str) -> str:
+        """公开快照的路径（`personas/public/<owner_key>.md`）。"""
+        return os.path.join(self._persona_public_dir, f"{_persona_key(owner_key)}{_MD_SUFFIX}")
+
+    def persona_user_path(self, user_id: str) -> str:
+        """按原始 `user_id` 取私有画像路径；用于测试与诊断（写入仍只看 owner key）。"""
+        return self._persona_user_path(_storage_key(user_id) or _invalid_id_path_key(user_id))
+
+    def _persona_user_view(self, owner_key: str) -> _DocumentView:
+        return _DocumentView(
+            path=self._persona_user_path(owner_key),
+            parser=persona_codec.parse_persona,
+            fresh=persona_models.default_persona,
+            scope=_SCOPE_PERSONA,
+            render=persona_codec.render_persona,
+        )
+
+    def _persona_flow_view(self, owner_key: str) -> _DocumentView:
+        return _DocumentView(
+            path=self._persona_flow_path(owner_key),
+            parser=persona_codec.parse_workflow,
+            fresh=persona_models.default_workflow,
+            scope=_SCOPE_PERSONA_FLOW,
+            render=persona_codec.render_workflow,
+        )
+
+    def _persona_public_view(self, owner_key: str) -> _DocumentView:
+        return _DocumentView(
+            path=self._persona_public_path(owner_key),
+            parser=persona_codec.parse_public_persona,
+            fresh=persona_models.default_public_persona,
+            scope=_SCOPE_PERSONA_PUBLIC,
+            render=persona_codec.render_public_persona,
+        )
+
+    def _persona_user_state(self, owner_key: str, *, force: bool = False) -> _Snapshot:
+        """私有画像快照：与用户记忆文件同款的惰性加载 + 有界 LRU + TTL 摘要比对。"""
+        state = self._persona_users.get(owner_key)
+        fresh = self._inspect(
+            self._persona_user_view(owner_key),
+            state,
+            ttl=self._refresh_seconds,
+            event="persona.refresh_failed" if state is not None else "persona.load_failed",
+            force=force,
+        )
+        self._store_persona(self._persona_users, owner_key, fresh)
+        return fresh
+
+    def _persona_flow_state(self, owner_key: str, *, force: bool = False) -> _Snapshot:
+        """工作流快照。**提交与终结路径都 `force=True`**：草稿编号、送达标记与基础版本是确认
+        的前提，TTL 缓存会把「刚刚落到盘上的那一稿」变成看不见的东西。"""
+        state = self._persona_flows.get(owner_key)
+        fresh = self._inspect(
+            self._persona_flow_view(owner_key),
+            state,
+            ttl=self._refresh_seconds,
+            event="persona.refresh_failed" if state is not None else "persona.load_failed",
+            force=force,
+        )
+        self._store_persona(self._persona_flows, owner_key, fresh)
+        return fresh
+
+    def _persona_public_state(self, owner_key: str, *, force: bool = False) -> _Snapshot:
+        """公开画像快照：写入与撤回路径必须 `force=True`（私有公开投影的 R24 同款理由）。"""
+        state = self._persona_public.get(owner_key)
+        fresh = self._inspect(
+            self._persona_public_view(owner_key),
+            state,
+            ttl=self._refresh_seconds,
+            event="persona.refresh_failed" if state is not None else "persona.load_failed",
+            force=force,
+        )
+        self._store_persona(self._persona_public, owner_key, fresh)
+        return fresh
+
+    def _store_persona(
+        self, cache: "OrderedDict[str, _Snapshot]", owner_key: str, state: _Snapshot
+    ) -> None:
+        """写入快照缓存并维持 LRU 上界；淘汰只释放内存，**不删文件**。"""
+        cache[owner_key] = state
+        cache.move_to_end(owner_key)
+        while len(cache) > _PERSONA_CACHE_SIZE:
+            cache.popitem(last=False)
+
+    def _commit_persona(
+        self,
+        cache: "OrderedDict[str, _Snapshot]",
+        owner_key: str,
+        view: _DocumentView,
+        state: _Snapshot,
+        built: dict[str, Any],
+        *,
+        screen: _ScreenFn | None = None,
+    ) -> tuple[str, _Snapshot]:
+        """以「基线快照逐字段未变」为前提整份替换一份画像文档；返回（状态, 新快照）。
+
+        CAS 由 applier 在**真正要写的那个基线**上执行：`_write_document` 接手外部版本之后会用
+        外部基线重放 applier，磁盘上人工改过的版本因此不会被这次写入静默覆盖（同 revision 的
+        改动也算：比的是整份文档，不是修订号）。
+        """
+        status, _, written = self._write_document(
+            view, state, _replace_applier(state.document, built), screen=screen
+        )
+        if written is not state:
+            self._store_persona(cache, owner_key, written)
+        return status, written
+
+    def _record_operation(
+        self,
+        operations: Mapping[str, Any],
+        operation_id: str,
+        status: str,
+        object_id: str | None,
+        revision: int,
+    ) -> dict[str, dict[str, Any]]:
+        """画像文档的幂等记账：与记忆的 `_record` 同一套「按插入顺序淘汰最旧」规则。
+
+        只记元数据（状态、对象 ID、修订号），绝不记正文（设计 §8）。
+        """
+        updated: dict[str, dict[str, Any]] = {key: value for key, value in operations.items()}
+        updated.pop(operation_id, None)
+        updated[operation_id] = {"status": status, "object_id": object_id, "revision": revision}
+        while len(updated) > self._config.max_operations:
+            oldest = next(iter(updated))
+            if oldest == operation_id:
+                break
+            updated.pop(oldest)
+        return updated
+
+    # --- 用户画像：工作流与公开副本的内部步骤 -------------------------------
+
+    def _flow_expired(self, flow: Mapping[str, Any]) -> bool:
+        """工作流是否已过有效期（`expires_at` 为 0 表示没有设期限）。"""
+        expires = flow.get("expires_at")
+        if isinstance(expires, bool) or not isinstance(expires, (int, float)):
+            return False
+        return float(expires) > 0 and self._now() >= float(expires)
+
+    def _expire_flow_locked(self, owner_key: str, state: _Snapshot) -> dict[str, Any] | None:
+        """过期流程的清理：落成 `expired` 墓碑并清空待办正文（写锁内调用）。
+
+        写入失败时同样返回清理后的内存版本：这次已经不可能继续这个流程，返回内容与语义一致，
+        下一次访问会再试一次落盘。
+        """
+        document = state.document
+        if not isinstance(document, dict):
+            return None
+        if persona_models.workflow_is_empty(document) or not self._flow_expired(document):
+            return document
+        built = persona_models.cleared_workflow(document)
+        built["stage"] = "expired"
+        built["revision"] = state.revision + 1
+        status, written = self._commit_persona(
+            self._persona_flows, owner_key, self._persona_flow_view(owner_key), state, built
+        )
+        self._log_persona_write(_SCOPE_PERSONA_FLOW, status, written.revision)
+        if status == STATUS_OK and isinstance(written.document, dict):
+            return written.document
+        return built
+
+    def _clear_flow_locked(
+        self,
+        owner_key: str,
+        *,
+        stage: str | None,
+        operation_id: str = "",
+        object_id: str | None = None,
+    ) -> tuple[bool, str]:
+        """把待办流程终结成墓碑：清空正文、按需换阶段、记下幂等结果（写锁内调用）。
+
+        返回（是否写入成功, 稳定状态）。`stage=None` 表示保留现有阶段（`persona_save_workflow`
+        的 `value=None`：调用方只要求清空正文，不要求改变流程状态）。
+        """
+        state = self._persona_flow_state(owner_key, force=True)
+        document = state.document
+        if not isinstance(document, dict):
+            return False, STATUS_UNAVAILABLE
+        if operation_id:
+            hit = document["operations"].get(operation_id)
+            if hit is not None:
+                return True, str(hit["status"])
+        if persona_models.workflow_is_empty(document):
+            # 没有待办流程（从来没建过，或已经是终态墓碑）：nothing to clear。
+            return True, STATUS_NOOP
+        built = persona_models.cleared_workflow(document)
+        if stage is not None:
+            built["stage"] = stage
+        if built == document:
+            # 正文早就清空了（重复取消、重复清空）：不再涨修订号，也不重复记幂等结果。
+            return True, STATUS_NOOP
+        built["revision"] = state.revision + 1
+        if operation_id:
+            built["operations"] = self._record_operation(
+                document["operations"], operation_id, STATUS_OK, object_id, built["revision"]
+            )
+        else:
+            built["operations"] = dict(document["operations"])
+        status, written = self._commit_persona(
+            self._persona_flows, owner_key, self._persona_flow_view(owner_key), state, built
+        )
+        self._log_persona_write(_SCOPE_PERSONA_FLOW, status, written.revision)
+        return status == STATUS_OK, status
+
+    def _confirm_baseline_matches(
+        self,
+        kind: str,
+        document: Mapping[str, Any],
+        revision: int,
+        flow: Mapping[str, Any],
+    ) -> bool:
+        """确认前的基线复核：修订号 + 内容指纹（写锁内调用）。
+
+        - **修订号**：宿主记账，拦住「展示草稿之后画像又前进了一版」。
+          唯一的例外是 `create` 且当前正文为空：建档的基线按定义就是一份**空的**生效画像
+          （没有画像时才走建档），而清空之后的重新建档同样走这条路 —— 那时墓碑还带着旧修订号，
+          把它算进基线会让用户永远无法重新建档。内容安全由指纹保证，这里放宽的只是记账。
+        - **指纹**：草稿基于的内容本身（段落 + 特征），随流程落盘，因此跨重启成立；
+          空指纹表示这条流程来自还没有指纹字段的版本，此时只核对修订号（向后兼容）。
+        """
+        if revision != flow.get("base_revision") and not (
+            kind == "create" and not str(document.get("paragraph") or "")
+        ):
+            return False
+        fingerprint = flow.get("base_fingerprint")
+        if isinstance(fingerprint, str) and fingerprint:
+            return _persona_fingerprint(document) == fingerprint
+        return True
+
+    def _confirm_persona_locked(
+        self,
+        owner_key: str,
+        state: _Snapshot,
+        flow: Mapping[str, Any],
+        draft_id: str,
+        operation_id: str,
+    ) -> str:
+        """建档与编辑的提交：把**已展示的**那一稿写进生效画像（设计 §3、§9）。
+
+        只复制工作流里存的段落与特征 —— 用户确认的就是他看见的那一份，不再次调用模型润色。
+        `create` 打开画像；`edit` 保留现有开关（关闭状态下的编辑不隐式重新开启，设计 §6）。
+        """
+        document = state.document
+        if not isinstance(document, dict):
+            return STATUS_UNAVAILABLE
+        hit = document["operations"].get(operation_id)
+        if hit is not None and hit.get("object_id") == draft_id:
+            # 幂等：上一次确认已经把这一稿写进生效文件，只是还没终结流程。`object_id` 必须是
+            # 同一份草稿 —— 同一个文件里的其它幂等记录（元数据保存之类）不能冒充一次提交。
+            return str(hit["status"])
+        built = dict(document)
+        built["revision"] = state.revision + 1
+        built["paragraph"] = flow["paragraph"]
+        built["features"] = copy.deepcopy(flow["features"])
+        built["committed_draft_id"] = draft_id
+        built["migrated"] = True
+        built["updated_at"] = self._timestamp()
+        built["last_change"] = (
+            texts.PERSONA_CHANGE_CREATED_TEXT if flow.get("kind") == "create" else texts.PERSONA_CHANGE_EDITED_TEXT
+        )
+        if flow.get("kind") == "create":
+            built["enabled"] = True
+        built["operations"] = self._record_operation(
+            document["operations"], operation_id, STATUS_OK, draft_id, built["revision"]
+        )
+        try:
+            persona_models.validate_persona(built)
+        except persona_models.PersonaValidationError:
+            return STATUS_INVALID_PROPOSAL
+        if self._contains_secret(_persona_texts(built)):
+            return STATUS_SECRET_DETECTED
+        status, written = self._commit_persona(
+            self._persona_users,
+            owner_key,
+            self._persona_user_view(owner_key),
+            state,
+            built,
+            screen=lambda _document: _persona_texts(built),
+        )
+        self._log_persona_write(_SCOPE_PERSONA, status, written.revision)
+        return status
+
+    def _confirm_public_locked(
+        self,
+        owner_key: str,
+        persona_state: _Snapshot,
+        flow: Mapping[str, Any],
+        operation_id: str,
+    ) -> str:
+        """公开发布的提交：写入**独立**快照，私有画像一个字节都不改（设计 §7）。
+
+        公开副本只含短文与必要身份、版本元数据：访谈答案、证据索引、修改意见与置信度都不
+        出现在这里。`source_revision` 记下快照的来源版本，`/persona` 因此能显示「私有 v8，
+        公开 v5」。
+        """
+        document = persona_state.document
+        if not isinstance(document, dict):
+            return STATUS_UNAVAILABLE
+        public_state = self._persona_public_state(owner_key, force=True)
+        public = public_state.document
+        if not isinstance(public, dict):
+            return STATUS_UNAVAILABLE
+        hit = public["operations"].get(operation_id)
+        if hit is not None and hit.get("object_id") == flow.get("draft_id"):
+            # 幂等：上一次确认已经发布了这一稿，只是还没终结流程。
+            return str(hit["status"])
+        built = dict(public)
+        username = document.get("username")
+        built["owner_username"] = username if isinstance(username, str) else ""
+        built["paragraph"] = flow["paragraph"]
+        # 来源版本取**草稿的基线**，不是当下的修订号：快照发布的是用户预览过的那一段文字，
+        # 它的来源就是预览时的那一版（确认路径已经复核过 base_revision，两者必然一致；
+        # 记基线是把这层语义写进文件，而不是让它取决于「读的时候恰好是几」）。
+        built["source_revision"] = int(flow.get("base_revision") or 0)
+        built["published_at"] = self._timestamp()
+        built["revision"] = public_state.revision + 1
+        built["operations"] = self._record_operation(
+            public["operations"], operation_id, STATUS_OK, flow.get("draft_id"), built["revision"]
+        )
+        try:
+            persona_models.validate_public_persona(built)
+        except persona_models.PersonaValidationError:
+            # 最可能的失败是拿不到合法站点用户名：没有身份就不发布（公开索引按它归属）。
+            return STATUS_INVALID_PROPOSAL
+        if self._contains_secret((built["paragraph"], built["owner_username"])):
+            return STATUS_SECRET_DETECTED
+        status, written = self._commit_persona(
+            self._persona_public, owner_key, self._persona_public_view(owner_key), public_state, built
+        )
+        if status == STATUS_OK:
+            # 新快照已经落盘并复核过：解除隔离，让这一版公开画像重新进入索引与大区引用。
+            self._persona_release(owner_key)
+            self._reindex_persona_public(owner_key, written.document)
+        self._log_persona_write(_SCOPE_PERSONA_PUBLIC, status, written.revision)
+        return status
+
+    def _confirm_clear_locked(
+        self,
+        owner_key: str,
+        persona_state: _Snapshot,
+        flow: Mapping[str, Any],
+        operation_id: str,
+    ) -> str:
+        """清空的提交：**先撤回、再删除**（设计 §7）。撤回失败时不删私有内容，保留以便继续处理。"""
+        public_status = self._revoke_persona_public_locked(owner_key, f"{operation_id}:public")
+        if public_status not in (STATUS_OK, STATUS_NOOP):
+            return STATUS_UNAVAILABLE
+        legacy_status = self._revoke_legacy_locked(owner_key, f"{operation_id}:legacy")
+        if legacy_status not in (STATUS_OK, STATUS_NOOP):
+            return STATUS_UNAVAILABLE
+        document = persona_state.document
+        if not isinstance(document, dict):
+            return STATUS_UNAVAILABLE
+        built = dict(document)
+        built["revision"] = persona_state.revision + 1
+        # 墓碑：保留身份与开关字段、清掉全部正文；`migrated=true` 因此不会退回旧个人记忆（设计 §11）。
+        built["enabled"] = False
+        built["migrated"] = True
+        built["paragraph"] = ""
+        built["features"] = []
+        built["observations"] = []
+        built["pending_unpublish"] = False
+        # 提交标记照记：清空同样是「先写生效文件、再终结流程」的两步，崩溃后靠它收尾。
+        built["committed_draft_id"] = flow.get("draft_id") or ""
+        built["updated_at"] = self._timestamp()
+        built["last_change"] = texts.PERSONA_CHANGE_CLEARED_TEXT
+        built["operations"] = self._record_operation(
+            document["operations"], operation_id, STATUS_OK, flow.get("draft_id"), built["revision"]
+        )
+        status, written = self._commit_persona(
+            self._persona_users, owner_key, self._persona_user_view(owner_key), persona_state, built
+        )
+        self._log_persona_write(_SCOPE_PERSONA, status, written.revision)
+        if status == STATUS_OK:
+            # 公开副本（画像的与旧的）都已撤回：隔离的使命结束，解除即可（索引里本来就没有它）。
+            self._persona_release(owner_key)
+        return status
+
+    def _revoke_persona_public_locked(self, owner_key: str, operation_id: str) -> str:
+        """撤回画像公开副本：写一份空快照（保留 operations），并把它移出索引（写锁内调用）。
+
+        本来就没有公开副本时是 `noop`：不写文件，也不给从未发布过的用户凭空造一份空文件
+        （与记忆公开投影的 R9 同一套理由）。
+        """
+        state = self._persona_public_state(owner_key, force=True)
+        document = state.document
+        if not isinstance(document, dict):
+            return STATUS_UNAVAILABLE
+        hit = document["operations"].get(operation_id)
+        if hit is not None:
+            return str(hit["status"])
+        if not document.get("paragraph") and not document.get("owner_username"):
+            return STATUS_NOOP
+        built = persona_models.default_public_persona()
+        built["revision"] = state.revision + 1
+        built["operations"] = self._record_operation(
+            document["operations"], operation_id, STATUS_OK, None, built["revision"]
+        )
+        status, written = self._commit_persona(
+            self._persona_public, owner_key, self._persona_public_view(owner_key), state, built
+        )
+        if status == STATUS_OK:
+            self._reindex_persona_public(owner_key, written.document)
+        self._log_persona_write(_SCOPE_PERSONA_PUBLIC, status, written.revision)
+        return status
+
+    def _revoke_legacy_locked(self, owner_key: str, operation_id: str) -> str:
+        """撤回该用户的**旧**公开个人记忆（逐用户迁移与关闭共用，写锁内调用）。
+
+        走记忆自己的 `_mutate_public_locked`（同一把锁、同一套原子写），因此不会自锁，也不会
+        绕过密钥筛与幂等表。旧记忆未启用时没有可撤回的东西：稳定 `noop`。
+        """
+        if not self._enabled:
+            return STATUS_NOOP
+        result = self._mutate_public_locked(
+            owner_key, operation_id, lambda document: self._apply_unpublish_all(document, operation_id)
+        )
+        if result.status in (STATUS_OK, STATUS_NOOP):
+            return STATUS_OK
+        return STATUS_UNAVAILABLE
+
+    # --- 用户画像：公开索引与补充资料 ---------------------------------------
+
+    def _refresh_persona_public(self) -> int:
+        """重扫 `personas/public/` 并一次引用替换索引；返回索引到的公开画像条数。
+
+        空快照（撤回后的墓碑）不入索引：它只是幂等元数据的载体（与记忆公开投影的 R9 同款）。
+        """
+        index: dict[str, list[str]] = {}
+        total = 0
+        for owner_key in self._persona_file_keys(self._persona_public_dir):
+            if self._persona_suppressed_owner(owner_key):
+                # 隔离中的 owner 不进索引：盘上可能还留着崩溃前没撤掉的公开副本。
+                continue
+            state = self._persona_public_state(owner_key, force=True)
+            document = state.document
+            if not isinstance(document, dict) or state.reason is not None:
+                continue
+            username = document.get("owner_username")
+            if not isinstance(username, str) or not username or not document.get("paragraph"):
+                continue
+            index.setdefault(username, []).append(owner_key)
+            total += 1
+        self._persona_index = {name: tuple(items) for name, items in index.items()}
+        return total
+
+    def _reindex_persona_public(self, owner_key: str, document: Any) -> None:
+        """一次 mutation 之后把该 owner 的索引项换成文档的当前事实。"""
+        current = document if isinstance(document, dict) else None
+        if isinstance(current, dict) and (not current.get("owner_username") or not current.get("paragraph")):
+            current = None
+        if self._persona_suppressed_owner(owner_key):
+            current = None
+        self._persona_index = _reindex_persona(self._persona_index, owner_key, current)
+
+    def _persona_public_items(
+        self, subjects: tuple[PublicMemorySubject, ...]
+    ) -> list[SupplementalItem]:
+        """按 subject 次序取公开画像短文并给出 `priority`（设计 §7）。
+
+        形状复查与记忆公开投影同款：只接受形状合法的 subject，同一个 owner 只取第一次出现。
+        组间基数排在既有分组之后（公开画像永远不是最优先的资料）。
+        """
+        if not self._public_dir_readable(self._persona_public_dir):
+            self._log_persona_omitted(_SCOPE_PERSONA_PUBLIC, _REASON_IO)
+            return []
+        ordered: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for subject in subjects:
+            if not _valid_subject(subject) or subject.owner_key in seen:
+                continue
+            seen.add(subject.owner_key)
+            if self._persona_suppressed_owner(subject.owner_key):
+                # 已受理但还没撤回完成的 owner：本轮一条都不引用（设计 §7）。
+                self._log_persona_omitted(_SCOPE_PERSONA_PUBLIC, "suppressed")
+                continue
+            state = self._persona_public_state(subject.owner_key)
+            document = state.document
+            if not isinstance(document, dict) or not document.get("paragraph"):
+                # 冷启动就没有有效快照、或已经撤回：这个 owner 本轮省略。
+                self._log_persona_omitted(_SCOPE_PERSONA_PUBLIC, state.reason)
+                continue
+            paragraph = document.get("paragraph")
+            if isinstance(paragraph, str) and paragraph:
+                ordered.append((subject.username, paragraph))
+        base = _PERSONA_PUBLIC_PRIORITY_BASE * self._priority_stride
+        return [
+            SupplementalItem(
+                group=persona_models.PERSONA_PUBLIC_GROUP,
+                label=f"@{username}",
+                content=paragraph,
+                priority=base + rank,
+            )
+            for rank, (username, paragraph) in enumerate(ordered)
+        ]
+
+    def _persona_file_keys(self, directory: str) -> tuple[str, ...]:
+        """画像目录下的 owner key 列表（按文件名排序）；目录不可读返回空元组。
+
+        与公开投影的扫描同款：非法的文件名直接跳过，超过 `MAX_PERSONA_FILES` 时按排序截断
+        并只记一个稳定 reason。
+        """
+        try:
+            with os.scandir(directory) as scan:
+                names = [entry.name for entry in scan]
+        except OSError as exc:
+            self._log_persona_scan_failure(_REASON_IO, error=type(exc).__name__)
+            return ()
+        keys = sorted(
+            name[: -len(_MD_SUFFIX)]
+            for name in names
+            if name.endswith(_MD_SUFFIX) and _valid_owner_key(name[: -len(_MD_SUFFIX)])
+        )
+        if len(keys) > MAX_PERSONA_FILES:
+            self._log_persona_scan_failure(_REASON_TOO_MANY_FILES)
+            keys = keys[:MAX_PERSONA_FILES]
+        return tuple(keys)
+
+    # --- 用户画像：日志 -----------------------------------------------------
+
+    def _log_persona_write(self, scope: str, status: str, revision: int) -> None:
+        """画像写入只记稳定状态与修订号；短文、问题、回答与来源摘要一律不进日志（设计 §8）。"""
+        log_event(
+            _logger,
+            logging.INFO,
+            "persona.updated",
+            scope=scope,
+            status=status,
+            revision=revision,
+        )
+
+    def _log_persona_omitted(self, scope: str, reason: str | None) -> None:
+        log_event(
+            _logger,
+            logging.INFO,
+            "persona.context_omitted",
+            scope=scope,
+            reason=reason if reason is not None else "unavailable",
+        )
+
+    def _log_persona_scan_failure(self, reason: str, **fields: object) -> None:
+        """扫描失败只记一条稳定 reason；同一份失败重复出现不再刷屏（与公开投影同款）。"""
+        if self._persona_scan_reason == reason:
+            return
+        self._persona_scan_reason = reason
+        log_event(
+            _logger,
+            logging.WARNING,
+            "persona.load_failed",
+            scope=_SCOPE_PERSONA,
+            reason=reason,
+            **fields,
+        )
 
     # --- 原子写（规划 §5.5 的七步） ----------------------------------------
 
@@ -1331,7 +3013,7 @@ class MemoryService:
                 return status, None, snapshot
             built = _canonical_document(built)
             object_id = _canonical_object_id(object_id)
-            data = self._render(built)
+            data = self._render_document(view, built)
             temp_path = _write_temp_file(os.path.dirname(view.path), data)
             disk = _read_bytes(view.path, self._config.max_file_bytes + 1)
             digest = _digest(disk)
@@ -1350,7 +3032,7 @@ class MemoryService:
                     return status, None, adopted
                 built = _canonical_document(built)
                 object_id = _canonical_object_id(object_id)
-                data = self._render(built)
+                data = self._render_document(view, built)
                 _overwrite_temp_file(temp_path, data)
             self._replace(temp_path, view.path)
             temp_path = None
@@ -1387,6 +3069,12 @@ class MemoryService:
             return view.parser(disk, self._config)
         except CodecError:
             return None
+
+    def _render_document(self, view: _DocumentView, document: Any) -> bytes:
+        """按 view 渲染：画像三类文档自带渲染器，记忆三类走 `_render` 的类型分派。"""
+        if view.render is not None:
+            return view.render(document)
+        return self._render(document)
 
     def _render(self, document: _MemoryDocument) -> bytes:
         if isinstance(document, PrivateDocument):
@@ -1538,13 +3226,16 @@ class MemoryService:
         """写入失败只记稳定 token：`reason` 是 codec 的六个 reason 之一，`error` 是异常类名。
 
         绝不记异常字符串：`OSError` 的字符串里有绝对路径，`UnicodeEncodeError` 的对象就是正文。
+        画像三类文件的 scope 以 `persona_` 开头，事件名据此分到画像那一支，方便运维按子系统
+        过滤（字段集合与安全规则完全一致）。
         """
         fields: dict[str, object] = {"scope": scope}
         if reason is not None:
             fields["reason"] = reason
         if error is not None:
             fields["error"] = error
-        log_event(_logger, logging.WARNING, "memory.write_failed", **fields)
+        event = "persona.write_failed" if scope.startswith("persona") else "memory.write_failed"
+        log_event(_logger, logging.WARNING, event, **fields)
 
     def _log_updated(
         self,
@@ -2113,6 +3804,198 @@ def _common_entry_count(document: CommonDocument) -> int:
     return len(document.all_user) + len(document.lobby)
 
 
+def _persona_key(owner_key: str) -> str:
+    """画像文件名里的 owner key：形状不合法时换成同形兜底键（越不出目录，也不含原始取值）。
+
+    与 `public_path_from_owner_key` 同款：路径只由宿主算出的 owner key 派生，伪造的取值落不到
+    任何真实文件上。
+    """
+    return owner_key if _valid_owner_key(owner_key) else _invalid_owner_key_path_key(owner_key)
+
+
+def _replace_applier(expected: Any, built: dict[str, Any]) -> _ApplyFn:
+    """构造一个「基线与预期快照**完全相同**才整份替换」的 applier（画像三类文档共用）。
+
+    CAS 写在 applier 里而不是写在调用点：`_write_document` 接手外部版本之后会用**外部基线**
+    重放同一个 applier，检查因此覆盖「磁盘上被人手改过」的那条路径（§5.5 第 4 步）。
+
+    比的是**整份文档的深相等**，不是只比修订号：修订号是宿主自己的记账，一次人工编辑完全可以
+    「改了正文、没动 revision」——只比修订号会让那次编辑被静默覆盖，而这正是外部编辑接手机制
+    要防的事。深相等只在「磁盘摘要与快照不一致」时才跑到，正常路径一次都不会多花代价。
+    """
+
+    def apply(baseline: Any) -> tuple[Any | None, str, str | None]:
+        if not isinstance(baseline, dict) or baseline != expected:
+            return None, STATUS_CONFLICT, None
+        return built, STATUS_OK, None
+
+    return apply
+
+
+def _merge_fields(
+    current: Mapping[str, Any], value: Mapping[str, Any], fields: Sequence[str]
+) -> dict[str, Any] | None:
+    """把调用方给的字段并到现值上：未知字段返回 None，缺的字段沿用现值。
+
+    「缺的沿用现值」是 A 侧对契约里「A supplies defaults」的落地：宿主只要给它在改的字段，
+    不必先读一遍再把整份文档抄回来；文件还不存在时现值就是那份默认文档（基线 revision 0）。
+    未知字段仍然整条拒绝 —— 宽容解析会把一次越权或一个拼错的字段名变成静默通过的事件。
+    """
+    if set(value) - set(fields):
+        return None
+    merged = dict(current)
+    for key, item in value.items():
+        merged[key] = copy.deepcopy(item)
+    return merged
+
+
+def _persona_texts(document: Mapping[str, Any]) -> tuple[str, ...]:
+    """一份画像文档里**将要写进 Markdown**的全部用户可见文本：密钥筛的取材函数（§37）。
+
+    短文、变更说明、用户名、观察摘要与特征取值都算；证据引用只是标签，也一并过筛 ——
+    命中即整条拒绝，命中的具体字符串绝不进日志。
+    """
+    texts: list[str] = []
+    for name in ("paragraph", "last_change", "username"):
+        value = document.get(name)
+        if isinstance(value, str):
+            texts.append(value)
+    for item in document.get("observations") or ():
+        if isinstance(item, str):
+            texts.append(item)
+    for feature in document.get("features") or ():
+        if isinstance(feature, Mapping):
+            value = feature.get("value")
+            if isinstance(value, str):
+                texts.append(value)
+            for ref in feature.get("evidence_refs") or ():
+                if isinstance(ref, str):
+                    texts.append(ref)
+    return tuple(texts)
+
+
+def _workflow_texts(document: Mapping[str, Any]) -> tuple[str, ...]:
+    """一份工作流里将要写进 Markdown 的全部文本：问题、回答、草稿、摘要与修改意见。"""
+    texts: list[str] = []
+    for name in ("paragraph", "correction"):
+        value = document.get(name)
+        if isinstance(value, str):
+            texts.append(value)
+    for name in ("source_summaries", "questions"):
+        for item in document.get(name) or ():
+            if isinstance(item, str):
+                texts.append(item)
+    answers = document.get("answers")
+    if isinstance(answers, Mapping):
+        for item in answers.values():
+            if isinstance(item, str):
+                texts.append(item)
+    for feature in document.get("features") or ():
+        if isinstance(feature, Mapping):
+            value = feature.get("value")
+            if isinstance(value, str):
+                texts.append(value)
+    return tuple(texts)
+
+
+def _merge_auto_features(
+    current: Any, proposed: Any, *, now_stamp: str
+) -> tuple[list[dict[str, Any]], bool] | None:
+    """把模型给的新特征与现行文档里的**用户锁定维度**合并（设计 §5 的推断规则）。
+
+    保守冻结是这里的核心：宿主无法判断模型换的说法是不是同一个意思（`_rewording_of` 那种
+    字面包含只是启发式），因此只要某个维度里存在用户锁定项，那个维度的**全部**特征一律冻结成
+    现行文档里的那几条 —— 不采纳、不合并、不换词：
+
+    - 锁定维度：整维冻结，逐字保留现有特征（含它们自己的时间戳与 `user_locked`）。
+    - 其它维度：采纳模型给的内容，但 `user_locked` **强制为假**（模型无权决定锁定标志，
+      与「不输出 owner/path/flags」同一条约束），并由宿主盖时间戳：
+      `last_seen_at` 一律取本次提交时刻；`first_seen_at` 只在同名 `(dimension, value)` 特征
+      已经存在时沿用旧值 —— 否则「首次观察到」会被每次更新推后。
+    - 返回值第二项表示**模型是否动过锁定维度**（提案里该维度的特征集合与现行不一致）。
+      调用方据此保留上一段短文：模型的新句子可能正是在描述那几条被宿主丢弃的改动，
+      宿主没有语义能力把它改回去，只能整段不采纳。
+    - 形状不对（不是 dict、字段集合不符）时返回 None，调用方映射成 `invalid_proposal`。
+    """
+    if not isinstance(proposed, list):
+        return None
+    for item in proposed:
+        if not isinstance(item, dict) or set(item) != set(persona_models.FEATURE_FIELDS):
+            return None
+    locked_dims = {
+        item.get("dimension")
+        for item in current or ()
+        if isinstance(item, Mapping) and item.get("user_locked")
+    }
+    existing = {
+        (item.get("dimension"), item.get("value")): item
+        for item in current or ()
+        if isinstance(item, Mapping)
+    }
+    touched_locked = False
+    for dimension in locked_dims:
+        proposed_keys = {
+            (item["dimension"], item["value"]) for item in proposed if item["dimension"] == dimension
+        }
+        current_keys = {
+            key for key in existing if key[0] == dimension
+        }
+        if proposed_keys != current_keys:
+            touched_locked = True
+            break
+    merged: list[dict[str, Any]] = []
+    for item in proposed:
+        if item["dimension"] in locked_dims:
+            continue
+        prior = existing.get((item["dimension"], item["value"]))
+        stamped = dict(item)
+        stamped["user_locked"] = False
+        # 同名项沿用它的**首次**观察时间；没有同名项、或旧项自己没记过时间时，一律盖提交时刻。
+        prior_first = prior.get("first_seen_at") if isinstance(prior, Mapping) else ""
+        stamped["first_seen_at"] = prior_first if isinstance(prior_first, str) and prior_first else now_stamp
+        stamped["last_seen_at"] = now_stamp
+        merged.append(stamped)
+    for item in current or ():
+        if isinstance(item, Mapping) and item.get("dimension") in locked_dims:
+            merged.append(copy.deepcopy(dict(item)))
+    return merged, touched_locked
+
+
+def _persona_fingerprint(document: Mapping[str, Any]) -> str:
+    """画像基线指纹，保护同修订号的外部字段修改。"""
+    payload = {key: value for key, value in document.items() if key not in ("revision", "operations")}
+    try:
+        data = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=_FINGERPRINT_SEPARATORS,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        # 形状不可能通过校验，这里只是兜底：拿不到指纹就返回空串（等价于「没有指纹」）。
+        return ""
+    return hashlib.sha256(data).hexdigest()
+
+
+def _reindex_persona(
+    index: Mapping[str, tuple[str, ...]], owner_key: str, document: Mapping[str, Any] | None
+) -> Mapping[str, tuple[str, ...]]:
+    """一次 mutation 之后重建索引的一份新映射（一次引用替换，绝不就地改）。
+
+    `document` 为 None 表示该 owner 现在没有公开画像：把它从所有用户名下摘掉，空掉的名字
+    也随之消失（否则索引会留下一串永远取不到内容的用户名）。
+    """
+    rebuilt: dict[str, list[str]] = {name: list(keys) for name, keys in index.items()}
+    for name, keys in rebuilt.items():
+        if owner_key in keys:
+            rebuilt[name] = [key for key in keys if key != owner_key]
+    if document is not None:
+        username = document.get("owner_username")
+        if isinstance(username, str) and username:
+            rebuilt.setdefault(username, []).append(owner_key)
+    return {name: tuple(keys) for name, keys in rebuilt.items() if keys}
+
+
 def _digest(data: bytes | None) -> bytes | None:
     """文件字节摘要；文件不存在时是 None（「不存在」也是一个可比较的基线）。"""
     if data is None:
@@ -2215,6 +4098,9 @@ def _canonical_document(document: _MemoryDocument) -> _MemoryDocument:
             entries=tuple(_canonical_entry(item, PREFIX_USER) for item in document.entries),
             operations=_canonical_operations(document.operations),
         )
+    if isinstance(document, dict):
+        # 画像三类文档是纯 dict，没有需要收敛的 ID 宽度：原样返回（render 由各自的 view 提供）。
+        return document
     if isinstance(document, PublicMemoryDocument):
         # 公开条目的 ID 沿用来源的 `UM-` 序号，因此与私有条目同一套收敛规则（§41.3）。
         return replace(

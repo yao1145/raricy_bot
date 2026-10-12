@@ -62,6 +62,12 @@ IMAGE_QUALITIES: tuple[str, ...] = ("low", "medium", "high", "auto")
 # `size` 形如 `1024x1024`；宽松解析会让 "1024*1024" 这类写法留到上游才报错。
 _IMAGE_SIZE_RE = re.compile(r"^[1-9][0-9]{1,4}x[1-9][0-9]{1,4}$")
 
+# 画像草稿与问卷展示的固定开销（字符数）：草稿编号、推测依据、"确认 / 修改一次 / 取消" 说明、
+# 五道题的题号与提示。运行期的真实检查在 `persona/controller.py` 里按**实际文本长度**做
+# （超限的那一次展示不发送、保留待办）；这里只用它做启动期交叉校验，保证一个合法配置
+# 不会让草稿整条装不进一条回复。
+_PERSONA_RENDER_OVERHEAD_CHARS: int = 400
+
 
 # ConfigError 的机器可读分类：`KIND_MISSING` 只表示**还没填**（草稿可以接受、
 # 正式配置必须拒绝），其余一律是取值/格式/跨字段问题（草稿也必须拒绝）。
@@ -346,6 +352,35 @@ class MemoryConfig:
 
 
 @dataclass(frozen=True)
+class PersonaConfig:
+    """用户画像配置（设计 §12、USER_PERSONA_DESIGN §12）；默认关闭。
+
+    画像与旧个人记忆共用同一个 `MemoryService` 与同一份 `memory.root_dir`（设计 §8），
+    因此这里**没有** `root_dir`、`queue_size` 之类的存储项：目录由服务派生，命令队列沿用
+    `memory.queue_size`。启用画像不会打开旧记忆的任何开关（`memory.enabled` 保持原值）。
+
+    `auto_update_available` 是部署级开关：为假时送达后的自动更新一次都不启动，用户侧
+    `/persona on` 仍可开启私有使用与公开，只是不再收集新证据。
+    `max_model_calls` 是一次流程（阅读 + 5 题 + 草稿 + 一次修改）共用的模型调用上限；
+    `workflow_ttl_seconds` 是待办流程的无操作过期时间；`update_messages` /
+    `min_update_seconds` / `max_updates_per_day` 是送达后自动更新的三个节流旋钮。
+    """
+
+    enabled: bool = False
+    auto_update_available: bool = True
+    blog_pages: int = 10
+    message_pages: int = 10
+    writer_context_tokens: int = 12000
+    writer_timeout_seconds: float = 45.0
+    max_model_calls: int = 12
+    max_paragraph_chars: int = 500
+    workflow_ttl_seconds: int = 86400
+    update_messages: int = 10
+    min_update_seconds: int = 1800
+    max_updates_per_day: int = 6
+
+
+@dataclass(frozen=True)
 class BlogTaskConfig:
     """一个定时发文任务的静态事实（设计 §4.1）。
 
@@ -486,6 +521,7 @@ class Config:
     mcp: McpConfig = field(default_factory=McpConfig)
     knowledge_base: KnowledgeBaseConfig = field(default_factory=KnowledgeBaseConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    persona: PersonaConfig = field(default_factory=PersonaConfig)
     blog: BlogConfig = field(default_factory=BlogConfig)
     stickers: StickerConfig = field(default_factory=StickerConfig)
     image_generation: ImageGenerationConfig = field(default_factory=ImageGenerationConfig)
@@ -573,6 +609,10 @@ def parse_config(
     memory = _memory(
         _section(raw, "memory"), behavior, comments, knowledge_base, storage
     )
+    # 画像与记忆共用存储根目录与门禁配置（设计 §8、§12），因此解析顺序排在记忆之后。
+    persona = _persona(
+        _section(raw, "persona"), behavior, knowledge_base, storage, memory
+    )
     # 稿库的相对路径以调用方给的基准目录解析（CLI 传配置文件所在目录、
     # Launcher 传档案目录），不随进程的工作目录漂移。
     blog = _blog(_section(raw, "blog"), config_dir)
@@ -613,6 +653,7 @@ def parse_config(
         mcp=mcp,
         knowledge_base=knowledge_base,
         memory=memory,
+        persona=persona,
         blog=blog,
         stickers=stickers_cfg,
         image_generation=image_generation,
@@ -1556,6 +1597,82 @@ def _memory(
         writer_context_tokens=writer_context_tokens,
         writer_timeout_seconds=writer_timeout_seconds,
         auto_capture_available=auto_capture_available,
+    )
+
+
+def _persona(
+    container: Mapping[str, Any],
+    behavior: BehaviorConfig,
+    knowledge_base: KnowledgeBaseConfig,
+    storage: StorageConfig,
+    memory: MemoryConfig,
+) -> PersonaConfig:
+    """构造用户画像配置（设计 §12）；关闭时只做类型与单字段范围校验。
+
+    交叉约束只在启用时施加：一个与画像无关的默认值组合（例如把
+    `behavior.max_output_chars` 调得很小）不该让默认关闭的部署启动失败。
+    画像沿用记忆的存储根目录与门禁配置，因此这里的重叠检查与 `_memory` 是同一份规则。
+    """
+    where = "persona"
+    enabled = _bool_flag(container, "enabled", where, False)
+    auto_update_available = _bool_flag(container, "auto_update_available", where, True)
+    blog_pages = _positive_int(container, "blog_pages", where, 10)
+    message_pages = _positive_int(container, "message_pages", where, 10)
+    writer_context_tokens = _positive_int(container, "writer_context_tokens", where, 12000)
+    writer_timeout_seconds = _positive_number(
+        container, "writer_timeout_seconds", where, 45.0
+    )
+    max_model_calls = _positive_int(container, "max_model_calls", where, 12)
+    max_paragraph_chars = _positive_int(container, "max_paragraph_chars", where, 500)
+    workflow_ttl_seconds = _positive_int(container, "workflow_ttl_seconds", where, 86400)
+    update_messages = _positive_int(container, "update_messages", where, 10)
+    min_update_seconds = _positive_int(container, "min_update_seconds", where, 1800)
+    max_updates_per_day = _positive_int(container, "max_updates_per_day", where, 6)
+
+    if enabled:
+        # 采样扫描上限要有界：每页 50 项，翻 100 页已经是五千次列表请求。
+        if blog_pages > 100 or message_pages > 100:
+            raise ConfigError(
+                f"配置 {where}.blog_pages 与 message_pages 不能大于 100 页"
+            )
+        # 一次建档至少要有「阅读 + 5 题 + 草稿」三次调用，再加一次修改的额度（设计 §4.3）。
+        if max_model_calls < 4:
+            raise ConfigError(f"配置 {where}.max_model_calls 不能小于 4")
+        if max_paragraph_chars > behavior.max_input_chars:
+            raise ConfigError(
+                f"配置 {where}.max_paragraph_chars 不能大于 behavior.max_input_chars"
+            )
+        # 草稿要连同编号、依据与操作说明一起装进一条回复；装不下会在展示时被截断，
+        # 用户就看不到「确认 / 修改一次 / 取消」。这与记忆披露的预留是同一条思路。
+        if (
+            max_paragraph_chars + _PERSONA_RENDER_OVERHEAD_CHARS
+            >= behavior.max_output_chars
+        ):
+            raise ConfigError(
+                f"配置 {where}.max_paragraph_chars 不能占满 behavior.max_output_chars："
+                "草稿编号、依据与操作说明还要留在同一条消息里"
+            )
+        if min_update_seconds > workflow_ttl_seconds:
+            raise ConfigError(
+                f"配置 {where}.min_update_seconds 不能大于 workflow_ttl_seconds"
+            )
+        _check_memory_root_dir(
+            memory.root_dir, knowledge_base.root_dir, storage.db_path
+        )
+
+    return PersonaConfig(
+        enabled=enabled,
+        auto_update_available=auto_update_available,
+        blog_pages=blog_pages,
+        message_pages=message_pages,
+        writer_context_tokens=writer_context_tokens,
+        writer_timeout_seconds=writer_timeout_seconds,
+        max_model_calls=max_model_calls,
+        max_paragraph_chars=max_paragraph_chars,
+        workflow_ttl_seconds=workflow_ttl_seconds,
+        update_messages=update_messages,
+        min_update_seconds=min_update_seconds,
+        max_updates_per_day=max_updates_per_day,
     )
 
 

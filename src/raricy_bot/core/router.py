@@ -12,6 +12,12 @@
 （`memory_access` / `memory_queue` / `private_enabled`）都不注入时整条记忆路径不存在，
 行为与升级前逐字节一致（D-60 的回退路径），此时 `Request.memory_allowed` 恒为 `False`。
 
+用户画像命令（设计 §2、§8）与记忆命令同形：`persona_access` / `persona_queue` /
+`persona_session` 三个参数都不注入时整条画像路径不存在。区别只有一处 —— 画像还要识别
+**隐式输入**：编号回答（`1. …`）、回复问卷消息的内容、回复草稿消息的修改意见或 `同意`。
+这些判定必须在路由器里**同步、无 I/O** 完成，因此装配层注入的 `persona_session` 是一个
+只读 Controller 内存快照的回调（`PersonaSessionHint`），命中后与显式命令走同一条入队路径。
+
 大区近期消息（INTERFACES.md §38、D-95）是这一层的第二件新职责：**每条**大区消息
 （包括机器人自己的公开回复与未 `@` 的普通消息）在进入任何过滤之前先交给缓冲器观察，
 但只有真正构造出 `Request` 且成功入队时才消费那一批。本地回复、被忽略的消息与队列满
@@ -31,7 +37,7 @@ import asyncio
 import logging
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -49,6 +55,22 @@ from ..memory.commands import (
     parse_memory_command,
 )
 from ..memory.models import user_storage_key
+from ..persona.commands import (
+    CONTROL_COMMANDS,
+    KIND_EDIT,
+    STAGE_AWAITING_ANSWERS,
+    STAGE_AWAITING_FINAL_REVIEW,
+    STAGE_AWAITING_REVIEW,
+    STAGE_DRAFT_PENDING_DELIVERY,
+    STAGE_REVISING,
+    PersonaCommand,
+    PersonaCommandRequest,
+    PersonaSessionHint,
+    is_confirmation_text,
+    parse_draft_id,
+    parse_numbered_answers,
+    parse_persona_command,
+)
 from ..site.models import LOBBY, Author, ChatMessage, StreamEvent
 from ..store import Store
 from ..text_utils import (
@@ -77,6 +99,16 @@ _logger = get_logger("core.router")
 
 # SSE 中需要静默忽略的 kind，它们的 reason 与 kind 同名。
 _PASSIVE_KINDS: tuple[str, ...] = ("typing", "read")
+
+# 只作用于**个人**范围、迁移后必须停用的旧记忆命令（设计 §11.6）。
+# 共同记忆（`suggest all_user` / `candidates` / `approve` / `reject` / `delete` /
+# `list all_user|lobby` / `status`）不在其中 —— 迁移只切个人资料，不动共同记忆。
+_PERSONAL_MEMORY_COMMANDS: frozenset[str] = frozenset(
+    {"remember", "forget", "public", "unpublic", "clear", "auto_on", "auto_off", "on", "off"}
+)
+
+# 迁移后同样停用的旧记忆查询：`/memory list`（自己的条目）与 `/memory list public`。
+_PERSONAL_MEMORY_LIST_ARGUMENTS: frozenset[str] = frozenset({None, "public"})
 
 # 值得运维关注的「可行动」结果：会入队、会回本地文案、或推进水位。
 # 其余（typing/read/unknown_event/malformed 及各类前置过滤）是大区高频背景，
@@ -108,6 +140,13 @@ _ACTIONABLE_REASONS: frozenset[str] = frozenset(
         "memory_dm_only",
         "memory_beta_denied",
         "memory_queue_full",
+        # 记忆已迁移（设计 §11.6）：旧个人记忆命令回迁移说明，同样是本地文案。
+        "memory_migrated",
+        # 画像命令的四个结果（设计 §2、§8）：与记忆同形，只承载稳定短标识。
+        "persona_queued",
+        "persona_dm_only",
+        "persona_denied",
+        "persona_queue_full",
         "image_queued",
     }
 )
@@ -158,6 +197,10 @@ class Request:
     # 这条消息被唤起之前积累的大区公开消息（§38.2），入队那一刻固化；**私聊恒为空元组**。
     # 用不可变 tuple 而不是引用：请求进了队列之后，缓冲器还可以继续被 SSE 改动。
     lobby_recent: tuple[LobbyRecentMessage, ...] = ()
+    # 当前作者是否可用画像的公开/私有资料（设计 §7）：由 Router 用 `message.author.id`
+    # 与**画像自己的门禁**（`persona.enabled` 的那一份）算出。画像未装配时恒为 `False`，
+    # 与 `memory_allowed` 相互独立 —— 两个子系统各自启用（设计 §12），一个关着不影响另一个。
+    persona_allowed: bool = False
     # 本地随机关联标识（计划 §4）：把同一条消息的路由判定、模型失败与发送结果串起来。
     # 它只由随机数生成，不编码 message_id / 用户 / 频道 —— 因此可以安全地进日志与归档。
     trace_id: str = ""
@@ -169,8 +212,9 @@ class Request:
 class RouteResult:
     """一次判定的结果；`reason` 是稳定短标识，仅用于日志。"""
 
-    # "queued" | "reply_now" | "ignored" | "busy" | "resync" | "memory_queued"。
-    # `memory_queued` **不是** `queued`：app 不把它当聊天请求处理，终态由记忆 worker 负责（§34.1、§34.3）。
+    # "queued" | "reply_now" | "ignored" | "busy" | "resync" | "memory_queued" | "persona_queued"。
+    # `memory_queued` 与 `persona_queued` **不是** `queued`：app 不把它们当聊天请求处理，
+    # 终态分别由记忆 worker 与画像 worker 负责（§34.1、§34.3、设计 §8）。
     action: str
     channel_id: str | None
     message_id: int | None
@@ -207,6 +251,13 @@ class MessageRouter:
         image_queue: EnqueueQueue[ImageRequest] | None = None,
         image_enabled: bool = False,
         site_base_url: str = "",
+        persona_access: MemoryAccessPolicy | None = None,
+        persona_queue: EnqueueQueue[PersonaCommandRequest] | None = None,
+        persona_session: Callable[[str], PersonaSessionHint | None] | None = None,
+        persona_migrated: Callable[[str | None], bool] | None = None,
+        persona_control: Callable[[str, str], None] | None = None,
+        persona_control_epoch: Callable[[str], int] | None = None,
+        persona_prepare: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._self_user_id = self_user_id
         self._bot_username = bot_username
@@ -235,6 +286,20 @@ class MessageRouter:
         self._image_queue = image_queue
         self._image_enabled = image_enabled and image_queue is not None
         self._site_base_url = site_base_url
+        # 画像同样是可选能力：三个参数（策略、队列、流程快照回调）要么都给、要么都不给。
+        # 未装配时 `/persona` 只是普通正文，整条画像路径不存在（与记忆的 D-60 回退同款）。
+        self._persona_access = persona_access
+        self._persona_queue = persona_queue
+        self._persona_session = persona_session
+        self._persona_prepare = persona_prepare
+        # 迁移标记回调：同步、无 I/O（读内存快照）。返回真时旧**个人**记忆命令回迁移说明，
+        # 共同记忆命令不受影响（设计 §11.6）。未注入时行为与升级前一致。
+        self._persona_migrated = persona_migrated
+        # 立即控制回调（设计 §6）：授权控制命令一到达就同步通知装配层；`persona_control_epoch`
+        # 给出该用户当前的代次，用来给入队请求盖章。两者都不注入时画像命令照常入队执行，
+        # 只是没有「立即失效」这一层加速（行为与本次改动前一致）。
+        self._persona_control = persona_control
+        self._persona_control_epoch = persona_control_epoch
         self._image_scope = f"{site_base_url.rstrip('/')}|{self_user_id}"
         self._logger = _logger
 
@@ -425,6 +490,15 @@ class MessageRouter:
         if expired_result is not None:
             return expired_result
 
+        # 本人私聊路由前加载迁移状态与流程；公开路径不读取私有文件。
+        if (channel_kind == "dm" and self._persona_prepare is not None
+                and self._persona_access is not None
+                and self._persona_access.permits_commands(message.author.id, channel_kind)):
+            await self._persona_prepare(message.author.id)
+            expired_result = await skip_if_expired()
+            if expired_result is not None:
+                return expired_result
+
         # 7. 引用上下文（已删除的引用视为无）。
         reply_context: str | None = None
         if message.reply is not None and not message.reply.is_deleted:
@@ -469,7 +543,12 @@ class MessageRouter:
             if await self._store.is_image_user_blocked(self._image_scope, message.author.id):
                 return emit_current_message("reply_now", "image_blacklisted", text=texts.IMAGE_BLACKLIST_TEXT, **local)
             prompt = image_command.prompt
-            if leading_capability_command(prompt) or leading_execution_command(prompt) or parse_memory_command(prompt):
+            if (
+                leading_capability_command(prompt)
+                or leading_execution_command(prompt)
+                or parse_memory_command(prompt)
+                or parse_persona_command(prompt)
+            ):
                 return emit_current_message("reply_now", "capability_conflict", text=texts.CAPABILITY_CONFLICT_TEXT, **local)
             if not prompt:
                 return emit_current_message("reply_now", "image_usage", text=texts.IMAGE_USAGE_TEXT, **local)
@@ -511,6 +590,27 @@ class MessageRouter:
                     expires_at=expires_at,
                 )
 
+        # 9.05 用户画像命令与访谈输入（设计 §2、§8）：与记忆命令同一位置、同一套入队形状。
+        # 必须早于能力命令解析，理由与记忆完全一样：`/search /persona …` 不能在剥掉能力前缀
+        # 之后被当成一次画像操作执行，也不能让画像意图漏进搜索查询。
+        if self._persona_path_active():
+            persona_command = parse_persona_command(user_text)
+            if persona_command is None:
+                persona_command = self._implicit_persona_command(
+                    message, user_text, channel_kind
+                )
+            if persona_command is not None:
+                return self._route_persona_command(
+                    persona_command,
+                    message=message,
+                    channel_id=channel_id,
+                    channel_kind=channel_kind,
+                    session_key=session_key,
+                    thread_root_id=thread_root_id,
+                    event_id=event_id,
+                    expires_at=expires_at,
+                )
+
         # 9.1 解析单轮能力命令（D-39）。命令本身不是聊天正文，不进入模型；一条消息里
         # **最多剥离一个**前缀，剥离后若正文又以能力命令开头就本地拒绝 —— 用户只理解
         # 一套披露时，`/search /kb ...` 会同时把查询发给 Exa、把本地资料发给模型。
@@ -539,6 +639,7 @@ class MessageRouter:
                 leading_capability_command(user_text) is not None
                 or leading_execution_command(user_text) is not None
                 or self._leads_with_memory_command(user_text)
+                or self._leads_with_persona_command(user_text)
             ):
                 return emit_current_message(
                     "reply_now",
@@ -686,6 +787,9 @@ class MessageRouter:
             thread_root_id=thread_root_id,
             enabled_features=enabled_features,
             memory_allowed=self._memory_allowed(message.author.id),
+            # 画像的门禁独立于记忆（设计 §12）：画像启用而旧记忆关闭时，私有短文与
+            # 公开快照仍然可用，因此这一格不能从 `memory_allowed` 借值。
+            persona_allowed=self._persona_allowed(message.author.id),
             # 当前作者的 subject 在**入队前**算好（§47.2）：worker 与 App 都不再回头去碰
             # `message.author.id`，公开记忆路径拿到的只有这个不可逆的 key（R1）。
             public_memory_subject=self._public_memory_subject(message.author),
@@ -799,7 +903,7 @@ class MessageRouter:
         memory_allowed = self._memory_allowed(user_id)
         # `private_enabled` 只在 memory_allowed 为真时影响措辞，但回调本身同步无 I/O
         # （D-67 的 `private_settings_cached` 只读内存快照），照常求值即可。
-        return texts.help_text(
+        text = texts.help_text(
             channel_kind=channel_kind,
             vision_enabled=self._vision_enabled,
             kb_enabled=self._kb_enabled,
@@ -808,7 +912,19 @@ class MessageRouter:
             blog_max_chars=self._cfg.quoted_blog_max_chars,
             capabilities=self._capabilities,
             image_enabled=self._image_enabled,
+            persona_allowed=(self._persona_path_active() and self._persona_access is not None
+                             and self._persona_access.permits_common(user_id)),
         )
+        # 用户画像的管理命令只在私聊生效（设计 §2），因此这一段只拼进私聊的帮助文案，
+        # 且只在画像路径真的装配好、当前作者又通过画像门禁时才出现。
+        if (
+            channel_kind != "lobby"
+            and self._persona_path_active()
+            and self._persona_access is not None
+            and self._persona_access.permits_commands(user_id, channel_kind)
+        ):
+            return text + texts.PERSONA_HELP_TEXT
+        return text
 
     # --- 记忆命令（§34.1） ---------------------------------------------------
 
@@ -833,7 +949,7 @@ class MessageRouter:
         与 `_memory_allowed` 一样，注入与否就是这条路径的总开关：关掉记忆的部署里
         连一次哈希都不发生，`Request.public_memory_subject` 恒为 `None`。
         """
-        if self._memory_access is None:
+        if self._memory_access is None and self._persona_access is None:
             return None
         return _conversation_subject(author)
 
@@ -892,9 +1008,24 @@ class MessageRouter:
                 event_id=event_id,
                 expires_at=expires_at,
             )
+        user_id = message.author.id
+        if self._is_personal_memory_command(command) and self._migrated_for(user_id):
+            # 设计 §11.6：已迁移用户的旧个人记忆命令回迁移说明，不暗中翻译成新操作；
+            # 共同记忆命令（`list all_user`、`candidates` 等）照常走下面的原路径。
+            return self._emit(
+                "reply_now",
+                "memory_migrated",
+                channel_id=channel_id,
+                message_id=message.id,
+                reply_to=message.id,
+                text=texts.PERSONA_MIGRATED_TEXT,
+                channel_kind=channel_kind,
+                thread_root_id=thread_root_id,
+                event_id=event_id,
+                expires_at=expires_at,
+            )
         access = self._memory_access
         queue = self._memory_queue
-        user_id = message.author.id
         # `access` 与 `queue` 已由调用方保证注入，这里的判空只为类型收窄。
         # 拿不到稳定身份（`author.id` 为空）与未通过 Beta 接入门是同一处置：固定拒绝文案。
         # `permits_commands` 对空 `user_id` 本来就为假（§28），这里显式判一次是为了不构造
@@ -962,6 +1093,236 @@ class MessageRouter:
             event_id=event_id,
             expires_at=expires_at,
         )
+
+    # --- 用户画像命令（设计 §2、§8） ----------------------------------------
+
+    def _persona_path_active(self) -> bool:
+        """画像路径是否可用：策略与队列**都**注入才算（与 `_memory_path_active` 同款）。
+
+        `MemoryAccessPolicy` 不暴露 `enabled`，因此注入与否就是路由层唯一的总开关：
+        `persona.enabled=false` 时 app 根本不注入，`/persona` 于是只是普通正文。
+        """
+        return self._persona_access is not None and self._persona_queue is not None
+
+    def _persona_allowed(self, user_id: str | None) -> bool:
+        """当前作者能否使用画像的公开/私有资料（设计 §7）；未注入时恒 False。
+
+        与命令门禁同一份策略、同一个 `permits_common` 口径：`all` 模式下任何非空作者 ID
+        都通过，`allowlist` 模式要求名单内的稳定 ID。作者 ID 为空（评论作者等）一律为假。
+        """
+        access = self._persona_access
+        if access is None:
+            return False
+        return access.permits_common(user_id)
+
+    def _leads_with_persona_command(self, text: str) -> bool:
+        """剥离一个能力前缀之后，剩余正文是否又以画像命令开头（与记忆同款，D-39）。"""
+        return self._persona_path_active() and parse_persona_command(text) is not None
+
+    def _implicit_persona_command(
+        self, message: ChatMessage, user_text: str, channel_kind: str
+    ) -> PersonaCommand | None:
+        """把「普通消息形态的流程输入」翻译成一条内部命令；不是流程输入时返回 `None`。
+
+        判定**同步、无 I/O**：只看装配层给的流程快照与这条消息的引用目标。设计 §2 的边界
+        在这里落地 —— 只有编号回答、回复问卷消息、回复草稿消息（含 `同意`）与回复编辑提示的
+        内容才进流程，其余普通消息照常走聊天。
+        """
+        if channel_kind != "dm":
+            return None
+        user_id = message.author.id
+        probe = self._persona_session
+        if not user_id or probe is None:
+            return None
+        try:
+            hint = probe(user_id)
+        except Exception:
+            # 快照回调是纯内存读，理论上不会失败；真失败也只让这条消息回到普通聊天。
+            return None
+        if hint is None:
+            return None
+        reply_to = (
+            message.reply.id
+            if message.reply is not None and not message.reply.is_deleted
+            else None
+        )
+        if hint.stage == STAGE_AWAITING_ANSWERS:
+            if reply_to is not None and reply_to == hint.questions_message_id:
+                # 回复问卷消息：整段正文按编号回答（可能一次答多题）处理。
+                return PersonaCommand(name="answer_batch", argument=user_text)
+            if parse_numbered_answers(user_text):
+                return PersonaCommand(name="answer_batch", argument=user_text)
+            return None
+        if hint.stage in (
+            STAGE_DRAFT_PENDING_DELIVERY,
+            STAGE_AWAITING_REVIEW,
+            STAGE_AWAITING_FINAL_REVIEW,
+        ):
+            if reply_to is None or reply_to != hint.delivered_message_id:
+                return None
+            if is_confirmation_text(user_text):
+                number = parse_draft_id(hint.draft_id)
+                if number is None:
+                    return None
+                return PersonaCommand(name="confirm", argument=hint.draft_id, number=number)
+            return PersonaCommand(name="revise", argument=user_text)
+        if hint.stage == STAGE_REVISING and hint.kind == KIND_EDIT:
+            if reply_to is not None and reply_to == hint.questions_message_id:
+                return PersonaCommand(name="revise", argument=user_text)
+            return None
+        return None
+
+    def _route_persona_command(
+        self,
+        command: PersonaCommand,
+        *,
+        message: ChatMessage,
+        channel_id: str,
+        channel_kind: str,
+        session_key: str,
+        thread_root_id: int | None,
+        event_id: int | None,
+        expires_at: float | None,
+    ) -> RouteResult:
+        """画像命令的授权与入队（设计 §2）：顺序与记忆命令逐条对应。"""
+        if channel_kind != "dm":
+            # 大区与评论是公开场景：同一文本只回固定提示，不入队（设计 §2）。
+            return self._emit(
+                "reply_now",
+                "persona_dm_only",
+                channel_id=channel_id,
+                message_id=message.id,
+                reply_to=message.id,
+                text=texts.PERSONA_DM_ONLY_TEXT,
+                channel_kind=channel_kind,
+                thread_root_id=thread_root_id,
+                event_id=event_id,
+                expires_at=expires_at,
+            )
+        access = self._persona_access
+        queue = self._persona_queue
+        user_id = message.author.id
+        if (
+            not user_id
+            or access is None
+            or queue is None
+            or not access.permits_commands(user_id, channel_kind)
+        ):
+            return self._emit(
+                "reply_now",
+                "persona_denied",
+                channel_id=channel_id,
+                message_id=message.id,
+                reply_to=message.id,
+                text=texts.PERSONA_UNAVAILABLE_TEXT,
+                channel_kind=channel_kind,
+                thread_root_id=thread_root_id,
+                event_id=event_id,
+                expires_at=expires_at,
+            )
+        reply_to = (
+            message.reply.id
+            if message.reply is not None and not message.reply.is_deleted
+            else None
+        )
+        # 立即控制（设计 §6）：`off` / `clear` / `cancel` / `edit` / `private` 一被授权就
+        # **同步**通知装配层（推进画像代次、取消在途任务、清空证据缓冲、抑制私有使用），
+        # 不等它排到队首 —— 用户已经明确要求停止时，在途的模型结果不能继续落盘。
+        # 回调只做同步、无 I/O 的事；失败绝不影响路由（它只是加速，持久化仍由命令完成）。
+        if command.name in CONTROL_COMMANDS and self._persona_control is not None:
+            try:
+                self._persona_control(user_id, command.name)
+            except Exception as exc:
+                log_event(
+                    self._logger,
+                    logging.WARNING,
+                    "router.persona_control_failed",
+                    error=type(exc).__name__,
+                )
+        request = PersonaCommandRequest(
+            event_id=event_id,
+            message_id=message.id,
+            channel_id=channel_id,
+            channel_kind=channel_kind,
+            session_key=session_key,
+            user_id=user_id,
+            # 站点用户名原样落进请求：它是公开快照索引的唯一来源（与记忆命令的 R12 同款）。
+            username=message.author.username,
+            command=command,
+            reply_to_message_id=reply_to,
+            expires_at=expires_at,
+            # 控制代次在**回调之后**读取：控制命令自己带新代次，排在它前面的旧请求
+            # （用旧代次入队）由 worker 在执行前丢弃。
+            control_seq=self._persona_control_seq(user_id),
+        )
+        try:
+            queue.put_nowait(request)
+        except asyncio.QueueFull:
+            return self._emit(
+                "busy",
+                "persona_queue_full",
+                channel_id=channel_id,
+                message_id=message.id,
+                reply_to=message.id,
+                text=texts.BUSY_NOTICE_TEXT,
+                actor_id=user_id,
+                channel_kind=channel_kind,
+                thread_root_id=thread_root_id,
+                event_id=event_id,
+                expires_at=expires_at,
+            )
+        # 终态由画像 worker 负责（与记忆命令同款）：这里不标记完成、也不构造聊天 Request。
+        return self._emit(
+            "persona_queued",
+            "persona_queued",
+            channel_id=channel_id,
+            message_id=message.id,
+            reply_to=message.id,
+            channel_kind=channel_kind,
+            thread_root_id=thread_root_id,
+            event_id=event_id,
+            expires_at=expires_at,
+        )
+
+    def _persona_control_seq(self, user_id: str) -> int:
+        """读当前用户的控制代次（同步、无 I/O）；未注入回调时恒 0。
+
+        代次只增不减：装配层每收到一条授权控制命令就加一，worker 在执行前比对入队时的取值，
+        不一致就丢弃那条请求（见 `PersonaCommandRequest.control_seq`）。
+        """
+        reader = self._persona_control_epoch
+        if reader is None:
+            return 0
+        try:
+            return int(reader(user_id))
+        except Exception:
+            return 0
+
+    def _migrated_for(self, user_id: str | None) -> bool:
+        """当前用户是否已迁移到画像（设计 §11.6）；未注入回调或不适用时恒 False。"""
+        probe = self._persona_migrated
+        if probe is None or not user_id:
+            return False
+        try:
+            return bool(probe(user_id))
+        except Exception:
+            # 迁移标记只影响旧个人命令的处置，探针失败按「未迁移」处理（保持旧路径可用）。
+            return False
+
+    @staticmethod
+    def _is_personal_memory_command(command: MemoryCommand) -> bool:
+        """这条旧记忆命令是否只作用于**个人**范围（迁移后必须停用）。"""
+        if command.name in _PERSONAL_MEMORY_COMMANDS:
+            return True
+        if command.name == "list":
+            # 带作用域的是共同记忆（`/memory list all_user|lobby`），照常可用；
+            # 其余两种（自己的私有条目、自己的公开条目）都是个人范围。
+            return (
+                command.scope is None
+                and command.argument in _PERSONAL_MEMORY_LIST_ARGUMENTS
+            )
+        # `status` 展示的是本人的私有开关与条目数，迁移后不再是权威状态。
+        return command.name == "status"
 
     # --- 大区共享链 ---------------------------------------------------------
 

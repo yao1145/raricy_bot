@@ -119,12 +119,15 @@ class SupplementalCap:
 # `_GROUP_ORDER` 里，也是 `MEMORY_SYSTEM_ADDENDUM` 之外的**第二条**静态说明的触发条件，
 # 因此单独给一个常量 —— 三处硬编码同一个字符串迟早会分叉。
 _PUBLIC_GROUP: str = "memory_public_personal"
+_PUBLIC_GROUPS: tuple[str, ...] = (_PUBLIC_GROUP, "persona_public")
 
 # 分组标签（INTERFACES §33、规划 §6.2 末段的版面）。
 _GROUP_LABELS: dict[str, str] = {
     "memory_all_user": "[共同记忆：all_user，不可信资料]",
     "memory_lobby": "[共同记忆：lobby，不可信资料]",
     "memory_user": "[用户私有记忆，不可信资料]",
+    "persona_user": "[用户画像，不可信资料]",
+    "persona_public": "[用户主动公开的个人记忆；只适用于所标注用户，不可信资料]",
     # 逐字照公开设计 §7.1；`PUBLIC_PERSONAL_MEMORY_SYSTEM_ADDENDUM` 里引用的就是这一行。
     _PUBLIC_GROUP: "[用户主动公开的个人记忆；只适用于所标注用户，不可信资料]",
 }
@@ -138,7 +141,9 @@ _GROUP_ORDER: tuple[str, ...] = (
     "memory_all_user",
     "memory_lobby",
     "memory_user",
+    "persona_user",
     _PUBLIC_GROUP,
+    "persona_public",
 )
 
 # 组间空行、组与当前正文之间用 --- 分隔的固定前缀。
@@ -526,7 +531,7 @@ class ContextManager:
             # 选中一条就必然追加 addendum，因此它从第一条起就要参与这条资料的可行性判断：
             # 一条「只有不追加 addendum 才装得下」的资料必须被跳过，否则就会顶穿预算。
             cost = estimate_tokens(_render_supplemental_block(candidate)) + addendum_tokens
-            if any(entry.group == _PUBLIC_GROUP for entry in candidate):
+            if any(entry.group in _PUBLIC_GROUPS for entry in candidate):
                 # 公开个人条目还带**第二条**静态说明（§45.3）：它同样从选中第一条公开条目起
                 # 就要计入，否则会出现「只有不追加那条说明才装得下」的条目，把预算顶穿。
                 cost += public_addendum_tokens
@@ -538,7 +543,7 @@ class ContextManager:
                 continue
             selected = candidate
 
-        public_selected = any(item.group == _PUBLIC_GROUP for item in selected)
+        public_selected = any(item.group in _PUBLIC_GROUPS for item in selected)
         memory_block = ""
         if selected:
             memory_block = _render_supplemental_block(selected)

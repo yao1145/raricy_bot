@@ -256,6 +256,20 @@ memory:  # 长期记忆 Beta；正文存授权 Markdown，公开与私有读取�
 
   auto_capture_available: false  # 部署是否允许自动记忆；用户仍需在私聊中主动开启
 
+persona:  # Linux 完整版用户画像；复用 memory 的目录与接入名单，默认不启用
+  enabled: false  # 部署总开关；开启后用户须主动建档并确认
+  auto_update_available: true  # 允许已开启画像的用户通过后续私聊自动更新
+  blog_pages: 10  # 首次采样最多读取的作者搜索页数，每页最多 50 项
+  message_pages: 10  # 首次采样最多读取的 DM 页数，每页最多 100 条
+  writer_context_tokens: 12000  # 单次模型请求总输入预算，超出时分块阅读
+  writer_timeout_seconds: 45  # 单次模型调用超时秒数，不含等待共享并发门
+  max_model_calls: 12  # 单次建档阅读与生成的模型调用上限
+  max_paragraph_chars: 500  # 画像短文字符硬上限；通常生成约 150–300 个汉字
+  workflow_ttl_seconds: 86400  # 建档或编辑流程无操作过期秒数
+  update_messages: 10  # 自动更新批次所需的本人有效私聊条数
+  min_update_seconds: 1800  # 同一用户自动更新的最小间隔秒数
+  max_updates_per_day: 6  # 每人每日自动更新次数上限
+
 blog:  # UTC+8 定时自动发文；普通用户接口例外，真实站点验收见 USAGE.md
   enabled: false  # 是否启动发文扫描、生成与对账；开启时至少配置一个任务
 

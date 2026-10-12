@@ -252,6 +252,7 @@ def help_text(
     blog_max_chars: int,
     capabilities: frozenset[str] = frozenset(),
     image_enabled: bool = False,
+    persona_allowed: bool = False,
 ) -> str:
     """/help 的文案：能力组合 × 媒体 × 记忆状态 × 频道（INTERFACES §36）。
 
@@ -274,6 +275,10 @@ def help_text(
         + _media_section(vision_enabled=vision_enabled, blog_max_chars=blog_max_chars)
         + _HELP_TAIL_ABOUT_LOBBY
     )
+
+    if persona_allowed:
+        common = _HELP_PERSONA_COMMON if memory_allowed else ""
+        return text + common + _HELP_PERSONA_DISCLOSURE + _HELP_TAIL_FOOT
 
     if not memory_allowed:
         return text + _HELP_TAIL_NO_MEMORY + _HELP_TAIL_FOOT
@@ -374,7 +379,8 @@ def _comment_article_line(article_max_chars: int) -> str:
 
 
 def comment_help_text(
-    *, memory_injected: bool, vision_enabled: bool, article_max_chars: int
+    *, memory_injected: bool, vision_enabled: bool, article_max_chars: int,
+    persona_injected: bool = False,
 ) -> str:
     """评论区的 /help 文案（§35、§36）。
 
@@ -395,6 +401,8 @@ def comment_help_text(
     )
     if memory_injected:
         text += _COMMENT_HELP_MEMORY
+    if persona_injected:
+        text += _COMMENT_HELP_PERSONA
     return text + _COMMENT_HELP_FOOT
 
 
@@ -1121,3 +1129,192 @@ IMAGE_HELP_TEXT = (
     "描述和编辑参考图发送给独立图像服务，结果存入公开图床；全站滚动 24 小时最多 50 张，"
     "最多保留 14 天，空间不足淘汰本功能最旧图片。\n"
 )
+
+# 用户画像的固定文案；动态正文仍由调用方作为数据传入。
+PERSONA_USAGE_TEXT = (
+    "用法：/persona 查看或首次建档；/persona on 开启；/persona off 关闭；"
+    "/persona edit 修改；/persona answer 编号 回答；/persona revise 修改意见；"
+    "/persona confirm 草稿编号 确认；/persona cancel 取消；"
+    "/persona public 预览公开；/persona private 撤回公开；/persona clear 清空。"
+    "管理命令只在本人私聊生效，每次建档或编辑可修改一次。"
+)
+PERSONA_DISCLOSURE_TEXT = (
+    "我将阅读你最近 5 篇可访问博客和发给我的最近 50 条有效文字消息，"
+    "再向你提问 5 个问题。这些内容会发送给当前模型服务。"
+    "问题、回答和审查草稿暂存私有 Markdown；确认后保存私有画像并随后续私聊自动更新。"
+    "每次建档或编辑可修改一次，公开版本另行审阅确认。"
+    "你可随时用 /persona off 停止使用和更新并撤回公开，用 /persona clear 清空。"
+)
+PERSONA_DM_ONLY_TEXT = "用户画像管理只在你与我的私聊中执行，请在私聊使用 /persona。"
+PERSONA_UNAVAILABLE_TEXT = "用户画像暂不可用，请稍后重试；普通聊天继续可用。"
+PERSONA_MIGRATED_TEXT = "个人资料请用 /persona 查看或建档，已有画像用 /persona edit 修改。"
+PERSONA_REVISION_USED_TEXT = "本次修改额度已用完，请确认当前草稿或用 /persona cancel 取消。"
+PERSONA_OFF_TEXT = "用户画像已关闭，自动更新已停止，公开副本已撤回；私有画像保留，可用 /persona on 重新开启。"
+PERSONA_PENDING_REVOKE_TEXT = "已停止私有画像使用与更新，公开撤回待完成；请稍后重试 /persona off。"
+PERSONA_HELP_TEXT = (
+    "\n- `/persona`：在私聊查看或创建用户画像。首次阅读最近 5 篇博客和本人最近 50 条私聊，"
+    "回答 5 题后审阅短文，每次流程可修改一次。"
+    "`/persona on` 开启使用与自动更新，`/persona off` 关闭并撤回公开，"
+    "`/persona edit` 修改，`/persona public` 审阅公开，`/persona private` 撤回公开。\n"
+)
+
+PERSONA_INPUT_TOO_LONG_TEXT = "回答或修改意见不能超过 1000 字，请缩短后重试。"
+
+_HELP_PERSONA_COMMON = "\n所有使用者共享的共同记忆仍可用于相关回答，其内容会随本轮请求交给模型。\n"
+_HELP_PERSONA_DISCLOSURE = (
+    "\n个人资料使用用户画像：在私聊发送 /persona 开始建档或查看。画像经本人确认后保存，"
+    "只在本人的私聊中使用，并可随已完成的私聊更新；可以随时关闭或清空。\n"
+    "公开须单独预览确认。大区与评论只读取与当前对话相关的公开短文，"
+    "不会读取私人画像；私有与公开画像可能随相应请求交给模型。/persona off 会撤回公开。\n"
+    "/reset 清理短期对话，不清除画像。旧个人记忆在迁移确认前保留，共同记忆继续可用。\n"
+)
+_COMMENT_HELP_PERSONA = (
+    "- 评论可引用相关用户本人确认公开的画像短文，短文会随本轮交给模型；"
+    "不会读取私人画像。画像管理请在私聊使用 /persona。\n"
+)
+
+PERSONA_TEXT_NO_PROFILE_TEXT = "你还没有用户画像。"
+
+PERSONA_TEXT_NO_PROFILE_EDIT_TEXT = "你还没有用户画像，先用 `/persona` 开始建档。"
+
+PERSONA_TEXT_NO_WORKFLOW_TEXT = "当前没有待办流程。"
+
+PERSONA_TEXT_ANSWERS_CLOSED_TEXT = "草稿已经生成，请确认当前草稿或用 `/persona cancel` 取消。"
+
+PERSONA_TEXT_ANSWER_PROGRESS_TEXT = "已记录第 {number} 题（已答 {done}/{total} 题）。"
+
+PERSONA_TEXT_ANSWER_INSTRUCTIONS_TEXT = (
+    "请用 `/persona answer <编号> <回答>` 逐题回答，或直接回复问卷消息一次回答多题；"
+    "不想回答的题目回复 `skip`。5 题都回答或跳过后我会给出画像草稿。"
+)
+
+PERSONA_TEXT_QUESTIONS_HEADER_TEXT = "我准备了 {count} 个问题："
+
+PERSONA_TEXT_COLLECT_SUMMARY_TEXT = "读取结果：博客 {blog} 篇、私聊 {messages} 条。"
+
+PERSONA_TEXT_COLLECT_WARNINGS_TEXT = "读取提示：{warnings}"
+
+PERSONA_TEXT_DRAFT_HEADER_TEXT = "画像草稿 {draft_id}（第 {version} 版）："
+
+PERSONA_TEXT_DRAFT_EVIDENCE_TEXT = "主要推测依据：{evidence}"
+
+PERSONA_TEXT_DRAFT_INSTRUCTIONS_TEXT = (
+    "发送 `/persona confirm {draft_id}` 或回复本条消息 `同意` 确认；"
+    "发送 `/persona revise <修改意见>` 修改一次；发送 `/persona cancel` 取消。"
+)
+
+PERSONA_TEXT_FINAL_REVIEW_INSTRUCTIONS_TEXT = (
+    "这是本次唯一一次修改后的版本：发送 `/persona confirm {draft_id}` 或回复本条消息 `同意` 确认，"
+    "或发送 `/persona cancel` 取消。"
+)
+
+PERSONA_TEXT_REVISION_FAILED_TEXT = (
+    "这次修改没有生成成功，已保留你的修改意见；可以重新发送同一条 `/persona revise` 重试，"
+    "或用 `/persona cancel` 取消。"
+)
+
+PERSONA_TEXT_REVISION_REJECTED_TEXT = "这条修改意见不是当前流程等待的内容，请先发送 `/persona` 查看进度或草稿。"
+
+PERSONA_TEXT_EDIT_PROMPT_TEXT = (
+    "当前画像（第 {revision} 版）：\n\n{paragraph}\n\n"
+    "本次编辑可以修改一次：发送 `/persona revise <修改意见>`，或直接回复本条消息告诉我怎么改；"
+    "发送 `/persona cancel` 取消。编辑期间自动更新暂停。"
+)
+
+PERSONA_TEXT_ON_ALREADY_TEXT = "用户画像已开启。"
+
+PERSONA_TEXT_ON_TEXT_TEXT = "用户画像已开启：回答会参考它，并随后续私聊自动更新（可用 `/persona off` 关闭）。"
+
+PERSONA_TEXT_STATUS_HEADER_TEXT = "用户画像（第 {revision} 版，{state}）："
+
+PERSONA_TEXT_STATUS_META_TEXT = "上次更新：{updated_at}（{last_change}）\n公开副本：{public}\n自动更新：{auto}"
+
+PERSONA_TEXT_STATUS_COMMANDS_TEXT = (
+    "可用命令：`/persona edit` 修改，`/persona public` 审阅公开，`/persona private` 撤回公开，"
+    "`/persona off` 关闭，`/persona clear` 清空。"
+)
+
+PERSONA_TEXT_STATE_ON_TEXT = "已开启"
+
+PERSONA_TEXT_STATE_OFF_TEXT = "已关闭"
+
+PERSONA_TEXT_AUTO_ON_TEXT = "已开启"
+
+PERSONA_TEXT_AUTO_OFF_TEXT = "已关闭"
+
+PERSONA_TEXT_PUBLIC_PUBLISHED_TEXT = "已发布"
+
+PERSONA_TEXT_PUBLIC_ABSENT_TEXT = "未发布"
+
+PERSONA_TEXT_PUBLIC_PENDING_TEXT = "撤回待完成"
+
+PERSONA_TEXT_LAST_CHANGE_UNKNOWN_TEXT = "无记录"
+
+PERSONA_TEXT_COMMIT_CREATE_TEXT = (
+    "画像已保存并开启：以后私聊会参考它，并随后续私聊自动更新。"
+    "可用 `/persona` 查看，`/persona edit` 修改，`/persona public` 审阅公开，"
+    "`/persona off` 关闭并撤回公开，`/persona clear` 清空。"
+)
+
+PERSONA_TEXT_COMMIT_EDIT_TEXT = "画像已更新（保持原来的开关状态）。"
+
+PERSONA_TEXT_COMMIT_PUBLIC_TEXT = "公开副本已发布：大区与评论中与你相关的回答可以引用这段短文。"
+
+PERSONA_TEXT_COMMIT_CLEAR_TEXT = "已清除私有画像与待办内容；公开副本已撤回，仅保留无正文的幂等元数据。"
+
+PERSONA_TEXT_CANCEL_TEXT = "已取消当前待办流程，原画像保持不变。"
+
+PERSONA_TEXT_PRIVATE_REVOKED_TEXT = "公开副本已撤回，私有画像继续可用。"
+
+PERSONA_TEXT_PRIVATE_PENDING_TEXT = "公开副本的撤回还没完成；私有画像继续可用，请稍后重试 `/persona private`。"
+
+PERSONA_TEXT_PUBLIC_PREVIEW_TEXT = (
+    "将公开以下短文副本（私有第 {revision} 版）：\n\n{paragraph}\n\n"
+    "公开后，大区与评论中与你的请求相关的回答可以引用这段副本；"
+    "它不会代你发布博客或调用站点写接口。发送 `/persona confirm {draft_id}` 确认发布，"
+    "或 `/persona cancel` 取消。"
+)
+
+PERSONA_TEXT_CLEAR_PREVIEW_TEXT = (
+    "确认清空：将撤回公开副本，并删除私有画像、访谈问答与待办草稿，"
+    "只保留无正文的幂等元数据。发送 `/persona confirm {draft_id}` 确认，或 `/persona cancel` 取消。"
+)
+
+PERSONA_TEXT_REJECTED_DRAFT_TEXT = "这不是当前已展示的草稿编号，请先发送 `/persona` 查看当前草稿。"
+
+PERSONA_TEXT_REJECTED_UNDELIVERED_TEXT = "这份草稿还没有送达，暂时不能确认；请先发送 `/persona` 重新查看草稿。"
+
+PERSONA_TEXT_WORKFLOW_UNAVAILABLE_TEXT = "本次流程暂时无法继续，请稍后发送 `/persona` 重试。"
+
+PERSONA_TEXT_COLLECT_TOO_LARGE_TEXT = (
+    "这次读取到的资料太多，超过了单次建档的摘要上限；本次没有开始访谈，"
+    "请稍后重试，或用 /persona cancel 取消本次流程。"
+)
+
+PERSONA_TEXT_PUBLIC_PUBLISHED_VERSION_TEXT = "已发布（第 {revision} 版）"
+
+PERSONA_TEXT_CHANGE_ON_TEXT: str = "已开启"
+
+PERSONA_TEXT_CHANGE_AUTO_TEXT: str = "自动更新"
+
+PERSONA_WARNING_LABELS_TEXT: dict[str, str] = {
+    "identity_missing": "没能确认站点用户名，无法核验博客作者",
+    "blog_username_missing": "缺少站点用户名，未读取博客",
+    "blog_search_failed": "博客搜索失败",
+    "blog_detail_failed": "有 {count} 篇候选博客的正文没读到",
+    "blog_scan_limit": "已到博客扫描页数上限，未取满 5 篇",
+    "dm_fetch_failed": "私聊历史读取失败",
+    "dm_scan_limit": "已到私聊扫描页数上限，未取满 50 条",
+}
+
+PERSONA_TEXT_WARNING_UNKNOWN_TEXT = "部分来源没能读完"
+
+PERSONA_CHANGE_CREATED_TEXT: str = "首次建档"
+
+PERSONA_CHANGE_EDITED_TEXT: str = "手动编辑"
+
+PERSONA_CHANGE_CLEARED_TEXT: str = "已清空"
+
+PERSONA_CHANGE_DISABLED_TEXT: str = "已关闭"
+
+PERSONA_CHANGE_UPDATED_TEXT: str = "自动更新"

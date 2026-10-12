@@ -35,6 +35,9 @@ from .blog_models import (
     BlogPublishResult,
     BlogSearchItem,
     BlogSearchPage,
+    PersonaBlogDetail,
+    PersonaBlogItem,
+    PersonaBlogPage,
 )
 from .comment_models import (
     BlogContext,
@@ -105,6 +108,26 @@ _USERNAME_RE: re.Pattern[str] = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{1,18}[A-Za
 def _is_searchable_username(value: object) -> bool:
     """查询词是否是站点用户名合同允许的形状（只认字符串，其余为否）。"""
     return isinstance(value, str) and _USERNAME_RE.fullmatch(value) is not None
+
+
+# 作者搜索的每页上限（blog-bot.md §9：站方把 `per_page` clamp 到 1..50）。
+_PERSONA_BLOG_PER_PAGE_MAX: int = 50
+
+
+def _validate_positive_page(page: object, per_page: object) -> None:
+    """校验画像采集的分页参数；越界在**发请求前**拒绝。
+
+    站方会把 `per_page` 夹进 1..50，但代码不依赖上游的宽容：写错的一页大小意味着
+    「扫描上限」与「实际扫描量」对不上，而那正是采样完整度的判据。
+    """
+    if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+        raise ValueError("page 必须是不小于 1 的整数")
+    if (
+        isinstance(per_page, bool)
+        or not isinstance(per_page, int)
+        or not 1 <= per_page <= _PERSONA_BLOG_PER_PAGE_MAX
+    ):
+        raise ValueError("per_page 必须是 1..50 的整数")
 
 
 def _user_items(payload: object) -> list[Any] | None:
@@ -771,6 +794,110 @@ class SiteClient:
         return BlogSearchPage(
             items=tuple(self._parse_search_item(item) for item in raw_items),
             has_next=self._blog_list_has_next(payload),
+        )
+
+    async def search_persona_blogs(
+        self, username: str, *, page: int = 1, per_page: int = 50
+    ) -> PersonaBlogPage:
+        """按作者名搜索文章列表（画像采集的候选入口；设计 §4.1）。
+
+        依据站方 `blog-bot.md` §9：列表接口支持 `search_fields=author`，**没有**
+        专用 `author_id` 查询参数，所以先用站点给出的当前用户名取候选，再由调用方
+        对 `author_id` 逐个精确核验；这里**不做**排除，因为搜索会命中同名作者。
+
+        刻意**不传** `sort`：站方「其余一律按发布时间」是默认档，写死 `sort=updated`
+        会把旧文当新文（设计 §4.1）。
+
+        `username` 只在 `params=` 里编码，不手拼 URL；错误文案**不**复用信封里的
+        `message`（作者名会被原样回显，而作者名不进日志、也不该出现在异常文案里，
+        §53.13）。401 不重登：这是一次可降级的只读采集，会话恢复由 SSE 那条路负责。
+
+        坏结构让**整页失败**（与 `search_blog_titles` 同款）：静默丢坏条目会把
+        「查询不完整」伪装成「没有更多文章」，而候选完整度正是采样的判据。
+        """
+        _validate_positive_page(page, per_page)
+        params = {
+            "search": username,
+            "search_fields": "author",
+            "page": page,
+            "per_page": per_page,
+        }
+        response, payload = await self._request_comment_envelope(
+            "GET", _BLOGS_PATH, params=params
+        )
+        code = payload["code"]
+        if code != 200:
+            raise self._error(
+                code,
+                f"code={code} http={int(response.status_code)}",
+                _parse_retry_after(response) if code == 429 else None,
+            )
+        raw_items = payload.get("blogs")
+        if not isinstance(raw_items, list):
+            raise self._error(200, "malformed blog list")
+        return PersonaBlogPage(
+            items=tuple(self._parse_persona_item(item) for item in raw_items),
+            has_next=self._blog_list_has_next(payload),
+        )
+
+    async def fetch_persona_blog(self, blog_id: str) -> PersonaBlogDetail:
+        """读取一篇带作者身份的博客详情（画像采集用；设计 §4.1）。
+
+        `id` 不是合法 UUID 时抛 `ValueError` 且**不发请求**（与 `fetch_blog_context`
+        同款）。详情里的 `author_id` 必须存在且非空：核验不了身份的文章不能当成本人
+        作品，缺字段按**响应形状不可用**处理（抛 `SiteError`），由调用方跳过该候选。
+
+        正文缺失（None）不是协议错误：被删除、无权限或形状不符都会走到这里，
+        返回 `content=None` 让调用方继续找后面的候选。401/403/404 一律按 `SiteError`
+        抛出，不在这一层重登或重试。
+        """
+        normalized = normalize_uuid(blog_id)
+        if normalized is None:
+            raise ValueError("文章 id 不是 UUID")
+        response, payload = await self._request_comment_envelope(
+            "GET", f"{_BLOGS_PATH}/{normalized}"
+        )
+        if payload["code"] != 200:
+            raise self._error_from_payload(response, payload)
+        blog = payload.get("blog")
+        if not isinstance(blog, Mapping):
+            raise self._error(200, "malformed blog response")
+        detail_id = normalize_uuid(blog.get("id"))
+        author_id = blog.get("author_id")
+        if (
+            detail_id != normalized
+            or not isinstance(author_id, str)
+            or not author_id
+        ):
+            raise self._error(200, "malformed blog response")
+        title = blog.get("title")
+        content = blog.get("content")
+        created_at = blog.get("created_at")
+        return PersonaBlogDetail(
+            blog_id=normalized,
+            author_id=author_id,
+            title=title if isinstance(title, str) else "",
+            content=content if isinstance(content, str) else None,
+            created_at=created_at if isinstance(created_at, str) else "",
+        )
+
+    def _parse_persona_item(self, item: object) -> PersonaBlogItem:
+        """解析作者搜索候选的一项；缺 `id` / `author_id` 让整页失败。
+
+        少了这两个字段就核验不了身份，跳过坏条目等于把「查不全」伪装成「没有」。
+        `created_at` 只用于展示，形状不对退化成空串，不影响谁有资格成为候选。
+        """
+        if not isinstance(item, Mapping):
+            raise self._error(200, "malformed blog item")
+        blog_id = normalize_uuid(item.get("id"))
+        author_id = item.get("author_id")
+        if blog_id is None or not isinstance(author_id, str) or not author_id:
+            raise self._error(200, "malformed blog item")
+        created_at = item.get("created_at")
+        return PersonaBlogItem(
+            blog_id=blog_id,
+            author_id=author_id,
+            created_at=created_at if isinstance(created_at, str) else "",
         )
 
     def _classify_publish(self, payload: Mapping[str, Any]) -> BlogPublishResult:

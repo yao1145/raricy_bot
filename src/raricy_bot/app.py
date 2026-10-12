@@ -25,6 +25,15 @@
   聊天轮在内容引用、博客、`/kb`、`pending_user` 与近期块的预算判定**全部确定之后**才解析
   subject，只用 S1 里的大区近期消息，公开候选与共同/私有候选合并成一组交给 `ContextManager`；
   DM 不解析、`memory_allowed=false` 不解析，任何失败都只让本轮少一份可选资料（§47.5）；
+- 用户画像（设计 §8、§12）与记忆并列装配、共用同一个 `MemoryService`：画像自己的
+  `start_persona` → 构造 `PersonaWriter` / `PersonaSources` / `PersonaController` → 启动画像
+  worker → Router 注入画像策略、队列、流程快照回调与迁移标记回调。`persona.enabled=false`
+  时整段跳过，`/persona` 只是普通正文；任一子系统的开关都不影响另一个。
+  公开画像与旧公开个人记忆共用同一个 subject 解析器与同一份合并索引（image 侧只多一处
+  `persona_public_context`），DM 里注入的是**本人**私有短文（`persona_user` 分组）；
+- 送达后自动更新（设计 §6）：普通回复**确实送达**之后把本人原始正文记进进程内有界缓冲，
+  每累计 `persona.update_messages` 条才在后台尝试一次合并更新；发送失败、大区、命令轮与
+  依赖外部资料的回合都不计入。缓冲与在途任务在 `stop()` 里先取消、再停服务；
 - 模型失败的 `failure` 通知同样用 `notice` + 触发者冷却；额度用尽补发一次 `quota` 通知；
 - 403 进入不可用状态，按 `ready_probe_seconds` 探测恢复（D-4）；
 - 定时发文的装配位置（§53.12）：在所有账号、Store、模型、MCP 都就绪**之后**，
@@ -43,7 +52,10 @@ import asyncio
 import inspect
 import logging
 import time
-from collections.abc import Callable, Iterable
+from collections import OrderedDict, deque
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -107,6 +119,15 @@ from .memory.models import STATUS_OK, ProposalAction, PublicMemorySubject
 from .memory.service import MemoryService
 from .memory.subjects import PublicMemoryInputs, PublicMemorySubjectResolver
 from .memory.writer import MemoryWriter
+from .persona.commands import (
+    MUTATING_COMMANDS,
+    PersonaCommandRequest,
+    PersonaCommandResult,
+)
+from .persona.controller import STATUS_DEFERRED, PersonaController
+from .persona.models import PERSONA_PUBLIC_GROUP, PERSONA_USER_GROUP
+from .persona.sources import PersonaSources
+from .persona.writer import PersonaWriter
 from .ops import OpsServer
 from .outbound import prepare_outbound
 from .quota import QuotaGuard, notice_cooldown_key
@@ -130,6 +151,38 @@ _REPLY_EMPTY_MARKER: str = "[无正文]"
 
 # 优雅关闭总超时（秒）；超时后不再等待，交由进程退出兜底。
 _SHUTDOWN_TIMEOUT_SECONDS: float = 10.0
+
+# 记忆的私有分组名（`core/context.py` 的 `_GROUP_LABELS` 键）：迁移后要从候选里剔除的那一组。
+# 只用于「已迁移用户不再注入旧个人条目」这一条过滤，不改标签、不碰渲染。
+_MEMORY_PRIVATE_GROUP: str = "memory_user"
+
+# 一次画像命令最多追加几条后续文案（使用说明送达后才会采集，因此正常只有一条）。
+# 上限是防御性的：流程推进不该因为一条消息而无限连发。
+_PERSONA_FOLLOW_UP_LIMIT: int = 2
+
+# 送达后证据缓冲的**显式上界**：每人一份 deque（长度为 `persona.update_messages`），
+# 用户数与此上限共同约束内存；超过就丢最旧的那一位。
+_PERSONA_EVIDENCE_USERS_MAX: int = 256
+
+# 同时在途的自动更新任务上限（每人至多一个，全局不超过这个数）。
+_PERSONA_UPDATES_MAX: int = 16
+
+# 控制命令的即时效果分组（设计 §6、§7）：
+# - 停止类：`off` / `clear` / `cancel` —— 取消在途命令、清空证据缓冲、抑制私有注入；
+# - `private` 只影响公开副本，**私有使用继续**（设计 §7）。
+_PERSONA_STOP_CONTROLS: frozenset[str] = frozenset({"off", "clear", "cancel"})
+_PERSONA_PRIVATE_SUPPRESS_CONTROLS: frozenset[str] = frozenset({"off", "clear"})
+_PERSONA_PUBLIC_SUPPRESS_CONTROLS: frozenset[str] = frozenset({"off", "clear", "private"})
+
+
+def _persona_evidence_line(message_id: int, text: str, now: float) -> str:
+    """一条送达证据的宿主首部：`[dm:<消息 id>|<宿主 UTC 日期>] 用户原文`。
+
+    格式与 `persona/sources.py` 的资料行一致，撰写器据此解析来源标签与**日期**
+    （跨日期的长期推断因此成立），而消息 id 就是用户能核对的站点对象 ID。
+    """
+    day = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d")
+    return f"[dm:{int(message_id)}|{day}] {text}"
 
 
 def _reply_image_url(request: Request) -> str | None:
@@ -220,6 +273,9 @@ class BotApp:
         memory_service: MemoryService | None = None,
         memory_writer: MemoryWriter | None = None,
         memory_controller: MemoryController | None = None,
+        persona_writer: PersonaWriter | None = None,
+        persona_sources: PersonaSources | None = None,
+        persona_controller: PersonaController | None = None,
         archive: Any | None = None,
         expect_site_user_id: str | None = None,
     ) -> None:
@@ -415,6 +471,44 @@ class BotApp:
             concurrency=1,
         )
 
+        # 用户画像（设计 §8、§12）。与记忆共享**同一个** `MemoryService` 与同一个存储根目录，
+        # 但门禁、队列、worker 与总开关都是自己的：任一子系统启用都能单独工作，
+        # `memory.enabled=false` 不影响画像，反之亦然。
+        self._persona_enabled = config.persona.enabled
+        # 画像门禁是记忆门禁的一份拷贝，只把 `enabled` 换成画像自己的开关（合同 §47）：
+        # 接入名单、`access_mode` 与「只有 DM」的私有口径因此与记忆逐字一致。
+        self._persona_access = MemoryAccessPolicy(
+            replace(config.memory, enabled=config.persona.enabled)
+        )
+        # 「画像能力真的装好了」的唯一事实来源（与 `_memory_armed` 同款）：worker 池跑起来
+        # 之后才置真，装配失败时 Router 一个画像参数都拿不到。
+        self._persona_armed = False
+        self._persona_service: MemoryService | None = None
+        self._persona_writer: PersonaWriter | None = persona_writer
+        self._persona_sources: PersonaSources | None = persona_sources
+        self._persona_controller: PersonaController | None = persona_controller
+        # 画像命令队列沿用记忆的队列容量（设计 §12：不为新子系统新造一套容量旋钮）。
+        self._persona_queue: SessionScheduler[PersonaCommandRequest] = SessionScheduler(
+            maxsize=config.memory.queue_size
+        )
+        self._persona_workers = WorkerPool(
+            queue=self._persona_queue,
+            handler=self._handle_persona_command,
+            concurrency=1,
+        )
+        # 送达后自动更新的**进程内**证据缓冲（设计 §6）：每人一份有界 deque，重启即丢，
+        # 不补存原始对话、不落盘。`_persona_updates` 保证同一用户同时只有一次在途更新。
+        # 每一条是 `(站点消息 id, 带宿主标签与日期的证据行)`：清除时只按 id 移除处理过的那些。
+        self._persona_pending: dict[str, deque[tuple[int, str]]] = {}
+        self._persona_updates: dict[str, asyncio.Task[None]] = {}
+        # 每用户在途的**画像命令子任务**（可被控制命令立刻取消）与「被控制取消过」的标记。
+        self._persona_children: dict[str, asyncio.Task[None]] = {}
+        self._persona_child_cancelled: set[asyncio.Task[None]] = set()
+        # 控制代次（每收到一条授权的控制命令加一）与「待停止」期间的私有注入抑制集合。
+        self._persona_control_seq: dict[str, int] = {}
+        self._persona_private_suppressed: set[str] = set()
+        self._persona_routing: OrderedDict[str, bool] = OrderedDict()
+
         self._workers = WorkerPool(
             queue=self._queue,
             handler=self._handle_request,
@@ -598,6 +692,9 @@ class BotApp:
         # 记忆装配（§34.2 第 1-3 步）：必须在聊天 worker 与评论服务启动之前，
         # 且整段只在 `memory.enabled=true` 时执行（D-60）。整段成功跑完才会置 `_memory_armed`。
         await self._start_memory()
+        # 画像装配（设计 §12）：紧跟记忆之后、同样早于聊天 worker 与评论服务。它与记忆共享
+        # 服务实例（同一个写入者），但有自己的 writer / sources / controller / worker。
+        await self._start_persona()
         await self._start_images(user)
 
         # 记忆路径的三种参数要么都给，要么都不给：全都为 None 时 Router 的行为与
@@ -605,6 +702,8 @@ class BotApp:
         # 只有记忆 worker 真的在跑，记忆命令才有消费者（§34.3 的 `memory_queued` 终态由它落笔）。
         # 装配失败时这一段与 `memory.enabled=false` 完全同形，`enabled=false` 走的就是这条。
         memory_on = self._memory_armed
+        # 画像的三个参数同样要么都给、要么都不给（与记忆同款）：判据是画像 worker 真的在跑。
+        persona_on = self._persona_armed
         self._router = MessageRouter(
             self_user_id=user.id,
             bot_username=self._config.secrets.username,
@@ -622,6 +721,19 @@ class BotApp:
             image_queue=self._image_queue if self._image_armed else None,
             image_enabled=self._image_armed,
             site_base_url=self._config.site.base_url,
+            persona_access=self._persona_access if persona_on else None,
+            persona_queue=self._persona_queue if persona_on else None,
+            # 流程快照回调（同步、无 I/O）：Router 靠它识别编号回答与回复草稿的输入。
+            persona_session=self._persona_hint if persona_on else None,
+            # 迁移标记回调：与画像是否装配**无关** —— 用户已经迁移到画像、而画像子系统
+            # 临时起不来时，旧个人记忆命令更不能重新开始工作（设计 §11 末段）。
+            # 它是同步缓存读，只作 UX 加速；真正的旧记忆读写门禁在服务层（设计 §11）。
+            persona_migrated=self._persona_migrated,
+            # 立即控制（设计 §6）：授权控制命令一到达就同步失效旧状态与在途任务；
+            # 代次回调给每条入队请求盖章。两者都不注入时行为与本次改动前一致。
+            persona_control=self._persona_control_received,
+            persona_control_epoch=self._persona_control_epoch,
+            persona_prepare=self._prepare_persona_user if persona_on else None,
         )
         # MCP 是可选扩展：任何连接、发现或子进程错误只让对应 feature 不可用，
         # 不得阻止普通聊天、评论或健康端点启动。
@@ -696,6 +808,7 @@ class BotApp:
                     # §34.2 第 5 步：与聊天侧同一个总闸，关闭时**不注入**任何记忆能力，
                     # 评论路径因此一次都不碰记忆（D-60）。
                     memory_access=self._memory_access if memory_on else None,
+                    persona_access=self._persona_access if persona_on else None,
                 )
                 self._comment_service = CommentService(
                     self._client,
@@ -722,7 +835,7 @@ class BotApp:
                     # 共同记忆只可能返回 `all_user`、公开条目只来自 `public/`；关闭时
                     # 同样不注入，评论侧连一个方法都拿不到。
                     memory_context=(
-                        self._comment_memory_items if memory_on else None
+                        self._comment_memory_items if (memory_on or persona_on) else None
                     ),
                     # §26.1 的 `common_context_tokens` 同样管评论侧：评论的整轮预算更小
                     # （`comments.context_input_tokens`），共同记忆不该把它吃光（§26.2 第 8 条）。
@@ -734,7 +847,7 @@ class BotApp:
                     # 公开条目装不下时整条跳过，先保住既有记忆（D-103 第 5 条）。
                     memory_public_tokens=(
                         self._config.memory.public_personal_context_tokens
-                        if memory_on
+                        if (memory_on or persona_on)
                         else None
                     ),
                 )
@@ -913,6 +1026,9 @@ class BotApp:
             service = self._comment_service
             if service is None or not service.alive:
                 return False
+        if self._persona_enabled and self._persona_armed and not self._persona_workers.alive:
+            # 画像启用且确实装过、worker 又死了：与聊天/评论同款判定为不健康。
+            return False
         return True
 
     def status_snapshot(self) -> dict[str, object]:
@@ -953,18 +1069,26 @@ class BotApp:
                 "armed": self._memory_armed,
                 "available": bool(memory_service is not None and memory_service.available),
             },
+            # 画像只报「配置意图 / 是否装配 / 有没有在途更新计数」这类计数，
+            # 不含短文、问题、回答或任何身份。
+            "persona": {
+                "enabled": self._persona_enabled,
+                "armed": self._persona_armed,
+                "pending_updates": len(self._persona_updates),
+            },
             "archive": self._archive_status() or {"enabled": False},
         }
 
     # --- 长期记忆（§34.2 / §34.3 / §30.1） -----------------------------------
 
     async def _start_memory(self) -> None:
-        """记忆装配的第一段（§34.2 第 1-3 步）；`enabled=false` 时整体跳过（D-60）。
+        """记忆装配的第一段（§34.2 第 1-3 步）；两个开关都关时整体跳过（D-60）。
 
-        关闭时连策略也不构造注入：Router 的三个记忆参数都为 `None`，`/remember` 仍是普通聊天，
-        `/search /remember x` 仍是普通搜索请求，`/help` 也不出现长期记忆与记忆命令两段。
+        关闭的判据是**两个子系统都关**：画像与记忆共享同一个 `MemoryService`（同一个存储根
+        目录、同一把写锁），因此只要有一个启用，服务实例就要建出来。旧记忆自己的行为一点都
+        不变 —— 服务实例存在不等于能力被装配，`/remember` 是否可用仍由 `_memory_armed` 决定。
         """
-        if not self._memory_enabled:
+        if not self._memory_enabled and not self._persona_enabled:
             return
         service = self._memory_service
         if service is None:
@@ -977,18 +1101,23 @@ class BotApp:
                 redactor=self._redactor,
             )
             self._memory_service = service
-        try:
-            # 服务自己承诺绝不抛出（§30.1），这一层兜的是注入的替身与将来的回归：
-            # 记忆起不来只记账，绝不阻止聊天、评论与健康端点启动（D-60）。
-            await service.start()
-        except Exception as exc:
-            log_event(
-                _logger,
-                logging.WARNING,
-                "memory.load_failed",
-                scope="common",
-                error=type(exc).__name__,
-            )
+        if self._memory_enabled:
+            try:
+                # 服务自己承诺绝不抛出（§30.1），这一层兜的是注入的替身与将来的回归：
+                # 记忆起不来只记账，绝不阻止聊天、评论与健康端点启动（D-60）。
+                await service.start()
+            except Exception as exc:
+                log_event(
+                    _logger,
+                    logging.WARNING,
+                    "memory.load_failed",
+                    scope="common",
+                    error=type(exc).__name__,
+                )
+        if not self._memory_enabled:
+            # 只启用画像：不构造记忆撰写器/控制器、不启动记忆 worker（队列没有消费者就
+            # 绝不能把记忆命令排进去，D-15），服务实例本身留给画像用。
+            return
         try:
             # 第 2-3 步（§34.2）与 MCP/KB 的邻居同款地包在软故障里：两个构造函数今天
             # 只是纯赋值，但将来的任何参数校验都会把一次记忆问题升级成启动失败 —— 那与
@@ -1028,10 +1157,23 @@ class BotApp:
             return
         # §47.4：公开 subject 的解析器在记忆路径**真的装好之后**单独装配 —— 它失败只该让
         # 「公开个人记忆」这一格缺席，不该把已经装好的共同/私有记忆一起关掉（D-60）。
-        # 索引取自服务的内存快照（同步、无 I/O），站点查询复用同一个 `SiteClient`。
+        self._start_public_resolver()
+
+    def _start_public_resolver(self) -> None:
+        """装配公开 subject 解析器（§47.4、设计 §7）；已经装好时什么都不做。
+
+        索引是**旧公开个人记忆与公开画像的合并索引**：两条来源各自维护一份内存快照
+        （同步、无 I/O），合并在这一层完成，重名的用户名合并成一条 owner 列表（去重保序），
+        解析器因此只查一次表。站点查询复用同一个 `SiteClient`（§6.4 的身份校验）。
+        """
+        if self._public_memory_resolver is not None:
+            return
+        service = self._memory_service
+        if service is None or not (self._memory_armed or self._persona_armed or self._persona_enabled):
+            return
         try:
             self._public_memory_resolver = PublicMemorySubjectResolver(
-                index_provider=service.public_username_index,
+                index_provider=lambda: self._public_username_index(service),
                 client=self._client,
                 max_subjects=self._config.memory.max_public_subjects_per_turn,
             )
@@ -1044,6 +1186,29 @@ class BotApp:
                 reason="resolver",
                 error=type(exc).__name__,
             )
+
+    def _public_username_index(
+        self, service: MemoryService
+    ) -> Mapping[str, tuple[str, ...]]:
+        """旧公开个人记忆与公开画像的合并索引（设计 §7、§11）：`username -> owner keys`。
+
+        两份索引各自可能缺席（旧记忆关闭时前者为空、画像未启动时后者为空），任一份读失败
+        都只当它是空的 —— 公开上下文是可选增强，绝不能因此让一轮聊天失败（D-60）。
+        重名不做取舍，而是合并：两条来源下的同名用户各自有独立的 owner key，丢掉任何一条
+        都会让某位用户「明明公开了却读不到」。
+        """
+        merged: dict[str, list[str]] = {}
+        for provider in (service.public_username_index, service.persona_public_username_index):
+            try:
+                index = provider()
+            except Exception:
+                continue
+            for username, keys in index.items():
+                bucket = merged.setdefault(username, [])
+                for key in keys:
+                    if key not in bucket:
+                        bucket.append(key)
+        return {username: tuple(keys) for username, keys in merged.items()}
 
     def _memory_private_enabled(self, user_id: str | None) -> bool:
         """`/help` 的 `private_enabled` 回调（§34.1 第 3 条，D-67）。
@@ -1059,6 +1224,229 @@ class BotApp:
             return False
         settings = service.private_settings_cached(user_id)
         return bool(settings is not None and settings.private_enabled)
+
+    # --- 用户画像（设计 §8、§12） -------------------------------------------
+
+    async def _start_persona(self) -> None:
+        """画像装配（设计 §12）；`persona.enabled=false` 时整体跳过。
+
+        顺序与记忆同款：服务（共享实例）→ 撰写器 / 采集器 / 控制器 → 画像 worker →
+        公开 subject 解析器。整段成功跑完才置 `_persona_armed`：失败时 Router 一个画像
+        参数都拿不到，`/persona` 退回普通正文，而聊天、评论与健康端点完全不受影响（D-60）。
+
+        画像**不会**因此打开旧记忆的任何开关：`start_persona` 只翻转画像自己的门禁
+        （`memory.enabled=false` 的部署照样只跑画像）。
+        """
+        if not self._persona_enabled:
+            return
+        service = self._memory_service
+        if service is None:  # pragma: no cover - `_start_memory` 已按同一开关建好实例
+            log_event(
+                _logger,
+                logging.WARNING,
+                "app.persona_start_failed",
+                error="service_missing",
+            )
+            return
+        self._persona_service = service
+        try:
+            await service.start_persona(
+                workflow_ttl_seconds=float(self._config.persona.workflow_ttl_seconds)
+            )
+            if not getattr(service, "persona_available", True):
+                log_event(_logger, logging.WARNING, "app.persona_start_failed", error="storage_unavailable")
+                return
+        except Exception as exc:
+            log_event(
+                _logger,
+                logging.WARNING,
+                "app.persona_start_failed",
+                error=type(exc).__name__,
+            )
+            return
+        try:
+            writer = self._persona_writer
+            if writer is None and self._model is not None:
+                # 撰写器绑定同一个主模型客户端与同一道并发门（设计 §12 末段）。
+                writer = PersonaWriter(
+                    self._model,
+                    model_gate=self._model_gate,
+                    redactor=self._redactor,
+                    max_context_tokens=self._config.persona.writer_context_tokens,
+                    timeout_seconds=self._config.persona.writer_timeout_seconds,
+                    max_calls=self._config.persona.max_model_calls,
+                    max_paragraph_chars=self._config.persona.max_paragraph_chars,
+                )
+                self._persona_writer = writer
+            if self._persona_sources is None:
+                self._persona_sources = PersonaSources(
+                    self._client,
+                    redactor=self._redactor,
+                    blog_pages=self._config.persona.blog_pages,
+                    message_pages=self._config.persona.message_pages,
+                )
+            controller = self._persona_controller
+            if controller is None and writer is not None:
+                controller = PersonaController(
+                    service=service,
+                    writer=writer,
+                    sources=self._persona_sources,
+                    access=self._persona_access,
+                    config=self._config.persona,
+                    # 单条展示的字符上限就是聊天回复的上限：草稿连编号与操作说明一起装进
+                    # 一条消息，装不下时保留待办、不发送（设计 §9 的展示检查）。
+                    max_display_chars=self._config.behavior.max_output_chars,
+                    now=self._now,
+                )
+                self._persona_controller = controller
+            if controller is None:
+                # 没有撰写器就没有可用的画像能力：不启动队列，避免有队列没消费者（D-15）。
+                log_event(
+                    _logger,
+                    logging.WARNING,
+                    "app.persona_start_failed",
+                    error="writer_missing",
+                )
+                return
+            await self._persona_workers.start()
+            self._persona_armed = True
+            log_event(_logger, logging.INFO, "app.persona_started")
+        except Exception as exc:
+            log_event(
+                _logger,
+                logging.WARNING,
+                "app.persona_start_failed",
+                error=type(exc).__name__,
+            )
+            return
+        self._start_public_resolver()
+
+    def _persona_hint(self, user_id: str):
+        """Router 的流程快照回调（**同步、无 I/O**）：读 Controller 的内存快照。
+
+        未装配或快照取不到时返回 `None`：那时这条消息走普通聊天，用户发一次 `/persona`
+        即可重新装填快照（冷启动的第一条回复消息因此不会被误当成访谈输入）。
+        """
+        controller = self._persona_controller
+        if controller is None:
+            return None
+        try:
+            return controller.cached_hint(user_id)
+        except Exception:  # pragma: no cover - 纯内存读取，理论上不会失败
+            return None
+
+    async def _prepare_persona_user(self, user_id: str) -> None:
+        """本人私聊路由前恢复迁移门禁和未完成流程。"""
+        service = self._persona_service
+        if service is None:
+            return
+        try:
+            blocked = not await service.persona_legacy_allowed(user_id)
+            controller = self._persona_controller
+            if controller is not None:
+                await controller.warm_session(user_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            blocked = True
+            log_event(_logger, logging.WARNING, "persona.context_omitted", reason="internal")
+        self._persona_routing[user_id] = blocked
+        self._persona_routing.move_to_end(user_id)
+        while len(self._persona_routing) > 256:
+            self._persona_routing.popitem(last=False)
+
+    def _persona_migrated(self, user_id: str | None) -> bool:
+        """该用户是否已迁移到画像（设计 §11.6）；同步、只读内存快照。
+
+        `persona_cached` 是唯一的同步来源：快照没加载时按「未迁移」处理，因此迁移期的用户
+        不会因为一次冷读被误判。启动恢复会把用户文件逐个载入快照，所以进程刚起来时这一格
+        通常已经就位。
+        """
+        if user_id in self._persona_routing:
+            return self._persona_routing[user_id]
+        service = self._persona_service
+        if service is None or not user_id:
+            return False
+        try:
+            document = service.persona_cached(user_id)
+        except Exception:  # pragma: no cover - 纯内存读取，理论上不会失败
+            return False
+        return bool(document and document.get("migrated"))
+
+    async def _persona_private_items(
+        self, request: Request
+    ) -> tuple[SupplementalItem, ...]:
+        """本轮 DM 的私有画像条目（设计 §7）；未开启或没有短文时返回空元组。
+
+        **异步读本人画像**（`persona_get`：内存快照命中时不读盘，未命中才加载）：
+        冷启动或快照被淘汰之后，DM 的私有短文仍然按设计注入 —— 只读 64 条 LRU 的
+        `persona_cached` 会让被淘汰的用户静默失去私有资料（review P1-5）。
+        **只读本人的私有文件**：这一格与公开路径互补，大区/评论只看公开快照。
+
+        面试、编辑与公开预览期间照常注入（画像仍在使用，只有自动更新被暂停）；
+        `off` / `clear` *待完成*期间不注入 —— 用户已经要求停止，上下文不该继续参考它。
+        """
+        service = self._persona_service
+        user_id = request.message.author.id
+        if service is None or not user_id or request.channel_kind != "dm":
+            return ()
+        if user_id in self._persona_private_suppressed:
+            return ()
+        try:
+            document = await service.persona_get(user_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log_event(
+                _logger,
+                logging.WARNING,
+                "persona.context_omitted",
+                scope="persona_user",
+                reason="internal",
+            )
+            return ()
+        if not document or not document.get("enabled"):
+            return ()
+        paragraph = str(document.get("paragraph") or "").strip()
+        if not paragraph:
+            return ()
+        # 分组名由画像模块定（`persona_user`），与记忆的私有分组**不同**：两者可以同时存在
+        # （迁移期旧私有记忆还在盘上），标签因此各自可辨。
+        return (
+            SupplementalItem(
+                group=PERSONA_USER_GROUP,
+                label=f"UP-{int(document.get('revision') or 0)}",
+                content=paragraph,
+                # 与私有记忆同一档优先级：它同样是「本人的资料」，不与共同记忆抢位置。
+                priority=0,
+            ),
+        )
+
+    async def _persona_is_migrated(self, user_id: str | None) -> bool:
+        """该用户是否已迁移到画像（**异步、可能读盘**）：上下文与自动提取的判据。
+
+        与 Router 的同步回调分开：路由层只能看内存快照，而「要不要注入旧私有记忆」
+        「要不要运行旧自动提取」是会影响持久数据的决定，必须拿到磁盘上的真实答案 ——
+        `persona_is_migrated` 存在时用它（A4 的异步入口），否则退回加载完整画像。
+        """
+        service = self._persona_service
+        if service is None or not user_id:
+            return False
+        reader = getattr(service, "persona_is_migrated", None)
+        if callable(reader):
+            try:
+                return bool(await reader(user_id))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+        try:
+            document = await service.persona_get(user_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+        return bool(document and document.get("migrated"))
 
     def _supplemental_caps(self) -> tuple[SupplementalCap, ...]:
         """补充资料的分组 token 上限（§33、§26.1）：把 `memory.*_context_tokens` 接上。
@@ -1078,9 +1466,15 @@ class BotApp:
             SupplementalCap(
                 ("memory_all_user", "memory_lobby"), memory.common_context_tokens
             ),
-            SupplementalCap(("memory_user",), memory.private_context_tokens),
+            # 画像的私有短文与旧私有记忆**合用一个上限**：它们都是「本人的资料」，在同一个
+            # DM 轮里互斥地出现（迁移期两者可能并存），各给一份上限会让一整轮资料翻倍。
             SupplementalCap(
-                ("memory_public_personal",), memory.public_personal_context_tokens
+                ("memory_user", PERSONA_USER_GROUP), memory.private_context_tokens
+            ),
+            # 公开画像与旧公开个人记忆同样合用一个上限（`persona_public` 由 A 侧返回）。
+            SupplementalCap(
+                ("memory_public_personal", PERSONA_PUBLIC_GROUP),
+                memory.public_personal_context_tokens,
             ),
         )
 
@@ -1114,19 +1508,26 @@ class BotApp:
                 error=type(exc).__name__,
             )
             return ()
-        return tuple(context.items)
+        if not await self._persona_is_migrated(request.message.author.id):
+            return tuple(context.items)
+        # 设计 §11.5：已迁移用户的普通请求**不再注入旧个人条目**（旧文件只作备份），
+        # 共同记忆照常。这一层只按分组名过滤，不认识任何条目内容。
+        return tuple(
+            item for item in context.items if item.group != _MEMORY_PRIVATE_GROUP
+        )
 
     def _public_memory_active(self, request: Request) -> bool:
-        """本轮的公开个人记忆路径是否生效（§47.4 第 2 条）；三个条件缺一不可。
+        """本轮的公开个人资料（旧公开记忆 + 公开画像）路径是否生效；三个条件缺一不可。
 
-        - 解析器已装配：`memory.enabled=false` 或记忆装配失败时它不存在，这一格整段跳过；
-        - `request.memory_allowed`：作者没过 Beta 门时连本地公开索引都不该看；
-        - 频道是 `"lobby"`：**DM 绝不加载任何人的公开个人记忆**（R4 的同一条口径），
+        - 解析器已装配：两个子系统都关或装配失败时它不存在，这一格整段跳过；
+        - `memory_allowed` 或 `persona_allowed`：作者没过**对应子系统**的门时连本地公开
+          索引都不该看。两条来源共用一次解析，因此只要求任一来源可用；
+        - 频道是 `"lobby"`：**DM 绝不加载任何人的公开资料**（R4 的同一条口径），
           连一次站点查询都不发。
         """
         return (
             self._public_memory_resolver is not None
-            and request.memory_allowed
+            and (request.memory_allowed or request.persona_allowed)
             and request.channel_kind == "lobby"
         )
 
@@ -1190,10 +1591,13 @@ class BotApp:
             return ()
         # 取回与软故障由 `_public_context_items` 统一处理：评论路径问的是同一件事，
         # 只有输入的构造方式不同。
-        return await self._public_context_items(subjects, request.channel_kind)
+        return await self._public_context_items(subjects, request.channel_kind,
+                                                memory_allowed=request.memory_allowed,
+                                                persona_allowed=request.persona_allowed)
 
     async def _public_context_items(
-        self, subjects: tuple[PublicMemorySubject, ...], channel_kind: str
+        self, subjects: tuple[PublicMemorySubject, ...], channel_kind: str,
+        *, memory_allowed: bool = True, persona_allowed: bool = True,
     ) -> tuple[SupplementalItem, ...]:
         """按已经解析出的 subject 取回公开个人条目（§42.7）；任何失败返回空元组（§47.5）。
 
@@ -1204,11 +1608,14 @@ class BotApp:
         service = self._memory_service
         if service is None or not subjects:
             return ()
+        items: tuple[SupplementalItem, ...] = ()
         try:
-            context = await service.public_context_for(
-                subjects=subjects, channel_kind=channel_kind
-            )
-            return tuple(context.items)
+            # 旧公开个人记忆（§42.7）：`memory.enabled=false` 时服务内部返回空结果。
+            if memory_allowed:
+                context = await service.public_context_for(
+                    subjects=subjects, channel_kind=channel_kind
+                )
+                items = tuple(context.items)
         except Exception as exc:
             # 软故障（§47.5）：已经解析出来的 subject 一个都不落地，回答照常生成。
             # `subject_count` 是本轮解析出的 owner 数（§51 的白名单字段），不含任何身份。
@@ -1221,7 +1628,27 @@ class BotApp:
                 subject_count=len(subjects),
                 error=type(exc).__name__,
             )
-            return ()
+        # 公开画像（设计 §7）：**同一批 subject、另一个只读目录**，两路互不牵连 ——
+        # 旧公开记忆读失败不影响公开画像，反之亦然（都是软故障）。
+        if self._persona_armed and persona_allowed:
+            try:
+                items = (
+                    *items,
+                    *await service.persona_public_context(
+                        subjects=subjects, channel_kind=channel_kind
+                    ),
+                )
+            except Exception as exc:  # pragma: no cover - 服务内部已吞异常
+                log_event(
+                    _logger,
+                    logging.WARNING,
+                    "memory.context_omitted",
+                    scope="persona_public",
+                    reason="internal",
+                    subject_count=len(subjects),
+                    error=type(exc).__name__,
+                )
+        return items
 
     def _auto_capture_eligible(self, request: Request) -> bool:
         """§34.4 的自动提取前置条件；**全部**同时成立才为真。
@@ -1302,6 +1729,12 @@ class BotApp:
         的红线（§37），而用户已经显式开启了自动记忆，写入依据也只是他自己的原文。
         """
         if not self._auto_capture_eligible(request):
+            return answer
+        if await self._persona_is_migrated(request.message.author.id):
+            # 设计 §11.5：已迁移用户的普通请求不再运行旧自动提取（新路径由画像的送达后
+            # 更新负责）。这一步要**读盘**，因此放在只读内存的本地判定**之后**：绝大多数
+            # 回合在上一行就返回了，只有真的可能写入的回合才付这次加载。
+            return answer
             return answer
         controller = self._memory_controller
         if controller is None:
@@ -1391,11 +1824,11 @@ class BotApp:
         `memory_allowed` 为假时两路都不读：门禁由评论服务在调用前判过（§48.2），走到这里
         时它恒为真，这一层只是纵深防御 —— 将来哪个调用方改了门禁，也不会让读取面静默变宽。
         """
-        if not inputs.memory_allowed:
+        if not (inputs.memory_allowed or inputs.persona_allowed):
             return ()
         items: tuple[SupplementalItem, ...] = ()
         service = self._memory_service
-        if service is not None:
+        if inputs.memory_allowed and service is not None:
             try:
                 context = await service.context_for(
                     user_id=None,
@@ -1468,7 +1901,9 @@ class BotApp:
                 error=type(exc).__name__,
             )
             return ()
-        return await self._public_context_items(subjects, inputs.channel_kind)
+        return await self._public_context_items(subjects, inputs.channel_kind,
+                                                memory_allowed=inputs.memory_allowed,
+                                                persona_allowed=inputs.persona_allowed)
 
     async def _handle_memory_command(self, request: MemoryCommandRequest) -> None:
         """记忆 worker 的处理：执行命令 → 回一条本地文案 → 无论成败都标记终态（§34.3）。
@@ -1496,6 +1931,13 @@ class BotApp:
                 return
             if self._is_expired(getattr(request, "expires_at", None)):
                 return
+            if (self._persona_armed and MessageRouter._is_personal_memory_command(request.command)
+                    and self._persona_service is not None
+                    and not await self._persona_service.persona_legacy_allowed(request.user_id)):
+                await self._send_message(request.channel_id, texts.PERSONA_MIGRATED_TEXT,
+                                         request.message_id, kind="notice_local", thread_root_id=None,
+                                         expires_at=getattr(request, "expires_at", None))
+                return
             result = await controller.execute_command(request)
             if self._is_expired(getattr(request, "expires_at", None)):
                 return
@@ -1515,6 +1957,345 @@ class BotApp:
             await self._mark_handled_for_deadline(
                 request.message_id, getattr(request, "expires_at", None)
             )
+
+    # --- 用户画像 worker（设计 §8、§9） --------------------------------------
+
+    async def _handle_persona_command(self, request: PersonaCommandRequest) -> None:
+        """画像 worker 的处理：丢弃被取代的请求 → 在**子任务**里执行 → 结算终态。
+
+        与记忆命令的三点差别：
+
+        - 文案同样用 `notice_local`（应答明确用户动作，不占主动通知名额）；
+        - 发送**确认送达之后**才回调 `mark_delivered`（设计 §9：确认只接受已送达的当前草稿，
+          没送达的草稿不能成为确认依据）；
+        - 使用说明送达后才开始采集（设计 §3.1），因此允许最多 `_PERSONA_FOLLOW_UP_LIMIT`
+          条后续文案。
+
+        命令体跑在**每用户一个子任务**里（`_persona_children`）：用户随手发一条
+        `/persona off` 时，装配层能立刻取消这位用户在途的采集/生成，而不必等它跑完
+        （设计 §6 的「立即使旧令牌失效」）。子任务被控制命令取消是**正常结局**：这里吞掉
+        那一次 `CancelledError`，worker 池与其它用户的命令都不受影响。
+        """
+        if self._persona_command_superseded(request):
+            log_event(
+                _logger,
+                logging.INFO,
+                "persona.command",
+                status="superseded",
+                kind=request.command.name or "usage",
+            )
+            await self._mark_handled_for_deadline(
+                request.message_id, getattr(request, "expires_at", None)
+            )
+            return
+        task = asyncio.create_task(
+            self._persona_command_body(request), name="bot-persona-cmd"
+        )
+        self._persona_children[request.user_id] = task
+        try:
+            await task
+        except asyncio.CancelledError:
+            if task in self._persona_child_cancelled:
+                self._persona_child_cancelled.discard(task)
+                log_event(
+                    _logger,
+                    logging.INFO,
+                    "persona.command",
+                    status="cancelled_by_control",
+                    kind=request.command.name or "usage",
+                )
+            else:
+                # 关闭流程取消的是**这一个** worker 任务：照原样传播。
+                task.cancel()
+                raise
+        finally:
+            if self._persona_children.get(request.user_id) is task:
+                self._persona_children.pop(request.user_id, None)
+            await self._mark_handled_for_deadline(
+                request.message_id, getattr(request, "expires_at", None)
+            )
+
+    def _persona_command_superseded(self, request: PersonaCommandRequest) -> bool:
+        """丢弃已被更晚控制命令取代的流程请求。"""
+        if request.command.name not in MUTATING_COMMANDS:
+            return False
+        return request.control_seq != self._persona_control_epoch(request.user_id)
+
+    async def _persona_command_body(self, request: PersonaCommandRequest) -> None:
+        """一条画像命令的实际执行（跑在子任务里，可被控制命令取消）。"""
+        if self._is_expired(getattr(request, "expires_at", None)):
+            return
+        controller = self._persona_controller
+        if controller is None:
+            # 软故障也要**可见**：这条命令只能被就地放弃，终态照留在调用方的 finally 里。
+            log_event(
+                _logger,
+                logging.WARNING,
+                "persona.command",
+                status="unavailable",
+                reason="controller_unavailable",
+            )
+            return
+        result = await controller.execute_command(request)
+        if request.command.name in ("on", "cancel", "confirm") and result.status in ("ok", "noop"):
+            # 重新开启成功：撤掉「待停止」期间对私有短文注入的抑制。
+            document = await self._persona_service.persona_get(request.user_id)
+            if document and document.get("enabled"):
+                self._persona_private_suppressed.discard(request.user_id)
+        if self._is_expired(getattr(request, "expires_at", None)):
+            return
+        if self._unavailable or not result.text:
+            return
+        outcome = await self._send_message(
+            request.channel_id,
+            result.text,
+            request.message_id,
+            kind="notice_local",
+            thread_root_id=None,
+            expires_at=getattr(request, "expires_at", None),
+        )
+        await self._persona_follow_up(request, controller, result, outcome)
+
+    async def _persona_follow_up(
+        self,
+        request: PersonaCommandRequest,
+        controller: PersonaController,
+        result: PersonaCommandResult,
+        outcome: SendResult,
+    ) -> None:
+        """送达回调链：把真实送达的消息 id 交给控制器，并转发它要求的后续文案。
+
+        只有**确认送达**才继续（`outcome.delivered`）：发送失败时流程停在原地，用户再发
+        `/persona` 就能重新展示当前进度。链条长度有上限，任何一步失败都就地停下。
+        """
+        if not outcome.delivered or not result.delivery_kind:
+            return
+        follow = await controller.mark_delivered(
+            request,
+            kind=result.delivery_kind,
+            draft_id=result.draft_id,
+            message_id=outcome.message_id,
+        )
+        for _ in range(_PERSONA_FOLLOW_UP_LIMIT):
+            if follow is None or not follow.text or not follow.delivery_kind:
+                return
+            if self._is_expired(getattr(request, "expires_at", None)) or self._unavailable:
+                return
+            outcome = await self._send_message(
+                request.channel_id,
+                follow.text,
+                request.message_id,
+                kind="notice_local",
+                thread_root_id=None,
+                expires_at=getattr(request, "expires_at", None),
+            )
+            if not outcome.delivered:
+                return
+            follow = await controller.mark_delivered(
+                request,
+                kind=follow.delivery_kind,
+                draft_id=follow.draft_id,
+                message_id=outcome.message_id,
+            )
+
+    # --- 送达后自动更新（设计 §6） ------------------------------------------
+
+    def _persona_update_eligible(self, request: Request) -> bool:
+        """本轮是否算一次「有效用户消息」（设计 §6 的三个前置条件）。
+
+        与 `_auto_capture_eligible` 同一套口径：只在本人 DM、只算普通聊天轮，且排除
+        单轮能力命令与依赖外部资料的回合 —— 那些回合的问题是冲着资料去的，用户自己写下的
+        十几个字不构成关于他的证据。用户侧开关、节流与在途状态由 `PersonaController`
+        复查（它是唯一知道画像现状的地方）。
+        """
+        if not self._persona_armed or not self._config.persona.auto_update_available:
+            return False
+        if request.channel_kind != "dm":
+            return False
+        if not request.persona_allowed or not request.message.author.id:
+            return False
+        if request.enabled_features:
+            return False
+        if self._ctx.generation(request.session_key) != request.generation:
+            return False
+        message = request.message
+        if has_media(message):
+            return False
+        if _reply_image_url(request) is not None:
+            return False
+        if any(find_refs(text) for text in _ref_source_texts(request) if text):
+            return False
+        return True
+
+    def _note_persona_evidence(self, request: Request) -> None:
+        """把这一轮的本人原始正文记进进程内缓冲（设计 §6）；只在送达之后调用。
+
+        每条形如 `[dm:<消息 id>|<宿主 UTC 日期>] 用户原文`：来源标签与日期都来自**宿主**
+        （消息 id 是站点给的真实 id），因此后续压缩出的观察摘要带得住可核查的引用与跨日期
+        证据。缓冲**有界**（每人 `update_messages` 条，满了挤掉最旧的），每人一份、
+        每人一条在途更新任务，用户数也有上限：重启即丢，不补存原始对话，也不落盘。
+        """
+        if not self._persona_update_eligible(request):
+            return
+        user_id = request.message.author.id
+        text = request.user_text.strip()
+        if not text or user_id in self._persona_private_suppressed:
+            # 「待停止」期间不再收集新证据：用户已经要求关闭，不能继续攒。
+            return
+        limit = max(1, int(self._config.persona.update_messages))
+        buffer = self._persona_pending.get(user_id)
+        if buffer is None:
+            if len(self._persona_pending) >= _PERSONA_EVIDENCE_USERS_MAX:
+                # 显式上界：用户数超过上限时丢最旧的那一位（有界内存优先于完整性）。
+                self._persona_pending.pop(next(iter(self._persona_pending)), None)
+            buffer = deque(maxlen=limit)
+            self._persona_pending[user_id] = buffer
+        buffer.append((int(request.message.id), _persona_evidence_line(
+            request.message.id, text, self._now()
+        )))
+        if len(buffer) >= limit:
+            self._schedule_persona_update(user_id, request.message.id)
+
+    def _schedule_persona_update(self, user_id: str, message_id: int) -> None:
+        """起一个后台更新任务（同一用户同时只跑一个，全局也有并发上限）。"""
+        if user_id in self._persona_updates:
+            return
+        if len(self._persona_updates) >= _PERSONA_UPDATES_MAX:
+            # 在途更新太多：这一批证据留在缓冲里，等下一次送达再判断（有界任务数）。
+            return
+        task = asyncio.create_task(
+            self._run_persona_update(user_id, message_id), name="bot-persona-update"
+        )
+        self._persona_updates[user_id] = task
+        task.add_done_callback(lambda _t: self._persona_updates.pop(user_id, None))
+
+    async def _run_persona_update(self, user_id: str, message_id: int) -> None:
+        """一次合并更新：压缩与模型调用都在锁外，提交时由服务侧复核授权（设计 §6）。"""
+        buffer = self._persona_pending.get(user_id)
+        controller = self._persona_controller
+        if buffer is None or controller is None:
+            return
+        snapshot = tuple(buffer)
+        if not snapshot:
+            return
+        processed = {mid for mid, _ in snapshot}
+        try:
+            status = await controller.maybe_update(
+                user_id,
+                tuple(line for _, line in snapshot),
+                message_id=message_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log_event(
+                _logger,
+                logging.WARNING,
+                "persona.update",
+                status="unavailable",
+                reason="internal",
+            )
+            return
+        if status != STATUS_DEFERRED:
+            # 只按**处理过的那些 id** 移除：模型调用期间新到的消息（以及因为 deque 上限
+            # 被挤掉的旧条目）都不会被误删 —— 按长度 pop 会把还没处理的新消息删掉。
+            remaining = deque(
+                (mid, line) for mid, line in buffer if mid not in processed
+            )
+            remaining = deque(remaining, maxlen=buffer.maxlen)
+            if remaining:
+                self._persona_pending[user_id] = remaining
+            else:
+                self._persona_pending.pop(user_id, None)
+        if status not in ("ok", STATUS_DEFERRED):
+            log_event(_logger, logging.DEBUG, "persona.update", status=status)
+
+    # --- 立即控制（设计 §6、§7） --------------------------------------------
+
+    def _persona_control_received(self, user_id: str, control: str) -> None:
+        """Router 的同步回调：授权的控制命令一到达就失效旧状态（**无 I/O、不抛出**）。
+
+        做四件事，全部是「用户已经明确要求停止/改变」时唯一正确的即时反应：
+
+        1. 推进控制代次：排队中的旧请求（用旧代次入队）由 worker 在执行前丢弃；
+        2. 通知控制器丢掉流程快照并让在途的自动更新令牌失效；
+        3. `off` / `clear` / `cancel` 取消该用户在途的画像命令子任务，并清空证据缓冲；
+        4. `off` / `clear` 立刻抑制私有短文注入，`off` / `clear` / `private` 立刻让公开
+           副本对读取方不可见（`persona_quarantine`，服务层实现时生效）。
+
+        持久化仍由排队的那条命令完成 —— 这里只让「已经停止的世界」立刻成立。
+        """
+        if not user_id:
+            return
+        self._persona_control_seq[user_id] = self._persona_control_seq.get(user_id, 0) + 1
+        controller = self._persona_controller
+        if controller is not None:
+            try:
+                controller.control_received(user_id, control)
+            except Exception:  # pragma: no cover - 纯内存操作，理论上不会失败
+                log_event(
+                    _logger,
+                    logging.WARNING,
+                    "persona.control",
+                    status="failed",
+                    reason="controller",
+                )
+        if control in _PERSONA_STOP_CONTROLS:
+            self._cancel_persona_child(user_id)
+            self._persona_pending.pop(user_id, None)
+        if control in _PERSONA_PRIVATE_SUPPRESS_CONTROLS:
+            self._persona_private_suppressed.add(user_id)
+        if control in _PERSONA_PUBLIC_SUPPRESS_CONTROLS:
+            self._suppress_persona_public(user_id)
+
+    def _persona_control_epoch(self, user_id: str | None) -> int:
+        """该用户当前的控制代次（同步、无 I/O）；未知用户为 0。"""
+        if not user_id:
+            return 0
+        return int(self._persona_control_seq.get(user_id, 0))
+
+    def _cancel_persona_child(self, user_id: str) -> None:
+        """取消该用户在途的画像命令子任务（不杀 worker 池）。"""
+        task = self._persona_children.get(user_id)
+        if task is None or task.done():
+            return
+        # 先标记再取消：等待它的那个 worker 任务据此把这次取消当成**正常结局**。
+        self._persona_child_cancelled.add(task)
+        task.cancel()
+
+    def _suppress_persona_public(self, user_id: str) -> None:
+        """立刻让该用户的公开画像对读取方不可见（同步；服务层未实现时只记一条日志）。"""
+        service = self._persona_service
+        quarantine = getattr(service, "persona_quarantine", None)
+        if service is None or not callable(quarantine):
+            return
+        try:
+            quarantine(user_id)
+        except Exception:  # pragma: no cover - 纯内存操作，理论上不会失败
+            log_event(
+                _logger,
+                logging.WARNING,
+                "persona.control",
+                status="failed",
+                reason="quarantine",
+            )
+
+    async def _cancel_persona_tasks(self) -> None:
+        """关闭顺序里的第一步：取消全部在途的画像命令子任务与更新任务。"""
+        updates = tuple(self._persona_updates.values())
+        children = tuple(self._persona_children.values())
+        self._persona_updates.clear()
+        self._persona_children.clear()
+        self._persona_pending.clear()
+        self._persona_control_seq.clear()
+        self._persona_private_suppressed.clear()
+        # 关闭同样走「控制取消了子任务」这条路径：正在等待它的 worker 处理器据此把它当成
+        # 正常结局，不把 CancelledError 传播给事件循环里的其它任务（标记由消费者摘除）。
+        self._persona_child_cancelled.update(children)
+        for task in (*updates, *children):
+            task.cancel()
+        if updates or children:
+            await asyncio.gather(*updates, *children, return_exceptions=True)
 
     def _is_expired(self, expires_at: float | None) -> bool:
         """统一判定输入消息的截止时间；`None` 保留旧直接调用行为。"""
@@ -1584,6 +2365,9 @@ class BotApp:
             return
         elif result.action == "image_queued":
             # 只有图像 worker 负责结算这一触发消息。
+            return
+        elif result.action == "persona_queued":
+            # 画像命令已经躺在画像队列里：终态由画像 worker 负责（与记忆命令同款）。
             return
 
     async def _send_local(self, result: RouteResult) -> None:
@@ -1813,6 +2597,13 @@ class BotApp:
             supplemental: tuple[SupplementalItem, ...] = ()
             if request.memory_allowed:
                 supplemental = await self._memory_context_items(request)
+            if request.persona_allowed:
+                # 本人 DM 的私有画像（设计 §7）：与记忆候选**并列**，只多一组分组名不同的
+                # 条目；两个子系统各自启用，因此两条路径互不依赖。
+                supplemental = (
+                    *supplemental,
+                    *await self._persona_private_items(request),
+                )
             # 大区近期公开消息（§38.3）在这里渲染成逐条字符串：`ContextManager` 不认识
             # `LobbyRecentMessage`，只负责预算与拼装。DM 的 `lobby_recent` 恒为空元组，
             # 两个参数保持「同时为空」，整条路径与升级前逐字节一致。
@@ -2036,6 +2827,9 @@ class BotApp:
                         rendered,
                         subject=request.public_memory_subject,
                     )
+                # 送达后才算一次画像证据（设计 §6）：发送失败的这一轮不贡献任何观察，
+                # 也不进缓冲 —— 用户没看见答案的回合不属于已完成的对话。
+                self._note_persona_evidence(request)
             if outcome.reason == "quota":
                 await self._notify_quota(request)
         finally:
@@ -2622,6 +3416,11 @@ class BotApp:
         await self._workers.stop()
         # 记忆 worker 与主聊天 worker 同一阶段停下；此时没有新的记忆命令会被领取。
         await self._memory_workers.stop()
+        # 画像的在途任务必须先撤（设计 §12 末段）：更新任务用的是同一个模型客户端与服务，
+        # 晚撤就会在它们都关掉之后才落盘。顺序是「取消任务 → 停画像 worker → 停服务」。
+        await self._cancel_persona_tasks()
+        self._persona_armed = False
+        await self._persona_workers.stop()
         self._image_armed = False
         await self._image_workers.stop()
         if self._image_service is not None:
@@ -2631,10 +3430,15 @@ class BotApp:
         # 记忆刷新 task 在 worker 之后停（§34.2 第 3 步）：刷新的只是内存快照，
         # 但它要早于模型客户端与 Store，否则末次刷新会撞上已经关掉的东西。
         # 与启动同一条口径：关闭时连 stop() 都不必调（那时服务根本没被启动过，D-60）。
-        if self._memory_enabled:
+        if self._memory_enabled or self._persona_enabled:
             service = self._memory_service
             if service is not None:
-                await service.stop()
+                # 画像先停：推进纪元让在途令牌失效、清空画像缓存与索引，再停记忆刷新任务
+                # （§34.2 第 3 步：两者都要早于模型客户端与 Store）。
+                if self._persona_enabled:
+                    await service.stop_persona()
+                if self._memory_enabled:
+                    await service.stop()
 
         await self._ops.stop()
         await self._mcp_manager.stop()

@@ -2020,3 +2020,67 @@ Provider 的 `content_policy` 只来自有界错误信封明确 code/type；普�
 Service 先永久加入黑名单，再按 `uncertain` 处理本次额度并发送固定禁用提示，不写原始错误体。
 Store 的 `block_image_user` 幂等保留首次封禁，`unblock_image_user` 仅供本地管理入口使用。
 本地管理 `images.admin list` 只读；`block/unblock` 必须持有公共数据锁，作用域不唯一时要求 `--scope`。
+
+
+## 63. 用户画像（Linux 完整版）
+
+职责入口为 [commands.py](../../src/raricy_bot/persona/commands.py)、
+[controller.py](../../src/raricy_bot/persona/controller.py)、
+[sources.py](../../src/raricy_bot/persona/sources.py)、
+[writer.py](../../src/raricy_bot/persona/writer.py)、
+[models.py](../../src/raricy_bot/persona/models.py) 与
+[codec.py](../../src/raricy_bot/persona/codec.py)。装配见 `app.py`，路由见 `core/router.py`；
+固定用户文案由 `texts.py` 管理。理由与旧规则替代范围见 D-164–D-166，使用见 USAGE §3.5。
+
+### 63.1 配置与访问
+
+`PersonaConfig` 在 `config.py` 中独立配置，部署默认关闭，自动更新能力默认可用；
+采样数量固定为 5 篇博客、50 条本人有效 DM 和 5 题，分页及模型预算由配置限制。
+画像访问使用独立启用状态，名单和访问模式复用 `MemoryAccessPolicy`；
+`memory.enabled=false` 不代表 `persona.enabled=true` 时画像不可用。
+管理命令只允许稳定身份对应的本人 DM，公开路径只允许大区或评论，DM 不加载第三方公开画像。
+
+### 63.2 资料与模型
+
+`SiteClient.search_persona_blogs(username, page, per_page)` 使用站方作者搜索；
+`fetch_persona_blog(blog_id)` 保留作者 ID。列表与详情分别核验稳定作者 ID，禁止通过同名作者混入。
+DM 固定当前频道，以命令消息 ID 为采样水位，向过去分页；排除非本人、机器人、系统、删除、
+命令与纯图片消息。不足时返回实际数量和稳定警告，不能伪称读满。
+
+`PersonaWriter` 只输出问题、短文与特征，无站点写工具。动态来源、旧画像、答案和修改意见均为
+user 数据，system 为静态常量；输入输出均脱敏。JSON 严格限制字段、枚举和已知证据标签。
+初稿、编辑及自动更新的特征引用中混入未知标签时，仅剔除未知标签；清理后仍须至少一个有效引用。
+非字符串、空列表、超出引用数量上限或全部引用无效仍拒绝输出；阅读摘要的引用保持严格校验。
+信息不完整不阻止初稿生成或自动更新，不设来源数量、跨日期门槛；无依据的维度不生成特征条目。
+全部没有可用信息时允许空特征列表，短文简短说明待补充；不改变引用校验和用户锁定项保护。
+资料按上下文预算分块读取，压缩摘要供后续问答与草稿复用，不静默丢掉超限尾部。
+`budget={used, limit}` 属于当前工作流，每次模型调用前扣减，包含失败，累计用量随工作流保存。
+
+### 63.3 存储与提交
+
+`MemoryService` 负责单进程单写者，旧记忆与新画像共享写锁。独立 schema 存于
+`memory.root_dir/personas/users/`、`workflows/`、`public/`，文件名只按 owner key 派生。
+私有画像和工作流返回严格校验的 dict，类型与字段定义以 `persona/models.py` 为准。
+文件原子替换、修订号及操作 ID 用于冲突和重放控制；正文不写日志或 SQLite。
+
+`persona_confirm` 在锁内检查 owner、工作流期限、当前草稿编号、送达状态、基础修订号与基线指纹。
+新工作流由存储层捕获画像字段的 SHA-256 指纹，排除修订号与幂等表；同修订号的外部修改也会冲突。
+本人 DM 路由前异步恢复工作流与旧个人命令门禁，重启和缓存淘汰不会丢失访谈归属。
+提交的是已展示、已脱敏的确切短文与特征，先保存提交标记再清理工作流，恢复不会重复生效。
+每个建档或编辑流程只允许一次修改，失败后冻结原修改意见，取消或完成立即清除待办正文。
+`/reset` 不重置画像工作流或修改次数。终态记录保留无正文幂等元数据，过期工作流清除敏感正文。
+
+### 63.4 自动更新与公开
+
+自动更新只在本人普通 DM 的回答送达后观察本人原文，按数量、间隔及 UTC+8 日额度限流。
+模型调用在写锁外；`persona_begin_update` 取进程授权令牌，`persona_commit_update` 在锁内复核
+代次、版本、启用和编辑状态，保留用户锁定特征。关闭、清空、外部编辑或删除后旧结果不得写入。
+
+公开是单独预览确认的短文快照，不含访谈与证据；自动更新私有版本不改变公开版本。
+`persona_public_context` 只读公开路径；公开条目由现有精确 subject 解析器决定，按补充资料预算
+进入当前轮 user 消息。`persona_public` 组沿用公开资料静态说明及其 token 预算。
+聊天与评论分别携带画像和旧记忆门禁，各来源只在对应授权通过时读取。画像单独启用时也沿用资料预算。
+`off` 撤回公开并停止读取与更新，`on` 不重新发布；待撤回状态恢复时重试，未完成必须明确报告。
+
+迁移成功后停用旧个人资料的读取、写入与自动提取，旧公开副本先撤回，共同记忆继续原契约。
+清空保留迁移墓碑，防止重新使用旧私有文件。旧 `/memory off` 仍遵循 §32/D-102，新画像关闭按 D-165。

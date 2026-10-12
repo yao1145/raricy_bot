@@ -12,8 +12,9 @@
 | Light 独立发行版、首次配置与后台静默运行（L0–L5 已实现；干净 Windows 与真实站点验收待做） | [LIGHT_EDITION_DESIGN.md](design/LIGHT_EDITION_DESIGN.md)：完整版保留，包含架构、配置/凭据、进程控制、API、打包与验收设计 |
 | Light 下一代（N0–N4 已实施，N5 发行验收未做）：账号更换/删除、托盘与 Windows 登录启动 | [LIGHT_NEXT_GENERATION.md](design/LIGHT_NEXT_GENERATION.md)：现有代码审查、复现证据、档案事务、桌面集成、迁移与验收 |
 | 跨模块行为与代码入口 | [INTERFACES.md](design/INTERFACES.md) |
+| 用户画像（Linux 完整版） | [USAGE.md §3.5](usage/USAGE.md#35-用户画像-persona)：命令与审查流程；[INTERFACES.md §63](design/INTERFACES.md#63-用户画像linux-完整版)：采样、存储、更新与访问契约 |
 | 本次代码审查四项修复的问题、理由与替代关系 | [DESIGN_DECISIONS.md](design/DESIGN_DECISIONS.md) 的 D-115–D-118；已实施，一次性计划见[归档索引](ARCHIVE.md) |
-| 行为的理由、例外与取舍 | [DESIGN_DECISIONS.md](design/DESIGN_DECISIONS.md)（D-1–D-162；图像设计见 D-159，黑名单见 D-160，压缩与租期见 D-162） |
+| 行为的理由、例外与取舍 | [DESIGN_DECISIONS.md](design/DESIGN_DECISIONS.md)（D-1–D-166；用户画像见 D-164–D-166） |
 | 系统提示词规范 | [SYSTEM_PROMPTS.md](design/SYSTEM_PROMPTS.md)；文档不参与运行，配置提示词须同步到部署配置，静态附加说明须同步 `texts.py`；第三类静态来源（表情包，由已校验的部署配置渲染）见 §1.10、D-119 |
 | 用户命令、隐私说明、定时发文操作与待验收项 | [USAGE.md](usage/USAGE.md) |
 | 图像生成与编辑（完整版） | [使用方式](usage/USAGE.md#34-image-与-image-edit)、[部署配置](usage/DEPLOYMENT.md#图像接口配置)、[跨模块契约](design/INTERFACES.md#62-图像生成与编辑) |

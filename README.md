@@ -267,10 +267,16 @@ docker compose logs -f bot
   `/livez`、`/readyz`；记忆正文既不进日志也不进 SQLite。用户可见的说明见
   [`docs/usage/USAGE.md`](docs/usage/USAGE.md)，部署与灰度步骤见
   [`docs/usage/DEPLOYMENT.md`](docs/usage/DEPLOYMENT.md) §4.2.2。
+- **用户画像（Linux 完整版，默认关闭）**：启用 `persona.enabled` 后，在本人私聊使用
+  `/persona` 建档或查看，`on`/`off` 开关，`edit` 修改。首次阅读 5 篇本人博客与 50 条本人私聊，
+  回答 5 题、审查短文并确认，每次流程只可修改一次。确认后随送达的普通私聊自动更新。
+  默认私有，公开另行预览确认，关闭撤回公开；迁移后原个人命令转为画像入口，共同记忆保留。
+  详见[使用说明 §3.5](docs/usage/USAGE.md#35-用户画像-persona)。
 - **不主动联网、不能运行代码、查不到站内数据**：别人的余额、鱼干流水、通知、申诉进度，
   都要用户自己去对应页面看。
 - **图片与博客正文的边界**：图片默认关闭；聊天里**用户主动引用**的博客会读标题与正文
-  （上限 `behavior.quoted_blog_max_chars`，默认 1000 字，超限只给标题），没被引用的不读；
+  （上限 `behavior.quoted_blog_max_chars`，默认 1000 字，超限只给标题）；另在本人启动 `/persona`
+  建档时读取最近 5 篇本人博客，用途与采样规则见画像说明；
   聊天里**被回复消息的图**只取站点给的缩略图，不追原图；博客评论区只读文章标题和不
   超过 1000 字的正文，图则另受一轮 3 张（可配）的名额约束。
 - **旧聊天消息会静默跳过**：默认只处理站点创建时间在 3 小时内的消息（`behavior.message_max_age_seconds`）；
@@ -300,7 +306,8 @@ docker compose logs -f bot
 | `comments/` | 评论发现、独立队列、配额与发送 |
 | `capabilities.py`、`mcp/` | 能力声明、工具白名单、传输与适配 |
 | `kb/` | 本地只读 Markdown 检索 |
-| `memory/` | 共同/私有记忆、公开投影、命令与原子写入 |
+| `memory/` | 共同/私有记忆、公开投影、画像持久化与原子写入 |
+| `persona/` | 用户画像访谈、来源采样、生成与更新、命令编排 |
 | `blog/` | 定时发文的稿库/生成、调度、投递与只读对账 |
 | `logging_setup.py`、`redact.py` | 白名单日志、取值类型与出站脱敏；凭据登记中心 |
 | `error_archive.py` | 永久错误归档：JSONL 分片、只增不删、只读查询与校验 |
@@ -330,7 +337,7 @@ docker compose logs -f bot
 ——硬截断会让去重、水位或配额写入突然失败，后果比库变大严重得多。需要收缩物理文件时停机
 手工 `VACUUM`，步骤见 [`docs/usage/DEPLOYMENT.md`](docs/usage/DEPLOYMENT.md) §10.3。
 
-长期记忆（Beta，默认关闭）**不在 SQLite 里**：条目是 `memory.root_dir`（默认 `./data/memory`，
+长期记忆与用户画像（部署默认关闭）**不在 SQLite 里**：条目是 `memory.root_dir`（默认 `./data/memory`，
 容器里即 `/app/data/memory`）下的 Markdown 文件，按**敏感数据**管理——备份、恢复与访问控制
 见 [`docs/usage/DEPLOYMENT.md`](docs/usage/DEPLOYMENT.md) §4.2.2。
 

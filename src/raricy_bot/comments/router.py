@@ -69,6 +69,7 @@ class CommentRequest:
     # 当前评论作者能否使用共同记忆（§35）。未注入策略或门禁关闭时恒 False；
     # 为真也只意味着可以读 `all_user`，lobby 与用户私有文件在评论路径上永不读取。
     memory_allowed: bool = False
+    persona_allowed: bool = False
     # 当前评论作者的会话 subject（§48.1、公开设计 §14.3）：Router 在**仍持有**
     # `CommentNode.author.id` 时用 `user_storage_key` 算好，原始 ID 不离开路由器。
     # 只有不可逆的 owner key 与清洗后的用户名过界，供模型侧解析公开个人记忆。
@@ -195,6 +196,7 @@ class CommentRouter:
         logger: logging.Logger | None = None,
         vision_enabled: bool = False,
         memory_access: MemoryAccessPolicy | None = None,
+        persona_access: MemoryAccessPolicy | None = None,
     ) -> None:
         self._self_user_id = self_user_id
         self._bot_username = bot_username
@@ -210,6 +212,7 @@ class CommentRouter:
         # `permits_common`，不持有服务、不持有队列，因此它也读不到任何记忆正文。
         # `None` 表示未注入（记忆关闭或旧装配）：`memory_allowed` 恒 False（D-60）。
         self._memory_access = memory_access
+        self._persona_access = persona_access
         self._parent_lookup = parent_lookup
         self._logger = (
             logger_instance
@@ -336,6 +339,8 @@ class CommentRouter:
             # 门禁判定必须在这里完成：`comment.author.id` 一旦离开路由器就不可得，
             # 模型侧只剩这个布尔（§35、D-56）。
             memory_allowed=self._memory_allowed(comment.author.id),
+            persona_allowed=(self._persona_access is not None
+                             and self._persona_access.permits_common(comment.author.id)),
             # 同理，subject 也只能在这一刻算（§48.1）：请求里留下的是不可逆的 owner key
             # 与展示用用户名，原始作者 ID 到此为止，绝不随请求外流。
             public_memory_subject=self._public_memory_subject(comment.author),
@@ -576,7 +581,7 @@ class CommentRouter:
         按「拿不到身份」处理，与 `memory/service.py` 的 `_storage_key` 同一口径：
         记忆是软故障，一个怪 ID 不能把一条本该回复的评论变成异常。
         """
-        if self._memory_access is None or not author.id:
+        if (self._memory_access is None and self._persona_access is None) or not author.id:
             return None
         try:
             key = user_storage_key(author.id)
@@ -600,6 +605,7 @@ class CommentRouter:
         """
         return texts.comment_help_text(
             memory_injected=self._memory_access is not None,
+            persona_injected=self._persona_access is not None,
             vision_enabled=self._vision_enabled,
             article_max_chars=self._cfg.article_max_chars,
         )

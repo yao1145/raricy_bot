@@ -142,6 +142,7 @@ class CommentMemoryInputs:
     article_title: str  # 文章标题
     article_text: str | None  # 实际提供给模型的文章正文；超限时为 None
     memory_allowed: bool
+    persona_allowed: bool = False
 
 
 class CommentService:
@@ -1194,7 +1195,8 @@ class CommentService:
             # `pending_user`（资料块由 `build_messages` 摆在正文之前，与文章块、
             # 父评论块同一段），既不进 system，也绝不进历史。
             supplemental: tuple[SupplementalItem, ...] = ()
-            if getattr(request, "memory_allowed", False):
+            if (getattr(request, "memory_allowed", False)
+                    or getattr(request, "persona_allowed", False)):
                 # 输入在字符上限与引用预算判定**之后**才构造（§48.2、公开设计 §16）：文章
                 # 正文只有真的提供出去时才是 `article_text`，剪贴板只用展开成功的那部分。
                 # `memory_allowed` 恒为 True —— provider 只在门禁为真时被叫到（§48.2）。
@@ -1218,7 +1220,8 @@ class CommentService:
                             ),
                             article_title=article_title,
                             article_text=article_text,
-                            memory_allowed=True,
+                            memory_allowed=getattr(request, "memory_allowed", False),
+                            persona_allowed=getattr(request, "persona_allowed", False),
                         )
                     )
                 except Exception as exc:
@@ -1244,6 +1247,7 @@ class CommentService:
                 for group, tokens in (
                     ("memory_all_user", self.memory_common_tokens),
                     ("memory_public_personal", self.memory_public_tokens),
+                    ("persona_public", self.memory_public_tokens),
                 )
                 if tokens is not None
             )

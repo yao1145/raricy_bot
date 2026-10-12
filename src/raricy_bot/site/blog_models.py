@@ -58,3 +58,44 @@ class BlogSearchPage:
 
     items: tuple[BlogSearchItem, ...]
     has_next: bool
+
+
+@dataclass(frozen=True)
+class PersonaBlogItem:
+    """按作者搜索命中候选之一（画像采集用）。
+
+    只保留**核验身份**与**报告时间**所需的三项：作者搜索会命中同名或近似作者，
+    因此 `author_id` 是这一层唯一有判定意义的字段，标题不进来（画像不看标题抽样本，
+    标题也就没有理由出现在任何日志或回溯里，§53.13）。`created_at` 是站点的展示
+    字符串（blog-bot.md §5：东八区墙上时间贴 `Z` 标签），缺失时为空串，只用于
+    「覆盖时间」的展示，不参与核验。
+    """
+
+    blog_id: str
+    author_id: str
+    created_at: str = ""
+
+
+@dataclass(frozen=True)
+class PersonaBlogPage:
+    """一页作者搜索结果；`has_next` 为假表示服务端没有下一页。"""
+
+    items: tuple[PersonaBlogItem, ...]
+    has_next: bool
+
+
+@dataclass(frozen=True)
+class PersonaBlogDetail:
+    """一篇带作者身份的博客详情（画像采集用）。
+
+    标题与正文**不进 repr**：两者都是用户内容，异常回溯会把它带进日志。
+    `content` 为 None 表示站点没有给出可用正文（被删除、无权限或形状不符），
+    由调用方跳过该候选继续找后面的（设计 §4.1）。`author_id` 为空串表示**核验不了**
+    身份，同样不得当成本人文章。
+    """
+
+    blog_id: str
+    author_id: str
+    title: str = field(repr=False)
+    content: str | None = field(default=None, repr=False)
+    created_at: str = ""

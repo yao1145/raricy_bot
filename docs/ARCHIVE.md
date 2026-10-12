@@ -93,6 +93,7 @@ git show 435d72eab3e3992402cd691956bbe4bef8bcc3ee:docs/design/BLOG_PUBLISH_DESIG
 | 公开个人记忆设计 | `PUBLIC_PERSONAL_MEMORY_DESIGN.md` | `980b858` |
 | 公开个人记忆实施约束 | `PUBLIC_PERSONAL_MEMORY_PLAN.md`、`PUBLIC_PERSONAL_MEMORY_PLAN-constraints.md` | 仅本地；从原 `.superpowers/sdd/` 移出，原目录已删除 |
 | 模型当前时间片段 | `CURRENT_TIME_DESIGN.md` | `e9c5696` |
+| 用户画像设计 | `USER_PERSONA_DESIGN.md` | 仅本地；2026-10-12 从 `docs/design/USER_PERSONA_DESIGN.md` 移入，保留已批准方案；现行契约见 §63 / D-164–D-166 |
 
 记忆实施期的两套 R 编号不是同一套：长期记忆 R8–R16 对应 D-68–D-76；
 公开个人记忆 R1–R14 对应 §39–§52 / D-96–D-103。完整逐项映射留在旧决策记录附录。
