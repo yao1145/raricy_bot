@@ -56,23 +56,26 @@
 私聊重置还会作废旧轮次尚未发送的回答和相关提示；已经开始发送的站点请求可能完成，
 重置不会撤回已发送的消息。
 
-#### 3.2 五条能力命令
+#### 3.2 六条能力命令
 
 | 命令 | 查什么 | 前提 |
 |------|--------|------|
 | `/search <问题>` | 联网搜索（第三方 Exa） | 站长启用 MCP |
+| `/fetch <网页URL> [要求]` | 读取一个网页，结果最多 5000 字符（第三方 Exa） | 站长启用 fetch 与 Exa |
 | `/zhihu <问题>` | 知乎站内内容 | 站长启用 |
 | `/map <问题>` | 高德的地点、坐标与天气 | 站长启用 |
 | `/wolfram <问题>` | Wolfram 计算或事实查询 | 站长启用 |
 | `/kb <问题>` | 站长放在本机知识库里的 Markdown 资料 | 站长启用；默认只对指定的私聊用户开放 |
 
 - 用法是命令加空格加问题；`/searching`、`/kbase` 这类写法不会触发。
-- 这五条**只授权当前这一轮**：由模型判断本轮要不要真的去查，一次一轮；`/search` 默认最多五条摘要。
+- 这六条**只授权当前这一轮**：由模型判断本轮要不要真的去查，一次一轮；`/search` 默认最多五条摘要。
+- `/fetch` 每轮最多读取一个 HTTP(S) URL，完整工具结果最多 5000 字符，含标题、URL 和截断提示；
+  配置的 token 预算可进一步缩短。网页正文只用于本轮，之后保留压缩摘要。
 - 它们返回的都是**不可信的外部资料**，可能不准确或包含误导性文字；搜索只看摘要，不抓取网页全文。
 - `/kb` **不联网**：只查站长放进知识库目录里的资料。没有命中我会直接说明，不会拿常识冒充资料，
   也不会因此转去联网；知识库有刷新周期，刚放进目录的文件可能要等一会儿才能检索到。
 - 站长没启用 `/zhihu`、`/map`、`/wolfram` 时，我会回一句「暂不可用」；`/search` 与普通聊天不受影响。
-- **评论区不支持这五条**，也不会因此调用搜索、地图或读取知识库。
+- **评论区不支持这六条**，也不会因此调用搜索、网页读取、地图或读取知识库。
 
 #### 3.3 长期记忆：`/remember` 与 `/memory`（仅私聊）
 
@@ -260,7 +263,7 @@ Linux 完整版由站长启用 `persona.enabled` 后可用，访问名单沿用�
 - **你发给我的内容会被转交给第三方模型服务处理**，这是我能工作的前提。请不要发密码、密钥、
   身份证件一类的敏感信息。
 - **只有你明确使用能力命令时，当前轮的问题才会流向对应的第三方**：`/search` 交给第三方 Exa
-  搜索，`/zhihu` 交给知乎，`/map` 交给高德，`/wolfram` 交给 Wolfram。它们各自返回的都是
+  搜索，`/fetch` 将 URL 交给 Exa 读取网页，`/zhihu` 交给知乎，`/map` 交给高德，`/wolfram` 交给 Wolfram。它们各自返回的都是
   不可信资料，可能不准确或包含误导性文字。
 - **`/kb` 是另一条边界**：它读的是站长放在本机的知识库，命中的片段随本轮问题一起交给第三方
   模型，但**不会**发往任何搜索上游；反过来，普通聊天也不会自动去读知识库。知识库里的内容同样
@@ -324,7 +327,7 @@ Linux 完整版由站长启用 `persona.enabled` 后可用，访问名单沿用�
 | 只有装得下的部分会外送 | `core/context.py` 的 `transient_user_items` 按 `behavior.context_input_tokens`（默认 8000）从最新向旧选连续后缀；装不下就一条都不发，不会顶掉 system 与本轮正文 |
 | 记得最近约 10 轮 | `behavior.context_turns`（默认 10），超预算还会再按 token 裁一次 |
 | 每轮都知道当前时间（固定 UTC+8，取自服务器时钟） | `time_context.py` 的 `render_current_time` / `UTC8`；由 `core/context.py` 的 `ContextManager._time_fragment` 追加到 system 末段，评论与发文各自调用同一渲染函数（D-114） |
-| 聊天里能不能看图、联网边界、不能看博客正文 | `model.vision_enabled`（默认 `false`）决定看图的文案与行为；`/search`、`/zhihu`、`/map`、`/wolfram` 是聊天区的四个单轮能力入口；博客区每轮只读文章标题与 ≤1000 字正文且不获得 MCP |
+| 聊天里能不能看图、联网边界、不能看博客正文 | `model.vision_enabled`（默认 `false`）决定看图的文案与行为；`/search`、`/fetch`、`/zhihu`、`/map`、`/wolfram` 是聊天区的五个单轮 MCP 入口；博客区每轮只读文章标题与 ≤1000 字正文且不获得 MCP |
 | 长期记忆默认没有、按名单开通、命令只在私聊 | `memory.enabled`（默认 `false`）、`memory.access_mode`（默认 `allowlist`）与 `memory.allow_user_list`；`memory/access.py` 的 `MemoryAccessPolicy`；`core/router.py` 的记忆命令分支（未通过门禁回 `MEMORY_BETA_DENIED_TEXT`，大区里回 `MEMORY_DM_ONLY_TEXT`） |
 | 私有记忆只在本人的私聊里被参考 | `MemoryService.context_for` 的作用域表（D-56）：`lobby` 与 `comment` 两种频道**连私有文件都不打开**；`permits_private` 两种接入模式下都要求频道是 `dm` |
 | 共同记忆要管理员审核后才对所有人生效 | 两阶段写入（D-58）：`/memory suggest <scope> <内容>` 只生成候选，`/memory approve <MC-ID>` 才移入生效区；候选不出现在任何普通模型请求里 |
@@ -364,7 +367,7 @@ Linux 完整版由站长启用 `persona.enabled` 后可用，访问名单沿用�
 | 每条成功评论都真实通知被回复者 | 站点评论接口写入即通知，无机器人豁免（站方 comment-bot.md） |
 | `/help` `/reset` 在评论区两种写法都有效 | `comments/router.py`：`is_help_command` / `is_reset_command`，整条评论匹配 |
 | `/kb` 只授权当前轮、从本地资料检索 | `core/router.py` 第 9.1 步写入 `enabled_features`；`app.py` 的 `_prepare_kb` 走 `KnowledgeService.search`（D-41、D-43） |
-| 五条能力命令任意两条都不能叠加 | `text_utils.leading_capability_command` + 路由器的能力冲突分支；命令集合来自 `capabilities.py`（D-39、D-81） |
+| 六条能力命令任意两条都不能叠加 | `text_utils.leading_capability_command` + 路由器的能力冲突分支；命令集合来自 `capabilities.py`（D-39、D-81） |
 | 五个能力各查什么、绑哪些上游工具 | `capabilities.py` 的能力表：命令字面量、`allowed_tools`、`max_query_chars`（D-81） |
 | 没有适配器的能力不能启用 | `capabilities.IMPLEMENTED_FEATURES` + `config.py` 的加载期校验（D-82） |
 | 命中片段不发往任何 MCP 上游 | `/kb` 用普通 `complete()`，完全不走 MCP/`CapabilityLimiter`（D-41） |

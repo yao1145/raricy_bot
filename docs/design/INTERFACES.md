@@ -368,6 +368,15 @@ warning 按错误处理。测试目录当前被 Git 忽略，不能假设新克�
 每个 binding 独立适配器。stdio 与远程 SSE 配置互斥，SSE 需 HTTPS、环境 Bearer 与独立读超时。
 成功送达后才提交压缩摘要，原始工具消息不入历史；失败不影响普通聊天。
 
+`fetch` 通过 `/fetch URL [要求]` 授权本轮，白名单仅 `web_fetch_exa`，复用 Exa Provider/密钥池。
+模型只提供 `urls`（恰好一个无凭据的 HTTP(S) URL，最多 2048 字符）；宿主固定
+`maxCharacters=5000`，忽略扩大预算的参数。`result_count` 默认且固定为 1，
+`result_item_token_limit` 默认 5000，其他能力仍默认 3000。
+[ExaFetchAdapter](../../src/raricy_bot/mcp/exa_fetch.py) 按 Exa 3.4.1 的 Markdown 标题、URL、
+正文格式解析，完整工具文本最多 5000 字符（含元数据和截断提示），再应用配置的 token 上限。
+历史仅保留 `history_item_token_limit` 内的摘要。配置关闭或工具未发现时沿用能力不可用分支。
+本能力不加入发文工具白名单，Light 不注册。依据与替代关系见 D-163。
+
 诊断走**结构化字段**，不走原始正文（D-111）：阶段（`connect` / `discover` / `call` /
 `close`）、耗时、异常类型、JSON-RPC 数字错误码与子进程退出码；stdio 的 stderr 只按固定
 规则提取失败类别与经校验的模块名，原文一概不留。阶段停滞由 `McpManager` 的巡检任务

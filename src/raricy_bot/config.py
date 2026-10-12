@@ -2017,11 +2017,18 @@ def _mcp_env_map(value: Any, server: str, *, allow_secret: bool) -> dict[str, st
     result: dict[str, str] = {}
     key_name = "env_from" if allow_secret else "env"
     for raw_key, raw_value in value.items():
+        # Exa 多工具开关使用逗号分隔名称；凭据映射仍必须是单个环境变量名。
+        is_tool_list = (
+            not allow_secret
+            and raw_key == "ENABLED_TOOLS"
+            and isinstance(raw_value, str)
+            and all(_ENV_NAME_RE.fullmatch(item.strip()) for item in raw_value.split(","))
+        )
         if (
             not isinstance(raw_key, str)
             or not _ENV_NAME_RE.fullmatch(raw_key)
             or not isinstance(raw_value, str)
-            or not _ENV_NAME_RE.fullmatch(raw_value.strip())
+            or (not _ENV_NAME_RE.fullmatch(raw_value.strip()) and not is_tool_list)
         ):
             raise ConfigError(
                 f"配置 mcp.servers.{server}.{key_name} 必须使用合法的环境变量名和值"
@@ -2106,7 +2113,7 @@ def _mcp_feature(
             f"配置 mcp.features.{name} 是整条答案型能力，result_count 必须为 1"
         )
     item_limit = _positive_int(
-        container, "result_item_token_limit", f"mcp.features.{name}", 3000
+        container, "result_item_token_limit", f"mcp.features.{name}", spec.default_result_item_token_limit
     )
     history_limit = _positive_int(
         container, "history_item_token_limit", f"mcp.features.{name}", 500

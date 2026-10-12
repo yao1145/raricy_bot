@@ -30,6 +30,10 @@
 额度耗尽（402）、失效（401）或它的子进程崩了，就换下一个试；对模型和用户仍然只是
 一次 `/search` 和同一个 `exa__web_search_exa` 工具。
 
+网页读取 `/fetch` 也可复用这个池。启用 `mcp.features.fetch` 并绑定 `exa/web_fetch_exa`，
+服务 `env.ENABLED_TOOLS` 须包含 `web_fetch_exa`；每轮一个 URL，结果最多 5000 字符。
+配置步骤见 [网页读取说明](../../README.md#网页读取-fetch)。
+
 **不做**：
 
 - 不绕过 Exa 的账户、调用量、免费额度限制。池只提高**可用性**，不提高容量。
@@ -68,7 +72,7 @@ mcp:
       env_from:
         EXA_API_KEY: EXA_API_KEY
       env:
-        ENABLED_TOOLS: web_search_exa
+        ENABLED_TOOLS: web_search_exa,web_fetch_exa
         DEBUG: "false"
 ```
 
@@ -84,7 +88,7 @@ mcp:
       command: exa-mcp-server
       args: []
       env:
-        ENABLED_TOOLS: web_search_exa
+        ENABLED_TOOLS: web_search_exa,web_fetch_exa
         DEBUG: "false"
       account_pool:
         child_env: EXA_API_KEY          # 首版必须逐字是这个

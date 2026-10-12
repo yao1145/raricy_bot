@@ -23,15 +23,16 @@
 | `/help` | 能力、隐私与限制说明（本地回复，不调用模型） |
 | `/reset` | 开一段新对话，旧的还在 |
 | `/search <问题>` | 授权当前这一轮由模型判断是否调用 Exa 联网搜索；最多一次、最多五条摘要 |
+| `/fetch <网页URL> [要求]` | 授权本轮通过 Exa 读取一个网页；返回结果最多 5000 字符 |
 | `/zhihu <问题>` | 同上，但查知乎站内内容（需开启；见「可选能力」） |
 | `/map <问题>` | 同上，但查高德地图的坐标、地点与天气（需开启） |
 | `/wolfram <问题>` | 同上，但交给 Wolfram 做计算或事实查询（需开启） |
 | `/kb <问题>` | 授权当前这一轮从本地 Markdown 资料里检索（需开启） |
 
-这五条命令**不能写在同一条消息里**，任意两条叠加都会被本地拒绝。它们都只在私聊和大厅
+这六条命令**不能写在同一条消息里**，任意两条叠加都会被本地拒绝。它们都只在私聊和大厅
 生效，博客评论区不解析它们，也不调用搜索、地图或知识库。
 
-**关于你的消息**：发给它的内容会被转交给第三方模型服务；`/search`、`/zhihu`、`/map`、
+**关于你的消息**：发给它的内容会被转交给第三方模型服务；`/search`、`/fetch`、`/zhihu`、`/map`、
 `/wolfram` 的查询在模型决定调用工具时可能转交给对应的上游服务，`/kb` 命中的本地资料片段
 **不会**发给任何 MCP 上游。写给站内用户的完整说明（可直接发布到站点）
 见 [`docs/usage/USAGE.md`](docs/usage/USAGE.md)。
@@ -81,7 +82,7 @@ python -m pytest tests -q
 | `RARICY_USERNAME` | 是 | 站点登录用户名 |
 | `RARICY_PASSWORD` | 是 | 站点登录密码 |
 | `LLM_API_KEY` | 是 | 模型服务 API Key |
-| `EXA_API_KEY` | 否 | Exa MCP API Key；只在启用 `/search` 时使用 |
+| `EXA_API_KEY` | 否 | Exa MCP API Key；用于启用的搜索、网页读取或发文取材 |
 | `EXA_API_KEY_1..N` | 否 | 多 Key 池的各槽位 Key，名字由 `account_pool.host_envs` 指定 |
 | `AMAP_MAPS_API_KEY` | 否 | 高德 Web 服务 Key；只在启用 `/map` 时使用 |
 | `WOLFRAM_APP_ID` | 否 | Wolfram AppID；只在启用 `/wolfram` 时使用 |
@@ -110,6 +111,19 @@ python -m pytest tests -q
 多个**已获授权的** Key 可以配成池（`mcp.servers.exa.account_pool`）：每个 Key 一个子进程，
 一次搜索在其中做有界轮询与故障转移，对模型仍然只是一个工具。它提高的是可用性，**不是
 容量绕过**——上线前必须确认这些 Key 的授权，见「上线前人工检查」。
+
+### 网页读取 `/fetch`
+
+使用 `/fetch https://example.com/article 总结这篇文章`。每轮由模型决定是否读取一个网页，
+通过同一个 Exa 服务调用 `web_fetch_exa`；固定传入 `maxCharacters: 5000`，宿主再次将
+完整工具结果截断至 5000 字符（含标题、URL 和截断提示），还受配置的 token 预算约束。
+原始正文只用于本轮，回复送达后历史中仅保留压缩摘要。此能力属于完整版。
+
+启用时设置 `mcp.enabled`、`mcp.servers.exa.enabled`、`mcp.features.fetch.enabled` 为 `true`，
+并按 [配置示例](config.example.yaml) 将 fetch 绑定到 `exa/web_fetch_exa`，将 Exa 的
+`env.ENABLED_TOOLS` 设为 `web_search_exa,web_fetch_exa`。复用现有 `EXA_API_KEY` 或授权密钥池，
+无需升级固定的 `exa-mcp-server@3.4.1`。读取接口与输出格式依据
+[Exa 上游源码](https://github.com/exa-labs/exa-mcp-server/blob/main/src/tools/webFetch.ts)。
 
 ### 知乎 `/zhihu`、高德 `/map`、Wolfram `/wolfram`
 

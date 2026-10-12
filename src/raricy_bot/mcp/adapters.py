@@ -25,7 +25,7 @@ from typing import Any
 from ..capabilities import CAPABILITY_BY_FEATURE, CAPABILITIES
 from ..config import McpConfig, McpFeatureConfig
 from ..text_utils import estimate_tokens
-from . import amap, exa, wolfram, zhihu
+from . import amap, exa, exa_fetch, wolfram, zhihu
 from .adapter_kit import CapabilityLimiter, clip_plain_tokens
 from .contracts import ToolExecution
 from .registry import AdapterKey, model_tool_name
@@ -120,6 +120,7 @@ def _build_blog_write(
 # 逐项一致（tests/test_mcp_adapters.py 钉住），后者是配置校验用的那份声明。
 _FACTORIES: Mapping[tuple[str, str], AdapterFactory] = {
     ("search", "web_search_exa"): exa.build,
+    ("fetch", "web_fetch_exa"): exa_fetch.build,
     ("zhihu", "zhihu_search"): zhihu.build,
     ("map", "maps_geo"): amap.build,
     ("map", "maps_text_search"): amap.build,

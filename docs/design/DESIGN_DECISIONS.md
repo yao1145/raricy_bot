@@ -229,7 +229,9 @@ search 等能力由显式命令授权当前一轮；后续普通聊天和评论�
 
 ## D-32 MCP 工具发现与产品能力绑定分离
 
-Provider 发现工具不等于允许执行；只有 feature 绑定可生成 server__tool 定义，执行前再次校验。Exa 仅允许已有白名单工具，不能依模型自觉避免网页抓取等额外能力。
+Provider 发现工具不等于允许执行；只有 feature 绑定可生成 server__tool 定义，执行前再次校验。
+Exa 工具按能力分别授权：搜索只绑定 `web_search_exa`，网页读取仅在显式 `/fetch` 的本轮绑定
+`web_fetch_exa`（D-163），不能依模型自觉避免未授权的额外能力。
 
 <a id="d-33"></a>
 
@@ -2173,6 +2175,24 @@ Store 原子预留避免并发越额，重启不重投付费请求。单副本�
 部署前保留源码、镜像覆盖文件及一致性 SQLite 备份；回滚保留数据卷，但旧版启动会重新缩短租期。
 
 <a id="d-163"></a>
+
+## D-163 Exa 网页读取按独立 fetch 能力授权，结果限制为 5000 字符
+
+用户要求增加 fetch，指定 Exa MCP 的 `web_fetch_exa` 与 5000 字截断。
+采用现有显式命令模式新增 `/fetch URL [要求]`，普通聊天、`/search`、评论与发文的权限保持各自范围。
+本条补充 D-32/D-33，替代“Exa 不提供任何网页读取能力”的旧范围：搜索仍只读摘要，读取由 fetch 授权。
+Light 仍只注册本地能力（D-121）。
+
+已检查固定 `exa-mcp-server@3.4.1` 的 npm tarball，包含该工具，无新增依赖。
+参数和 Markdown 输出依据 [上游 webFetch.ts](https://github.com/exa-labs/exa-mcp-server/blob/main/src/tools/webFetch.ts)。
+模型只传一个 HTTP(S) URL，宿主验证格式、长度与无凭据；固定 `urls=[url]`、`maxCharacters=5000`。
+宿主对返回的标题、URL 与正文再次执行 5000 字符硬限制，截断提示计入预算；配置 token 上限可进一步缩短。
+fetch 的默认结果 token 预算为 5000，避免通用的 3000 预算提前截断中文；其他能力默认值保留。
+每轮一次调用、固定单条结果，复用现有 Provider/密钥池、软故障及按 feature 限流机制。
+配置示例默认关闭，已有部署须显式增加 fetch 绑定并在 Exa 的 `ENABLED_TOOLS` 开放该工具；
+`env.ENABLED_TOOLS` 支持逗号分隔的合法工具名；其他环境值与 `env_from` 保持原校验。
+回退只需关闭 fetch，数据结构不变。原始正文只进本轮 tool 消息，历史仍只保留压缩摘要。
+URL、正文、工具参数与上游错误原文不写日志或 SQLite。
 
 ## D-164 Linux 用户画像由本人访谈与审查替换个人记忆
 

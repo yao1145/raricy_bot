@@ -77,6 +77,9 @@ class Capability:
     ``result_count × result_item_token_limit`` 这一个整体预算就会变成 5 倍。
     """
 
+    default_result_item_token_limit: int = 3000
+    """当前轮结果的默认 token 预算；fetch 保留最多 5000 个中文字符的空间。"""
+
     @property
     def has_command(self) -> bool:
         """是否有用户可见的命令字面量。"""
@@ -99,6 +102,20 @@ TOOL_CAPABILITIES: tuple[Capability, ...] = (
         max_bindings=1,
         result_shape=SHAPE_LIST,
         max_query_chars=500,
+    ),
+    Capability(
+        feature="fetch",
+        command="/fetch",
+        source=SOURCE_MCP,
+        usage_text=texts.FETCH_USAGE_TEXT,
+        unavailable_text=texts.FETCH_UNAVAILABLE_TEXT,
+        system_addendum=texts.MCP_TOOL_SYSTEM_ADDENDUM,
+        allowed_tools=frozenset({"web_fetch_exa"}),
+        max_bindings=1,
+        result_shape=SHAPE_SINGLE,
+        max_query_chars=2048,
+        fixed_result_count=1,
+        default_result_item_token_limit=5000,
     ),
     Capability(
         feature="zhihu",
@@ -188,8 +205,7 @@ LOCAL_CAPABILITIES: tuple[Capability, ...] = (
     ),
 )
 
-# 完整版装配结果。命令顺序保持 search/zhihu/map/wolfram/kb：blog_write 没有命令，
-# 任何按 has_command 过滤的消费方拿到的相对顺序与拆分前逐字节一致。
+# 完整版装配结果。命令顺序为 search/fetch/zhihu/map/wolfram/kb；blog_write 没有命令。
 CAPABILITIES: tuple[Capability, ...] = TOOL_CAPABILITIES + LOCAL_CAPABILITIES
 
 # 已经接了适配器的 MCP 能力。声明在这里而不是 `mcp/adapters.py`，是因为 `config.py`
@@ -199,7 +215,7 @@ CAPABILITIES: tuple[Capability, ...] = TOOL_CAPABILITIES + LOCAL_CAPABILITIES
 # 那既不是我们评审过的清洗，也不是我们想给用户的形态，所以宁可在启动时报错。
 # `mcp/adapters.py` 的工厂表必须与本集合逐项一致，由 tests/test_mcp_adapters.py 钉住。
 IMPLEMENTED_FEATURES: frozenset[str] = frozenset(
-    {"search", "zhihu", "map", "wolfram", "blog_write"}
+    {"search", "fetch", "zhihu", "map", "wolfram", "blog_write"}
 )
 
 

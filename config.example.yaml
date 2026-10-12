@@ -42,7 +42,7 @@ mcp:  # 外部工具总配置；查询可能发往对应上游，所有凭据只
       env_from:  # 子进程变量名到宿主变量名的映射，只写变量名，与 account_pool 互斥
         EXA_API_KEY: EXA_API_KEY  # 提供 Exa Key 的宿主环境变量名，不是密钥值
       env:  # 子进程非敏感环境变量；凭据只能通过 env_from 注入
-        ENABLED_TOOLS: web_search_exa  # Exa 服务开放的工具；宿主仍会再次检查白名单
+        ENABLED_TOOLS: web_search_exa,web_fetch_exa  # Exa 服务开放的工具；宿主仍会再次检查白名单
         DEBUG: "false"  # 上游子进程调试开关，独立于宿主日志级别
     amap:  # 高德地图服务；依赖版本统一由 mcp-tools.package.json 管理
       enabled: false  # 是否启用本模块；上级总开关也须开启
@@ -77,6 +77,18 @@ mcp:  # 外部工具总配置；查询可能发往对应上游，所有凭据只
       max_tool_calls_per_turn: 1  # 单轮工具调用预算，不代表支持多步研究循环
       max_concurrency: 1  # 此能力全部绑定共享的工具调用并发上限
       min_interval_seconds: 2  # 此能力全部绑定共享的最小调用间隔秒数
+    fetch:  # 聊天 /fetch 能力；一次读取一个网页，结果最多 5000 字符
+      enabled: false  # 须同时开启 MCP 总开关与 Exa 服务
+      bindings:  # 复用 Exa 服务与已授权密钥池
+        - server: exa  # 引用 servers 中定义的服务器名称
+          tool: web_fetch_exa  # 允许调用的精确上游工具名
+      result_count: 1  # 单页结果，必须为 1
+      result_item_token_limit: 5000  # 默认保留 5000 字符空间；调小会进一步截断
+      history_item_token_limit: 500  # 送达后只保留压缩摘要
+      max_query_chars: 2048  # URL 字符上限；5000 字符的结果上限由宿主固定
+      max_tool_calls_per_turn: 1  # 单轮最多读取一次
+      max_concurrency: 1  # 本能力的并发上限
+      min_interval_seconds: 2  # 本能力的最小调用间隔秒数
     zhihu:  # 聊天 /zhihu 能力；部署前须核对真实返回样本
       enabled: false  # 是否启用本模块；上级总开关也须开启
       bindings:  # 本能力允许调用的工具绑定；全部绑定就绪才可用
