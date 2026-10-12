@@ -718,6 +718,35 @@ resolver 与公开 provider 的装配、保留 Markdown 文件即可；重新启
 调小即可消掉；启动期的校验（`enabled` 且 `auto_capture_available` 时）只保证脱敏增长为零时够用，
 所以看到这条日志说明还有脱敏增长那一项在吃空间。
 
+### 4.2.3 启用用户画像（Linux 完整版）
+
+在 `config.yaml` 增加独立部署开关，凭据仍使用现有模型环境变量：
+
+```yaml
+persona:  # 本人访谈、审查与后续自动更新
+  enabled: true  # 部署启用，用户仍须确认首份画像
+  auto_update_available: true  # 用户开启后允许送达后的私聊自动更新
+```
+
+访问模式与名单沿用 `memory.access_mode` / `memory.allow_user_list`；
+画像开关独立于 `memory.enabled`，共同记忆仍按旧配置管理。分页、上下文与更新阈值的完整配置
+见 [config.example.yaml](../../config.example.yaml)，字段和默认值以 `PersonaConfig` 为准。
+Linux 配置不自动公开或批量创建用户资料，首次流程由本人 `/persona` 发起。
+
+三类画像文件位于记忆目录的 `personas/users/`、`personas/workflows/` 和 `personas/public/`，
+与旧记忆共享单写者约束；记忆目录须保持数据卷持久化，备份包含这三个目录及旧私人文件。
+只有公开目录参与公开读取，问答与工作流按敏感文件管理，不加入 Git、镜像或发布包。
+画像流程说明见 [USAGE §3.5](USAGE.md#35-用户画像-persona)，契约见 INTERFACES §63。
+
+升级先保存镜像标记、代码、配置和一致性 SQLite/记忆备份，再用无网络的隔离容器完成定向测试
+和候选配置解析；启动后检查 `/livez`、`/readyz` 以及画像装配状态。
+失败回退只恢复代码、配置和镜像，不以旧数据备份覆盖当前运行数据。
+回退到不认识画像墓碑的旧镜像时，若存在画像控制文件，须先设 `memory.enabled: false`；
+否则旧镜像可能重新读取已经迁移或关闭的私人资料。关闭画像部署开关本身不删除任何 Markdown。
+
+维护者验收：离线替身验证流程与隐私边界；实际用户的资料可访问性、模型提问和短文质量，
+由本人启动 `/persona` 后审阅，不以离线测试替代真实用户验收。
+
 ### 4.3 两个不要动的默认值
 
 改了会出问题（原因见第 7 节）：
