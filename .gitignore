@@ -4,8 +4,9 @@ CLAUDE.md
 AGENTS.md
 docs/materials/logos_presentation
 
-# 知识库（按要求不入库）
-knowledge/
+# 公开网站知识库入库，用于本地、服务器和 GitHub 同步；其余知识库保留本地
+knowledge/*
+!knowledge/网站信息/
 
 # 博客草稿（按要求不入库）
 drafts/

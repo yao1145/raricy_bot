@@ -67,7 +67,7 @@ Windows 最低版本与具体依赖锁定版本由打包阶段根据 Python、�
 | 探针只提供有限健康信息 | [ops.py](../../src/raricy_bot/ops.py)、`BotApp.ready/live` | 不能从 readyz 推导模型、KB、记忆均正常 |
 | 记忆为单进程单写者 | D-59、D-115 | 必须防止两个入口同时占用同一数据集 |
 | DB、KB、记忆与归档、稿库的相对路径基准不完全相同 | [config.py](../../src/raricy_bot/config.py) | Light 使用明确的应用数据路径，不继承启动目录 |
-| 配置、测试、知识库等部分目录被 Git 忽略 | [.gitignore](../../.gitignore) | 发行和 CI 不得假设本地文件一定随仓库存在 |
+| 配置、测试及公开网站资料之外的知识库被 Git 忽略 | [.gitignore](../../.gitignore) | `knowledge/网站信息/` 已入库；发行和 CI 仍需核对其他本地资料是否随产物提供 |
 
 必须继续保持消息去重、恢复水位、配额结算、历史送达后提交、公开/私有记忆隔离、
 用户数据不插入 system，以及正文与凭据不进入日志和 SQLite 的现行边界。
