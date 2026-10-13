@@ -67,7 +67,7 @@ class CommentRequest:
     # 图片附件的地址（同源约束由 `fetch_image` 兜住）；图没了或本来就没带图时为 None。
     image_url: str | None = None
     # 当前评论作者能否使用共同记忆（§35）。未注入策略或门禁关闭时恒 False；
-    # 为真也只意味着可以读 `all_user`，lobby 与用户私有文件在评论路径上永不读取。
+    # 为真表示可以读全局共同记忆，用户私有文件在评论路径上永不读取。
     memory_allowed: bool = False
     persona_allowed: bool = False
     # 当前评论作者的会话 subject（§48.1、公开设计 §14.3）：Router 在**仍持有**
@@ -563,7 +563,7 @@ class CommentRouter:
 
         判据与聊天区同款（`access.permits_common`）：`allowlist` 模式要求非空作者 ID
         在名单内，`all` 模式对所有作者（含拿不到 ID 的评论）为真 —— 但真也只意味着
-        可读 `all_user`，评论路径永远不会读 `lobby` 或任何用户私有文件（§28、§30.2）。
+        可读全局共同记忆，评论路径永远不会读任何用户私有文件（§28、§30.2）。
         """
         access = self._memory_access
         if access is None:
@@ -596,7 +596,7 @@ class CommentRouter:
 
         记忆未注入（默认部署，或 `memory.enabled=false`）时不出现共同记忆那句：那时评论区
         一次都不会用到共同记忆，文案就不能声称它会随本轮请求发送（§26.3）。注入后才加上
-        （评论侧最多只用 `all_user`，绝不使用私有记忆）。判据不放宽到「当前作者能否读取」：
+        （评论侧读取全局共同记忆，绝不使用私有记忆）。判据不放宽到「当前作者能否读取」：
         披露句讲的是评论区的上限（「最多只会用到」），同一段评论线程里的两个人不该因为
         各自在不在名单里而看到两种措辞。
 

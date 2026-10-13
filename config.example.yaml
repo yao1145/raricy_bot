@@ -250,14 +250,14 @@ memory:  # 长期记忆 Beta；正文存授权 Markdown，公开与私有读取�
   refresh_seconds: 10  # 读取或重建快照的间隔秒数
   queue_size: 20  # 待处理请求队列的最大长度
 
-  max_common_entries_per_scope: 64  # 每个共同记忆作用域的生效条目上限
+  max_common_entries_per_scope: 64  # 全局已生效条目总上限，保留旧字段名以兼容配置
   max_private_entries_per_user: 32  # 每位用户的私有记忆条目上限
   max_candidates: 128  # 共同记忆待审批候选总数上限，满额不静默删除
   max_entry_chars: 500  # 单条记忆正文的字符上限
   max_file_bytes: 262144  # 本模块单个 Markdown 文件的字节数上限
   max_operations: 512  # 每份记忆文件保留的业务幂等操作记录上限
 
-  common_context_tokens: 800  # all_user 和 lobby 共同记忆合计的单轮 token 上限
+  common_context_tokens: 800  # 全局共同记忆单轮 token 上限
   private_context_tokens: 800  # 所属用户私有记忆的单轮 token 上限
   writer_context_tokens: 2000  # 记忆撰写整份请求的 token 上限，包含 system、来源及既有条目
   writer_timeout_seconds: 15  # 获取并发名额后，单次记忆撰写的超时秒数

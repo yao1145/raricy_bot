@@ -116,84 +116,6 @@ _HELP_TAIL_FOOT: str = (
     "\n重启后短期上下文会丢失；每条评论回复都会真实通知被回复的人。\n"
 )
 
-# 记忆允许（memory_allowed=True）时的如实披露，对应设计 §11 的七条。共同部分说明共同记忆、
-# 传输范围与保存范围：第 4 条（记忆可能随相关请求发送给第三方模型）不带任何限定，必须同时
-# 覆盖私有记忆——设计 §11 恰恰把私有记忆列为更敏感的一类（「私有记忆可能包含个人信息」）。
-# 私有部分按 channel_kind 与 private_enabled 二选一；收尾说明查看与删除入口，以及 /reset
-# 不等于删除长期记忆。整条仍要塞进站点单条消息上限。
-#
-# 披露段里的命令名**不带**反引号：这一段是陈述句而非命令清单，与下面 _HELP_MEMORY_CMDS 的
-# 排版有意区分（命令清单里才用 code 字形）。
-_HELP_MEMORY_DISCLOSURE_HEAD: str = (
-    "\n**关于长期记忆**\n"
-    "\n"
-    "- 我有一份所有使用者共享的共同记忆。\n"
-    "- 无论是共同记忆还是私有记忆，其内容都可能随相关请求发送给第三方模型；"
-    "普通聊天内容不会被完整保存。\n"
-)
-
-# 大区里的口径：声明私有记忆只在私聊里被参考（INTERFACES §36）。「大区不读未公开的私有记忆」
-# 那一半由公开个人记忆那一段统一承担（见 _HELP_MEMORY_PUBLIC），这里只剩作用范围这一半，
-# 两种取值各一句。
-_HELP_MEMORY_DISCLOSURE_LOBBY_ON: str = (
-    "- 你已经开启的私有记忆只在私聊中使用。\n"
-)
-_HELP_MEMORY_DISCLOSURE_LOBBY_OFF: str = (
-    "- 你可以用 /memory on 开启只属于自己的私有记忆，它只在私聊中使用。\n"
-)
-
-# 私聊里的口径：声明私有记忆只在本私聊中使用（INTERFACES §36）。
-_HELP_MEMORY_DISCLOSURE_DM_ON: str = (
-    "- 你的私有记忆已经开启，只在本次私聊中使用。\n"
-)
-_HELP_MEMORY_DISCLOSURE_DM_OFF: str = (
-    "- 你还没有开启私有记忆；打开后它只在本次私聊中使用，可以随时关闭。\n"
-)
-
-# 公开个人记忆的用户口径（公开设计 §17.2、INTERFACES §50.2）。第一句**逐字**取自设计原文，
-# 不得改写；它取代了升级前的「大区里不会使用任何人的私有记忆」——公开投影上线后，只说私有
-# 记忆已不足以说明公开场合到底会用到什么。两种 channel_kind 都拼它：私聊正是用户执行公开
-# 命令的地方，那一段里也没有任何只对大区成立的说法。
-#
-# 后两句覆盖设计 §17.2 要求的其余各条：命令只在私聊；`/memory off` 不撤回公开条目；
-# 触发来源是普通用户名、博客与文章正文、已展开的公开剪贴板；只按完整用户名精确匹配，
-# 不做模糊匹配（设计 §23）。「不必 @ 你」是用户最容易误解的一点：@ 不是必要条件。
-_HELP_MEMORY_PUBLIC: str = (
-    "- 大区与评论区不会使用任何未公开的私有记忆。用户可以在私聊中主动公开自己的某些条目；"
-    "只有当当前公开对话出现或精确提到该用户时，这些公开条目才可能随本轮请求发送给第三方模型。\n"
-    "- 公开与撤回命令只在私聊里可用。公开之后，别人消息里的普通用户名文字（不必 @ 你）、"
-    "博客与文章正文、以及已经展开的公开剪贴板里的用户名，都可能让你公开的条目随那一轮请求"
-    "发送给第三方模型；只按完整用户名精确匹配，不做模糊匹配。\n"
-    "- /memory off 只暂停在回复里使用你的私有记忆，不会撤回已经公开的条目。\n"
-)
-
-# 查看与删除入口，以及 /reset 的语义。两个动作分开说：/reset 既不删也不撤。
-_HELP_MEMORY_DISCLOSURE_FOOT: str = (
-    "- 你可以用 /memory list 查看自己的私有记忆，用 /remember 纠正或补充，"
-    "用 /memory forget <UM-ID> 删除其中一条。\n"
-    "- /reset 只是开始一段新对话，不等于删除长期记忆，也不会撤回已公开的条目。\n"
-)
-
-# 记忆命令组：只在私聊里可用（§32.2）。未通过接入门的账号调用会拿到固定拒绝，所以收尾
-# 那句话必须点明「普通聊天不受影响」，免得没权限的人以为整个机器人都不能用了。
-# 公开命令必须列在这里（R20）：`/help` 与通用用法文案是用户发现它们的**仅有两个**入口。
-_HELP_MEMORY_CMDS: str = (
-    "\n**记忆命令**（只在私聊里可用）\n"
-    "\n"
-    "- `/memory status` —— 查看私有记忆与自动记忆的开关状态、私有与公开条目数。\n"
-    "- `/memory on` 与 `/memory off` —— 开启或暂停在回复中使用你的私有记忆。\n"
-    "- `/memory auto on` 与 `/memory auto off` —— 开关自动记忆；"
-    "开启后私聊内容可能被自动整理成条目。\n"
-    "- `/memory list` —— 查看自己的私有条目；`/memory list public` 查看你已公开的条目。\n"
-    "- `/memory public <UM-ID>` 与 `/memory unpublic <UM-ID>` —— "
-    "把一条私有条目公开出去、或撤回它的公开副本。\n"
-    "- `/remember 内容` —— 把一段内容整理成私有记忆；保存后会展示正文与条目 ID。\n"
-    "- `/memory forget <UM-ID>` —— 删除一条私有记忆。\n"
-    "- `/memory clear` —— 清空全部私有记忆（公开条目一并撤回）。\n"
-    "\n"
-    "当前账号若还没有记忆使用资格，调用这些命令会收到一条说明；普通聊天不受影响。\n"
-)
-
 def _capability_commands(*, kb_enabled: bool, capabilities: frozenset[str]) -> str:
     """能力命令组：开场句 + 按部署开关出现的命令行。
 
@@ -263,11 +185,8 @@ def help_text(
     `blog_max_chars` 是本次部署的引用博客正文上限（`behavior.quoted_blog_max_chars`），
     必须由调用方传入 —— 文案里的那个数字曾经写死成 1000，对上限配成别的值的部署就是假话。
 
-    memory_allowed=False 时（记忆未启用，或用户未通过 Beta 门）收尾只陈述「没有长期记忆」，
-    此时 channel_kind 与 private_enabled 都不参与拼接，输出与公开个人记忆功能上线前**逐字节
-    一致**（§50.2：关闭态下这一版文案一个字符都不许变）。memory_allowed=True 时才换成如实
-    披露：公开个人记忆那一段（_HELP_MEMORY_PUBLIC）两种频道共用，私有记忆的作用范围按
-    channel_kind 声明，private_enabled 决定它的措辞是已开启还是如何开启。
+    memory_allowed 控制共同记忆披露，persona_allowed 控制画像披露。
+    channel_kind 与 private_enabled 保留调用兼容，不再用于展示旧个人记忆管理命令。
 
     `capabilities` 是本次部署真正开启的 MCP 能力名集合；默认空集表示一个都没开。
     """
@@ -287,28 +206,7 @@ def help_text(
     if not memory_allowed:
         return text + _HELP_TAIL_NO_MEMORY + _HELP_TAIL_FOOT
 
-    # 只有 "lobby" 走大区口径；其余取值（含 "dm"）一律按私聊口径，避免调用方写错就抛异常。
-    if channel_kind == "lobby":
-        private = (
-            _HELP_MEMORY_DISCLOSURE_LOBBY_ON
-            if private_enabled
-            else _HELP_MEMORY_DISCLOSURE_LOBBY_OFF
-        )
-    else:
-        private = (
-            _HELP_MEMORY_DISCLOSURE_DM_ON
-            if private_enabled
-            else _HELP_MEMORY_DISCLOSURE_DM_OFF
-        )
-    return (
-        text
-        + _HELP_MEMORY_DISCLOSURE_HEAD
-        + _HELP_MEMORY_PUBLIC
-        + private
-        + _HELP_MEMORY_DISCLOSURE_FOOT
-        + _HELP_MEMORY_CMDS
-        + _HELP_TAIL_FOOT
-    )
+    return text + _HELP_PERSONA_COMMON + _HELP_TAIL_FOOT
 
 
 # 评论区专用帮助文案；不调用模型，由 CommentRouter 直接发送。
@@ -332,7 +230,7 @@ _COMMENT_HELP_COMMANDS: str = (
     "\n"
     "- `/help` —— 重新发送这份说明。\n"
     "- `/reset` —— 创建一段新会话；旧会话不会被删除。\n"
-    "- 评论区不支持 `/search`、`/kb`、`/memory` 等命令；需要它们请到聊天里使用。\n"
+    "- 评论区不支持 `/search`、`/kb`、`/persona` 等命令；需要它们请到聊天里使用。\n"
 )
 
 _COMMENT_HELP_CONTENT_HEAD: str = "\n**关于内容**\n\n"
@@ -532,24 +430,23 @@ MEMORY_BETA_DENIED_TEXT: str = (
 
 # 大区里出现记忆命令时的固定提示（Router，§34.1）：记忆命令只在私聊执行。
 MEMORY_DM_ONLY_TEXT: str = (
-    "记忆命令只在私聊里可用，请在私聊中管理记忆。大区是公开对话，我不会在那里读写记忆。"
+    "全局记忆管理命令只在私聊里执行，请在私聊中管理；已批准的记忆也会用于大区与博客评论。"
 )
 
-# /memory 的用法（空参数或非法 ID，§32.2）。公开命令必须列在这里：这是用户发现
-# `/memory public` 与 `/memory unpublic` 的**唯一**入口（R20、§50.1 只钉了「用错参数时」那一份）。
+_PERSONAL_MEMORY_RETIRED_TEXT = "个人资料请用 /persona 查看或建档，已有画像用 /persona edit 修改。"
+
+# /memory 只展示共同记忆管理命令，个人资料使用 /persona。
 MEMORY_USAGE_TEXT: str = (
-    "用法：/memory status 查看状态；/memory on 与 /memory off 开启或暂停私有记忆；"
-    "/memory auto on 与 /memory auto off 开关自动记忆；/memory list 查看自己的私有条目；"
-    "/memory public <UM-ID> 公开一条私有条目；/memory unpublic <UM-ID> 撤回它的公开副本；"
-    "/memory list public 查看你已公开的条目；/memory forget <UM-ID> 删除一条；"
-    "/memory clear 清空全部私有条目。这些命令只在私聊里可用。"
+    "全局记忆管理用法：/memory list 查看已生效条目和待批准候选；"
+    "/memory suggest <内容> 起草候选；"
+    "/memory approve <MC-ID> 批准；/memory reject <MC-ID> 拒绝；"
+    "/memory delete <GM-ID> 删除生效条目。以上命令仅供记忆管理员在私聊使用，"
+    "批准后在私聊、大区与博客评论中全局生效。"
+    "个人资料请使用 /persona。"
 )
 
 # /remember 的用法（缺内容时，§32.2）。
-REMEMBER_USAGE_TEXT: str = (
-    "用法：/remember 你想让我长期记住的内容。我会把它整理成一条私有记忆，"
-    "保存后把正文和条目 ID 展示给你。"
-)
+REMEMBER_USAGE_TEXT: str = _PERSONAL_MEMORY_RETIRED_TEXT
 
 # 撰写失败：invalid_proposal 或超时（§31）。不透露模型返回的正文。
 MEMORY_WRITE_FAILED_TEXT: str = (
@@ -564,19 +461,21 @@ MEMORY_UNAVAILABLE_TEXT: str = (
 
 # 候选冲突：conflict（§32.3），候选基于的目标条目已被改动，不覆盖新内容。
 MEMORY_CONFLICT_TEXT: str = (
-    "这条记忆在别处已经被改动过，我没有覆盖它。请先用 /memory list 查看最新内容，"
+    "这条全局记忆在别处已经被改动过，我没有覆盖它。请先用 /memory list 查看最新内容，"
     "需要的话重新生成一次候选。"
 )
 
 # 记忆已满：full（§30.2），绝不静默删除既有条目。
 MEMORY_FULL_TEXT: str = (
-    "私有记忆已经达到条数上限，这一条没有保存，我也不会自动删除已有条目。"
-    "可以先用 /memory list 查看，再用 /memory forget <UM-ID> 删掉不需要的条目。"
+    "共同记忆或候选已达到条目上限，这次没有保存，也不会自动删除已有内容。"
+    "请用 /memory list 查看，"
+    "由管理员删除生效条目或拒绝候选后再试。"
 )
 
 # 目标条目或候选不存在：not_found（§27.4）。
 MEMORY_NOT_FOUND_TEXT: str = (
-    "没有找到这条记忆，ID 可能不对，或者它已经被删除。可以用 /memory list 查看当前有效的条目。"
+    "没有找到这条共同记忆或候选，ID 可能不对，或者它已经被删除。"
+    "可以用 /memory list 查看。"
 )
 
 # 密钥筛查命中：secret_detected（§30.2），整条拒绝，不保存脱敏版本。
@@ -591,11 +490,7 @@ MEMORY_SECRET_DETECTED_TEXT: str = (
 # （设计 §3.2、§50.1），撤回成功的确认则**绝不**回显已经撤下的正文（设计 §12.2）。
 
 # `/memory public` 与 `/memory unpublic` 的用法（缺参数或非法 ID，§52.1）。
-MEMORY_PUBLIC_USAGE_TEXT: str = (
-    "用法：/memory public <UM-ID> 把一条私有条目公开；/memory unpublic <UM-ID> 撤回它的公开副本；"
-    "/memory list public 查看你已公开的条目。公开之后，大区与博客评论里出现或精确提到你时，"
-    "这些条目可能随该轮请求一起发送给第三方模型。这些命令只在私聊里可用。"
-)
+MEMORY_PUBLIC_USAGE_TEXT: str = _PERSONAL_MEMORY_RETIRED_TEXT
 
 # 拿不到合法站点用户名时的拒绝（R8）：与「撰写失败」不是一回事，因此有自己的文案。
 MEMORY_PUBLIC_IDENTITY_TEXT: str = (
@@ -605,11 +500,7 @@ MEMORY_PUBLIC_IDENTITY_TEXT: str = (
 
 # 公开条目达到上限（full）：必须说清是**公开条目**的上限 —— 它与私有条目上限是两个数
 # （§39.1、§50.1），不能沿用 MEMORY_FULL_TEXT 的私有口径。
-MEMORY_PUBLIC_FULL_TEXT: str = (
-    "你的公开条目已经达到上限（这是公开条目的上限，与私有条目上限不是一个数），这一条没有公开，"
-    "我也不会自动撤回已有的公开条目。可以先用 /memory list public 查看，"
-    "再用 /memory unpublic <UM-ID> 撤回不需要的条目。"
-)
+MEMORY_PUBLIC_FULL_TEXT: str = _PERSONAL_MEMORY_RETIRED_TEXT
 
 # AI 撰写或自动提取试图更新一条仍然公开的来源条目（设计 §10.2、§40.3）：文案逐字取自设计原文。
 # 它与 `conflict`（磁盘摘要与内存快照不一致）不是一回事，两句不得共用。
@@ -617,25 +508,15 @@ MEMORY_PUBLIC_CONFLICT_TEXT: str = "该条目当前已公开，请先撤回公�
 
 # 重复公开同一条但内容已经不一样（R3）：公开的是发布那一刻的快照，绝不静默覆盖用户批准过的旧版本。
 # 与 MEMORY_PUBLIC_CONFLICT_TEXT 分开：那句说的是 AI 更新受阻，这句说的是用户自己重复公开。
-MEMORY_PUBLIC_MISMATCH_TEXT: str = (
-    "这条已经公开过，但公开的那份副本和现在的私人条目已经不一样了。公开的是发布那一刻的快照，"
-    "我不会覆盖你已经公开过的内容；请先用 /memory unpublic <UM-ID> 撤回，"
-    "确认内容后再用 /memory public <UM-ID> 重新公开。"
-)
+MEMORY_PUBLIC_MISMATCH_TEXT: str = _PERSONAL_MEMORY_RETIRED_TEXT
 
 # 公开列表的空态：列举类命令没有内容时也要给一句完整的话（§36）。
-MEMORY_PUBLIC_LIST_EMPTY_TEXT: str = (
-    "你还没有公开任何条目。可以用 /memory public <UM-ID> 把一条私有条目公开出去。"
-)
+MEMORY_PUBLIC_LIST_EMPTY_TEXT: str = _PERSONAL_MEMORY_RETIRED_TEXT
 
 # 首次开启私有记忆的说明（设计 §11、D-66）：挂在 /memory on、/memory auto on 的成功回复，
 # 以及隐式打开读取的 /remember 成功回复上。必须覆盖保存了什么、可能发送给第三方模型、
 # 只在本私聊使用、如何查看与删除；不加任何持久标记。
-MEMORY_FIRST_ENABLE_TEXT: str = (
-    "从现在起，你发来的内容可能被整理成只属于你的私有记忆：它只在本私聊里使用，"
-    "并可能随相关请求一并发送给第三方模型。你可以随时用 /memory list 查看、"
-    "用 /memory forget <UM-ID> 删除自己的私有记忆，也可以用 /memory off 暂停在回复中使用它。"
-)
+MEMORY_FIRST_ENABLE_TEXT: str = _PERSONAL_MEMORY_RETIRED_TEXT
 
 # ---- 命令回复（INTERFACES §32.2 的命令表）----
 # 交换点集中在 Controller 的 `_success_text` 与两处门禁分支（§32.3）。这里没有的文案，
@@ -643,16 +524,10 @@ MEMORY_FIRST_ENABLE_TEXT: str = (
 
 # 非管理员的权限拒绝。与 MEMORY_BETA_DENIED_TEXT 是两回事：那条管接入门，这条管管理权
 # （§32.2 的第二组命令只对 admin_user_list 开放）。
-MEMORY_ADMIN_REQUIRED_TEXT: str = (
-    "这条命令只对记忆管理员开放，你的账号没有相应的管理权限，这次操作没有执行。"
-    "你自己的私有记忆不受影响，仍然可以用 /memory on 与 /memory list 管理。"
-)
+MEMORY_ADMIN_REQUIRED_TEXT: str = _PERSONAL_MEMORY_RETIRED_TEXT
 
 # 部署未开放自动提取时的固定拒绝（§32.3：「/memory auto on」只在部署允许时成功）。
-MEMORY_AUTO_UNAVAILABLE_TEXT: str = (
-    "当前部署没有开放自动记忆，这次没有做任何改动。"
-    "你仍然可以用 /memory on 开启私有记忆；需要保存的内容也可以用 /remember 手动提交。"
-)
+MEMORY_AUTO_UNAVAILABLE_TEXT: str = _PERSONAL_MEMORY_RETIRED_TEXT
 
 # 开启确认：首次开启的说明（D-66）就挂在这两条回复上，不另写一份、也不加任何持久标记。
 # 顺序固定为「确认在前、说明在后」，说明本身逐字复用 MEMORY_FIRST_ENABLE_TEXT。
@@ -666,11 +541,7 @@ MEMORY_AUTO_ON_DONE_TEXT: str = (
 
 # `/memory off` 的确认：读取与自动提取一并关闭，已有条目保留（规划 §7.1）。
 # 最后一句是设计 §5.1 的硬要求：off 只暂停私聊里的私人读取，**不撤回**已公开条目，回复必须明说。
-MEMORY_OFF_DONE_TEXT: str = (
-    "已暂停私有记忆，自动记忆也一并关闭：之后的私聊里我不会再参考你的条目，"
-    "也不会自动保存新内容。已有条目都还在，可以用 /memory on 重新开启。"
-    "你此前公开过的条目仍然公开；不想让它们继续公开，请用 /memory unpublic <UM-ID> 逐一撤回。"
-)
+MEMORY_OFF_DONE_TEXT: str = _PERSONAL_MEMORY_RETIRED_TEXT
 
 # `/memory auto off` 的确认：只关自动提取，私有记忆读取保持原样。
 MEMORY_AUTO_OFF_DONE_TEXT: str = (
@@ -679,13 +550,10 @@ MEMORY_AUTO_OFF_DONE_TEXT: str = (
 )
 
 # 目标已不可见：幂等重放或防御分支里对象已经不在快照中。绝不回裸状态 token，也不编造正文。
-MEMORY_TARGET_GONE_TEXT: str = (
-    "这次操作此前已经记录过，但对应的条目或候选现在不在记忆里（可能已经被删除、批准或拒绝）。"
-    "可以用 /memory list 或 /memory candidates 查看当前状态。"
-)
+MEMORY_TARGET_GONE_TEXT: str = _PERSONAL_MEMORY_RETIRED_TEXT
 
 # 空态：列举类命令没有内容时也要给一句完整的话，空串会被当成命令坏了。
-MEMORY_LIST_EMPTY_TEXT: str = "你的私有记忆里还没有任何条目。可以用 /remember 让我整理并保存一条。"
+MEMORY_LIST_EMPTY_TEXT: str = _PERSONAL_MEMORY_RETIRED_TEXT
 MEMORY_LIST_COMMON_EMPTY_TEXT: str = "当前还没有任何已生效的共同记忆。"
 MEMORY_CANDIDATES_EMPTY_TEXT: str = "当前没有待批准的候选。"
 
@@ -708,28 +576,8 @@ _MEMORY_ACTION_UPDATED: str = "已更新"
 def memory_saved_text(
     *, memory_id: str, content: str, created: bool, opened: bool = False
 ) -> str:
-    """显式 /remember 成功后的回复：展示实际保存的正文与条目 ID（设计 §6.3、规划 §8.1）。
-
-    created 为真表示新增，否则表示更新——用布尔参数而不是 memory 模块的动作枚举，
-    保持本模块不依赖任何 memory 模块。content 是 AI 整理后实际落盘的正文。
-
-    opened 为真表示这次保存顺带打开了私有记忆读取（§32.3），回复要带上首次开启的说明
-    （D-66）：拼接留在本模块，调用方只传事实，说明本身逐字不动。
-    """
-    action = _MEMORY_ACTION_CREATED if created else _MEMORY_ACTION_UPDATED
-    text = (
-        action
-        + "私有记忆 "
-        + memory_id
-        + "："
-        + content
-        + "\n用 /memory forget "
-        + memory_id
-        + " 可以删除这一条；再发一次 /remember 可以纠正它的内容。"
-    )
-    if opened:
-        return text + "\n" + MEMORY_FIRST_ENABLE_TEXT
-    return text
+    """旧个人条目回执兼容入口，统一返回画像说明。"""
+    return _PERSONAL_MEMORY_RETIRED_TEXT
 
 
 def memory_auto_capture_text(*, memory_id: str, content: str, created: bool) -> str:
@@ -758,27 +606,8 @@ def memory_status_text(
     entry_count: int,
     public_entry_count: int,
 ) -> str:
-    """`/memory status` 的回复：两个开关的状态、私有条目数与公开条目数（§32.2、§50.1）。
-
-    四个参数都是普通值（bool / int），因此本模块仍然不 import 任何 memory 模块。
-    `str()` 只把计数转成十进制填入句子，不是格式化：本模块一律不做字符串插值，
-    唯一允许的拼接方式是 `+`（见 `tests/test_texts.py` 的源码级防线）。
-    """
-    private = _MEMORY_SWITCH_ON if private_enabled else _MEMORY_SWITCH_OFF
-    auto = _MEMORY_SWITCH_ON if auto_capture else _MEMORY_SWITCH_OFF
-    return (
-        "私有记忆："
-        + private
-        + "\n自动记忆："
-        + auto
-        + "\n私有条目："
-        + str(entry_count)
-        + " 条\n公开条目："
-        + str(public_entry_count)
-        + " 条\n"
-        + "开启或暂停私有记忆用 /memory on 与 /memory off；自动记忆用 /memory auto on 与 "
-        "/memory auto off；查看条目用 /memory list，查看已公开的条目用 /memory list public。"
-    )
+    """旧个人条目回执兼容入口，统一返回画像说明。"""
+    return _PERSONAL_MEMORY_RETIRED_TEXT
 
 
 def memory_entry_line(
@@ -798,69 +627,39 @@ def memory_entry_line(
 
 
 def memory_entry_list_text(*, scope: str | None, lines: tuple[str, ...]) -> str:
-    """`/memory list` 的回复：表头 + 每行一条 + 收尾提示；没有条目时回显式空态。
+    """共同记忆列表；旧个人作用域只返回画像说明。
 
     scope 为 None 表示调用者自己的私有条目，否则是 `MemoryScope` 的字符串取值（已生效共同记忆）。
     lines 是 memory_entry_line() 的结果；表头里的条数由它数出来，调用方不必另传计数。
     """
-    if not lines:
-        return MEMORY_LIST_EMPTY_TEXT if scope is None else MEMORY_LIST_COMMON_EMPTY_TEXT
     if scope is None:
-        head = "你的私有记忆，共 " + str(len(lines)) + " 条："
-        foot = "用 /memory forget <UM-ID> 可以删除其中一条；再发一次 /remember 可以纠正它的内容。"
-    else:
-        head = (
-            "已生效的共同记忆（范围："
-            + _memory_scope_label(scope)
-            + "），共 "
-            + str(len(lines))
-            + " 条："
-        )
-        foot = "这些条目对所有使用者生效；管理员可以用 /memory delete <GM-ID> 删除其中一条。"
+        return _PERSONAL_MEMORY_RETIRED_TEXT
+    if not lines:
+        return MEMORY_LIST_COMMON_EMPTY_TEXT
+    head = (
+        "已生效的共同记忆（范围："
+        + _memory_scope_label(scope)
+        + "），共 "
+        + str(len(lines))
+        + " 条："
+    )
+    foot = "这些条目对所有使用者生效；管理员可以用 /memory delete <GM-ID> 删除其中一条。"
     return head + "\n" + "\n".join(lines) + "\n" + foot
 
 
 def memory_public_entry_list_text(*, lines: tuple[str, ...]) -> str:
-    """`/memory list public` 的回复：表头 + 每行一条 + 撤回入口与上限口径；没有条目时回显式空态。
-
-    上限那一句只说「有独立的条数上限」，因为具体的数值来自部署配置，而本模块拿不到它
-    （与 `_blog_body_line` 的「数字必须由调用方传」是同一条理由：拿不到的数字不许写死）。
-    """
-    if not lines:
-        return MEMORY_PUBLIC_LIST_EMPTY_TEXT
-    return (
-        "你已公开的个人记忆，共 "
-        + str(len(lines))
-        + " 条：\n"
-        + "\n".join(lines)
-        + "\n公开条目有独立的条数上限（与私有条目上限不是一个数）；"
-        "用 /memory unpublic <UM-ID> 可以撤回其中一条。"
-    )
+    """旧个人条目回执兼容入口，统一返回画像说明。"""
+    return _PERSONAL_MEMORY_RETIRED_TEXT
 
 
 def memory_published_text(*, memory_id: str, content: str) -> str:
-    """`/memory public` 的成功回复：回显实际公开的 ID 与正文，并说明公开范围与撤回入口（§50.1）。
-
-    三条披露缺一不可：公开使用范围（大区与博客评论、出现或精确提到你）、第三方模型传输、
-    以及 `/memory unpublic` 这个撤回入口。正文是用户自己公开的内容，展示给本人属于 §37
-    允许的三处之一。
-    """
-    return (
-        "已公开 " + memory_id + "：" + content + "\n"
-        "它现在是你主动公开的个人记忆：大区与博客评论里出现或精确提到你时，"
-        "这一条可能随该轮请求一起发送给第三方模型。公开的是这一份快照，"
-        "之后修改私人条目不会自动更新它。用 /memory unpublic "
-        + memory_id
-        + " 可以撤回公开。"
-    )
+    """旧个人条目回执兼容入口，统一返回画像说明。"""
+    return _PERSONAL_MEMORY_RETIRED_TEXT
 
 
 def memory_unpublished_text(*, memory_id: str) -> str:
-    """`/memory unpublic` 的成功回复：只确认 ID 已不再用于公开请求（设计 §12.2）。
-
-    签名里只有 ID —— 已经撤下的正文没有位置可放，这就是「不回显」的结构性保证。
-    """
-    return "已撤回 " + memory_id + "：它不再用于公开请求，你的私人条目没有被改动。"
+    """旧个人条目回执兼容入口，统一返回画像说明。"""
+    return _PERSONAL_MEMORY_RETIRED_TEXT
 
 
 def memory_candidate_line(
@@ -875,13 +674,7 @@ def memory_candidate_line(
 
     五个参数都是普通值：作用域与动作传字符串取值，文本模块不 import memory 模块。
     """
-    descriptor = (
-        candidate_id
-        + "（范围："
-        + _memory_scope_label(scope)
-        + "；动作："
-        + _memory_action_label(action)
-    )
+    descriptor = candidate_id + "（动作：" + _memory_action_label(action)
     if target_id is not None:
         descriptor = descriptor + "；目标：" + target_id
     return descriptor + "）：" + content
@@ -909,12 +702,7 @@ def memory_candidate_created_text(
     content: str,
 ) -> str:
     """`/memory suggest` 的成功回复：命名候选 ID，并说清它还没有生效（D-58）。"""
-    descriptor = (
-        "（范围："
-        + _memory_scope_label(scope)
-        + "；动作："
-        + _memory_action_label(action)
-    )
+    descriptor = "（动作：" + _memory_action_label(action)
     if target_id is not None:
         descriptor = descriptor + "；目标：" + target_id
     return (
@@ -933,7 +721,44 @@ def memory_candidate_created_text(
 
 def memory_approved_text(*, memory_id: str, content: str) -> str:
     """`/memory approve` 的成功回复：说清它从此刻起对所有使用者生效（§32.2）。"""
-    return "已批准 " + memory_id + "，它从现在起对所有使用者生效：" + content
+    return "已批准 " + memory_id + "，它从现在起在私聊、大区与博客评论中全局生效：" + content
+
+
+def memory_global_list_text(*, active_lines: tuple[str, ...], pending_lines: tuple[str, ...]) -> str:
+    """分段展示全局已生效条目与待审核候选，不显示旧区段。"""
+    active = "\n".join(active_lines) if active_lines else "暂无已生效条目。"
+    pending = "\n".join(pending_lines) if pending_lines else "暂无待批准候选。"
+    return (
+        f"全局记忆\n\n已生效（{len(active_lines)} 条）：\n{active}"
+        f"\n\n待批准候选（{len(pending_lines)} 条，尚未生效）：\n{pending}"
+        "\n\n用 /memory suggest <内容> 起草，/memory approve <MC-ID> 批准，"
+        "/memory reject <MC-ID> 拒绝，/memory delete <GM-ID> 删除生效条目。"
+    )
+
+
+def memory_list_pages(text: str, *, max_chars: int) -> tuple[str, ...]:
+    """按单条回复上限拆分完整列表，尽量在换行处分页，不丢弃末尾内容。"""
+    if len(text) <= max_chars:
+        return (text,)
+    if max_chars < 1:
+        raise ValueError("列表分页上限必须为正数")
+    digits = len(str(len(text)))
+    header_size = len(f"全局记忆列表（{'9' * digits}/{'9' * digits}）\n")
+    capacity = max_chars - header_size
+    if capacity < 1:
+        return tuple(text[start:start + max_chars] for start in range(0, len(text), max_chars))
+    parts: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(start + capacity, len(text))
+        if end < len(text):
+            newline = text.rfind("\n", start, end)
+            if newline >= start:
+                end = newline + 1
+        parts.append(text[start:end])
+        start = end
+    return tuple(f"全局记忆列表（{number}/{len(parts)}）\n{part}"
+                 for number, part in enumerate(parts, 1))
 
 
 def memory_candidate_rejected_text(*, candidate_id: str) -> str:
@@ -947,24 +772,13 @@ def memory_deleted_text(*, memory_id: str) -> str:
 
 
 def memory_forgotten_text(*, memory_id: str) -> str:
-    """`/memory forget` 的成功回复：命名被删掉的私有条目。"""
-    return "已删除私有记忆 " + memory_id + "。"
+    """旧个人条目回执兼容入口，统一返回画像说明。"""
+    return _PERSONAL_MEMORY_RETIRED_TEXT
 
 
 def memory_cleared_text(*, removed: int, revoked: int) -> str:
-    """`/memory clear` 的成功回复：报出本次撤回的公开条目数与删除的私有条目数（§12.4、§50.1）。
-
-    两个计数都由调用方在各自步骤**之前**数出来（顺序照设计 §12.4：先撤回、再清空）：幂等命中
-    不会重放那两个动作，因此重放那一次确实一条都没撤回、也没删除，如实报 0 而不是复述第一次的
-    条数（`operations` 里没有地方存它们）。
-    """
-    return (
-        "已清空你的私有记忆：本次先撤回了 "
-        + str(revoked)
-        + " 条公开条目，再删除了 "
-        + str(removed)
-        + " 条私有条目；设置保持不变，需要的内容可以用 /remember 重新保存。"
-    )
+    """旧个人条目回执兼容入口，统一返回画像说明。"""
+    return _PERSONAL_MEMORY_RETIRED_TEXT
 
 
 # 大区共享会话的静态 system 附加说明（D-24）。
@@ -1158,7 +972,7 @@ PERSONA_DISCLOSURE_TEXT = (
 )
 PERSONA_DM_ONLY_TEXT = "用户画像管理只在你与我的私聊中执行，请在私聊使用 /persona。"
 PERSONA_UNAVAILABLE_TEXT = "用户画像暂不可用，请稍后重试；普通聊天继续可用。"
-PERSONA_MIGRATED_TEXT = "个人资料请用 /persona 查看或建档，已有画像用 /persona edit 修改。"
+PERSONA_MIGRATED_TEXT = _PERSONAL_MEMORY_RETIRED_TEXT
 PERSONA_REVISION_USED_TEXT = "本次修改额度已用完，请确认当前草稿或用 /persona cancel 取消。"
 PERSONA_OFF_TEXT = "用户画像已关闭，自动更新已停止，公开副本已撤回；私有画像保留，可用 /persona on 重新开启。"
 PERSONA_PENDING_REVOKE_TEXT = "已停止私有画像使用与更新，公开撤回待完成；请稍后重试 /persona off。"

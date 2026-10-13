@@ -159,20 +159,19 @@ _COMMENT: str = "comment"
 # 「只有 dm」，公开投影的读取门正好相反——它只出现在大区与评论里。
 _PUBLIC_CHANNELS: frozenset[str] = frozenset((_LOBBY, _COMMENT))
 
-# `SupplementalItem.group` 的四个稳定取值（§30.2、§33、§45.3）。
+# 补充资料分组保留旧全站名称，旧大区条目归入同一全局分组。
 _GROUP_ALL_USER: str = "memory_all_user"
-_GROUP_LOBBY: str = "memory_lobby"
 _GROUP_USER: str = "memory_user"
 _GROUP_PUBLIC: str = "memory_public_personal"
 
-# `priority` 数值是实现细节（D-62）：只表达「DM 私有优先于 all_user，lobby 优先于 all_user」的
+# `priority` 数值是实现细节（D-62）：只表达「DM 私有优先于全局共同记忆」的
 # 组间次序。`SupplementalItem.priority` 是一个整数（§33），组间次序只能靠**步长**表达，因此步长
 # 在构造时按容量上限现算（见 `__init__`），不能写死——§26.2 只要求上限是正整数，不保证它小于
 # 某个固定的步长。
 
 # 公开个人记忆的组间基数（§45.3）：它必须**整体晚于**既有三组（数值更大），因此取「已用基数的
-# 下一个」。既有基数只有 0（lobby / 私有）与 1（all_user），最大名次是 `max_common - 1`，而步长
-# 至少是 `max_common + 1`，所以 2 * 步长 > 1 * 步长 + max_common - 1 恒成立（见 `__init__` 的
+# 下一个」。既有基数只有 0（私有）与 1（全局），旧文件两区段最多合计 `2 * max_common` 条，步长
+# 覆盖这个兼容上界，避免合并后的尾部条目跨入公开组的优先级区间（见 `__init__` 的
 # 现算注释）。公开组是最后一组，它自己的名次再大也不会撞进别的组。
 _PUBLIC_PRIORITY_BASE: int = 2
 
@@ -362,7 +361,7 @@ class MemoryService:
         # 设到 1000 以上的部署会让某个作用域的尾部名次跨进另一组的区间，破坏 §30.2 的相对次序。
         self._priority_stride: int = 1 + max(
             1,
-            int(config.max_common_entries_per_scope),
+            2 * int(config.max_common_entries_per_scope),
             int(config.max_private_entries_per_user),
         )
         self._write_lock = asyncio.Lock()
@@ -681,15 +680,11 @@ class MemoryService:
         )
 
     def _scope_items(self, document: CommonDocument, channel_kind: str) -> list[SupplementalItem]:
-        """按频道取共同记忆：DM 与评论只有 `all_user`，大区加 `lobby`（§30.2）。
-
-        未知的 `channel_kind` 按评论处理：只给 `all_user`，绝不扩大到别的范围。
-        """
-        items = self._items(document.all_user, _GROUP_ALL_USER, base=1, prefix=PREFIX_ALL_USER)
-        if channel_kind == _LOBBY:
-            # 大区共同记忆优先于全站共同记忆；私有记忆与它作用域互斥，不会同时出现。
-            items = self._items(document.lobby, _GROUP_LOBBY, base=0, prefix=PREFIX_LOBBY) + items
-        return items
+        """所有已生效共同条目全局适用，旧区段仅作磁盘与 ID 兼容。"""
+        return self._items(
+            document.all_user + document.lobby, _GROUP_ALL_USER,
+            base=1, prefix=PREFIX_ALL_USER,
+        )
 
     def _items(
         self, entries: tuple[MemoryEntry, ...], group: str, *, base: int, prefix: str
@@ -800,13 +795,15 @@ class MemoryService:
             return ()
         return tuple(state.document.entries)
 
-    async def common_entries(self, scope: MemoryScope) -> tuple[MemoryEntry, ...]:
-        """该作用域已生效的共同条目；`user` 作用域没有共同条目，返回空元组。"""
-        if not self._enabled or scope not in (MemoryScope.ALL_USER, MemoryScope.LOBBY):
+    async def common_entries(self, scope: MemoryScope | None = None) -> tuple[MemoryEntry, ...]:
+        """默认返回全局条目；显式旧区段参数只供存储兼容调用。"""
+        if not self._enabled or scope not in (None, MemoryScope.ALL_USER, MemoryScope.LOBBY):
             return ()
         state = self._common_state()
         if not isinstance(state.document, CommonDocument):
             return ()
+        if scope is None:
+            return state.document.all_user + state.document.lobby
         return tuple(_common_bucket(state.document, scope))
 
     async def candidates(self) -> tuple[MemoryCandidate, ...]:
@@ -3631,6 +3628,12 @@ class MemoryService:
         entries = list(_common_bucket(document, candidate.scope))
         stamp = self._timestamp()
         same_key = _find_by_key(entries, candidate.key, None)
+        other_entries = _common_bucket(
+            document, MemoryScope.LOBBY if candidate.scope == MemoryScope.ALL_USER else MemoryScope.ALL_USER
+        )
+        if _find_by_key(list(other_entries), candidate.key, None) is not None:
+            # 旧区段在运行时已经合并，同名键不能跨区段形成另一条全局记忆。
+            return None, STATUS_CONFLICT, None
         if candidate.action == ProposalAction.UPDATE:
             referenced = _find_by_memory_id(entries, candidate.target_id, prefix)
             if referenced is None:
@@ -3656,7 +3659,7 @@ class MemoryService:
             entries[entries.index(same_key)] = entry
             memory_id = entry.memory_id
         else:
-            if len(entries) >= self._config.max_common_entries_per_scope:
+            if _common_entry_count(document) >= self._config.max_common_entries_per_scope:
                 return None, STATUS_FULL, None
             start = (
                 document.next_all_user_id

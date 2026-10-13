@@ -617,7 +617,7 @@ python -c "import re,io,yaml; t=io.open('docs/design/SYSTEM_PROMPTS.md',encoding
   不进上下文。
 - **长期记忆（Beta，默认关闭）**：`memory.enabled` 打开后还要按 `access_mode` /
   `allow_user_list` 的接入名单放行；私有条目只在所属用户的**私聊**里读取，大区与博客评论
-  最多只用共同记忆（评论只用 `all_user`），任何场景都不会把私有记忆带进公开请求。条目存在
+  最多只用全局共同记忆（私聊、大区与评论使用同一池），任何场景都不会把私有记忆带进公开请求。条目存在
   `memory.root_dir` 的 Markdown 里（默认 `./data/memory`），进不了日志、SQLite 或历史；
   记忆不可用是软故障。三段相关静态提示词见 §1.8。
 - **固定文案（不调模型）**：`/help`、`/reset`、空内容用法提示、图片读不到的提示、纯博客不支持

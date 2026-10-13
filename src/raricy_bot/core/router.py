@@ -50,8 +50,10 @@ from ..images.models import ImageRequest
 from ..logging_setup import get_logger, log_event, new_trace_id
 from ..memory.access import MemoryAccessPolicy
 from ..memory.commands import (
+    USAGE_COMMAND,
     MemoryCommand,
     MemoryCommandRequest,
+    is_personal_memory_command,
     parse_memory_command,
 )
 from ..memory.models import user_storage_key
@@ -100,16 +102,6 @@ _logger = get_logger("core.router")
 # SSE 中需要静默忽略的 kind，它们的 reason 与 kind 同名。
 _PASSIVE_KINDS: tuple[str, ...] = ("typing", "read")
 
-# 只作用于**个人**范围、迁移后必须停用的旧记忆命令（设计 §11.6）。
-# 共同记忆（`suggest all_user` / `candidates` / `approve` / `reject` / `delete` /
-# `list all_user|lobby` / `status`）不在其中 —— 迁移只切个人资料，不动共同记忆。
-_PERSONAL_MEMORY_COMMANDS: frozenset[str] = frozenset(
-    {"remember", "forget", "public", "unpublic", "clear", "auto_on", "auto_off", "on", "off"}
-)
-
-# 迁移后同样停用的旧记忆查询：`/memory list`（自己的条目）与 `/memory list public`。
-_PERSONAL_MEMORY_LIST_ARGUMENTS: frozenset[str] = frozenset({None, "public"})
-
 # 值得运维关注的「可行动」结果：会入队、会回本地文案、或推进水位。
 # 其余（typing/read/unknown_event/malformed 及各类前置过滤）是大区高频背景，
 # 降到 DEBUG，避免活跃站点上每个 SSE 帧刷一行 INFO（设计文档 §4 要求极简日志）。
@@ -140,7 +132,7 @@ _ACTIONABLE_REASONS: frozenset[str] = frozenset(
         "memory_dm_only",
         "memory_beta_denied",
         "memory_queue_full",
-        # 记忆已迁移（设计 §11.6）：旧个人记忆命令回迁移说明，同样是本地文案。
+        # 旧个人记忆入口退役：统一回画像说明，同样是本地文案。
         "memory_migrated",
         # 画像命令的四个结果（设计 §2、§8）：与记忆同形，只承载稳定短标识。
         "persona_queued",
@@ -574,21 +566,19 @@ class MessageRouter:
 
         # 9.0 记忆命令（§34.1、规划 §7.3）：**先于能力命令解析**识别，否则
         # `/search /remember x` 会在剥掉 `/search` 之后被当成记忆命令执行，绕过
-        # 「一条消息最多一个能力」（D-39）。记忆未注入时整段不存在：那时 `/remember`
-        # 不是命令，只是普通正文，行为必须与升级前逐字节一致（D-60）。
-        if self._memory_path_active():
-            memory_command = parse_memory_command(user_text)
-            if memory_command is not None:
-                return self._route_memory_command(
-                    memory_command,
-                    message=message,
-                    channel_id=channel_id,
-                    channel_kind=channel_kind,
-                    session_key=session_key,
-                    thread_root_id=thread_root_id,
-                    event_id=event_id,
-                    expires_at=expires_at,
-                )
+        # 「一条消息最多一个能力」（D-39）。旧个人命令即使未装配记忆也返回本地画像说明。
+        memory_command = parse_memory_command(user_text)
+        if memory_command is not None:
+            return self._route_memory_command(
+                memory_command,
+                message=message,
+                channel_id=channel_id,
+                channel_kind=channel_kind,
+                session_key=session_key,
+                thread_root_id=thread_root_id,
+                event_id=event_id,
+                expires_at=expires_at,
+            )
 
         # 9.05 用户画像命令与访谈输入（设计 §2、§8）：与记忆命令同一位置、同一套入队形状。
         # 必须早于能力命令解析，理由与记忆完全一样：`/search /persona …` 不能在剥掉能力前缀
@@ -972,10 +962,9 @@ class MessageRouter:
 
         记忆命令也是一种能力，`/search /remember x` 里两条命令并存：既不能按记忆命令执行
         （那样搜索被静默丢弃），也不该把 `/remember x` 原文当成搜索词发出去，因此与
-        `/search /kb` 同样本地拒绝（D-39）。未注入记忆时恒为 False：那时 `/remember`
-        不是命令，升级前怎么处理就怎么处理（D-60）。
+        `/search /kb` 同样本地拒绝（D-39），也覆盖已退役的个人命令。
         """
-        return self._memory_path_active() and parse_memory_command(text) is not None
+        return parse_memory_command(text) is not None
 
     def _route_memory_command(
         self,
@@ -991,7 +980,7 @@ class MessageRouter:
     ) -> RouteResult:
         """记忆命令的授权与入队（§34.1）；不调模型、不读命令以外的任何状态。
 
-        顺序固定为「只在 DM → Beta 接入门 → 入队」，与 §34.1 逐条对应。
+        顺序为「只在 DM → 旧个人入口返回画像说明 → Beta 接入门 → 共同记忆入队」。
         """
         # 大区是公开对话：同一文本只回固定提示，不进入 `MemoryAccessPolicy`（§28 末条），
         # 也不入队 —— 连管理员也不能在大区里执行记忆命令。
@@ -1009,9 +998,11 @@ class MessageRouter:
                 expires_at=expires_at,
             )
         user_id = message.author.id
-        if self._is_personal_memory_command(command) and self._migrated_for(user_id):
-            # 设计 §11.6：已迁移用户的旧个人记忆命令回迁移说明，不暗中翻译成新操作；
-            # 共同记忆命令（`list all_user`、`candidates` 等）照常走下面的原路径。
+        if self._is_personal_memory_command(command) or (
+            command.name == USAGE_COMMAND
+            and (self._memory_access is None or not self._memory_access.is_admin(user_id))
+        ):
+            # 旧个人入口统一退役，不再依赖是否建档或画像子系统是否装配成功。
             return self._emit(
                 "reply_now",
                 "memory_migrated",
@@ -1311,18 +1302,8 @@ class MessageRouter:
 
     @staticmethod
     def _is_personal_memory_command(command: MemoryCommand) -> bool:
-        """这条旧记忆命令是否只作用于**个人**范围（迁移后必须停用）。"""
-        if command.name in _PERSONAL_MEMORY_COMMANDS:
-            return True
-        if command.name == "list":
-            # 带作用域的是共同记忆（`/memory list all_user|lobby`），照常可用；
-            # 其余两种（自己的私有条目、自己的公开条目）都是个人范围。
-            return (
-                command.scope is None
-                and command.argument in _PERSONAL_MEMORY_LIST_ARGUMENTS
-            )
-        # `status` 展示的是本人的私有开关与条目数，迁移后不再是权威状态。
-        return command.name == "status"
+        """共用解析层的个人命令分类，避免路由与 worker 退役范围不一致。"""
+        return is_personal_memory_command(command)
 
     # --- 大区共享链 ---------------------------------------------------------
 

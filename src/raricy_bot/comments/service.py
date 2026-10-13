@@ -149,7 +149,7 @@ class CommentService:
     """独立评论服务：两个 poller、等待调度器与单并发 worker。
 
     评论侧与长期记忆的唯一接触面是注入的只读 provider（§35、§48.2）：`memory_allowed`
-    为真时问它一次（共同记忆只可能是 `all_user`；公开个人记忆由装配层的 provider 另走
+    为真时问它一次（共同记忆来自全局池；公开个人记忆由装配层的 provider 另走
     `public_context_for`，同样只读 `public/`）。这里**没有** `/remember`、`/memory`
     命令，也没有任何自动提取——那些条目只属于私聊。
     """
@@ -219,7 +219,7 @@ class CommentService:
         # 钉死在评论上，因此这条路径结构上要不到 `lobby`，也要不到任何用户私有文件。
         # None 表示记忆关闭或未注入：一次都不调用，评论与升级前逐字节一致（D-60）。
         self.memory_context = memory_context
-        # 评论侧 `all_user` 共同记忆的 token 上限（§26.1 的 `common_context_tokens`、§33）：
+        # 评论侧全局共同记忆的 token 上限（§26.1 的 `common_context_tokens`、§33）：
         # None 表示不设分组上限，只受评论自己的整轮预算约束（`comments.context_input_tokens`）。
         # 与 provider 一起注入，因为两者描述的是同一件事：这一轮能不能、能拿多少共同记忆。
         self.memory_common_tokens = memory_common_tokens

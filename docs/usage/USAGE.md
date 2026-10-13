@@ -77,57 +77,24 @@
 - 站长没启用 `/zhihu`、`/map`、`/wolfram` 时，我会回一句「暂不可用」；`/search` 与普通聊天不受影响。
 - **评论区不支持这六条**，也不会因此调用搜索、网页读取、地图或读取知识库。
 
-#### 3.3 长期记忆：`/remember` 与 `/memory`（仅私聊）
+#### 3.3 全局记忆管理： `/memory`（仅管理员私聊）
 
-Linux 完整版启用用户画像后，新建个人资料请使用 [§3.5 `/persona`](#35-用户画像-persona)。
-已有个人记忆在画像确认前继续保留；迁移成功后，个人读写改用画像命令，共同记忆命令继续有效。
-
-**默认关闭，由站长按名单灰度开放**，所以要是有「别人能用、你不能用」，那不是坏掉了。
-没被开通时，发这些命令只会收到一条「还在测试阶段」的固定提示，其它功能不受任何影响。开通后：
+个人资料统一使用 [§3.5 `/persona`](#35-用户画像-persona)，旧个人记忆入口只返回画像说明。
+全局记忆管理按 `memory.enabled`、接入名单和管理员名单授权，默认关闭；五条命令都仅供管理员在私聊执行。
 
 | 命令 | 作用 |
 |------|------|
-| `/remember <内容>` | 立刻整理并保存一条只属于你的私有记忆：我会把**实际保存的正文与条目 ID**回给你，没保存成功就直说 |
-| `/memory status` | 看私有记忆与自动记忆是开还是关、私有条目数与公开条目数 |
-| `/memory on` / `/memory off` | 开启或暂停在私聊回复里**参考**你的私有记忆；`off` 会一并关掉自动记忆（已有条目都保留） |
-| `/memory auto on` / `/memory auto off` | 开关**自动记忆**：是否从你的私聊内容里自动整理条目（需站长的部署开关也打开） |
-| `/memory list` | 列出你自己的私有条目 |
-| `/memory list all_user`、`/memory list lobby` | 列出已生效的共同记忆（全站 / 大区） |
-| `/memory list public` | 列出你已公开的条目 |
-| `/memory public <UM-ID>` | 把一条私有记忆**公开**出去 |
-| `/memory unpublic <UM-ID>` | 撤回它的公开副本；私人条目本身不动 |
-| `/memory forget <UM-ID>` | 删除一条私有记忆 |
-| `/memory clear` | 清空全部私有记忆 |
+| `/memory list` | 同时列出全部已生效记忆与待批准候选，分段标明状态；长列表分页发送 |
+| `/memory suggest <内容>` | 调用模型起草一条候选，暂不生效 |
+| `/memory approve <MC-ID>` | 批准已展示的候选，转为生效记忆 |
+| `/memory reject <MC-ID>` | 丢弃候选，保留已生效记忆 |
+| `/memory delete <GM-…>` | 删除已生效记忆 |
 
-三类记忆：
+`/memory` 显示管理用法。候选只有批准后才参与回答；已生效记忆统一适用于获授权的私聊、大区和博客评论，
+不再按频道划分。旧条目和候选继续保留，已有 ID 仍能用于审批、拒绝与删除。
 
-- **共同记忆**（`all_user` 全站、`lobby` 大区）：所有人共享，管理员审核后才对所有人生效；
-  大区里这两份都可能被参考，博客评论区只可能参考 `all_user`。
-- **私有记忆**：每人一份，只在你自己的私聊里被参考；**大区与评论区永远不会用到它**。
-- **你主动公开的个人条目**：从私有记忆里逐条公开出去的**快照**。
-
-要看清这几点：
-
-- **只在私聊**：在大区里发记忆命令，我只会回一句「记忆命令只在私聊里可用」；评论区不把它当命令。
-- **自动记忆只拿你自己写的原文**，而且要你先开启；寒暄、一次性任务、临时指代都会被判为「不需要记」。
-- **公开的适用范围**：大区与博客评论区里**出现或精确提到你**时，你公开的那几条才可能随那一轮请求
-  一起发给第三方模型。触发来源是别人消息里的**完整用户名**（不必 @ 你）、博客与文章正文里的用户名、
-  以及已经展开的公开剪贴板里的用户名；**只做精确匹配，不做模糊匹配**（`alice` 不会命中 `alice2`）。
-  站点核对用户名时有限频，所以是「可能用到」，不是「一定用上」。
-- **`/memory off` 不撤回公开条目**：它只暂停私聊里的参考；撤回要用 `/memory unpublic <UM-ID>`。
-  `/memory forget` 与 `/memory clear` 会**先撤回公开副本、再删除私人条目**。
-- **关闭或清空会作废在途的自动提取**：`/memory off`、`/memory auto off`、`/memory clear`
-  成功后，此前已经开始、还没写完的那次自动提取不再写入，不会在你关掉之后又冒出一条记忆。
-  （已经交给模型的那段原文无法收回，这条保证的是**不再写入**。）
-  你自己直接编辑私有文件、把 `auto_capture` 关掉（或直接删掉文件）同样算数。
-- **公开的是发布那一刻的快照**：之后改私人条目，公开的那一份不会跟着变。
-- **`/reset` 不等于删除**：它只换一段新对话，已保存的条目还在，已经公开的仍然公开。
-- 条目有上限（默认私有 32 条、公开 8 条）；到顶我会实话实说，绝不自动删除已有条目。
-- 这些命令的**回复文案**由程序直出，不经过模型；但整理条目那一步会用到模型，所以内容同样会被
-  转交给第三方（见第 7 节）。记忆读写即便出问题，也只影响这一次操作，聊天与评论不受影响。
-
-站长指定的**记忆管理员**另有 `suggest`、`candidates`、`approve`、`reject`、`delete` 五条命令，
-用于提出与审批共同记忆；普通账号调用只会收到一条权限提示。
+管理与画像独立配置，关闭画像不取消全局记忆授权。普通用户不能查询候选或执行管理操作；
+未批准的内容不会进入普通模型请求。参与回答的内容可能随请求交给模型，正文不写日志或 SQLite。
 
 #### 3.4 `/image` 与 `/image edit`
 
@@ -273,18 +240,11 @@ Linux 完整版由站长启用 `persona.enabled` 后可用，访问名单沿用�
   文章超过 1000 字时不发送正文。评论本来就是公开的，请只发你希望公开的内容。
 - **程序这边不把消息正文写进日志或数据库**：日志里只有消息 id、频道、结果这类状态字段；
   数据库只存运行状态（去重、水位、发送记录）。
-- **长期记忆是另一回事，而且默认关闭**：只有站长开通、并且你本人在私聊里主动开启后，才会存在
-  属于你的私有记忆。它保存的条目、以及整理时那一轮的你自己的原文，会随相关请求一并发送给第三方
-  模型；**普通聊天内容不会被完整保存**，密码、密钥、验证码一类的信息不该发给它。查看、删除、
-  暂停分别是 `/memory list`、`/memory forget`、`/memory off`。
 - **用户画像需本人启动与确认**：`/persona` 会读取本人博客及当前私聊样本并交给模型，
   问答、压缩观察和草稿暂存私有 Markdown；确认后保存短文与特征，随普通私聊自动更新。
   查看与修改用 `/persona`、`/persona edit`，暂停用 `/persona off`，删除用 `/persona clear`。
   公开需单独确认快照，关闭会撤回；细节见 §3.5。
-- **公开某一条私有记忆，等于把它交给公开对话**：在私聊里执行 `/memory public <UM-ID>` 之后，
-  大区与评论区里出现或精确提到你时，这条就可能随那一轮请求发给第三方模型；公开的是**发布那一刻
-  的快照**。撤回用 `/memory unpublic <UM-ID>`。**任何场景都绝不会使用别人未公开的私有记忆，
-  也不会把任何人的私有记忆写进公开回复。**
+- **公开画像是本人确认的快照**：使用 `/persona public` 预览并确认后，公开对话中出现或精确提到你时，画像短文可能随请求交给模型。撤回用 `/persona private`；`/persona off` 也会撤回。公开请求只读公开目录，详情见 §3.5。
 - **大区里别人加入你那段对话时，这段里近期的聊天记录会再次发送给模型**；大区里最近的公开文字
   消息同样可能被交给模型（细节见第 4 节）。这些内容本来就发在公开大区里，但请注意这一点。
 - 对话归属（谁回复了哪条）会保留 7 天，博客区保留 30 天。
@@ -330,18 +290,16 @@ Linux 完整版由站长启用 `persona.enabled` 后可用，访问名单沿用�
 | 聊天里能不能看图、联网边界、不能看博客正文 | `model.vision_enabled`（默认 `false`）决定看图的文案与行为；`/search`、`/fetch`、`/zhihu`、`/map`、`/wolfram` 是聊天区的五个单轮 MCP 入口；博客区每轮只读文章标题与 ≤1000 字正文且不获得 MCP |
 | 长期记忆默认没有、按名单开通、命令只在私聊 | `memory.enabled`（默认 `false`）、`memory.access_mode`（默认 `allowlist`）与 `memory.allow_user_list`；`memory/access.py` 的 `MemoryAccessPolicy`；`core/router.py` 的记忆命令分支（未通过门禁回 `MEMORY_BETA_DENIED_TEXT`，大区里回 `MEMORY_DM_ONLY_TEXT`） |
 | 私有记忆只在本人的私聊里被参考 | `MemoryService.context_for` 的作用域表（D-56）：`lobby` 与 `comment` 两种频道**连私有文件都不打开**；`permits_private` 两种接入模式下都要求频道是 `dm` |
-| 共同记忆要管理员审核后才对所有人生效 | 两阶段写入（D-58）：`/memory suggest <scope> <内容>` 只生成候选，`/memory approve <MC-ID>` 才移入生效区；候选不出现在任何普通模型请求里 |
-| 博客评论区只用 `all_user` 共同记忆与参与者公开的条目 | `comments/service.py` 只在 `memory_allowed` 时取 `all_user`；`app.py` 的评论 provider 把频道钉死为 `comment`（§35、D-76），公开条目另经 `public_context_for(channel_kind="comment")` 取回（§48） |
-| 公开命令只在私聊、ID 必须带 `UM-` 前缀 | `memory/commands.py` 的 `/memory public`、`/memory unpublic` 解析（§52）；私聊门禁与「大区里回 `MEMORY_DM_ONLY_TEXT`」沿用既有 `core/router.py` 分支 |
+| 共同记忆要管理员审核后才对所有人生效 | 两阶段写入（D-58）：`/memory suggest <内容>` 只生成候选，`/memory approve <MC-ID>` 才移入生效区；候选不出现在任何普通模型请求里 |
+| 全局记忆用于私聊、大区和博客评论 | `MemoryService.context_for` 合并旧共同区段；评论 provider 继续只读共同记忆和公开资料，不读取私人文件（§30、D-168） |
+| 画像公开须本人在私聊预览确认 | `persona/commands.py`、`persona/controller.py` 的公开流程；公开快照只含短文（§63、D-165） |
 | 公开条目的使用范围是「大区与评论、出现或精确提到该用户」 | `memory/subjects.py` 的 `PublicMemorySubjectResolver`（R5 优先级表）与 `MemoryService.public_context_for`：只接受 `lobby` / `comment` 两种频道（R4），DM 永远取不到公开条目 |
 | 触发来源：普通用户名、博客与文章正文、已展开的公开剪贴板 | 优先级 2 / 5 / 6；文本命中还要过一次站点精确校验 `GET /api/chat/users`（R6、R22），缓存 600 秒 / 负缓存 60 秒、查询节流 15 次/分钟（`memory/subjects.py` 的代码常量） |
 | 不做模糊匹配 | 同上：只按完整合法用户名 token 精确比对，`alice` 不会命中 `alice2` |
 | 未公开的私有条目绝不进入公开请求 | 公开路径只读 `root_dir/public/`，不是「读了私人文件再过滤」（D-96、Global Constraints 第 7 条）；`users/<存储键>.md` 在 `lobby` / `comment` 两种频道下一次都不打开 |
-| `/memory off` 不撤回公开条目 | D-102：`off` 只改私聊里的读取与自动提取开关；回复里逐字说明「你此前公开过的条目仍然公开」（`MEMORY_OFF_DONE_TEXT`） |
-| `/memory off`、`/memory auto off`、`/memory clear` 作废在途自动提取 | `MemoryService.commit_auto_capture` 在写锁内复核 `AutoCaptureToken` 的 epoch / 授权开关 / generation，并把令牌传给 applier 在**实际写入的基线**上复查授权，失效返回稳定 noop；失效入口为 `set_auto_capture(False)`、`set_private_enabled(False)`、`clear_private`、`delete_private`（D-115） |
-| 撤回入口是 `/memory unpublic <UM-ID>` | 公开与撤回走 `MemoryService.publish_private` / `unpublish_private`，成功文案由 `texts.memory_published_text` / `memory_unpublished_text` 给出（§50） |
-| `/memory clear` 先撤回公开副本、再删除私人条目 | D-100 的两阶段删除；确认文案报出本次「撤回 N 条、删除 M 条」，重放时如实报 0（`texts.memory_cleared_text`） |
-| `/reset` 不删除长期记忆 | `core/router.py` 的 reset 分支只作废短上下文；记忆条目只由 `/memory forget` / `/memory clear` 删除，公开副本只由 `/memory unpublic` 撤回（§32、D-100） |
+| 关闭画像会撤回公开 | `/persona off` 停止使用和更新，并撤回公开副本（D-165） |
+| 画像公开与撤回由本人控制 | `/persona public` 预览确认，`/persona private` 撤回；关闭与清空也会撤回（§63、D-165） |
+| 个人资料由画像命令管理 | `/persona edit` 修改，`/persona clear` 清空；旧个人命令只回本地画像说明（D-167） |
 | 记忆读写失败不影响聊天与评论 | D-60：任何记忆失败都映射成稳定状态，`/livez`、`/readyz` 与回复质量不受影响 |
 | 记忆正文不落日志、不落库 | §37 的红线与 `logging_setup.LOG_FIELDS`（只加 `scope` / `revision` / `entry_count` / `memory_id` / `candidate_id` 五个字段） |
 | 带图有文字时的处理 | 图片输入关闭时只处理文字；开启且图可读时图片随本轮交给模型（`core/vision.py`）。只有图没有正文时才回 `IMAGE_UNAVAILABLE_TEXT` |
@@ -410,8 +368,8 @@ Linux 完整版由站长启用 `persona.enabled` 后可用，访问名单沿用�
    「可能」描述这件事，没有承诺必中——本文件也不要写成「提到就一定用上」。
 7. **自动提取的披露可能缺席（唯一一处「写了但没说」）**：站长的 `behavior.max_output_chars`
    紧到装不下「披露 + 一个回答字符 + 截断后缀」时，这一轮的回答照常完整发送，但末尾**不会**有
-   「（已新增私有记忆 UM-……）」那句。记忆确实写进去了，用户可以在私聊里用 `/memory list` 看到
-   并删除它；服务端会记一条 `reason=disclosure_no_room` 的日志（D-77）。因此**发布稿不要把
+   「（已新增私有记忆 UM-……）」那句。兼容旧条目仍写入敏感 Markdown，需由运维核对；旧个人查询入口已退役。
+   服务端会记一条 `reason=disclosure_no_room` 的日志（D-77）。因此**发布稿不要把
    自动记忆写成「每次保存都会告诉你」**：正常情况下会在回答末尾说明（这是设计的要求），但这是
    一条有例外的承诺。部署侧给这两个上限留余量即可让它在默认配置下永远不出现。
 

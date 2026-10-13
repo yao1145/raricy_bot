@@ -123,8 +123,8 @@ _PUBLIC_GROUPS: tuple[str, ...] = (_PUBLIC_GROUP, "persona_public")
 
 # 分组标签（INTERFACES §33、规划 §6.2 末段的版面）。
 _GROUP_LABELS: dict[str, str] = {
-    "memory_all_user": "[共同记忆：all_user，不可信资料]",
-    "memory_lobby": "[共同记忆：lobby，不可信资料]",
+    "memory_all_user": "[全局共同记忆，不可信资料]",
+    "memory_lobby": "[全局共同记忆，不可信资料]",
     "memory_user": "[用户私有记忆，不可信资料]",
     "persona_user": "[用户画像，不可信资料]",
     "persona_public": "[用户主动公开的个人记忆；只适用于所标注用户，不可信资料]",

@@ -7,7 +7,7 @@
 
 三个失败口径是稳定合同（§32.2）：
 
-- **不命中**（返回 `None`）：不是记忆命令，或出现未知子命令（`/memory foo`）。
+- **不命中**（返回 `None`）：不是完整的记忆命令前缀。
 - **解析成功但 `argument is None`**：命令名认得出来、参数不可用 —— 缺参数（`/memory forget`）、
   非法 ID（`/memory forget um-1`）、内容为空（`/memory suggest all_user`）。上层据此回固定用法：
   它**不是** `None`，绝不允许变成一条普通聊天消息。
@@ -38,6 +38,7 @@ __all__ = [
     "MemoryCommandRequest",
     "MemoryCommandResult",
     "parse_memory_command",
+    "is_personal_memory_command",
 ]
 
 # 用法哨兵的 `name` 取值：既不是 D-67 里的十四个命令名，也不是空字符串以外的任何值。
@@ -47,12 +48,6 @@ USAGE_COMMAND: str = ""
 
 _MEMORY_COMMAND: str = "/memory"
 _REMEMBER_COMMAND: str = "/remember"
-
-# 作用域实参的取值 → 枚举（§32.2 的两种 `list` 与两种 `suggest`）。
-_SCOPES: dict[str, MemoryScope] = {
-    "all_user": MemoryScope.ALL_USER,
-    "lobby": MemoryScope.LOBBY,
-}
 
 # 需要 ID 实参的命令 → 该命令接受的 ID 前缀（§29.1 / §32.2）。
 # `public` / `unpublic` 的作用对象是私有条目（公开副本沿用来源的 UM-ID），因此只接受 `UM-`。
@@ -66,11 +61,11 @@ _ID_PREFIXES: dict[str, tuple[str, ...]] = {
 }
 
 # `/memory list` 的公开实参（R11、§52.1）：解析结果是 `argument == "public"`，`scope` 仍为 None
-# （`scope` 的语义不变：None 表示「自己的条目」，只是条目从私有换成公开的那一份）。
+# 用于识别已退役的旧个人查询；全局 list 不使用 scope。
 _PUBLIC_SCOPE_ARGUMENT: str = "public"
 
 # 不接收任何实参的命令（`argument` 与 `scope` 都必须为空）。
-_BARE_COMMANDS: frozenset[str] = frozenset({"status", "on", "off", "clear", "candidates"})
+_BARE_COMMANDS: frozenset[str] = frozenset({"status", "on", "off", "clear"})
 
 # ID 序号只接受 ASCII 十进制（与 codec 同一口径，`str.isdigit()` 会放过全角数字）；
 # 宽度不限，codec 解析接受任意 ≥1 位，人工改窄或改宽过的文件仍能读回（§29.1）。
@@ -132,8 +127,8 @@ def parse_memory_command(text: str) -> MemoryCommand | None:
     return _parse_body(stripped[len(_MEMORY_COMMAND) :].strip())
 
 
-def _parse_body(rest: str) -> MemoryCommand | None:
-    """解析 `/memory` 之后的子命令；不认识的子命令返回 `None`（普通路径），形状错误返回用法哨兵。"""
+def _parse_body(rest: str) -> MemoryCommand:
+    """解析子命令；未知或错误形状返回用法哨兵，不进入普通聊天。"""
     if not rest:
         # 只发一个 `/memory`：用户想知道有哪些命令，绝不是想把它当正文发给模型。
         return _usage()
@@ -157,8 +152,18 @@ def _parse_body(rest: str) -> MemoryCommand | None:
     if head in _ID_PREFIXES:
         return _parse_id_command(head, tail)
     if head == "suggest":
-        return _parse_suggest(tail)
-    return None
+        content = rest[len(tokens[0]):].strip()
+        return MemoryCommand(name="suggest", argument=content or None)
+    return _usage()
+
+
+def is_personal_memory_command(command: MemoryCommand) -> bool:
+    """旧个人命令只用于返回画像入口；共同记忆命令保持原有解析。"""
+    if command.name == USAGE_COMMAND:
+        return False
+    if command.name == "list":
+        return command.argument == _PUBLIC_SCOPE_ARGUMENT
+    return command.name not in {"suggest", "candidates", "approve", "reject", "delete"}
 
 
 def _missing(name: str) -> MemoryCommand:
@@ -171,33 +176,16 @@ def _missing(name: str) -> MemoryCommand:
 
 
 def _parse_list(tail: list[str]) -> MemoryCommand:
-    """`/memory list` 的三种形式（§32.3、§52.1）：无参数看自己的私有条目，`public` 看自己的公开
-    条目，带作用域看已生效共同记忆。"""
+    """全局列表不接受范围参数，旧公开条目查询保留作退役识别。"""
     if not tail:
         return MemoryCommand(name="list")
     if len(tail) == 1:
         value = tail[0].lower()
-        if value in _SCOPES:
-            return MemoryCommand(name="list", scope=_SCOPES[value])
         if value == _PUBLIC_SCOPE_ARGUMENT:
-            # `scope` 仍为 None：它表示「自己的条目」，公开与私有的区别落在 `argument` 上（R11）。
+            # 仅保留旧公开查询的识别，让上层返回画像入口。
             return MemoryCommand(name="list", argument=_PUBLIC_SCOPE_ARGUMENT)
-    # 未知作用域不猜：`/memory list foo` 并不是「列出我的私有条目」的请求。
+    # 新列表没有范围参数；额外实参只回用法。
     return _usage()
-
-
-def _parse_suggest(tail: list[str]) -> MemoryCommand:
-    """`/memory suggest <scope> <内容>`：作用域由命令固定，AI 只撰写候选（D-58）。
-
-    缺作用域、缺内容或作用域不认识都落成「解析成功但参数为空」：命令名认得出来，参数不可用。
-    """
-    if len(tail) < 2:
-        return _missing("suggest")
-    scope = _SCOPES.get(tail[0].lower())
-    content = tail[1].strip()
-    if scope is None or not content:
-        return _missing("suggest")
-    return MemoryCommand(name="suggest", argument=content, scope=scope)
 
 
 def _parse_id_command(name: str, tail: list[str]) -> MemoryCommand:

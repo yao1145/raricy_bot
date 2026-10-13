@@ -41,7 +41,7 @@ from .. import texts
 from ..logging_setup import get_logger, log_event
 from .access import MemoryAccessPolicy
 from .codec import PREFIX_ALL_USER, PREFIX_CANDIDATE, PREFIX_LOBBY, PREFIX_USER
-from .commands import USAGE_COMMAND, MemoryCommandRequest, MemoryCommandResult
+from .commands import USAGE_COMMAND, MemoryCommandRequest, MemoryCommandResult, is_personal_memory_command
 from .models import (
     STATUS_CONFLICT,
     STATUS_FORBIDDEN,
@@ -108,21 +108,16 @@ _FAILURE_TEXTS: dict[str, str] = {
     STATUS_PUBLIC_CONFLICT: texts.MEMORY_PUBLIC_CONFLICT_TEXT,
 }
 
-# 需要 admin 的命令（§32.2 的第二组）；Controller 与 Service 两层都查（§32.3、R14）。
-# 公开动作是普通用户的命令，不在这一组里。
-_ADMIN_COMMANDS: frozenset[str] = frozenset({"suggest", "candidates", "approve", "reject", "delete"})
+# 全局列表包含候选，五个管理命令均要求管理员；写入由 Service 独立复查。
+_ADMIN_COMMANDS: frozenset[str] = frozenset({"list", "suggest", "approve", "reject", "delete"})
 
 # 不接收实参的命令：对它们来说 `argument is None` 是正常形状，只有缺参数形状的命令才回用法（§32.2）。
-_NO_ARGUMENT_COMMANDS: frozenset[str] = frozenset(
-    {"status", "on", "off", "auto_on", "auto_off", "clear", "candidates"}
-)
+_NO_ARGUMENT_COMMANDS: frozenset[str] = frozenset({"list"})
 
-# 实参可有可无的命令（§52.1）：`list` 不带实参看私有条目、带 `public` 看公开条目。
-# 它**不**在 `_NO_ARGUMENT_COMMANDS` 里，否则带实参的 `/memory list public` 会被反向形状检查
-# 当成「不给实参却塞了实参」而只回用法。
-_OPTIONAL_ARGUMENT_COMMANDS: frozenset[str] = frozenset({"list"})
+# 当前全局命令没有可选实参，保留独立集合供形状校验。
+_OPTIONAL_ARGUMENT_COMMANDS: frozenset[str] = frozenset()
 
-# 命令名 → 处理方法（D-67 钉死的十四个名字 + §52.1 新增的 `public` / `unpublic`）。
+# 全局命令名 → 处理方法。
 # `_run` 在分派前完成门禁、admin 判定与用法检查。
 _Handler = Callable[
     ["MemoryController", MemoryCommandRequest], Awaitable[MemoryCommandResult]
@@ -215,9 +210,15 @@ class MemoryController:
             # Router 已经查过一次；这是本模块按 §32.3 的独立一层，不是那次检查的副本。
             return self._result(STATUS_FORBIDDEN, texts.MEMORY_BETA_DENIED_TEXT)
         name = request.command.name
+        if is_personal_memory_command(request.command):
+            return self._result(STATUS_NOOP, texts.PERSONA_MIGRATED_TEXT)
         if name == USAGE_COMMAND or name not in _HANDLERS:
             # 用法哨兵与未知命令名都只回固定用法：不写任何东西，也绝不落到普通聊天。
-            return self._result(STATUS_NOOP, texts.MEMORY_USAGE_TEXT)
+            return self._result(
+                STATUS_NOOP,
+                texts.MEMORY_USAGE_TEXT if self.access.is_admin(request.user_id)
+                else texts.PERSONA_MIGRATED_TEXT,
+            )
         if name in _ADMIN_COMMANDS and not self.access.is_admin(request.user_id):
             # 第一层 admin 判定（§32.3）；Service 的四个管理 mutation 各自还会独立复查（R14）。
             # 文案是**权限**拒绝，与接入门的拒绝（MEMORY_BETA_DENIED_TEXT）不是同一件事。
@@ -333,56 +334,24 @@ class MemoryController:
         return await self._from_outcome(request, outcome.status, outcome.object_id)
 
     async def _list(self, request: MemoryCommandRequest) -> MemoryCommandResult:
-        """`/memory list` 的三种形式（§32.3、§52.1）：无参看自己的私有条目、`public` 看自己的
-        公开条目、带作用域看**已生效**共同记忆。
-
-        三种形式都只展示已生效内容：候选不在这里出现，只有管理员能用 `/memory candidates` 看。
-        私有一栏还标出每条是否已公开（设计 §5.1）：标记来自公开快照，不看私人文件就能算出来。
-        """
-        scope = request.command.scope
-        argument = request.command.argument
-        if scope is not None:
-            entries = await self.service.common_entries(scope)
-            lines = tuple(
-                texts.memory_entry_line(memory_id=entry.memory_id, content=entry.content)
-                for entry in entries
-            )
-            return self._result(
-                STATUS_OK,
-                texts.memory_entry_list_text(scope=scope.value, lines=lines),
-            )
-        if argument == _PUBLIC_ARGUMENT:
-            public_lines = tuple(
-                texts.memory_entry_line(memory_id=entry.memory_id, content=entry.content)
-                for entry in await self.service.public_entries(request.user_id)
-            )
-            return self._result(
-                STATUS_OK, texts.memory_public_entry_list_text(lines=public_lines)
-            )
-        if argument is not None:
-            # 手搓请求里的未知实参（解析器只会给出 `public`）：只回固定用法，绝不「猜着执行」。
+        """管理员查看全局已生效条目与候选，候选保持待审核状态。"""
+        if request.command.argument is not None or request.command.scope is not None:
             return self._result(STATUS_NOOP, texts.MEMORY_USAGE_TEXT)
-        published = await self._published_ids(request.user_id)
-        entries = await self.service.private_entries(request.user_id)
-        lines = tuple(
-            texts.memory_entry_line(
-                memory_id=entry.memory_id,
-                content=entry.content,
-                # 比对用 `_same_memory_id` 的归一化口径（§41.2、§41.3）：公开文件里的 ID 可以
-                # 被人手改窄（`UM-6`），逐字相等会把**仍然公开着**的这条渲染成 `[私有]` ——
-                # 那等于告诉用户他没暴露，而暴露是真的。
-                published=any(
-                    _same_memory_id(entry.memory_id, one) for one in published
-                ),
-            )
+        entries = await self.service.common_entries()
+        candidates = await self.service.candidates()
+        active_lines = tuple(
+            texts.memory_entry_line(memory_id=entry.memory_id, content=entry.content)
             for entry in entries
         )
-        # 空列举是**成功**：用户没有点名任何目标，问题（当前有哪些条目）也已经回答，空态由
-        # 文案自己说清（§36）。回 `not_found` 会让 `_log_command` 把一次日常查看记成失败，
-        # 污染日志派生的健康信号 —— §27.4 的 `not_found` 只指「目标条目或候选不存在」。
-        return self._result(
-            STATUS_OK, texts.memory_entry_list_text(scope=None, lines=lines)
+        pending_lines = tuple(
+            texts.memory_candidate_line(
+                candidate_id=item.candidate_id, scope=item.scope.value,
+                action=item.action.value, target_id=item.target_id, content=item.content,
+            ) for item in candidates
         )
+        return self._result(STATUS_OK, texts.memory_global_list_text(
+            active_lines=active_lines, pending_lines=pending_lines,
+        ))
 
     async def _public(self, request: MemoryCommandRequest) -> MemoryCommandResult:
         """`/memory public <UM-ID>`：把一条私有条目抄成公开快照（设计 §12.1、INTERFACES §42.4）。
@@ -527,10 +496,10 @@ class MemoryController:
         return await self._from_outcome(request, STATUS_OK, outcome.object_id, opened=opened)
 
     async def _suggest(self, request: MemoryCommandRequest) -> MemoryCommandResult:
-        """`/memory suggest <scope> <内容>`：AI 只撰写候选，作用域由解析固定（规划 §8.2、D-58）。"""
-        scope = request.command.scope
+        """`/memory suggest <内容>`：从全局池撰写候选，旧存储区段由宿主选择。"""
+        scope = MemoryScope.ALL_USER
         content = request.command.argument
-        if scope is None or content is None:
+        if content is None:
             # 与 `_remember` 同样的兜底：手搓请求也不允许绕过形状检查。
             return self._result(STATUS_NOOP, texts.MEMORY_USAGE_TEXT)
         operation_id = self._operation_id(request)
@@ -538,13 +507,20 @@ class MemoryController:
         replay = await self.service.find_operation(operation_id)
         if replay is not None:
             return await self._from_outcome(request, replay.status, replay.object_id)
-        existing = await self.service.common_entries(scope)
+        existing = await self.service.common_entries()
         proposal_result = await self.writer.propose_common(content, existing)
         proposal = proposal_result.proposal
         if proposal_result.status != STATUS_OK or proposal is None:
             return self._result(STATUS_INVALID_PROPOSAL, texts.MEMORY_WRITE_FAILED_TEXT)
         if proposal.action is ProposalAction.NOOP:
             return self._result(STATUS_NOOP, texts.MEMORY_WRITE_FAILED_TEXT)
+        # 旧文件区段仅用于保留 ID 与存储格式，不再限制生效频道。
+        target = next((entry for entry in existing if (
+            (proposal.target_id is not None and _same_memory_id(entry.memory_id, proposal.target_id))
+            or (proposal.target_id is None and entry.key == proposal.key)
+        )), None)
+        if target is not None and target.memory_id.startswith(PREFIX_LOBBY):
+            scope = MemoryScope.LOBBY
         outcome = await self.service.add_common_candidate(
             scope,
             proposal,
@@ -921,21 +897,18 @@ def _command_failure_text(request: MemoryCommandRequest, status: str) -> str | N
 
 
 def _same_memory_id(left: str | None, right: str | None) -> bool:
-    """两个 UM-ID 指的是不是同一条：**宽度不算数**（`UM-6` 与 `UM-000006` 同一条，§41.3）。
-
-    只服务「拿命令里的 ID 去公开快照里找那一条」这一件事：公开命令回 `noop` 时服务不返回
-    对象 ID，而用户完全可能写 `UM-6` 这种人工改窄过的序号。宽度不同的两个 `UM-` ID 只要序号
-    的数值形态相同就算同一条；其余形状一律按逐字相等处理（不做任何猜测）。
-    """
+    """同前缀的个人或共同条目按 ASCII 序号比较，兼容人工缩窄过的 ID。"""
     if left is None or right is None:
         return False
     if left == right:
         return True
-    if not left.startswith(PREFIX_USER) or not right.startswith(PREFIX_USER):
+    prefix = next((item for item in (PREFIX_USER, PREFIX_ALL_USER, PREFIX_LOBBY)
+                   if left.startswith(item) and right.startswith(item)), None)
+    if prefix is None:
         return False
-    left_digits = left[len(PREFIX_USER) :]
-    right_digits = right[len(PREFIX_USER) :]
-    if not left_digits.isdigit() or not right_digits.isdigit():
+    left_digits = left[len(prefix) :]
+    right_digits = right[len(prefix) :]
+    if not all(value.isascii() and value.isdigit() for value in (left_digits, right_digits)):
         return False
     return left_digits.lstrip("0") == right_digits.lstrip("0")
 
@@ -961,18 +934,7 @@ def _service_forbidden_text(request: MemoryCommandRequest) -> str:
 
 # 命令名 → 处理方法。放在类之后定义，`_run` 运行期读它，因此顺序无关。
 _HANDLERS: dict[str, _Handler] = {
-    "status": MemoryController._status,
-    "on": MemoryController._on,
-    "off": MemoryController._off,
-    "auto_on": MemoryController._auto_on,
-    "auto_off": MemoryController._auto_off,
     "list": MemoryController._list,
-    _PUBLISH_COMMAND: MemoryController._public,
-    _UNPUBLISH_COMMAND: MemoryController._unpublic,
-    "forget": MemoryController._forget,
-    "clear": MemoryController._clear,
-    "candidates": MemoryController._candidates,
-    "remember": MemoryController._remember,
     "suggest": MemoryController._suggest,
     "approve": MemoryController._approve,
     "reject": MemoryController._reject,

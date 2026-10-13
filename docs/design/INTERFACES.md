@@ -443,15 +443,15 @@ Markdown 保存条目和 operations；不把业务幂等结果另存 SQLite。
 
 ## 30. `memory/service.py`（存储服务）
 
-入口：[MemoryService](../../src/raricy_bot/memory/service.py)，记忆的唯一写入口。
+入口：[MemoryService](../../src/raricy_bot/memory/service.py)，记忆的唯一写入口。`common_entries()` 无参数返回全局池；显式旧区段参数仅供存储兼容。旧文件区段与 ID 保留，新候选的存储区段由宿主按既有目标或键决定，与生效频道无关。容量按全局生效条目总数检查，跨旧区段同名键审批冲突，旧超额条目不自动删除（D-168）。
 单进程 mutation lock；同目录临时文件、flush/fsync、摘要比对、os.replace 后一次发布新快照。
 外部编辑冲突不得静默覆盖，坏文件保留最后有效快照；错误映射稳定状态。
 
 | 请求场景 | 可读取的生效内容 |
 |---|---|
-| DM | all_user；仅所属用户且 private_enabled 时读取 user |
-| lobby | all_user + lobby；公开投影另走 §42 |
-| comment | all_user；公开投影另走 §42 |
+| DM | 全局共同记忆；仅所属用户且 private_enabled 时读取兼容旧 user 条目 |
+| lobby | 全局共同记忆；公开投影另走 §42 |
+| comment | 全局共同记忆；公开投影另走 §42 |
 
 共同候选不进普通请求；管理 mutation 在 I/O 和幂等查询前复查 admin。
 `private_path` 是私有路径只读入口；`private_settings_cached` 无 I/O。
@@ -483,8 +483,8 @@ generation，失效返回稳定 `noop`（不写、不产生披露）；并把令
 入口：[命令解析](../../src/raricy_bot/memory/commands.py)、[MemoryController](../../src/raricy_bot/memory/controller.py)。
 执行顺序：权限→查 operations 幂等→读取快照→AI→校验→原子写→固定回执；
 重放返回首次结果，不重复调用 AI，也不改成 duplicate。
-共同候选由管理员提出、审批；批准的是已展示版本，不再调模型，目标变动则 conflict。
-私有开关、手动保存与自动提取分开；reset 不动长期记忆。公开命令和两阶段删除见 §52。
+共同候选由管理员提出、审批；批准的是已展示版本，不再调模型，目标变动则 conflict。Controller.list 在权限检查后读取合并的全局条目及候选；App 在脱敏与表情归一后分页，逐页检查过期与送达，失败后停止，不静默截掉尾部。
+命令入口为管理员专用的全局 list/suggest/approve/reject/delete。list 无参数，包含已生效条目和候选；suggest 只接收正文，正文完整交给模型，命令不再携带范围。裸命令或错误参数对管理员回共同用法，对普通用户回画像说明；旧个人命令均返回画像说明，不调用存储或模型（D-167）。旧个人条目的服务方法保留作存储兼容。全局共同记忆合并读取规则见 D-168。
 自动提取的授权规则不由控制器自建：控制器从 `begin_auto_capture` 取令牌，模型调用后经
 `commit_auto_capture` 提交，失效判定全部落在服务层的写锁内（D-115）。
 
@@ -509,14 +509,14 @@ Router 只授权、构造请求、入记忆队列；只有 worker 成功启动�
 入口：[CommentRouter](../../src/raricy_bot/comments/router.py)、[CommentService](../../src/raricy_bot/comments/service.py)。
 Router 在有 author.id 时计算 memory_allowed；下游传递已做出的决定。
 `_CommentMemoryAccess` 是共同记忆决策载体，不能换回用 None 复问 allowlist 的真实策略（D-76）。
-评论不读 lobby 或私有文件；公开资料单独走 §48。
+评论读取全局共同记忆，不读取私有文件；公开资料单独走 §48。旧大区条目也属于全局池。
 
 ## 36. `texts.py`（帮助与记忆文案）
 
 入口：[help_text、comment_help_text 与记忆回执](../../src/raricy_bot/texts.py)。
 配置上限必须注入；不恢复已删除的 HELP_TEXT 常量（D-94）。
-开启读取/自动记忆及隐式开启的保存回执说明保存、外送、范围、查看删除方式，不另存“已披露”标记。
-help 只读缓存；快照未暖时可保守显示未开启（D-79）。
+帮助只展示共同记忆与已授权画像的披露，不再展示旧个人记忆开启、保存或公开指令。
+旧个人回执保留兼容符号，但统一返回画像说明（D-167）。
 
 ## 37. 记忆日志与安全
 
@@ -625,14 +625,9 @@ peek/discard 保持同一批次的正文与元数据，不另建长期参与者�
 复用 [日志白名单](../../src/raricy_bot/logging_setup.py)，仅记录稳定原因和计数。
 不记录 username、owner key、扫描文本、命中条目正文或文件路径；身份校验失败不能把上游响应倾倒到日志。
 
-## 52. `memory/commands.py` 与 `memory/controller.py`（公开命令）
+## 52. 旧个人条目的公开存储兼容
 
-入口：[解析器](../../src/raricy_bot/memory/commands.py)、[Controller](../../src/raricy_bot/memory/controller.py)。
-public/unpublic/list public 只在 DM，条目 ID 必须匹配 UM 前缀；发布/撤回不调用 AI。
-forget/clear 先以 `cmd:<message_id>:unpublish` 撤回，再以 `cmd:<message_id>` 删除私有；
-撤回失败不执行删除，重放从幂等结果继续。
-memory off 只关私有读取与自动提取，公开副本不变；自动更新遇 public_conflict 静默跳过，
-显式 remember 返回专用说明。
+旧公开投影与撤回、删除顺序仍供迁移和存储兼容使用，个人公开命令已经退役（D-167）。当前公开入口为 §63 的画像预览与确认流程；旧条目文件不能直接删除，也不能重新暴露旧命令。
 
 ## 53. 定时发文（`blog/`）
 
@@ -2092,4 +2087,4 @@ user 数据，system 为静态常量；输入输出均脱敏。JSON 严格限制
 `off` 撤回公开并停止读取与更新，`on` 不重新发布；待撤回状态恢复时重试，未完成必须明确报告。
 
 迁移成功后停用旧个人资料的读取、写入与自动提取，旧公开副本先撤回，共同记忆继续原契约。
-清空保留迁移墓碑，防止重新使用旧私有文件。旧 `/memory off` 仍遵循 §32/D-102，新画像关闭按 D-165。
+清空保留迁移墓碑，防止重新使用旧私有文件。旧个人命令统一退役（D-167），画像关闭按 D-165。

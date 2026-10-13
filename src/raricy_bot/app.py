@@ -246,7 +246,7 @@ class _CommentMemoryAccess:
     所以这里只回答「共同记忆可读」，并且：
     - 只有 `CommentService` 在 `memory_allowed` 为真时才调用它（唯一调用点）；
     - 私有一律 False（纵深防御：`context_for` 本来也只在 DM 才问私有）；
-    - 频道由 provider 钉死为 `comment`，作用域因此永远只有 `all_user`（§30.2 的表）。
+    - 频道由 provider 钉死为 `comment`，读取同一全局共同记忆池（§30.2 的表）。
     """
 
     def permits_common(self, user_id: str | None) -> bool:
@@ -832,7 +832,7 @@ class BotApp:
                         self._image_loader if self._comment_vision else None
                     ),
                     # §34.2 第 5 步的只读 context provider：请求感知（§48.2）、只读，
-                    # 共同记忆只可能返回 `all_user`、公开条目只来自 `public/`；关闭时
+                    # 共同记忆返回全局池、公开条目只来自 `public/`；关闭时
                     # 同样不注入，评论侧连一个方法都拿不到。
                     memory_context=(
                         self._comment_memory_items if (memory_on or persona_on) else None
@@ -1451,8 +1451,8 @@ class BotApp:
     def _supplemental_caps(self) -> tuple[SupplementalCap, ...]:
         """补充资料的分组 token 上限（§33、§26.1）：把 `memory.*_context_tokens` 接上。
 
-        共同记忆（`all_user` 与 `lobby`）**合计**一份预算、私有记忆（`memory_user`）单独一份，
-        与 `config.example.yaml` 里那句「all_user 与 lobby 合计使用这一份共同记忆预算」一致
+        全局共同记忆使用一份预算、私有记忆（`memory_user`）单独一份，
+        与 `config.example.yaml` 里那句「全局共同记忆单轮 token 上限」一致
         —— 传两个分组名进同一个上限，而不是各给一份。公开个人记忆有**自己**的一份
         （`public_personal_context_tokens`，§45.3、公开设计 §7.3）：DM 用「共同 + 私有」、
         大区用「共同 + 公开个人」，三份上限各自独立、与整轮预算是两道独立的门。
@@ -1813,10 +1813,10 @@ class BotApp:
         `CommentMemoryInputs` —— 当前 subject、会话 subjects、已允许扫描的文本段与门禁布尔，
         没有任何私人正文。它拿不到原始作者 ID，「谁」只能以不可逆的 owner key 出现。
 
-        两路各自独立取用、各自软失败，都只读 `public/` 或 `all_user`：
+        两路各自独立取用、各自软失败，都只读 `public/` 或全局共同记忆：
 
         1. **共同记忆**：`user_id=None` + `channel_kind="comment"` + `_CommentMemoryAccess`
-           载体，按 §30.2 的表只可能解析出 `all_user`（§35、D-76）。作者 ID 不可得，门禁
+           载体，按 §30.2 的表读取全局共同记忆（§35、D-76）。作者 ID 不可得，门禁
            结论由 `CommentRouter` 用真实 ID 判过、由载体带过这一段。
         2. **公开个人记忆**：由 `public_context_for` 从公开投影里取（§42.7、§48.2）；
            它不经过载体，因此载体的 fail-open 构造扩大不了任何范围（D-76 的 2026-09-17 补充）。
@@ -1931,9 +1931,7 @@ class BotApp:
                 return
             if self._is_expired(getattr(request, "expires_at", None)):
                 return
-            if (self._persona_armed and MessageRouter._is_personal_memory_command(request.command)
-                    and self._persona_service is not None
-                    and not await self._persona_service.persona_legacy_allowed(request.user_id)):
+            if MessageRouter._is_personal_memory_command(request.command):
                 await self._send_message(request.channel_id, texts.PERSONA_MIGRATED_TEXT,
                                          request.message_id, kind="notice_local", thread_root_id=None,
                                          expires_at=getattr(request, "expires_at", None))
@@ -1945,14 +1943,28 @@ class BotApp:
                 # D-4：不可用期间不发消息（与 `_send_local` 同一口径）；
                 # 命令本身已经执行完，终态照常在 finally 里落。
                 return
-            await self._send_message(
-                request.channel_id,
-                result.text,
-                request.message_id,
-                kind="notice_local",
-                thread_root_id=None,
-                expires_at=getattr(request, "expires_at", None),
-            )
+            parts = (result.text,)
+            if request.command.name == "list":
+                rendered, _ = prepare_outbound(
+                    result.text, redactor=self._redactor, table=self._sticker_table,
+                    max_chars=None,
+                )
+                parts = texts.memory_list_pages(
+                    rendered, max_chars=self._config.behavior.max_output_chars,
+                )
+            for part in parts:
+                if self._unavailable or self._is_expired(getattr(request, "expires_at", None)):
+                    return
+                outcome = await self._send_message(
+                    request.channel_id,
+                    part,
+                    request.message_id,
+                    kind="notice_local",
+                    thread_root_id=None,
+                    expires_at=getattr(request, "expires_at", None),
+                )
+                if not outcome.delivered:
+                    return
         finally:
             await self._mark_handled_for_deadline(
                 request.message_id, getattr(request, "expires_at", None)
