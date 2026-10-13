@@ -54,7 +54,7 @@ import logging
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -96,6 +96,7 @@ from .core.worker import (
     ModelClient,
     ModelError,
     OpenAIModelClient,
+    STAGE_FIRST_ROUND,
     ToolGenerationCancelled,
     WorkerPool,
 )
@@ -137,7 +138,7 @@ from .site.models import LOBBY, ChatMessage
 from .site.sse import SSEReceiver
 from .stickers import StickerTable
 from .store import STATUS_SKIPPED, Store
-from .text_utils import has_media, truncate_at_paragraph
+from .text_utils import estimate_tokens, has_media, truncate_at_paragraph
 
 _logger = get_logger("app")
 
@@ -173,6 +174,34 @@ _PERSONA_UPDATES_MAX: int = 16
 _PERSONA_STOP_CONTROLS: frozenset[str] = frozenset({"off", "clear", "cancel"})
 _PERSONA_PRIVATE_SUPPRESS_CONTROLS: frozenset[str] = frozenset({"off", "clear"})
 _PERSONA_PUBLIC_SUPPRESS_CONTROLS: frozenset[str] = frozenset({"off", "clear", "private"})
+
+# 模型自主知识库检索（设计「模型自主知识库检索」）：工具协议、schema 与查询串的保守预留下限。
+# 1024 要装下首轮的 tool_calls 信封（一个查询，上限是 `capabilities.KB_MODEL_MAX_QUERY_CHARS`
+# 字符）与回传的 tool 消息外壳；schema 按工具定义另估一遍。少算会让第二轮真的顶穿上限，
+# 而多算只是这一轮少留几条历史。
+_KB_TOOL_PROTOCOL_MIN_TOKENS: int = 1024
+
+# 首轮就发现工具走不通时可以退回普通聊天的那几个稳定分类。
+# 只认这三个：其余失败（超时、限流、空回复、非法请求）与**已经执行过工具之后**的失败
+# 都按既有失败路径收口 —— 不回退、不重试，也就不存在第二次工具尝试。
+_KB_TOOL_FALLBACK_KINDS: frozenset[str] = frozenset(
+    {"tools_unsupported", "tools_unavailable", "input_too_large"}
+)
+
+
+@dataclass(frozen=True)
+class _KbToolTurn:
+    """一轮普通聊天里可以交给模型的自主知识库检索（设计「调用与授权」）。
+
+    三样东西都只属这一轮：`tool` 带着本轮的频道、用户与代次回调，`definition` 是发回端点
+    的工具定义（预算估算要用它的 schema），`reserved_tokens` 是这一轮先从输入预算里扣掉的
+    额度。字段类型是 `Any` 而不是 `kb.tool` 的类型：本模块两种版本共用，`kb.tool` 只在
+    真正要用它的那一次调用里延迟导入。
+    """
+
+    tool: Any
+    definition: Any
+    reserved_tokens: int
 
 
 def _persona_evidence_line(message_id: int, text: str, now: float) -> str:
@@ -2588,6 +2617,10 @@ class BotApp:
             # 本轮唯一启用的 MCP 能力（D-39 保证至多一个）；本地能力（`/kb`）不走这条口子，
             # 它在上面已经收口，取不到模型也不用再判一次。
             capability = self._enabled_capability(request)
+            # 模型自主检索知识库（设计「调用与授权」）：只有**没有任何显式能力**的普通聊天才有。
+            # 判否时只是「这一轮没有这个工具」：不发提示、不打断，显式 `/kb` 与 MCP 能力
+            # 仍各走各的收口。
+            kb_tool_turn = self._kb_tool_turn(request)
             system_addenda: list[str] = []
             if request.channel_kind == "lobby":
                 system_addenda.append(texts.LOBBY_SHARED_SYSTEM_ADDENDUM)
@@ -2604,6 +2637,12 @@ class BotApp:
             # 时间片段由 `build_messages` 追加，天然在最后（D-114 第 2 条）。关闭时是空串，不追加。
             if self._sticker_addendum:
                 system_addenda.append(self._sticker_addendum)
+            # 自主检索的工具说明是这一轮**新增**的最后一段静态说明：先留一份不含它的加法表，
+            # 首轮发现工具走不通时才能原样退回普通聊天（见 `_complete_kb_tool`）。
+            system_addendum_plain = "\n\n".join(system_addenda) or None
+            if kb_tool_turn is not None:
+                system_addenda.append(texts.KB_TOOL_SYSTEM_ADDENDUM)
+            system_addendum = "\n\n".join(system_addenda) or None
             # 记忆候选只在本轮作者可用时取（§34.3）；取失败传空元组继续，绝不打断聊天（D-60）。
             # 位置在 `/kb` 的本地收口之后：那些分支本来就不调模型，也就没有必要读记忆。
             supplemental: tuple[SupplementalItem, ...] = ()
@@ -2626,7 +2665,12 @@ class BotApp:
             feature_context = (
                 "kb" in request.enabled_features or blog_block is not None
             )
-            system_addendum = "\n\n".join(system_addenda) or None
+            kb_reserved_tokens = 0
+            if kb_tool_turn is not None:
+                # 工具轮按能力轮处理：历史可以整对丢光（D-38），并先为工具结果、工具协议与
+                # schema 留出额度；`select_recent_suffix` 拿到的是同一个预留值。
+                feature_context = True
+                kb_reserved_tokens = kb_tool_turn.reserved_tokens
             # 公开记忆本轮可能生效时**先**算 S1（R2、§47.3）：喂给模型的近期块必须是
             # 「将要解析 subject 的那一串」，否则缓冲里有、但装不进这一轮的近期消息也会
             # 贡献 subject —— 而那些正文模型根本没见过。位置在内容引用、博客、`/kb`、
@@ -2641,6 +2685,9 @@ class BotApp:
                     feature_context=feature_context,
                     transient_user_items=recent_items,
                     transient_user_header=texts.LOBBY_RECENT_CONTEXT_HEADER,
+                    # 与 `build_messages` 同一个预留值：两处一旦分叉，S1 就不再是最终
+                    # 选择的上界（§45.2）。
+                    reserved_input_tokens=kb_reserved_tokens,
                 )
                 # S1 必然是入参的**后缀**（§45.2），按条数切回来就是它对应的那些记录。
                 # 已知的保守面（R2 的刻意取舍）：S1 内随后被记忆块挤掉的那几条仍会贡献
@@ -2661,39 +2708,48 @@ class BotApp:
                         lobby_recent=recent_messages,
                     ),
                 )
-            messages = self._ctx.build_messages(
-                request.session_key,
-                self._config.system_prompt,
-                pending_user=pending,
-                system_addendum=system_addendum,
-                # 数据块不可丢弃，历史可以（D-38）：/kb 与引用的博客正文同理。
-                feature_context=feature_context,
-                # 记忆正文只走这一条口子：`build_messages` 把它放进 role="user" 的当前轮，
-                # 既不进 system，也不进历史（§33、D-56）。本方法之外不再碰 memory 文本。
-                supplemental_items=supplemental,
-                # §26.1 的三个 token 旋钮在这里生效：共同记忆、私有记忆与公开个人记忆各有
-                # 一份上限，记忆因此不能把整轮预算吃光、把历史挤掉（取舍仍由 `build_messages`
-                # 做，D-62）。
-                supplemental_caps=self._supplemental_caps(),
-                # 近期消息与块头要么都给、要么都不给：没有条目时不传表头，否则
-                # `build_messages` 会按契约抛 ValueError。公开路径生效时这里给的是 **S1**，
-                # 它同时就是模型真正看到的那一串（R2、§47.3）。
-                transient_user_items=recent_items,
-                transient_user_header=(
-                    texts.LOBBY_RECENT_CONTEXT_HEADER if recent_items else None
-                ),
-            )
-            if image_part is not None:
-                attach_image(messages, image_part)
-            # 被引用的那张缩略图紧随消息自己的图，然后是各处引用换出来的图：
-            # 一张图一块，顺序只影响模型的阅读次序。
-            # 博客正文换出来的图也在其中——它同样只属当前轮，取回来了就该交出去。
-            if reply_image_part is not None:
-                attach_image(messages, reply_image_part)
-            for part in ref_parts:
-                attach_image(messages, part)
-            for part in blog.image_parts:
-                attach_image(messages, part)
+            # 本轮的消息只在这一处拼装，`addendum` 是唯一的变量：首轮发现工具走不通时要
+            # **去掉**新增的工具说明再拼一次，其余入参逐字相同 —— `build_messages` 是纯函数
+            # （不写历史、不推进代次），两次调用因此对历史与资料的取舍完全一致。
+            def _render_messages(addendum: str | None) -> list[dict[str, Any]]:
+                built = self._ctx.build_messages(
+                    request.session_key,
+                    self._config.system_prompt,
+                    pending_user=pending,
+                    system_addendum=addendum,
+                    # 数据块不可丢弃，历史可以（D-38）：/kb 与引用的博客正文同理。
+                    feature_context=feature_context,
+                    # 记忆正文只走这一条口子：`build_messages` 把它放进 role="user" 的当前轮，
+                    # 既不进 system，也不进历史（§33、D-56）。本方法之外不再碰 memory 文本。
+                    supplemental_items=supplemental,
+                    # §26.1 的三个 token 旋钮在这里生效：共同记忆、私有记忆与公开个人记忆各有
+                    # 一份上限，记忆因此不能把整轮预算吃光、把历史挤掉（取舍仍由 `build_messages`
+                    # 做，D-62）。
+                    supplemental_caps=self._supplemental_caps(),
+                    # 近期消息与块头要么都给、要么都不给：没有条目时不传表头，否则
+                    # `build_messages` 会按契约抛 ValueError。公开路径生效时这里给的是 **S1**，
+                    # 它同时就是模型真正看到的那一串（R2、§47.3）。
+                    transient_user_items=recent_items,
+                    transient_user_header=(
+                        texts.LOBBY_RECENT_CONTEXT_HEADER if recent_items else None
+                    ),
+                    # KB 工具轮的预留（工具结果 + 协议/schema）；普通聊天恒为 0，与升级前一致。
+                    reserved_input_tokens=kb_reserved_tokens,
+                )
+                if image_part is not None:
+                    attach_image(built, image_part)
+                # 被引用的那张缩略图紧随消息自己的图，然后是各处引用换出来的图：
+                # 一张图一块，顺序只影响模型的阅读次序。
+                # 博客正文换出来的图也在其中——它同样只属当前轮，取回来了就该交出去。
+                if reply_image_part is not None:
+                    attach_image(built, reply_image_part)
+                for part in ref_parts:
+                    attach_image(built, part)
+                for part in blog.image_parts:
+                    attach_image(built, part)
+                return built
+
+            messages = _render_messages(system_addendum)
             model = self._model
             if self._is_expired(getattr(request, "expires_at", None)):
                 return
@@ -2706,10 +2762,21 @@ class BotApp:
                     await self._notify_failure(request)
                 return
             history_context: str | None = None
+            # 这一轮真的用上了知识库工具时置真：它同时决定送达后要不要跳过依赖资料的写作路径。
+            kb_tools_used = False
             try:
                 if capability is not None:
                     text, history_context = await self._complete_capability(
                         model, messages, request, capability
+                    )
+                elif kb_tool_turn is not None:
+                    text, kb_tools_used = await self._complete_kb_tool(
+                        model,
+                        messages,
+                        request,
+                        kb_tool_turn,
+                        # 回退用的消息与上面这一份只差工具说明。
+                        plain_messages=lambda: _render_messages(system_addendum_plain),
                     )
                 else:
                     async with self._model_gate:
@@ -2798,7 +2865,12 @@ class BotApp:
             # 还会再复查一次代次）。它换出来的是**要发出的文本**，历史提交用已归一的
             # `rendered`（不含披露）—— 披露里就是记忆正文，绝不进历史（§33 的红线）。
             # 披露预算按归一后的长度算，`growth` 那套算术不用改。
-            send_text = await self._auto_capture_answer(request, rendered)
+            if kb_tools_used:
+                # 这一轮的回答建立在知识库资料上：第三方资料不进自动提取（§34.4 的口径），
+                # 回答原样发出。没用到工具的普通轮一个字都不变。
+                send_text = rendered
+            else:
+                send_text = await self._auto_capture_answer(request, rendered)
 
             # 发送器也是异步边界；/reset 在此期间到达时，旧请求不得再发送。
             # 自动提取本身也是一段异步边界，这个检查因此不只是形式：记忆已经落盘而回复不发的
@@ -2841,7 +2913,10 @@ class BotApp:
                     )
                 # 送达后才算一次画像证据（设计 §6）：发送失败的这一轮不贡献任何观察，
                 # 也不进缓冲 —— 用户没看见答案的回合不属于已完成的对话。
-                self._note_persona_evidence(request)
+                # 用了知识库工具的那一轮同样不算：它与 `_persona_update_eligible` 排除的
+                # 「依赖外部资料的回合」是同一条口径。
+                if not kb_tools_used:
+                    self._note_persona_evidence(request)
             if outcome.reason == "quota":
                 await self._notify_quota(request)
         finally:
@@ -2964,15 +3039,7 @@ class BotApp:
         }
         # 兼容测试替身或旧的可选客户端；正式 OpenAI 客户端支持 model_gate，
         # 只在两次模型请求周围占门，等待/执行 MCP 时不占普通聊天槽位。
-        try:
-            signature = inspect.signature(complete_with_tools)
-            accepts_gate = any(
-                parameter.kind is inspect.Parameter.VAR_KEYWORD
-                for parameter in signature.parameters.values()
-            ) or "model_gate" in signature.parameters
-        except (TypeError, ValueError):
-            # 某些代理对象没有可反射签名；它们采用旧兼容路径。
-            accepts_gate = False
+        accepts_gate = self._accepts_model_gate(complete_with_tools)
         if accepts_gate:
             kwargs["model_gate"] = self._model_gate
 
@@ -2982,6 +3049,160 @@ class BotApp:
             async with self._model_gate:
                 completion = await complete_with_tools(messages, **kwargs)
         return completion.text, completion.history_context
+
+    @staticmethod
+    def _accepts_model_gate(complete_with_tools: Any) -> bool:
+        """客户端是否接受 `model_gate`；不支持时调用方自己占门（旧兼容路径）。"""
+        try:
+            signature = inspect.signature(complete_with_tools)
+        except (TypeError, ValueError):
+            # 某些代理对象没有可反射签名；它们采用旧兼容路径。
+            return False
+        return any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        ) or "model_gate" in signature.parameters
+
+    def _turn_is_current(self, request: Request) -> bool:
+        """本轮是否仍然有效：会话代次未变，且没有跨过消息的截止时间。
+
+        工具轮把这一条同时交给模型客户端与工具执行器：`/reset`、线程过期与权限撤销
+        都必须能让已经开始的检索停下（设计「调用与授权」）。
+        """
+        if self._ctx.generation(request.session_key) != request.generation:
+            return False
+        return not self._is_expired(getattr(request, "expires_at", None))
+
+    def _kb_tool_turn(self, request: Request) -> _KbToolTurn | None:
+        """本轮能不能让模型自主检索知识库；不可用时返回 None。
+
+        门在本地一次判完（设计「调用与授权」）：只有**没有任何显式能力**的普通聊天、
+        知识库开着且开了自主工具、当前频道与作者通过既有访问策略、索引已有可用快照、
+        客户端支持工具时才提供。任何一条不成立都只是「这一轮没有工具」：普通聊天照常，
+        不发提示、不打断用户；显式 `/kb` 仍走自己的三种本地文案。
+        """
+        if request.enabled_features:
+            # `/kb` 与四个 MCP 能力各自在自己的路径上收口，工具不叠加（D-39）。
+            return None
+        config = self._config.knowledge_base
+        if not config.enabled or not config.auto_tool_enabled:
+            return None
+        if not self._kb.available:
+            # 还没有成功构建过快照：与 D-45 的软故障口径一致，只降级这一条可选路径。
+            return None
+        if not self._kb.permits(
+            channel_kind=request.channel_kind, user_id=request.message.author.id
+        ):
+            return None
+        model = self._model
+        if model is None or not callable(getattr(model, "complete_with_tools", None)):
+            # Light 与没有工具协议的客户端保持旧路径；判断只看模型能力，不看部署版本。
+            return None
+        context_tokens = self._config.behavior.context_input_tokens
+        max_result_tokens = min(config.max_context_tokens, context_tokens // 3)
+        try:
+            # 延迟导入：这条路径只有完整版带 tool 的客户端才走得到，`kb.tool` 也就没必要
+            # 参与两种版本的启动导入图。它自己刻意不依赖 MCP（结果类型与 `mcp.contracts`
+            # 同名同义、各自定义），把它留在函数里是这个约定的直接体现。
+            from .kb.tool import KB_TOOL_DEFINITION, KnowledgeTool
+        except ImportError:
+            return None
+        reserved = self._kb_tool_reserved_tokens(KB_TOOL_DEFINITION, max_result_tokens)
+        if max_result_tokens <= 0 or reserved >= context_tokens:
+            # 预算小到连工具结果或工具协议都装不下：放弃工具，普通聊天继续。
+            return None
+        tool = KnowledgeTool(
+            self._kb,
+            channel_kind=request.channel_kind,
+            user_id=request.message.author.id,
+            generation_is_current=lambda: self._turn_is_current(request),
+            max_result_tokens=max_result_tokens,
+        )
+        return _KbToolTurn(
+            tool=tool, definition=KB_TOOL_DEFINITION, reserved_tokens=reserved
+        )
+
+    @staticmethod
+    def _kb_tool_reserved_tokens(definition: Any, result_tokens: int) -> int:
+        """工具轮要先从输入预算里扣掉的额度：工具结果 + 工具协议与 schema。
+
+        协议那一块用 `_KB_TOOL_PROTOCOL_MIN_TOKENS` 作保守下限，schema 按发回端点的定义
+        实估一遍；查询串的上限远小于这个下限，因此被它一并盖住。
+        """
+        return (
+            result_tokens
+            + _KB_TOOL_PROTOCOL_MIN_TOKENS
+            + estimate_tokens(str(definition.input_schema))
+        )
+
+    async def _complete_kb_tool(
+        self,
+        model: ModelClient,
+        messages: list[dict[str, Any]],
+        request: Request,
+        turn: _KbToolTurn,
+        plain_messages: Callable[[], list[dict[str, Any]]],
+    ) -> tuple[str, bool]:
+        """跑一轮模型自主的知识库检索；返回 `(正文, 本轮是否用上了工具)`。
+
+        `plain_messages` 是**去掉工具说明**后的同一轮消息，只用于首轮就发现工具走不通时
+        的回退：那时这一轮还没有取到任何资料，退成普通聊天与用户看到的结果一致。
+        已经执行过工具之后的失败绝不回退 —— 那会把一次依赖资料的回合伪装成普通聊天，
+        也会变成第二次工具尝试。
+        """
+        complete_with_tools = getattr(model, "complete_with_tools")
+        attempted = False
+
+        async def execute(call):
+            nonlocal attempted
+            # 进了执行器就算「尝试过」：此后一律按既有失败路径收口，不回退也不重试。
+            attempted = True
+            return await turn.tool.execute(call)
+
+        kwargs: dict[str, Any] = {
+            "tools": (turn.definition,),
+            "execute": execute,
+            # 一次回答最多一次合法工具调用：第二轮不再提供任何可调用工具。
+            "max_tool_calls": 1,
+            # 代次与截止时间都由这一个回调承载（检索与模型请求都在它的保护下）。
+            "generation_is_current": lambda: self._turn_is_current(request),
+            # 首轮与带工具结果的第二轮都在最终序列化请求上做硬检查。
+            "max_input_tokens": self._config.behavior.context_input_tokens,
+        }
+        # 与 `_complete_capability` 同一套探测：正式客户端只在模型请求周围占门，
+        # 本地检索不占普通聊天槽位。
+        accepts_gate = self._accepts_model_gate(complete_with_tools)
+        if accepts_gate:
+            kwargs["model_gate"] = self._model_gate
+        try:
+            if accepts_gate:
+                completion = await complete_with_tools(messages, **kwargs)
+            else:
+                async with self._model_gate:
+                    completion = await complete_with_tools(messages, **kwargs)
+        except ModelError as exc:
+            if (
+                attempted
+                or exc.stage not in (None, STAGE_FIRST_ROUND)
+                or exc.kind not in _KB_TOOL_FALLBACK_KINDS
+            ):
+                raise
+            if not self._turn_is_current(request):
+                # 与工具循环里的其它异步边界同样处理：本轮已作废，既不回退也不发通知。
+                raise ToolGenerationCancelled() from exc
+            log_event(
+                _logger,
+                logging.DEBUG,
+                "app.kb_tool_fallback",
+                reason=exc.kind,
+                channel_id=request.channel_id,
+                channel_kind=request.channel_kind,
+            )
+            async with self._model_gate:
+                text = await model.complete(plain_messages())
+            return text, False
+        # 工具原文、查询与参数都不进 history_context：KB 资料只属这一轮（D-43）。
+        return completion.text, attempted or bool(completion.used_tools)
 
     async def _prepare_kb(self, request: Request) -> str | None:
         """执行一轮 `/kb`：访问门 → 检索；返回数据块，本地拒绝时返回 None。

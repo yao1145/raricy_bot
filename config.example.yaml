@@ -200,6 +200,7 @@ system_prompt: |  # 聊天系统提示词；以下多行是实际发送内容，
 
 knowledge_base:  # 本地只读 Markdown 检索；命中内容会发送给模型，目录须经授权清点
   enabled: false  # 是否启用本模块；上级总开关也须开启
+  auto_tool_enabled: false  # 普通聊天是否把本地检索作为工具交给模型按需调用；默认关闭，/kb 强制检索与访问门不受影响
   root_dir: "./knowledge"  # 知识库根目录，容器中应只读挂载
   access_mode: allowlist  # allowlist 按用户和频道名单限制；all_chat 显式开放聊天范围
   allowed_channel_kinds:  # allowlist 模式允许的频道；dm 为私聊，lobby 为大区

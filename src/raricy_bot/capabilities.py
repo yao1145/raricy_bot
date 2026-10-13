@@ -31,6 +31,15 @@ IMAGE_COMMAND = "/image"
 SHAPE_LIST = "list"
 SHAPE_SINGLE = "single"
 
+# 本地知识库的模型工具（设计 §调用与授权）。它**不是** MCP 能力：不进下面的
+# TOOL_CAPABILITIES，不占 `mcp.features` 的名字，也不进任何上游工具白名单 ——
+# 知识库是本地只读检索（D-41），由普通聊天按需调用，与 Exa/知乎/地图/Wolfram 的
+# 授权、限流与故障转移完全无关。
+# 工具名与查询串上限只在这里声明：`kb/tool.py` 的工具定义、参数校验与 app 的装配
+# 共用同一份取值，不会出现「schema 写 500、校验按 300」的漂移。
+KB_MODEL_TOOL_NAME: str = "knowledge_search"
+KB_MODEL_MAX_QUERY_CHARS: int = 500
+
 
 @dataclass(frozen=True)
 class Capability:

@@ -537,6 +537,7 @@ actor 缺失的评论回复通知仍按 unmatched 计数。Service 在模型调�
 ```yaml
 knowledge_base:
   enabled: true
+  auto_tool_enabled: false       # true 时完整版普通聊天由模型按需调用本地检索；/kb 始终保留
   root_dir: "./knowledge"        # 容器里解析为 /app/knowledge，即下面的只读挂载点
   access_mode: allowlist         # 默认值；必须显式列出 allowed_user_ids
   allowed_channel_kinds:
@@ -572,7 +573,9 @@ Rocky/RHEL 启用 SELinux 时，按[附录 A](#附录-arocky-linux-9-差异)的�
 只读**递归**目录下的 `.md` 文件（扩展名大小写无关），一级子目录是分类，根目录直接放置的
 文件归入保留分类 `_root`；非法编码、超大文件、隐藏文件与符号链接会被跳过，其余文件仍可检索。
 命中片段只随当前这一轮发给第三方模型，不写进历史、SQLite 或日志，也不会发给 Exa；
-没有命中时直接回一句本地提示，**不会**调用模型。知识库不可用、无权限或目录被删只影响 `/kb`，
+显式 `/kb` 没有命中时直接回一句本地提示，不调用模型。开启 `auto_tool_enabled` 后，普通聊天
+由模型选择调用本地工具，结果用 `role="tool"` 提供；权限和容量沿用本节配置。知识库不可用、
+无权限或目录被删时，显式 `/kb` 回本地提示，自动工具轮退回普通聊天；
 普通聊天、评论、`/livez`、`/readyz` 照常。
 
 > **首次索引在启动阶段同步完成**，之后才启动 `/livez`：目录越大启动越慢，请让

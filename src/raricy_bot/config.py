@@ -299,9 +299,15 @@ class CommentConfig:
 
 @dataclass(frozen=True)
 class KnowledgeBaseConfig:
-    """本地 Markdown 知识库配置（INTERFACES §23.1）；默认关闭。"""
+    """本地 Markdown 知识库配置（INTERFACES §23.1）；默认关闭。
+
+    `auto_tool_enabled` 是「普通聊天由模型按需调用」的部署开关，与 `enabled` 分开放：
+    它只多给普通聊天一个工具，不改变 `/kb`、访问门与目录的任何事实。默认关闭，因此
+    既有部署升级后逐字节保持原有的显式 `/kb` 模式。
+    """
 
     enabled: bool = False
+    auto_tool_enabled: bool = False
     root_dir: str = "./knowledge"
     access_mode: str = "allowlist"
     allowed_channel_kinds: tuple[str, ...] = ("dm",)
@@ -1344,6 +1350,8 @@ def _knowledge_base(
     """构造知识库配置；关闭时只做类型与硬上限校验，不施加启用才成立的交叉约束。"""
     where = "knowledge_base"
     enabled = _bool_flag(container, "enabled", where, False)
+    # 严格布尔：`"true"`、`1` 一律在加载期失败，避免「配置写着开、运行期按字符串判真」。
+    auto_tool_enabled = _bool_flag(container, "auto_tool_enabled", where, False)
     root_dir = _text_with_default(container, "root_dir", where, "./knowledge")
 
     access_mode = container.get("access_mode", "allowlist")
@@ -1406,6 +1414,7 @@ def _knowledge_base(
 
     return KnowledgeBaseConfig(
         enabled=enabled,
+        auto_tool_enabled=auto_tool_enabled,
         root_dir=root_dir,
         access_mode=access_mode,
         allowed_channel_kinds=kinds,

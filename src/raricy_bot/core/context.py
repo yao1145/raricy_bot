@@ -228,6 +228,19 @@ def _exceeds_group_caps(
     return False
 
 
+def _validate_reserved_input_tokens(value: int) -> int:
+    """校验调用方给的预留额度：必须是非负的**真整数**。
+
+    `bool` 是 `int` 的子类，但把 `True` 当成 1 个 token 的预留几乎一定是调用方写错了参数名，
+    因此和项目里其它数值配置同一口径（`comments.service`、`config`）显式拒绝它。
+    非整数（含 `float`、`None`）与负值同样拒绝：预留额度是先从整轮预算里扣掉的一笔账，
+    值为负会反过来**放宽**预算，静默接受等于让调用方以为留了额度却什么也没留。
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("reserved_input_tokens 必须为非负整数")
+    return value
+
+
 class ContextManager:
     """内存会话历史；只做追加、清空、裁剪与消息拼装。"""
 
@@ -347,6 +360,7 @@ class ContextManager:
         supplemental_caps: tuple[SupplementalCap, ...] = (),
         transient_user_items: tuple[str, ...] = (),
         transient_user_header: str | None = None,
+        reserved_input_tokens: int = 0,
     ) -> list[dict[str, str]]:
         """拼装模型消息：第一条 system，其后是裁剪后的历史，最后是本轮未提交的用户内容。
 
@@ -386,7 +400,17 @@ class ContextManager:
         `块头 + 空行 + 条目...` 的一整块，拼在末尾那条 user 消息里、记忆块之后、
         当前正文之前。它们**不**触发 `MEMORY_SYSTEM_ADDENDUM`（近期公开消息不是记忆），
         也**绝不**写进 `_sessions`。
+
+        `reserved_input_tokens` 是调用方为**本轮后续注入**的内容预留的额度（当前唯一使用者
+        是模型工具轮的检索结果）：这笔钱不进入本轮任何一条消息，只是先从整轮预算里扣掉，
+        于是历史、记忆资料与近期消息都按**剩余**预算取舍（`_plan_turn` 的取舍口径不变，
+        见它自己的注释）。默认 0 时输出与没有这个参数时逐字节一致。
+
+        预留**不截断** system 与本轮正文：`pending_user` 永远保留，两条静态记忆说明也只由
+        是否选中记忆决定 —— 预留只影响还能装下多少可丢弃的历史与资料。真正的硬检查在后续
+        客户端（首轮与带工具结果的第二轮都过 `ToolCallingModelClient`），本模块不代它兜底。
         """
+        reserved = _validate_reserved_input_tokens(reserved_input_tokens)
         has_transient = bool(transient_user_items)
         if has_transient != bool(transient_user_header):
             # 只给块头不给条目（或反过来）是调用方写错了。静默吞掉会让「为什么模型没看到
@@ -414,6 +438,11 @@ class ContextManager:
         base_tokens = system_tokens
         if pending_user is not None:
             base_tokens += estimate_tokens(pending_user)
+        # 预留额度在这里一次性计入已经花掉的部分：`_plan_turn` 与下面的两条裁剪循环全都以
+        # `base_tokens` 为起点，因此不需要各自再减一遍，也不会漏掉任何一条出口。
+        # 不临时改 `_max_input_tokens`：同一个 `ContextManager` 被多个会话共享，改动实例状态
+        # 会让并发会话看到别人的预留（本模块不加锁，调用方只保证同一会话串行）。
+        base_tokens += reserved
 
         def over_budget() -> bool:
             return (
@@ -498,7 +527,8 @@ class ContextManager:
         —— 此时调用方必须**不**追加任何说明，输出与没有这两个参数时逐字节一致。
 
         预算的分配次序（§7.2 与 §11.3）：
-        1. system、静态 addendum 与本轮 `pending_user` 已经算进 `base_tokens`，不会动它们
+        1. system、静态 addendum、本轮 `pending_user` 与调用方预留的 `reserved_input_tokens`
+           （`build_messages` 已经把它并进 `base_tokens`）不会动它们
            —— 因此 `/kb` 与引用的博客正文（它们就在 `pending_user` 里）天然优先于全部资料。
         2. 普通聊天先锁定最近一组完整历史（规则 3）；能力轮次不锁定，历史可以被资料挤光
            （D-38 的硬上限不变）。
@@ -606,6 +636,7 @@ class ContextManager:
         feature_context: bool = False,
         transient_user_items: tuple[str, ...] = (),
         transient_user_header: str | None = None,
+        reserved_input_tokens: int = 0,
     ) -> tuple[str, ...]:
         """算出**本轮候选的近期消息后缀 S1**，供装配层在解析 subject 之前调用（§45.2、R2）。
 
@@ -628,7 +659,12 @@ class ContextManager:
         纯只读：不改历史、不推进代次、不写 `_sessions`；`_plan_turn` 与 `build_messages`
         的行为一个字都不变。`transient_user_items` 为空时返回空元组（这一轮没有近期消息，
         也就没有 S1）。
+
+        `reserved_input_tokens` 与 `build_messages` 的同名参数必须是**同一笔**预留，校验
+        口径也相同。少传会让这里的可用额度比 `_plan_turn` 更宽，选出的 S1 就不再是实际选择
+        的上界，本轮真正选中的近期消息会漏在 subject 范围之外（§45.2 的前提被破坏）。
         """
+        reserved = _validate_reserved_input_tokens(reserved_input_tokens)
         if not transient_user_items:
             return ()
         # 与 `build_messages` 同款：system、静态 addendum 与时间片段**分别**估算
@@ -643,6 +679,9 @@ class ContextManager:
         used += estimate_tokens(self._time_fragment())
         if pending_user is not None:
             used += estimate_tokens(pending_user)
+        # 与 `build_messages` 并入 `base_tokens` 的位置、口径一致：预留是调用方为本轮后续
+        # 注入的内容先扣掉的一笔额度，S1 必须按同一笔剩余额度算，否则两者会分叉。
+        used += reserved
         history = self._sessions.get(session_key, [])
         if not feature_context and history:
             # 规则 3 的同一笔预留：普通聊天先锁定最近一组完整历史，近期块只能争剩下的。

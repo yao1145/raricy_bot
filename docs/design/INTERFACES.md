@@ -397,7 +397,19 @@ warning 按错误处理。测试目录当前被 Git 忽略，不能假设新克�
 [服务](../../src/raricy_bot/kb/service.py)、[模型](../../src/raricy_bot/kb/models.py)。
 本地只读能力，不走 MCP；默认 DM + 稳定用户 ID allowlist。
 一级目录为分类，根文件归 `_root`；扫描受文件/字节/分块上限约束，完整构建后原子替换索引。
-命中块只入当前 user 消息，不留原文历史，不把检索片段或文件路径写日志；失败使用旧快照或降级。
+显式 `/kb` 命中块只入当前 user 消息；D-169 的自动工具结果只入当前 tool 消息。
+不留原文历史，不把检索片段或文件路径写日志；失败使用旧快照或降级。
+
+D-169 增加完整版普通聊天的模型工具入口：`knowledge_base.auto_tool_enabled` 默认关闭；
+启用且索引可用、访问允许、模型支持工具时，普通聊天提供本地 `knowledge_search`。
+模型决定是否检索，每轮最多一次工具尝试；显式 `/kb` 仍强制检索并使用普通 `complete`。
+工具仅接受 1–500 字符的 `query`，执行前后复查访问权限、会话代次与期限。
+自动结果只进当前 `role="tool"`，不保存工具参数、原文或检索摘要到历史；
+显式 `/kb` 结果继续当前 `role="user"`。两种模式都不访问 MCP 上游。
+普通工具轮为协议与资料预留预算，`build_messages` 与 `select_recent_suffix` 共用
+`reserved_input_tokens`；最终首轮及工具后续轮都按聊天输入上限检查。
+实际尝试工具的轮次跳过自动记忆提取和画像证据收集。显式联网命令、评论、发文与 Light 不增加该工具。
+入口：[KnowledgeTool](../../src/raricy_bot/kb/tool.py)、[聊天装配](../../src/raricy_bot/app.py)。
 
 ## 24. `core/blog.py`（引用博客）
 
